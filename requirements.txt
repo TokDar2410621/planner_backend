@@ -1,0 +1,27 @@
+# Django
+Django>=5.0,<6.0
+djangorestframework>=3.14,<4.0
+djangorestframework-simplejwt>=5.3,<6.0
+django-cors-headers>=4.3,<5.0
+
+# Database
+psycopg2-binary>=2.9,<3.0
+dj-database-url>=2.1,<3.0
+
+# AI & Document Processing
+google-generativeai>=0.3,<1.0
+PyMuPDF>=1.23,<2.0
+Pillow>=10.0,<11.0
+
+# Utils
+python-dotenv>=1.0,<2.0
+python-dateutil>=2.8,<3.0
+
+# Cloud Storage
+cloudinary>=1.36,<2.0
+django-cloudinary-storage>=0.3,<1.0
+
+# Testing
+pytest>=7.4,<8.0
+pytest-django>=4.5,<5.0
+factory-boy>=3.3,<4.0
