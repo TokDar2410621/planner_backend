@@ -55,39 +55,67 @@ class DocumentProcessor:
     """
 
     # Unified extraction prompt that extracts all types of schedule data
-    UNIFIED_EXTRACTION_PROMPT = """Tu es un expert en extraction de données d'emploi du temps. Analyse cette image TRÈS ATTENTIVEMENT et extrait TOUTES les informations au format JSON.
+    UNIFIED_EXTRACTION_PROMPT = """Tu es un expert en extraction de données d'emploi du temps. Analyse cette image avec une EXTRÊME PRÉCISION.
 
-TYPES DE DOCUMENTS À DÉTECTER:
-- Emploi du temps de COURS (université, école, CÉGEP, UQAC, etc.)
-- Planning de TRAVAIL (horaires de travail, shifts, jobs)
-- Calendrier mixte (cours + travail)
+=== ÉTAPE 1: IDENTIFIER LA STRUCTURE ===
+Regarde attentivement l'image et identifie:
+- Est-ce une GRILLE (tableau avec jours en colonnes et heures en lignes)?
+- Est-ce une LISTE (événements listés un par un)?
+- Où sont les JOURS? (en haut? sur le côté?)
+- Où sont les HEURES? (à gauche? dans chaque case?)
 
-COMMENT LIRE L'IMAGE:
-1. Identifie la structure: grille avec jours en colonnes/lignes, ou liste
-2. Repère les HEURES sur les axes (souvent à gauche ou en haut)
-3. Repère les JOURS (Lun/Mon, Mar/Tue, Mer/Wed, Jeu/Thu, Ven/Fri, Sam/Sat, Dim/Sun)
-4. Extrait CHAQUE bloc/case avec son jour, heure début, heure fin, et titre
+=== ÉTAPE 2: LIRE CHAQUE CELLULE/BLOC ===
+Pour CHAQUE bloc coloré ou case remplie:
+1. Note le JOUR de la colonne
+2. Note l'HEURE DE DÉBUT (regarder l'axe des heures à gauche)
+3. Note l'HEURE DE FIN (fin du bloc sur l'axe des heures)
+4. Note le CONTENU (nom du cours, code, salle, prof)
 
-CONVERSION DES ABRÉVIATIONS DE JOURS:
-- "Lun", "L", "Mon", "Monday" → "lundi"
-- "Mar", "M", "Tue", "Tuesday" → "mardi"
-- "Mer", "Me", "Wed", "Wednesday" → "mercredi"
-- "Jeu", "J", "Thu", "Thursday" → "jeudi"
-- "Ven", "V", "Fri", "Friday" → "vendredi"
-- "Sam", "S", "Sat", "Saturday" → "samedi"
-- "Dim", "D", "Sun", "Sunday" → "dimanche"
+=== FORMATS DE PLANNING COURANTS ===
 
-Format de réponse JSON:
+FORMAT GRILLE UNIVERSITAIRE:
+- Colonnes = Jours (Lun, Mar, Mer, Jeu, Ven)
+- Lignes = Créneaux horaires (8h, 9h, 10h...)
+- Cases = Cours avec code + nom + salle
+
+FORMAT PLANNING TRAVAIL:
+- Peut être hebdomadaire ou mensuel
+- Cherche les horaires de shift (ex: "9h-17h", "14h-22h")
+
+FORMAT LISTE/AGENDA:
+- Événements listés avec date et heure
+
+=== CONVERSION DES JOURS ===
+TOUJOURS convertir en français minuscule:
+- Lun/L/Mon/Monday/Lu → "lundi"
+- Mar/Ma/Tue/Tuesday → "mardi"
+- Mer/Me/Wed/Wednesday → "mercredi"
+- Jeu/Je/Thu/Thursday → "jeudi"
+- Ven/Ve/Fri/Friday → "vendredi"
+- Sam/Sa/Sat/Saturday → "samedi"
+- Dim/Di/Sun/Sunday → "dimanche"
+
+=== CONVERSION DES HEURES ===
+TOUJOURS format HH:MM (24h):
+- "8h" ou "8:00" → "08:00"
+- "8h30" ou "8:30" → "08:30"
+- "14h" → "14:00"
+- "2pm" → "14:00"
+- "midi" → "12:00"
+
+=== FORMAT JSON REQUIS ===
 {
     "detected_type": "course_schedule|work_schedule|mixed",
+    "schedule_structure": "grid|list|other",
     "courses": [
         {
-            "name": "Nom COMPLET du cours/matière",
+            "name": "Nom COMPLET (inclure le code si présent, ex: INF1120 - Programmation)",
             "day": "lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche",
             "start_time": "HH:MM",
             "end_time": "HH:MM",
-            "location": "Salle/Local/Bâtiment",
-            "professor": "Nom du prof si visible"
+            "location": "Salle/Local si visible",
+            "professor": "Prof si visible",
+            "course_code": "Code du cours si présent (ex: INF1120)"
         }
     ],
     "shifts": [
@@ -95,34 +123,27 @@ Format de réponse JSON:
             "day": "lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche",
             "start_time": "HH:MM",
             "end_time": "HH:MM",
-            "is_night_shift": true|false,
-            "role": "Poste/Rôle",
+            "is_night_shift": false,
+            "role": "Poste si mentionné",
             "notes": ""
         }
     ],
-    "events": [
-        {
-            "title": "Titre",
-            "day": "jour",
-            "start_time": "HH:MM",
-            "end_time": "HH:MM",
-            "notes": ""
-        }
-    ]
+    "events": []
 }
 
-RÈGLES CRITIQUES:
-- Jours TOUJOURS en français minuscules (lundi, mardi, mercredi, jeudi, vendredi, samedi, dimanche)
-- Heures au format 24h avec deux chiffres (ex: "08:00", "14:30", "19:30", "23:00")
-- Si "8h" → "08:00", si "14h30" → "14:30"
-- Si une plage horaire est floue: "Matin" = "08:00"-"12:00", "Après-Midi" = "14:00"-"18:00", "Soir" = "18:00"-"22:00"
-- is_night_shift = true si le shift commence après 20h OU finit après minuit
-- UN COURS = UNE ENTRÉE SÉPARÉE (même si le même cours se répète plusieurs jours)
-- Si le même cours apparaît Lundi et Mercredi, crée 2 entrées distinctes
-- Arrays vides [] si aucune donnée de ce type trouvée
-- Retourne UNIQUEMENT le JSON valide, AUCUN texte avant ou après
+=== RÈGLES ABSOLUES ===
+1. UN BLOC = UNE ENTRÉE (si "Math" apparaît lundi ET mercredi = 2 entrées séparées)
+2. Si un bloc s'étend sur plusieurs heures, calcule la durée totale (ex: bloc de 8h à 10h = start 08:00, end 10:00)
+3. Si l'heure de fin n'est pas visible, estime selon la taille du bloc ou ajoute 1h30 par défaut
+4. Extrait TOUS les blocs visibles, même partiellement lisibles
+5. Arrays vides [] si aucune donnée de ce type
+6. UNIQUEMENT le JSON, aucun texte avant/après
+7. is_night_shift = true SEULEMENT si shift après 20h ou finit après minuit
 
-SOIS EXHAUSTIF: Extrait TOUS les cours/shifts visibles, même partiellement."""
+=== IMPORTANT ===
+- Lis TRÈS attentivement chaque case de la grille
+- Ne rate aucun cours/bloc
+- Vérifie que chaque jour de la semaine a été parcouru"""
 
     EXTRACTION_PROMPTS = {
         'course_schedule': UNIFIED_EXTRACTION_PROMPT,
@@ -193,11 +214,26 @@ SOIS EXHAUSTIF: Extrait TOUS les cours/shifts visibles, même partiellement."""
 
             if isinstance(content, list):
                 # Multiple images from PDF - convert PIL images to parts
-                parts = [prompt]
-                for img in content:
+                # Add context about multiple pages
+                multi_page_prompt = f"""Ce document contient {len(content)} page(s). Analyse TOUTES les pages et combine les informations.
+
+{prompt}
+
+IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes les données dans une seule réponse JSON."""
+
+                parts = [multi_page_prompt]
+                for idx, img in enumerate(content):
                     img_bytes = BytesIO()
-                    img.save(img_bytes, format='PNG')
-                    parts.append(types.Part.from_bytes(data=img_bytes.getvalue(), mime_type='image/png'))
+                    # Use higher quality JPEG for large images to reduce size while keeping quality
+                    if img.width > 2000 or img.height > 2000:
+                        img.save(img_bytes, format='JPEG', quality=95)
+                        mime_type = 'image/jpeg'
+                    else:
+                        img.save(img_bytes, format='PNG')
+                        mime_type = 'image/png'
+                    logger.info(f"Sending page {idx + 1}: {img.width}x{img.height}px as {mime_type}")
+                    parts.append(types.Part.from_bytes(data=img_bytes.getvalue(), mime_type=mime_type))
+
                 response = self.client.models.generate_content(
                     model=self.model_name,
                     contents=parts
@@ -221,7 +257,21 @@ SOIS EXHAUSTIF: Extrait TOUS les cours/shifts visibles, même partiellement."""
                 )
 
             # Parse response
+            logger.info(f"Raw Gemini response length: {len(response.text)} chars")
+            logger.debug(f"Raw response: {response.text[:500]}...")
+
             extracted_data = self._parse_response(response.text)
+
+            # Log extraction results
+            courses_count = len(extracted_data.get('courses', []))
+            shifts_count = len(extracted_data.get('shifts', []))
+            events_count = len(extracted_data.get('events', []))
+            logger.info(f"Extracted: {courses_count} courses, {shifts_count} shifts, {events_count} events")
+
+            if courses_count == 0 and shifts_count == 0:
+                logger.warning(f"No schedule data extracted from document {document.id}")
+                if 'parse_error' in extracted_data:
+                    logger.error(f"Parse error in response: {extracted_data.get('raw_response', '')[:300]}")
 
             # Update document
             document.extracted_data = extracted_data
@@ -243,7 +293,7 @@ SOIS EXHAUSTIF: Extrait TOUS les cours/shifts visibles, même partiellement."""
 
     def _extract_pdf_content(self, file_path: str) -> list:
         """
-        Extract content from PDF file as images.
+        Extract content from PDF file as high-resolution images.
 
         Args:
             file_path: Path to the PDF file
@@ -256,15 +306,21 @@ SOIS EXHAUSTIF: Extrait TOUS les cours/shifts visibles, même partiellement."""
 
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
-            # Render page to image with good resolution
-            mat = fitz.Matrix(2, 2)  # 2x zoom for better quality
+            # Render page to image with HIGH resolution for better OCR
+            # 3x zoom = ~216 DPI, good balance between quality and file size
+            mat = fitz.Matrix(3, 3)
             pix = page.get_pixmap(matrix=mat)
 
             # Convert to PIL Image
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+            # Log image dimensions for debugging
+            logger.info(f"PDF page {page_num + 1}: {img.width}x{img.height}px")
+
             images.append(img)
 
         doc.close()
+        logger.info(f"Extracted {len(images)} page(s) from PDF")
         return images
 
     def _load_image(self, file_path: str) -> Image.Image:
