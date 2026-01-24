@@ -41,10 +41,50 @@ def parse_time_string(time_str: str) -> Optional[dt_time]:
         if len(parts) >= 2:
             hour = int(parts[0])
             minute = int(parts[1])
+            # Normalize to quarter hours (00, 15, 30, 45)
+            minute = round(minute / 15) * 15
+            if minute == 60:
+                minute = 0
+                hour = (hour + 1) % 24
             return dt_time(hour, minute)
     except (ValueError, TypeError) as e:
         logger.warning(f"Could not parse time string '{time_str}': {e}")
     return None
+
+
+def is_night_shift(start_time: dt_time, end_time: dt_time) -> bool:
+    """
+    Determine if a work shift is a night shift.
+
+    A night shift is when:
+    - Work starts after 20:00 OR
+    - Work ends before 08:00 (next day) OR
+    - End time is before start time (crosses midnight)
+
+    Args:
+        start_time: Shift start time
+        end_time: Shift end time
+
+    Returns:
+        bool: True if it's a night shift
+    """
+    if start_time is None or end_time is None:
+        return False
+
+    # Crosses midnight (end time < start time)
+    if end_time < start_time:
+        return True
+
+    # Starts after 20:00
+    if start_time.hour >= 20:
+        return True
+
+    # Ends very early (before 8:00) but doesn't cross midnight
+    # This would be unusual, but let's handle it
+    if end_time.hour < 8 and start_time.hour < 8:
+        return True
+
+    return False
 
 
 class DocumentProcessor:
@@ -473,7 +513,11 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                     # Handle None values from JSON
                     role = shift.get('role') or ''
                     title = f"Travail - {role}" if role else 'Travail'
-                    is_night = shift.get('is_night_shift') or False
+
+                    # Auto-detect night shift based on times (more reliable than Gemini)
+                    is_night = is_night_shift(start_time, end_time)
+                    if is_night:
+                        logger.info(f"Auto-detected night shift: {start_time}-{end_time}")
 
                     block = RecurringBlock.objects.create(
                         user=user,

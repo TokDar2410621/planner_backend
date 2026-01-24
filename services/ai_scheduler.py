@@ -172,20 +172,38 @@ class AIScheduler:
             # Get blocked times for this day
             blocked_times = self._get_blocked_times(user, day_of_week)
 
-            # Add sleep block after night shift
-            if profile.post_night_shift_wake_time:
-                # Check if there was a night shift the day before
-                yesterday_blocks = RecurringBlock.objects.filter(
-                    user=user,
-                    day_of_week=(day_of_week - 1) % 7,
-                    is_night_shift=True,
-                    active=True
-                )
-                if yesterday_blocks.exists():
-                    blocked_times.append((
-                        time(0, 0),
-                        profile.post_night_shift_wake_time
-                    ))
+            # Add sleep/recovery block after night shift
+            # Check if there was a night shift the day before
+            yesterday_blocks = RecurringBlock.objects.filter(
+                user=user,
+                day_of_week=(day_of_week - 1) % 7,
+                is_night_shift=True,
+                active=True
+            )
+            if yesterday_blocks.exists():
+                # Find the latest end time of night shifts
+                latest_end = time(7, 0)  # Default assumption
+                for night_block in yesterday_blocks:
+                    if night_block.end_time and night_block.end_time > time(0, 0) and night_block.end_time < time(12, 0):
+                        if night_block.end_time > latest_end:
+                            latest_end = night_block.end_time
+
+                # Calculate wake time: end_time + min_sleep_hours
+                # Use configured wake time or calculate from shift end + sleep needed
+                if profile.post_night_shift_wake_time:
+                    wake_time = profile.post_night_shift_wake_time
+                else:
+                    # Default: wake up min_sleep_hours after shift ends
+                    sleep_hours = profile.min_sleep_hours or 7
+                    wake_hour = (latest_end.hour + sleep_hours) % 24
+                    wake_time = time(wake_hour, 0)
+
+                # Block from midnight to wake time
+                blocked_times.append((
+                    time(0, 0),
+                    wake_time
+                ))
+                logger.info(f"Blocked recovery time after night shift until {wake_time}")
 
             # Generate available slots
             day_slots = self._find_free_slots(
