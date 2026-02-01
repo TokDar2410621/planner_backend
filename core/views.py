@@ -319,8 +319,16 @@ class ChatView(APIView):
                 logger.error(f"Document processing error: {e}")
 
         # Generate chat response
-        engine = ChatOrchestrator()
-        result = engine.generate_response(request.user, message or "J'ai uploadé un document.", attachment)
+        try:
+            engine = ChatOrchestrator()
+            result = engine.generate_response(request.user, message or "J'ai uploadé un document.", attachment)
+            logger.info(f"Chat response generated successfully: {result.get('response', '')[:100]}...")
+        except Exception as e:
+            logger.error(f"ChatOrchestrator error: {e}", exc_info=True)
+            return Response(
+                {'error': f'Erreur interne: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
         response_data = {
             'response': result['response'],

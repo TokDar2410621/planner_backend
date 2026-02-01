@@ -7,9 +7,12 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import re
+import tempfile
 from io import BytesIO
 from typing import Optional, Tuple
+from contextlib import contextmanager
 
 import fitz  # PyMuPDF
 from PIL import Image
@@ -324,6 +327,55 @@ Analyse ce texte et retourne le JSON structuré:"""
         if not self.gemini_client and not self.hf_client:
             logger.warning("No AI API configured. Document processing will be limited.")
 
+    @contextmanager
+    def _get_local_file(self, document):
+        """
+        Get a local file path for the document.
+
+        For local storage: returns the path directly
+        For Cloudinary: downloads to a temp file and returns that path
+
+        Yields:
+            str: Path to a local file that can be read
+        """
+        # Check if we have a local path (local storage)
+        try:
+            local_path = document.file.path
+            if os.path.exists(local_path):
+                logger.info(f"Using local file: {local_path}")
+                yield local_path
+                return
+        except (NotImplementedError, AttributeError):
+            # Cloudinary storage doesn't have .path
+            pass
+
+        # Remote storage (Cloudinary) - download to temp file
+        logger.info(f"Downloading file from remote storage: {document.file.name}")
+
+        # Determine file extension
+        file_name = document.file.name
+        _, ext = os.path.splitext(file_name)
+        if not ext:
+            ext = '.pdf'  # Default to PDF
+
+        # Create temp file with correct extension
+        temp_fd, temp_path = tempfile.mkstemp(suffix=ext)
+        try:
+            # Download file content
+            with os.fdopen(temp_fd, 'wb') as temp_file:
+                # Read from Cloudinary/remote storage
+                document.file.seek(0)
+                for chunk in document.file.chunks():
+                    temp_file.write(chunk)
+
+            logger.info(f"Downloaded to temp file: {temp_path}")
+            yield temp_path
+        finally:
+            # Clean up temp file
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+                logger.info(f"Cleaned up temp file: {temp_path}")
+
     def _compute_file_hash(self, file_path: str) -> str:
         """
         Compute SHA-256 hash of file content.
@@ -466,78 +518,79 @@ Analyse ce texte et retourne le JSON structuré:"""
             dict: Extracted data from the document
         """
         try:
-            file_path = document.file.path
-            file_ext = file_path.lower().split('.')[-1]
+            # Use context manager to handle both local and remote (Cloudinary) storage
+            with self._get_local_file(document) as file_path:
+                file_ext = file_path.lower().split('.')[-1]
 
-            # Step 0: Compute file hash and check cache
-            content_hash = self._compute_file_hash(file_path)
-            document.content_hash = content_hash
-            document.file_name = document.file.name.split('/')[-1]
-            document.save(update_fields=['content_hash', 'file_name'])
+                # Step 0: Compute file hash and check cache
+                content_hash = self._compute_file_hash(file_path)
+                document.content_hash = content_hash
+                document.file_name = document.file.name.split('/')[-1]
+                document.save(update_fields=['content_hash', 'file_name'])
 
-            cached_data = self._check_cache(document.user, content_hash)
-            if cached_data:
-                # Use cached result - much faster!
-                extracted_data = cached_data.copy()
-                extracted_data['from_cache'] = True
-                logger.info(f"Using cached extraction for document {document.id}")
+                cached_data = self._check_cache(document.user, content_hash)
+                if cached_data:
+                    # Use cached result - much faster!
+                    extracted_data = cached_data.copy()
+                    extracted_data['from_cache'] = True
+                    logger.info(f"Using cached extraction for document {document.id}")
 
-                # Update document with cached data
+                    # Update document with cached data
+                    document.extracted_data = extracted_data
+                    document.processed = True
+                    document.processing_error = None
+                    document.save()
+
+                    # Still create recurring blocks from cached data
+                    self._create_recurring_blocks(document, extracted_data)
+
+                    return extracted_data
+
+                response_text = None
+                extraction_method = None
+
+                if file_ext == 'pdf':
+                    # NEW: Try text extraction first (pdfplumber)
+                    response_text, extraction_method = self._process_pdf_smart(file_path, document.document_type)
+
+                elif file_ext in ['png', 'jpg', 'jpeg', 'webp', 'gif']:
+                    # Images always use vision
+                    response_text, extraction_method = self._process_image(file_path, document.document_type)
+
+                else:
+                    raise ValueError(f"Type de fichier non supporté: {file_ext}")
+
+                if response_text is None:
+                    raise RuntimeError("Aucun service AI disponible")
+
+                # Parse response
+                logger.debug(f"Raw response ({extraction_method}): {response_text[:500]}...")
+                extracted_data = self._parse_response(response_text)
+
+                # Add extraction method to data
+                extracted_data['extraction_method'] = extraction_method
+
+                # Log extraction results
+                courses_count = len(extracted_data.get('courses', []))
+                shifts_count = len(extracted_data.get('shifts', []))
+                events_count = len(extracted_data.get('events', []))
+                logger.info(f"Extracted ({extraction_method}): {courses_count} courses, {shifts_count} shifts, {events_count} events")
+
+                if courses_count == 0 and shifts_count == 0:
+                    logger.warning(f"No schedule data extracted from document {document.id}")
+                    if 'parse_error' in extracted_data:
+                        logger.error(f"Parse error in response: {extracted_data.get('raw_response', '')[:300]}")
+
+                # Update document
                 document.extracted_data = extracted_data
                 document.processed = True
                 document.processing_error = None
                 document.save()
 
-                # Still create recurring blocks from cached data
+                # Create recurring blocks from extracted data
                 self._create_recurring_blocks(document, extracted_data)
 
                 return extracted_data
-
-            response_text = None
-            extraction_method = None
-
-            if file_ext == 'pdf':
-                # NEW: Try text extraction first (pdfplumber)
-                response_text, extraction_method = self._process_pdf_smart(file_path, document.document_type)
-
-            elif file_ext in ['png', 'jpg', 'jpeg', 'webp', 'gif']:
-                # Images always use vision
-                response_text, extraction_method = self._process_image(file_path, document.document_type)
-
-            else:
-                raise ValueError(f"Type de fichier non supporté: {file_ext}")
-
-            if response_text is None:
-                raise RuntimeError("Aucun service AI disponible")
-
-            # Parse response
-            logger.debug(f"Raw response ({extraction_method}): {response_text[:500]}...")
-            extracted_data = self._parse_response(response_text)
-
-            # Add extraction method to data
-            extracted_data['extraction_method'] = extraction_method
-
-            # Log extraction results
-            courses_count = len(extracted_data.get('courses', []))
-            shifts_count = len(extracted_data.get('shifts', []))
-            events_count = len(extracted_data.get('events', []))
-            logger.info(f"Extracted ({extraction_method}): {courses_count} courses, {shifts_count} shifts, {events_count} events")
-
-            if courses_count == 0 and shifts_count == 0:
-                logger.warning(f"No schedule data extracted from document {document.id}")
-                if 'parse_error' in extracted_data:
-                    logger.error(f"Parse error in response: {extracted_data.get('raw_response', '')[:300]}")
-
-            # Update document
-            document.extracted_data = extracted_data
-            document.processed = True
-            document.processing_error = None
-            document.save()
-
-            # Create recurring blocks from extracted data
-            self._create_recurring_blocks(document, extracted_data)
-
-            return extracted_data
 
         except Exception as e:
             logger.error(f"Error processing document {document.id}: {str(e)}")
