@@ -25,6 +25,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
         model = UserProfile
         fields = [
             'avatar_url',
+            'preferred_llm',
             'min_sleep_hours',
             'post_night_shift_wake_time',
             'peak_productivity_time',

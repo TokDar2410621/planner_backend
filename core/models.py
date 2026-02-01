@@ -17,8 +17,19 @@ class UserProfile(models.Model):
         ('evening', 'Soir'),
     ]
 
+    LLM_CHOICES = [
+        ('gemini', 'Gemini (Google)'),
+        ('claude', 'Claude (Anthropic)'),
+    ]
+
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
     avatar_url = models.URLField(max_length=500, blank=True, null=True)
+    preferred_llm = models.CharField(
+        max_length=20,
+        choices=LLM_CHOICES,
+        default='gemini',
+        help_text="Modèle IA préféré pour le chat"
+    )
     min_sleep_hours = models.PositiveIntegerField(default=7)
     post_night_shift_wake_time = models.TimeField(null=True, blank=True)
     peak_productivity_time = models.CharField(

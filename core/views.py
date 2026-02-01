@@ -44,7 +44,7 @@ from .serializers import (
     SharedScheduleSerializer,
     CreateShareSerializer,
 )
-from services import DocumentProcessor, ChatEngine, AIScheduler
+from services import DocumentProcessor, ChatOrchestrator, AIScheduler
 from services.ai_insights import AIInsightsService
 
 logger = logging.getLogger(__name__)
@@ -319,7 +319,7 @@ class ChatView(APIView):
                 logger.error(f"Document processing error: {e}")
 
         # Generate chat response
-        engine = ChatEngine()
+        engine = ChatOrchestrator()
         result = engine.generate_response(request.user, message or "J'ai uploadé un document.", attachment)
 
         response_data = {

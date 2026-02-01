@@ -1117,58 +1117,9 @@ IMPORTANT: Si l'utilisateur donne des infos de planning, crée les blocs. Sois p
             logger.error(f"Error accessing user profile in _handle_proposal_feedback: {e}")
             return None
 
-        message_lower = message.lower().strip()
-        logger.debug(f"_handle_proposal_feedback called with message: '{message_lower}'")
+        logger.debug(f"_handle_proposal_feedback called with message: '{message}'")
 
-        # DIRECT DETECTION: Handle obvious acceptance phrases without Gemini
-        # This ensures button clicks always work reliably
-        acceptance_phrases = [
-            'oui, crée ce planning',
-            'crée ce planning',
-            'crée le planning',
-            'créer le planning',
-            'créer ce planning',
-            'valide le planning',
-            'valider le planning',
-            "c'est bon",
-            'c\'est parfait',
-            'ok crée',
-            'oui crée',
-            'go pour le planning',
-            'accepte le planning',
-            'accepter le planning',
-        ]
-
-        if any(phrase in message_lower for phrase in acceptance_phrases):
-            logger.info(f"Direct acceptance detected: '{message}'")
-            try:
-                created_blocks = self._create_proposed_blocks(user)
-                blocks_count = len(created_blocks) if created_blocks else 0
-                logger.info(f"Created {blocks_count} proposed blocks for user {user.id}")
-            except Exception as e:
-                logger.error(f"Error creating proposed blocks: {e}")
-                created_blocks = []
-                blocks_count = 0
-
-            # Mark onboarding as completed regardless of block creation
-            profile.onboarding_completed = True
-            profile.onboarding_step = 3
-            profile.save()
-            logger.info(f"Onboarding completed for user {user.id}")
-
-            if blocks_count > 0:
-                response_text = f"✅ Parfait! J'ai créé {blocks_count} blocs dans ton planning.\n\nTon planning est prêt!"
-            else:
-                response_text = "✅ Parfait! Ton planning est configuré."
-
-            return {
-                'text': response_text,
-                'quick_replies': [
-                    {'label': "📋 Voir mon planning", 'value': 'Montre-moi mon planning'},
-                    {'label': "➕ Ajouter une tâche", 'value': "J'ai une tâche à ajouter"},
-                ]
-            }
-
+        # Let Gemini decide if the user accepts or not
         if not self.client:
             return None
 
@@ -2343,9 +2294,11 @@ UTILISE LE CONTEXTE DE SESSION:
             preferences_updated = []  # Track which preferences were updated
 
             for part in response.parts:
-                logger.info(f"Response part type: {type(part)}, has function_call: {hasattr(part, 'function_call')}")
+                has_fc = hasattr(part, 'function_call')
+                fc_value = getattr(part, 'function_call', None) if has_fc else None
+                logger.info(f"Response part type: {type(part)}, has function_call: {has_fc}, function_call value: {fc_value}")
 
-                if hasattr(part, 'function_call') and part.function_call:
+                if has_fc and fc_value:
                     fc = part.function_call
                     args = dict(fc.args)
                     function_calls_made.append(fc.name)

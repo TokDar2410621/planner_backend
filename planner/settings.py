@@ -135,8 +135,15 @@ CORS_ALLOW_CREDENTIALS = True
 # Google OAuth
 GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID', '')
 
-# Gemini API
+# ============== LLM Configuration ==============
+# Default LLM provider: 'gemini' or 'claude'
+LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'gemini')
+
+# Gemini API (Google)
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
+
+# Claude API (Anthropic)
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
 
 # Hugging Face API (fallback for Gemini vision)
 HF_API_KEY = os.getenv('HF_API_KEY', '')
