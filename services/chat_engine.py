@@ -378,11 +378,20 @@ class ChatEngine:
             # The AI has tools to: create blocks, create tasks, show proposals,
             # accept proposals, add document data, update preferences, etc.
             else:
-                gemini_response = self._smart_conversation(user, message, system_prompt, history)
-                result['response'] = gemini_response.get('text', '')
-                result['quick_replies'] = gemini_response.get('quick_replies', [])
-                if gemini_response.get('tasks_created'):
-                    result['tasks_created'] = gemini_response['tasks_created']
+                # Check for recently processed documents that user hasn't seen
+                recent_doc = self._check_recently_processed_document(user)
+                if recent_doc:
+                    doc_response = self._handle_document_upload(user, recent_doc)
+                    result['response'] = doc_response['text']
+                    result['quick_replies'] = doc_response.get('quick_replies', [])
+                    if recent_doc.extracted_data:
+                        result['extracted_data'] = recent_doc.extracted_data
+                else:
+                    gemini_response = self._smart_conversation(user, message, system_prompt, history)
+                    result['response'] = gemini_response.get('text', '')
+                    result['quick_replies'] = gemini_response.get('quick_replies', [])
+                    if gemini_response.get('tasks_created'):
+                        result['tasks_created'] = gemini_response['tasks_created']
 
         except Exception as e:
             logger.error(f"Error generating response: {e}")
@@ -1430,6 +1439,24 @@ Retourne UNIQUEMENT le JSON."""
             dict: Response with text and quick_replies
         """
         from services.document_processor import DocumentProcessor
+        from datetime import timedelta
+
+        # First check if there's a document still processing (last 10 minutes)
+        ten_minutes_ago = timezone.now() - timedelta(minutes=10)
+        processing_doc = UploadedDocument.objects.filter(
+            user=user,
+            processed=False,
+            processing_error__isnull=True,
+            uploaded_at__gte=ten_minutes_ago
+        ).order_by('-uploaded_at').first()
+
+        if processing_doc:
+            return {
+                'text': f"Le document '{processing_doc.file.name.split('/')[-1]}' est encore en cours de traitement. Patiente quelques secondes et réessaie!",
+                'quick_replies': [
+                    {'label': "🔄 Vérifier à nouveau", 'value': "Tu as fini d'analyser mon document?"},
+                ]
+            }
 
         # Get the most recent processed document
         recent_doc = UploadedDocument.objects.filter(
@@ -1489,6 +1516,50 @@ Retourne UNIQUEMENT le JSON."""
                     {'label': "📝 Décrire mon emploi du temps", 'value': "Je vais te décrire mon emploi du temps"},
                 ]
             }
+
+    def _check_recently_processed_document(self, user: User) -> Optional[UploadedDocument]:
+        """
+        Check if user has a recently processed document they haven't seen yet.
+
+        This handles the async processing case: user uploads doc, processing happens
+        in background, then when user asks again we show them the results.
+
+        Args:
+            user: The current user
+
+        Returns:
+            UploadedDocument or None: Recently processed document if found
+        """
+        from datetime import timedelta
+
+        # Look for documents processed in the last 5 minutes that have data
+        five_minutes_ago = timezone.now() - timedelta(minutes=5)
+
+        recent_doc = UploadedDocument.objects.filter(
+            user=user,
+            processed=True,
+            processing_error__isnull=True,
+            uploaded_at__gte=five_minutes_ago
+        ).exclude(extracted_data={}).order_by('-uploaded_at').first()
+
+        if recent_doc and recent_doc.extracted_data:
+            # Check if we've already notified about this document
+            # by looking at recent assistant messages
+            recent_messages = ConversationMessage.objects.filter(
+                user=user,
+                role='assistant',
+                created_at__gte=recent_doc.uploaded_at
+            ).order_by('-created_at')[:3]
+
+            # If we already sent a message about extracted data, skip
+            for msg in recent_messages:
+                if 'cours détecté' in msg.content.lower() or 'créneaux de travail détecté' in msg.content.lower() or 'blocs créés' in msg.content.lower():
+                    return None
+
+            logger.info(f"Found recently processed document {recent_doc.id} to notify user about")
+            return recent_doc
+
+        return None
 
     def _handle_document_upload(self, user: User, attachment: UploadedDocument) -> dict:
         """
