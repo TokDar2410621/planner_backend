@@ -66,6 +66,8 @@ class UploadedDocument(models.Model):
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='documents')
     file = models.FileField(upload_to='documents/')
+    file_name = models.CharField(max_length=255, blank=True)
+    content_hash = models.CharField(max_length=64, blank=True, db_index=True)
     document_type = models.CharField(
         max_length=20,
         choices=DOCUMENT_TYPE_CHOICES,

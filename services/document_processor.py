@@ -1,8 +1,10 @@
 """
 Document processing service using pdfplumber text extraction + LLM structuring.
 Fallback to Gemini Vision for scanned PDFs.
+Includes caching to avoid re-processing identical documents.
 """
 import base64
+import hashlib
 import json
 import logging
 import re
@@ -322,6 +324,51 @@ Analyse ce texte et retourne le JSON structuré:"""
         if not self.gemini_client and not self.hf_client:
             logger.warning("No AI API configured. Document processing will be limited.")
 
+    def _compute_file_hash(self, file_path: str) -> str:
+        """
+        Compute SHA-256 hash of file content.
+
+        Args:
+            file_path: Path to the file
+
+        Returns:
+            str: Hex digest of the hash
+        """
+        sha256_hash = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+
+    def _check_cache(self, user, content_hash: str) -> Optional[dict]:
+        """
+        Check if we've already processed a document with the same content.
+
+        Args:
+            user: The user who owns the document
+            content_hash: SHA-256 hash of the file content
+
+        Returns:
+            dict or None: Cached extracted_data if found, None otherwise
+        """
+        if not content_hash:
+            return None
+
+        # Look for a previously processed document with same hash for this user
+        cached_doc = UploadedDocument.objects.filter(
+            user=user,
+            content_hash=content_hash,
+            processed=True,
+            processing_error__isnull=True
+        ).exclude(extracted_data={}).first()
+
+        if cached_doc:
+            logger.info(f"Cache HIT: Found previously processed document with hash {content_hash[:16]}...")
+            return cached_doc.extracted_data
+
+        logger.info(f"Cache MISS: No cached document found for hash {content_hash[:16]}...")
+        return None
+
     @retry_with_backoff(max_retries=3, base_delay=2.0, max_delay=30.0)
     def _call_gemini(self, contents):
         """
@@ -407,6 +454,7 @@ Analyse ce texte et retourne le JSON structuré:"""
         Process an uploaded document and extract schedule data.
 
         NEW PIPELINE:
+        0. Check cache - if same file was processed before, reuse the result
         1. PDF → pdfplumber text extraction (preserves structure)
         2. If text found → send TEXT to Gemini for structuring
         3. If no text (scanned PDF) → fallback to Gemini Vision
@@ -420,6 +468,30 @@ Analyse ce texte et retourne le JSON structuré:"""
         try:
             file_path = document.file.path
             file_ext = file_path.lower().split('.')[-1]
+
+            # Step 0: Compute file hash and check cache
+            content_hash = self._compute_file_hash(file_path)
+            document.content_hash = content_hash
+            document.file_name = document.file.name.split('/')[-1]
+            document.save(update_fields=['content_hash', 'file_name'])
+
+            cached_data = self._check_cache(document.user, content_hash)
+            if cached_data:
+                # Use cached result - much faster!
+                extracted_data = cached_data.copy()
+                extracted_data['from_cache'] = True
+                logger.info(f"Using cached extraction for document {document.id}")
+
+                # Update document with cached data
+                document.extracted_data = extracted_data
+                document.processed = True
+                document.processing_error = None
+                document.save()
+
+                # Still create recurring blocks from cached data
+                self._create_recurring_blocks(document, extracted_data)
+
+                return extracted_data
 
             response_text = None
             extraction_method = None

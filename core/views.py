@@ -311,10 +311,10 @@ class ChatView(APIView):
             )
             attachment = doc
 
-            # Process document
+            # Process document ASYNCHRONOUSLY to avoid timeout
             try:
                 processor = DocumentProcessor()
-                processor.process_document(doc)
+                processor.process_document_async(doc.id)
             except Exception as e:
                 logger.error(f"Document processing error: {e}")
 
@@ -351,10 +351,10 @@ class DocumentViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         doc = serializer.save(user=self.request.user)
 
-        # Process document after upload
+        # Process document ASYNCHRONOUSLY after upload
         try:
             processor = DocumentProcessor()
-            processor.process_document(doc)
+            processor.process_document_async(doc.id)
         except Exception as e:
             logger.error(f"Document processing error: {e}")
 
