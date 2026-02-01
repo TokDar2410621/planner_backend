@@ -28,6 +28,7 @@ from core.models import (
     RecurringBlock,
 )
 from services.ai_scheduler import AIScheduler
+from utils.helpers import retry_with_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -57,11 +58,34 @@ class ChatEngine:
         """Initialize the chat engine."""
         if GEMINI_AVAILABLE and settings.GEMINI_API_KEY:
             self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
-            self.model_name = 'gemini-2.0-flash'
+            self.model_name = 'gemini-2.5-flash'
         else:
             self.client = None
             self.model_name = None
             logger.warning("Gemini API not configured. Chat will be limited.")
+
+    @retry_with_backoff(max_retries=3, base_delay=2.0, max_delay=30.0)
+    def _call_gemini(self, contents, config=None):
+        """
+        Call Gemini API with retry logic for rate limits (429).
+
+        Args:
+            contents: Content to send to Gemini
+            config: Optional GenerateContentConfig
+
+        Returns:
+            Response from Gemini
+        """
+        if config:
+            return self.client.models.generate_content(
+                model=self.model_name,
+                contents=contents,
+                config=config
+            )
+        return self.client.models.generate_content(
+            model=self.model_name,
+            contents=contents
+        )
 
     # ==================== SECURITY LAYER ====================
 
@@ -432,15 +456,15 @@ TES CAPACITÉS:
 3. Tu peux ANALYSER le planning et suggérer des optimisations
 4. Tu connais les créneaux libres de l'utilisateur
 
-RÈGLES IMPORTANTES - SOIS PROACTIF:
-- Réponds en français, sois concis et AGIS immédiatement
-- NE POSE PAS de questions inutiles. Si l'utilisateur dit "travail sur Housing AI", CRÉE directement un bloc avec des valeurs par défaut intelligentes
+RÈGLES IMPORTANTES:
+- Réponds en français, sois amical et naturel
+- Tu peux avoir des conversations normales! Pas besoin de toujours parler de planning
+- Quand l'utilisateur demande une action de planning, sois proactif et agis immédiatement
 - Utilise des VALEURS PAR DÉFAUT quand les détails manquent:
   * Jours non précisés → tous les jours de la semaine (0-6)
   * Horaires non précisés → trouve un créneau libre de 1-2h le matin ou l'après-midi
   * Durée non précisée → 1h pour les tâches, 2h pour les projets
-- AGIS D'ABORD, puis demande si l'utilisateur veut ajuster
-- Tu peux toujours modifier après coup si l'utilisateur n'est pas satisfait"""
+- Si l'utilisateur dit juste "salut", "ça va?", etc. → réponds naturellement, ne demande pas son emploi du temps"""
 
     def _get_conversation_history(self, user: User, limit: int = 10) -> list:
         """
@@ -497,7 +521,7 @@ Règles:
 Retourne UNIQUEMENT le JSON."""
 
         try:
-            response = self.client.models.generate_content(model=self.model_name, contents=prompt)
+            response = self._call_gemini(prompt)
             # Parse JSON from response
             json_match = re.search(r'\{[\s\S]*\}', response.text)
             if json_match:
@@ -803,7 +827,7 @@ Retourne UNIQUEMENT le JSON."""
             # No blocks yet - use Gemini to understand
             return self._smart_onboarding_conversation(user, message, profile)
 
-        return {'text': "Comment puis-je t'aider?", 'quick_replies': []}
+        return {'text': "Je suis là pour t'aider! Dis-moi tes horaires ou contraintes.", 'quick_replies': []}
 
     def _process_onboarding_document(self, user: User, attachment: UploadedDocument, profile: UserProfile) -> dict:
         """Process document during onboarding and show summary."""
@@ -932,7 +956,7 @@ Réponds en JSON:
 IMPORTANT: Si l'utilisateur donne des infos de planning, crée les blocs. Sois proactif."""
 
         try:
-            response = self.client.models.generate_content(model=self.model_name, contents=prompt)
+            response = self._call_gemini(prompt)
             json_match = re.search(r'\{[\s\S]*\}', response.text)
             if not json_match:
                 return self._default_onboarding_response(profile)
@@ -994,8 +1018,20 @@ IMPORTANT: Si l'utilisateur donne des infos de planning, crée les blocs. Sois p
             # Build response
             response_text = data.get('response_to_user', '')
             if blocks_created:
-                block_names = list(set([b.title for b in blocks_created]))
-                response_text += f"\n\n✅ J'ai créé {len(blocks_created)} bloc(s): {', '.join(block_names)}"
+                # Group blocks by title and time for better display
+                day_names = ['lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi', 'dimanche']
+                block_groups = {}
+                for b in blocks_created:
+                    key = (b.title, b.start_time.strftime('%H:%M'), b.end_time.strftime('%H:%M'))
+                    if key not in block_groups:
+                        block_groups[key] = []
+                    block_groups[key].append(day_names[b.day_of_week])
+
+                block_descriptions = []
+                for (title, start, end), days in block_groups.items():
+                    block_descriptions.append(f"{title} ({start}-{end}) les {', '.join(days)}")
+
+                response_text += f"\n\n✅ J'ai créé {len(blocks_created)} bloc(s): {'; '.join(block_descriptions)}"
 
             # Determine next action
             next_step = data.get('next_step', 'continue_onboarding')
@@ -1112,9 +1148,9 @@ IMPORTANT: Si l'utilisateur donne des infos de planning, crée les blocs. Sois p
             logger.info(f"Onboarding completed for user {user.id}")
 
             if blocks_count > 0:
-                response_text = f"Parfait! J'ai créé {blocks_count} blocs dans ton planning.\n\nTon planning est prêt! Comment puis-je t'aider?"
+                response_text = f"✅ Parfait! J'ai créé {blocks_count} blocs dans ton planning.\n\nTon planning est prêt!"
             else:
-                response_text = "Parfait! Ton planning est configuré.\n\nComment puis-je t'aider?"
+                response_text = "✅ Parfait! Ton planning est configuré."
 
             return {
                 'text': response_text,
@@ -1187,7 +1223,7 @@ Réponds en JSON:
             "days": ["vendredi", "samedi", ...],
             "start_time": "HH:MM",
             "end_time": "HH:MM",
-            "title": "Travail",
+            "title": "Travail (nuit)" ou "Travail" ou "Travail - [employeur]" si mentionné,
             "is_night_shift": true/false,
             "location": "Lieu de travail si mentionné"
         }} (si applicable),
@@ -1211,7 +1247,7 @@ Réponds en JSON:
 Retourne UNIQUEMENT le JSON."""
 
         try:
-            response = self.client.models.generate_content(model=self.model_name, contents=prompt)
+            response = self._call_gemini(prompt)
             json_match = re.search(r'\{[\s\S]*\}', response.text)
             if not json_match:
                 return None
@@ -1231,10 +1267,10 @@ Retourne UNIQUEMENT le JSON."""
                 profile.onboarding_step = 3
                 profile.save()
                 return {
-                    'text': f"Parfait! J'ai créé {len(created_blocks)} blocs dans ton planning.\n\nTon planning est prêt! Comment puis-je t'aider?",
+                    'text': f"✅ Parfait! J'ai créé {len(created_blocks)} blocs dans ton planning.\n\nTon planning est prêt!",
                     'quick_replies': [
                         {'label': "📋 Voir mon planning", 'value': 'Montre-moi mon planning'},
-                        {'label': "➕ Ajouter une tâche", 'value': "J'ai une tâche à ajouter"},
+                        {'label': "➕ Ajouter autre chose", 'value': "J'ai autre chose à ajouter"},
                     ]
                 }
 
@@ -1838,10 +1874,9 @@ Tu peux appeler PLUSIEURS outils en même temps si nécessaire.
 Réponds en français."""
 
         try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(tools=tools),
+            response = self._call_gemini(
+                prompt,
+                config=types.GenerateContentConfig(tools=tools)
             )
 
             # Check if Gemini called any tools
@@ -1923,7 +1958,7 @@ Réponds en français."""
                 }
             else:
                 return {
-                    'text': response_text.strip() if response_text else "Comment puis-je t'aider ?",
+                    'text': response_text.strip() if response_text else "C'est noté! Tu veux ajouter autre chose?",
                     'quick_replies': [
                         {'label': "✅ Ça me va!", 'value': "oui c'est bon, crée les blocs"},
                         {'label': "📋 Voir mon planning", 'value': 'Montre-moi mon planning'},
@@ -1939,9 +1974,9 @@ Réponds en français."""
                 'interactive_inputs': []
             }
 
-    def _call_gemini(self, system_prompt: str, history: list, message: str) -> str:
+    def _call_gemini_conversation(self, system_prompt: str, history: list, message: str) -> str:
         """
-        Call Gemini API for general conversation.
+        Call Gemini API for general conversation (builds context from history).
 
         Args:
             system_prompt: The system context
@@ -1963,7 +1998,7 @@ Réponds en français."""
         context += f"\nUtilisateur: {message}\nAssistant:"
 
         try:
-            response = self.client.models.generate_content(model=self.model_name, contents=context)
+            response = self._call_gemini(context)
             return response.text.strip()
         except Exception as e:
             logger.error(f"Gemini API error: {e}")
@@ -2043,7 +2078,7 @@ Réponds en français."""
                     ),
                     types.FunctionDeclaration(
                         name="update_preference",
-                        description="Mettre à jour une préférence utilisateur",
+                        description="Mettre à jour une préférence utilisateur APRÈS confirmation. Utilise cette fonction UNIQUEMENT après avoir demandé confirmation avec ask_preference_confirmation.",
                         parameters=types.Schema(
                             type="OBJECT",
                             properties={
@@ -2051,6 +2086,19 @@ Réponds en français."""
                                 "value": types.Schema(type="STRING", description="Nouvelle valeur"),
                             },
                             required=["preference", "value"]
+                        )
+                    ),
+                    types.FunctionDeclaration(
+                        name="ask_preference_confirmation",
+                        description="Demander confirmation à l'utilisateur pour une préférence détectée. UTILISE CETTE FONCTION quand tu détectes une information comme le temps de trajet, les heures de sommeil, etc. Affiche des options radio pour confirmer/modifier.",
+                        parameters=types.Schema(
+                            type="OBJECT",
+                            properties={
+                                "preference_type": types.Schema(type="STRING", description="Type: transport_time|sleep_hours|productivity_time|deep_work_hours"),
+                                "detected_value": types.Schema(type="STRING", description="Valeur détectée dans le message (ex: '20' pour 20 min)"),
+                                "question": types.Schema(type="STRING", description="Question à poser à l'utilisateur"),
+                            },
+                            required=["preference_type", "detected_value", "question"]
                         )
                     ),
                     types.FunctionDeclaration(
@@ -2089,6 +2137,23 @@ Réponds en français."""
                             required=[]
                         )
                     ),
+                    types.FunctionDeclaration(
+                        name="ask_clarification",
+                        description="Demander une clarification quand le message de l'utilisateur n'est pas clair ou ambigu. Affiche des options radio pour guider l'utilisateur.",
+                        parameters=types.Schema(
+                            type="OBJECT",
+                            properties={
+                                "question": types.Schema(type="STRING", description="Question de clarification à poser"),
+                                "options": types.Schema(
+                                    type="ARRAY",
+                                    items=types.Schema(type="STRING"),
+                                    description="Liste des options possibles (2-4 options)"
+                                ),
+                                "allow_other": types.Schema(type="BOOLEAN", description="Permettre une réponse personnalisée"),
+                            },
+                            required=["question", "options"]
+                        )
+                    ),
                 ]
             )
         ]
@@ -2106,40 +2171,89 @@ Historique récent:
         profile = user.profile
         onboarding_status = "terminé" if profile.onboarding_completed else f"en cours (étape {profile.onboarding_step})"
 
+        # Analyze session context from recent history
+        session_context = self._analyze_session_context(history, message)
+
         prompt += f"""
 Utilisateur: {message}
 
+CONTEXTE DE SESSION:
+- Dernier sujet: {session_context.get('last_topic', 'aucun')}
+- Action en attente: {session_context.get('pending_action', 'aucune')}
+- Humeur conversation: {session_context.get('mood', 'neutre')}
+- Clarification demandée: {'oui' if session_context.get('clarification_asked') else 'non'}
+
 STATUT ONBOARDING: {onboarding_status}
+DATE: {timezone.now().strftime('%Y-%m-%d %H:%M')}
 
-TES OUTILS (FONCTIONS DISPONIBLES):
-1. create_recurring_block - Créer un bloc récurrent (cours, travail, sport, projet, sommeil, etc.)
-2. create_task - Créer une tâche avec deadline
-3. update_preference - Mettre à jour les préférences (peak_productivity_time: morning|afternoon|evening)
-4. show_planning_proposal - Afficher une proposition de planning intelligent
-5. accept_planning_proposal - Valider et créer le planning proposé quand l'utilisateur dit "oui", "c'est bon", "valide", "crée le planning"
-6. add_document_data - Ajouter les données d'un document uploadé au planning
-7. complete_onboarding - Terminer l'onboarding
+══════════════════════════════════════════════════════════════
+CLASSIFICATION DES MESSAGES - ANALYSE D'ABORD LE TYPE:
+══════════════════════════════════════════════════════════════
 
-INSTRUCTIONS CRITIQUES - UTILISE LES FONCTIONS:
-- Tu es un assistant de planification intelligent et PROACTIF
-- RÈGLE D'OR: Tu DOIS appeler les fonctions pour effectuer des actions. NE DIS JAMAIS "j'ai créé" sans avoir appelé une fonction!
-- Si l'utilisateur demande quelque chose → APPELLE LA FONCTION APPROPRIÉE
-- Pour créer des blocs, utilise des valeurs par défaut si non précisées:
-  * Pas de jours précisés? → days: [0,1,2,3,4] (Lundi-Vendredi)
-  * Pas d'horaire précisé? → trouve un créneau libre de 1-2h
-  * Pas de durée? → 2h pour les projets, 1h pour les tâches simples
-- Si l'utilisateur mentionne un TRAVAIL/JOB → create_recurring_block avec block_type: "work"
-- Si l'utilisateur veut voir son planning/proposition → show_planning_proposal
-- Si l'utilisateur accepte ("oui", "ok", "crée", "valide", "c'est bon") → accept_planning_proposal
-- Si l'utilisateur parle de productivité (matin/soir/après-midi) → update_preference avec peak_productivity_time
-- Date d'aujourd'hui: {timezone.now().strftime('%Y-%m-%d')}
+1. CASUAL (salut, ça va, merci, ok, cool, etc.)
+   → Réponds naturellement et chaleureusement SANS appeler de fonction
+   → Exemples: "Salut! Comment ça va aujourd'hui?", "De rien, avec plaisir!"
 
-UTILISE LES FONCTIONS. NE FAIS PAS SEMBLANT DE CRÉER QUELQUE CHOSE."""
+2. PREFERENCE (temps trajet, sommeil, productivité, etc.)
+   → UTILISE ask_preference_confirmation avec options radio
+   → "20 min de route" → ask_preference_confirmation(preference_type="transport_time", detected_value="20", question="Je note 20 minutes de trajet. C'est bien ça?")
+   → "je dors 7h" → ask_preference_confirmation(preference_type="sleep_hours", detected_value="7", question="...")
+
+3. ACTION (créer bloc, ajouter tâche, modifier planning)
+   → Exécute l'action avec la fonction appropriée
+   → "je travaille de 19h à 7h" → create_recurring_block directement
+
+4. QUESTION (c'est quoi mon planning, j'ai quoi demain, comment ça marche)
+   → Réponds à la question en utilisant le contexte fourni
+   → Utilise show_planning_proposal si pertinent
+
+5. CONFIRMATION (oui, d'accord, c'est bon, valide, confirme)
+   → Si confirmation d'une préférence (ex: "transport_time_minutes: 20") → update_preference
+   → Si confirmation de planning → accept_planning_proposal
+
+6. HORS_SUJET (météo, capitale, recette, etc.)
+   → "Je suis spécialisé dans la planification! Je peux t'aider à organiser ton emploi du temps, ajouter des blocs, gérer tes tâches..."
+
+7. AMBIGU (pas clair ce que l'utilisateur veut)
+   → UTILISE ask_clarification pour proposer des options
+   → ask_clarification(question="Je n'ai pas bien compris. Tu voulais:", options=["Ajouter un bloc à ton planning", "Modifier une préférence", "Voir ton planning"], allow_other=true)
+
+══════════════════════════════════════════════════════════════
+FONCTIONS DISPONIBLES:
+══════════════════════════════════════════════════════════════
+- create_recurring_block: Créer bloc récurrent (cours, travail, sport, etc.)
+- create_task: Créer tâche avec deadline
+- ask_preference_confirmation: Demander confirmation préférence (AVANT update_preference)
+- update_preference: Sauvegarder préférence (APRÈS confirmation)
+- ask_clarification: Demander clarification si message ambigu
+- show_planning_proposal: Montrer proposition de planning
+- accept_planning_proposal: Valider planning proposé
+- add_document_data: Ajouter données document
+- complete_onboarding: Terminer onboarding
+
+══════════════════════════════════════════════════════════════
+RÈGLES IMPORTANTES:
+══════════════════════════════════════════════════════════════
+1. JAMAIS répondre "Comment puis-je t'aider?" de façon robotique
+2. Pour CASUAL → Réponds naturellement, sois amical
+3. Pour PREFERENCE → TOUJOURS ask_preference_confirmation d'abord
+4. Pour AMBIGU → UTILISE ask_clarification avec options
+5. Pour HORS_SUJET → Explique poliment ton domaine (planification)
+6. Sois concis et naturel, pas robotique
+
+══════════════════════════════════════════════════════════════
+UTILISE LE CONTEXTE DE SESSION:
+══════════════════════════════════════════════════════════════
+- Si "confirmation_attendue" → L'utilisateur répond probablement à ta question précédente
+- Si "réponse_attendue" → Interprète la réponse dans le contexte de ta question
+- Si "clarification_asked" → L'utilisateur clarifie sa demande précédente
+- Si "last_topic" est défini → Le sujet est probablement lié à ce thème
+- Si "mood: frustré" → Sois plus empathique et propose de l'aide
+- Si "mood: positif" → Continue sur cette lancée positive"""
 
         try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
+            response = self._call_gemini(
+                prompt,
                 config=types.GenerateContentConfig(
                     tools=tools,
                     tool_config=types.ToolConfig(
@@ -2155,6 +2269,7 @@ UTILISE LES FONCTIONS. NE FAIS PAS SEMBLANT DE CRÉER QUELQUE CHOSE."""
             blocks_created = []
             skipped_days_all = []
             function_calls_made = []
+            preferences_updated = []  # Track which preferences were updated
 
             for part in response.parts:
                 logger.info(f"Response part type: {type(part)}, has function_call: {hasattr(part, 'function_call')}")
@@ -2185,8 +2300,63 @@ UTILISE LES FONCTIONS. NE FAIS PAS SEMBLANT DE CRÉER QUELQUE CHOSE."""
                         else:
                             logger.error(f"Failed to create task with args: {args}")
 
+                    elif fc.name == "ask_preference_confirmation":
+                        # Generate interactive radio inputs for preference confirmation
+                        pref_type = args.get('preference_type', '')
+                        detected_value = args.get('detected_value', '')
+                        question = args.get('question', 'Confirme cette information:')
+
+                        interactive_input = self._generate_preference_radio_input(pref_type, detected_value, question)
+                        if interactive_input:
+                            # Return immediately with interactive inputs
+                            return {
+                                'text': question,
+                                'quick_replies': [],
+                                'tasks_created': [],
+                                'interactive_inputs': [interactive_input]
+                            }
+                        logger.info(f"Asked preference confirmation: {pref_type}={detected_value}")
+
+                    elif fc.name == "ask_clarification":
+                        # Generate clarification radio inputs when message is ambiguous
+                        question = args.get('question', "Je n'ai pas bien compris. Tu voulais:")
+                        options = args.get('options', [])
+                        allow_other = args.get('allow_other', True)
+
+                        if options:
+                            interactive_input = {
+                                'id': 'clarification',
+                                'type': 'radio',
+                                'label': 'Clarification',
+                                'question': question,
+                                'options': [{'value': opt, 'label': opt} for opt in options],
+                                'allowOther': allow_other,
+                                'otherPlaceholder': 'Autre chose...',
+                            }
+                            return {
+                                'text': question,
+                                'quick_replies': [],
+                                'tasks_created': [],
+                                'interactive_inputs': [interactive_input]
+                            }
+                        logger.info(f"Asked clarification with {len(options)} options")
+
                     elif fc.name == "update_preference":
-                        self._execute_update_preference(user, args)
+                        pref_result = self._execute_update_preference(user, args)
+                        if pref_result:
+                            pref_name = args.get('preference', '')
+                            pref_value = args.get('value', '')
+                            preferences_updated.append({'name': pref_name, 'value': pref_value})
+                            # Add confirmation if AI didn't provide text
+                            pref_confirmations = {
+                                'transport_time_minutes': f"✅ J'ai noté {pref_value} minutes de trajet.",
+                                'min_sleep_hours': f"✅ J'ai noté {pref_value}h de sommeil minimum.",
+                                'peak_productivity_time': f"✅ J'ai noté que tu es plus productif le {pref_value.replace('morning', 'matin').replace('afternoon', 'après-midi').replace('evening', 'soir')}.",
+                                'max_deep_work_hours_per_day': f"✅ J'ai noté {pref_value}h de travail profond max par jour.",
+                            }
+                            if pref_name in pref_confirmations and not response_text:
+                                response_text = pref_confirmations[pref_name]
+                            logger.info(f"Preference updated: {pref_name}={pref_value}")
 
                     elif fc.name == "show_planning_proposal":
                         proposal = self._generate_smart_planning_proposal(user)
@@ -2203,9 +2373,9 @@ UTILISE LES FONCTIONS. NE FAIS PAS SEMBLANT DE CRÉER QUELQUE CHOSE."""
                         profile.onboarding_step = 3
                         profile.save()
                         if blocks_count > 0:
-                            response_text = f"✅ Parfait! J'ai créé {blocks_count} blocs dans ton planning.\n\nTon planning est prêt! Comment puis-je t'aider?"
+                            response_text = f"✅ Parfait! J'ai créé {blocks_count} blocs dans ton planning.\n\nTon planning est prêt! Tu veux ajouter autre chose?"
                         else:
-                            response_text = "✅ Ton planning est configuré! Comment puis-je t'aider?"
+                            response_text = "✅ Ton planning est configuré! Tu veux ajouter des blocs?"
 
                     elif fc.name == "add_document_data":
                         add_result = self._add_extracted_to_planning(user)
@@ -2217,7 +2387,7 @@ UTILISE LES FONCTIONS. NE FAIS PAS SEMBLANT DE CRÉER QUELQUE CHOSE."""
                         profile.onboarding_completed = True
                         profile.onboarding_step = 3
                         profile.save()
-                        response_text = "✅ Configuration terminée! Comment puis-je t'aider maintenant?"
+                        response_text = "✅ Configuration terminée! Tu peux maintenant ajouter des tâches ou des blocs à ton planning."
                         logger.info(f"Onboarding completed for user {user.id}")
 
                 elif hasattr(part, 'text') and part.text:
@@ -2230,11 +2400,24 @@ UTILISE LES FONCTIONS. NE FAIS PAS SEMBLANT DE CRÉER QUELQUE CHOSE."""
 
             # Add confirmation for created items
             if blocks_created:
-                block_names = [b.title for b in blocks_created]
+                # Group blocks by title and time for better display
+                day_names = ['lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi', 'dimanche']
+                block_groups = {}
+                for b in blocks_created:
+                    key = (b.title, b.start_time.strftime('%H:%M'), b.end_time.strftime('%H:%M'))
+                    if key not in block_groups:
+                        block_groups[key] = []
+                    block_groups[key].append(day_names[b.day_of_week])
+
+                block_descriptions = []
+                for (title, start, end), days in block_groups.items():
+                    block_descriptions.append(f"{title} ({start}-{end}) les {', '.join(days)}")
+
+                confirmation = f"✅ J'ai créé {len(blocks_created)} bloc(s): {'; '.join(block_descriptions)}"
                 if result_text:
-                    result_text += f"\n\n✅ Bloc(s) créé(s): {', '.join(block_names)}"
+                    result_text += f"\n\n{confirmation}"
                 else:
-                    result_text = f"✅ J'ai créé {len(blocks_created)} bloc(s): {', '.join(block_names)}"
+                    result_text = confirmation
 
             # Inform about skipped days due to overlapping blocks
             if skipped_days_all:
@@ -2258,15 +2441,23 @@ UTILISE LES FONCTIONS. NE FAIS PAS SEMBLANT DE CRÉER QUELQUE CHOSE."""
                     result_text += f"\n📅 Planifié automatiquement dans ton emploi du temps!"
 
             if not result_text:
-                result_text = "Comment puis-je t'aider?"
+                # Intelligent fallback based on context
+                result_text = self._get_intelligent_fallback(user, message, function_calls_made)
 
-            # Build contextual quick replies
-            quick_replies = self._get_contextual_quick_replies(user, blocks_created, tasks_created)
+            # Check if this is a casual conversation (no quick replies needed)
+            is_casual = self._is_casual_message(message)
+
+            # Build contextual quick replies (skip for casual conversation)
+            if is_casual and not blocks_created and not tasks_created and not preferences_updated:
+                quick_replies = []  # Natural conversation without buttons
+            else:
+                quick_replies = self._get_contextual_quick_replies(user, blocks_created, tasks_created, preferences_updated)
 
             return {
                 'text': result_text,
                 'quick_replies': quick_replies,
-                'tasks_created': tasks_created
+                'tasks_created': tasks_created,
+                'interactive_inputs': []
             }
 
         except Exception as e:
@@ -2274,7 +2465,8 @@ UTILISE LES FONCTIONS. NE FAIS PAS SEMBLANT DE CRÉER QUELQUE CHOSE."""
             return {
                 'text': "J'ai eu un souci. Peux-tu reformuler?",
                 'quick_replies': [],
-                'tasks_created': []
+                'tasks_created': [],
+                'interactive_inputs': []
             }
 
     def _execute_create_block(self, user: User, args: dict) -> Optional[RecurringBlock]:
@@ -2445,6 +2637,267 @@ UTILISE LES FONCTIONS. NE FAIS PAS SEMBLANT DE CRÉER QUELQUE CHOSE."""
             logger.error(f"Error creating task: {e}")
             return None
 
+    def _analyze_session_context(self, history: list, current_message: str) -> dict:
+        """
+        Analyze conversation history to build session context.
+        This helps the bot understand the flow of conversation.
+        """
+        import re
+
+        context = {
+            'last_topic': None,
+            'pending_action': None,
+            'mood': 'neutre',
+            'clarification_asked': False,
+            'preference_being_discussed': None,
+        }
+
+        if not history:
+            return context
+
+        # Analyze last few messages
+        recent_messages = history[-4:]  # Last 4 messages (2 exchanges)
+
+        # Topic detection patterns
+        topic_patterns = {
+            'transport': r'(trajet|route|transport|voiture|métro|bus|vélo)',
+            'sommeil': r'(dors|sommeil|couche|réveil|lever|nuit)',
+            'travail': r'(travail|boulot|job|bureau|entreprise|horaires)',
+            'cours': r'(cours|école|université|fac|études|exam)',
+            'sport': r'(sport|gym|fitness|entraînement|course|foot)',
+            'productivité': r'(productif|concentration|focus|efficace)',
+            'planning': r'(planning|emploi du temps|agenda|calendrier)',
+        }
+
+        # Check recent messages for topics
+        for msg in reversed(recent_messages):
+            content = msg.get('content', '').lower()
+            for topic, pattern in topic_patterns.items():
+                if re.search(pattern, content):
+                    context['last_topic'] = topic
+                    break
+            if context['last_topic']:
+                break
+
+        # Check for pending actions (questions asked by bot)
+        if recent_messages:
+            last_assistant_msg = None
+            for msg in reversed(recent_messages):
+                if msg.get('role') == 'assistant':
+                    last_assistant_msg = msg.get('content', '')
+                    break
+
+            if last_assistant_msg:
+                # Check if bot asked a question
+                if '?' in last_assistant_msg:
+                    if any(word in last_assistant_msg.lower() for word in ['confirme', 'c\'est bien', 'correct']):
+                        context['pending_action'] = 'confirmation_attendue'
+                    elif any(word in last_assistant_msg.lower() for word in ['quel', 'quelle', 'combien', 'quand']):
+                        context['pending_action'] = 'réponse_attendue'
+
+                # Check if clarification was asked
+                if any(phrase in last_assistant_msg.lower() for phrase in ['je n\'ai pas compris', 'tu voulais', 'peux-tu préciser']):
+                    context['clarification_asked'] = True
+
+        # Detect conversation mood
+        current_lower = current_message.lower()
+        if any(word in current_lower for word in ['merci', 'super', 'génial', 'parfait', 'cool', 'top']):
+            context['mood'] = 'positif'
+        elif any(word in current_lower for word in ['non', 'pas ça', 'erreur', 'problème', 'bug']):
+            context['mood'] = 'frustré'
+        elif self._is_casual_message(current_message):
+            context['mood'] = 'casual'
+
+        # Check if preference is being discussed
+        pref_patterns = {
+            'transport_time': r'(\d+)\s*(min|minutes?)\s*(de\s*)?(route|trajet)',
+            'sleep_hours': r'(dors|dort)\s*(\d+)\s*h',
+            'productivity_time': r'(productif|efficace).*(matin|soir|après-midi)',
+        }
+
+        for pref, pattern in pref_patterns.items():
+            if re.search(pattern, current_lower):
+                context['preference_being_discussed'] = pref
+                break
+
+        return context
+
+    def _is_casual_message(self, message: str) -> bool:
+        """
+        Check if a message is casual conversation (greetings, thanks, ok, etc.)
+        These messages don't need quick replies - keep the conversation natural.
+        """
+        import re
+        message_lower = message.lower().strip()
+
+        casual_patterns = [
+            r'^(salut|hello|hi|hey|coucou|bonjour|bonsoir|yo)[\s!?]*$',
+            r'^(ça va|ca va|comment ça va|comment vas-tu|quoi de neuf)[\s!?]*$',
+            r'^(ça va bien|ca va bien|bien et toi|super et toi).*$',
+            r'^(merci|thanks|thx|merci beaucoup)[\s!?]*$',
+            r'^(ok|d\'accord|cool|super|nice|top|parfait|génial|genial)[\s!?]*$',
+            r'^(oui|non|ouais|nope|yep|nan)[\s!?]*$',
+            r'^(de rien|pas de quoi|avec plaisir)[\s!?]*$',
+            r'^(à plus|a plus|bye|ciao|à bientôt|a bientot)[\s!?]*$',
+        ]
+
+        for pattern in casual_patterns:
+            if re.search(pattern, message_lower):
+                return True
+        return False
+
+    def _get_intelligent_fallback(self, user: User, message: str, function_calls_made: list) -> str:
+        """
+        Generate an intelligent fallback response based on context.
+
+        Instead of generic "Comment puis-je t'aider?", provide contextual responses.
+        """
+        import re
+
+        message_lower = message.lower().strip()
+
+        # Casual greetings - respond naturally
+        casual_patterns = {
+            r'^(salut|hello|hi|hey|coucou|bonjour|bonsoir)': [
+                "Salut! Comment ça va?",
+                "Hey! Qu'est-ce qui t'amène?",
+                "Coucou! Je suis là pour t'aider avec ton planning.",
+            ],
+            r'^(ça va|ca va|comment ça va|comment vas-tu)': [
+                "Ça va bien, merci! Et toi, comment je peux t'aider?",
+                "Super! Qu'est-ce que je peux faire pour toi?",
+            ],
+            r'^(merci|thanks|thx)': [
+                "De rien! N'hésite pas si tu as besoin d'autre chose.",
+                "Avec plaisir! Je suis là si tu as besoin.",
+            ],
+            r'^(ok|d\'accord|cool|super|nice|top)': [
+                "Parfait! Autre chose?",
+                "Super! Tu as besoin d'autre chose?",
+            ],
+            r'^(oui|non|ouais|nope)$': [
+                "D'accord! Qu'est-ce que tu veux faire maintenant?",
+            ],
+        }
+
+        import random
+        for pattern, responses in casual_patterns.items():
+            if re.search(pattern, message_lower):
+                return random.choice(responses)
+
+        # Check user's profile completion
+        profile = user.profile
+        missing_prefs = []
+        if not profile.transport_time_minutes:
+            missing_prefs.append("temps de trajet")
+        if not profile.min_sleep_hours:
+            missing_prefs.append("heures de sommeil")
+
+        # Check if they have blocks
+        from core.models import RecurringBlock
+        blocks_count = RecurringBlock.objects.filter(user=user).count()
+
+        # Contextual suggestion based on what's missing
+        if not profile.onboarding_completed:
+            if blocks_count == 0:
+                return "Dis-moi tes contraintes! Par exemple: 'je travaille de 9h à 17h' ou 'j'ai cours le lundi matin'."
+            elif missing_prefs:
+                return f"Pour optimiser ton planning, dis-moi ton {missing_prefs[0]}. Par exemple: 'je prends 20 min de route'."
+
+        # If we made function calls but got no response, something went wrong
+        if function_calls_made:
+            return "C'est noté! Autre chose à ajouter?"
+
+        # Default contextual response
+        if blocks_count > 0:
+            return "Je suis là! Tu veux ajouter quelque chose à ton planning ou modifier une préférence?"
+        else:
+            return "Je suis ton assistant de planification! Dis-moi tes horaires de travail, tes cours, ou tes activités."
+
+    def _generate_preference_radio_input(self, pref_type: str, detected_value: str, question: str) -> dict:
+        """
+        Generate a radio input configuration for preference confirmation.
+
+        Args:
+            pref_type: Type of preference (transport_time, sleep_hours, etc.)
+            detected_value: The value detected from the user's message
+            question: The question to ask
+
+        Returns:
+            dict: Radio input configuration for the frontend
+        """
+        # Define options based on preference type
+        options_map = {
+            'transport_time': {
+                'id': 'transport_time_minutes',
+                'label': 'Temps de trajet',
+                'options': [
+                    {'value': '10', 'label': '10 minutes'},
+                    {'value': '15', 'label': '15 minutes'},
+                    {'value': '20', 'label': '20 minutes'},
+                    {'value': '30', 'label': '30 minutes'},
+                    {'value': '45', 'label': '45 minutes'},
+                    {'value': '60', 'label': '1 heure'},
+                ],
+                'other_placeholder': 'Nombre de minutes...',
+            },
+            'sleep_hours': {
+                'id': 'min_sleep_hours',
+                'label': 'Heures de sommeil',
+                'options': [
+                    {'value': '6', 'label': '6 heures'},
+                    {'value': '7', 'label': '7 heures'},
+                    {'value': '8', 'label': '8 heures'},
+                    {'value': '9', 'label': '9 heures'},
+                ],
+                'other_placeholder': 'Nombre d\'heures...',
+            },
+            'productivity_time': {
+                'id': 'peak_productivity_time',
+                'label': 'Moment de productivité',
+                'options': [
+                    {'value': 'morning', 'label': 'Le matin'},
+                    {'value': 'afternoon', 'label': 'L\'après-midi'},
+                    {'value': 'evening', 'label': 'Le soir'},
+                ],
+                'allow_other': False,
+            },
+            'deep_work_hours': {
+                'id': 'max_deep_work_hours_per_day',
+                'label': 'Heures de travail profond',
+                'options': [
+                    {'value': '2', 'label': '2 heures'},
+                    {'value': '3', 'label': '3 heures'},
+                    {'value': '4', 'label': '4 heures'},
+                    {'value': '5', 'label': '5 heures'},
+                    {'value': '6', 'label': '6 heures'},
+                ],
+                'other_placeholder': 'Nombre d\'heures...',
+            },
+        }
+
+        config = options_map.get(pref_type)
+        if not config:
+            return None
+
+        # Try to match detected_value to an option, or use it as default
+        default_value = detected_value
+        for opt in config['options']:
+            if opt['value'] == detected_value or opt['label'].lower().startswith(detected_value.lower()):
+                default_value = opt['value']
+                break
+
+        return {
+            'id': config['id'],
+            'type': 'radio',
+            'label': config['label'],
+            'question': question,
+            'options': config['options'],
+            'default': default_value,
+            'allowOther': config.get('allow_other', True),
+            'otherPlaceholder': config.get('other_placeholder', 'Précisez...'),
+        }
+
     def _execute_update_preference(self, user: User, args: dict) -> bool:
         """Execute preference update from Gemini function call."""
         try:
@@ -2493,7 +2946,7 @@ UTILISE LES FONCTIONS. NE FAIS PAS SEMBLANT DE CRÉER QUELQUE CHOSE."""
             logger.error(f"Error updating preference: {e}")
             return False
 
-    def _get_contextual_quick_replies(self, user: User, blocks_created: list = None, tasks_created: list = None) -> list:
+    def _get_contextual_quick_replies(self, user: User, blocks_created: list = None, tasks_created: list = None, preferences_updated: list = None) -> list:
         """
         Generate contextual quick reply buttons based on user state.
 
@@ -2501,6 +2954,7 @@ UTILISE LES FONCTIONS. NE FAIS PAS SEMBLANT DE CRÉER QUELQUE CHOSE."""
             user: The current user
             blocks_created: List of blocks just created (if any)
             tasks_created: List of tasks just created (if any)
+            preferences_updated: List of preferences just updated (if any)
 
         Returns:
             list: Contextual quick reply buttons
@@ -2513,8 +2967,28 @@ UTILISE LES FONCTIONS. NE FAIS PAS SEMBLANT DE CRÉER QUELQUE CHOSE."""
         today = timezone.now()
         is_weekend = today.weekday() >= 5
 
+        # If preferences were updated, offer relevant follow-up actions
+        if preferences_updated:
+            pref_names = [p['name'] for p in preferences_updated]
+
+            if 'transport_time_minutes' in pref_names:
+                quick_replies.append({'label': "🚗 Ajouter déplacement", 'value': "Ajoute des blocs de déplacement dans mon planning"})
+                quick_replies.append({'label': "📅 Voir planning", 'value': 'Montre-moi mon planning'})
+
+            elif 'min_sleep_hours' in pref_names:
+                quick_replies.append({'label': "😴 Ajouter sommeil", 'value': "Ajoute des blocs de sommeil dans mon planning"})
+                quick_replies.append({'label': "📅 Voir planning", 'value': 'Montre-moi mon planning'})
+
+            elif 'peak_productivity_time' in pref_names:
+                quick_replies.append({'label': "📅 Optimiser planning", 'value': "Optimise mon planning selon ma productivité"})
+                quick_replies.append({'label': "➕ Ajouter tâche", 'value': "Je veux ajouter une tâche"})
+
+            else:
+                quick_replies.append({'label': "📅 Voir planning", 'value': 'Montre-moi mon planning'})
+                quick_replies.append({'label': "➕ Ajouter bloc", 'value': "Je veux ajouter un bloc"})
+
         # If blocks were just created, offer to see planning
-        if blocks_created:
+        elif blocks_created:
             quick_replies.append({'label': "📅 Voir le planning", 'value': 'Montre-moi mon planning de la semaine'})
             quick_replies.append({'label': "➕ Ajouter autre chose", 'value': "Je veux ajouter un autre bloc"})
 

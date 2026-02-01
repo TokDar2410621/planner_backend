@@ -14,6 +14,7 @@ from .models import (
     Task,
     ScheduledBlock,
     ConversationMessage,
+    SharedSchedule,
 )
 
 
@@ -23,6 +24,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
     class Meta:
         model = UserProfile
         fields = [
+            'avatar_url',
             'min_sleep_hours',
             'post_night_shift_wake_time',
             'peak_productivity_time',
@@ -43,8 +45,8 @@ class UserSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = ['id', 'username', 'email', 'first_name', 'last_name', 'profile']
-        read_only_fields = ['id']
+        fields = ['id', 'username', 'email', 'first_name', 'last_name', 'date_joined', 'profile']
+        read_only_fields = ['id', 'date_joined']
 
 
 class UserRegistrationSerializer(serializers.ModelSerializer):
@@ -272,3 +274,37 @@ class OnboardingStatusSerializer(serializers.Serializer):
     current_step = serializers.IntegerField()
     total_steps = serializers.IntegerField()
     next_action = serializers.CharField()
+
+
+class SharedScheduleSerializer(serializers.ModelSerializer):
+    """Serializer for SharedSchedule model."""
+
+    share_url = serializers.CharField(read_only=True)
+    is_valid = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SharedSchedule
+        fields = [
+            'id',
+            'share_token',
+            'title',
+            'is_active',
+            'expires_at',
+            'include_tasks',
+            'created_at',
+            'view_count',
+            'share_url',
+            'is_valid',
+        ]
+        read_only_fields = ['id', 'share_token', 'created_at', 'view_count', 'share_url', 'is_valid']
+
+    def get_is_valid(self, obj):
+        return obj.is_valid()
+
+
+class CreateShareSerializer(serializers.Serializer):
+    """Serializer for creating a share link."""
+
+    title = serializers.CharField(max_length=100, required=False, default='Mon planning')
+    expires_in_days = serializers.IntegerField(required=False, min_value=1, max_value=365)
+    include_tasks = serializers.BooleanField(default=False)

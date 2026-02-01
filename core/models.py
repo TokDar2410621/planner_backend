@@ -1,6 +1,7 @@
 """
 Models for Planner AI backend.
 """
+import uuid
 from django.db import models
 from django.contrib.auth.models import User
 from django.db.models.signals import post_save
@@ -17,6 +18,7 @@ class UserProfile(models.Model):
     ]
 
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
+    avatar_url = models.URLField(max_length=500, blank=True, null=True)
     min_sleep_hours = models.PositiveIntegerField(default=7)
     post_night_shift_wake_time = models.TimeField(null=True, blank=True)
     peak_productivity_time = models.CharField(
@@ -219,6 +221,34 @@ class RecurringBlockCompletion(models.Model):
         ordering = ['-date', '-completed_at']
 
 
+class TaskHistory(models.Model):
+    """Historical data for completed tasks - used for AI predictions."""
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='task_history')
+    task_title = models.CharField(max_length=200)
+    task_type = models.CharField(max_length=20)
+    estimated_duration_minutes = models.PositiveIntegerField(null=True, blank=True)
+    actual_duration_minutes = models.PositiveIntegerField()
+    scheduled_start_time = models.TimeField(null=True, blank=True)
+    day_of_week = models.PositiveIntegerField()  # 0-6
+    completed_at = models.DateTimeField()
+    energy_level = models.CharField(max_length=10, blank=True)  # high, medium, low
+    was_rescheduled = models.BooleanField(default=False)
+    reschedule_count = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        verbose_name = "Historique tâche"
+        verbose_name_plural = "Historique tâches"
+        ordering = ['-completed_at']
+        indexes = [
+            models.Index(fields=['user', 'task_type']),
+            models.Index(fields=['user', 'task_title']),
+        ]
+
+    def __str__(self):
+        return f"{self.task_title} - {self.actual_duration_minutes}min"
+
+
 class ConversationMessage(models.Model):
     """Message in the chat conversation."""
 
@@ -248,3 +278,37 @@ class ConversationMessage(models.Model):
         verbose_name = "Message"
         verbose_name_plural = "Messages"
         ordering = ['created_at']
+
+
+class SharedSchedule(models.Model):
+    """Shareable link for a user's schedule."""
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='shared_schedules')
+    share_token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    title = models.CharField(max_length=100, blank=True, default='Mon planning')
+    is_active = models.BooleanField(default=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    include_tasks = models.BooleanField(default=False)  # Include scheduled tasks or just recurring
+    created_at = models.DateTimeField(auto_now_add=True)
+    view_count = models.PositiveIntegerField(default=0)
+
+    def __str__(self):
+        return f"Partage {self.share_token} - {self.user.username}"
+
+    @property
+    def share_url(self):
+        return f"/shared/{self.share_token}"
+
+    def is_valid(self):
+        """Check if the share link is still valid."""
+        if not self.is_active:
+            return False
+        if self.expires_at:
+            from django.utils import timezone
+            return timezone.now() < self.expires_at
+        return True
+
+    class Meta:
+        verbose_name = "Planning partagé"
+        verbose_name_plural = "Plannings partagés"
+        ordering = ['-created_at']
