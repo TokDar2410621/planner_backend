@@ -23,6 +23,7 @@ from core.models import (
     Task,
     ScheduledBlock,
 )
+from utils.helpers import retry_with_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +77,18 @@ class AIScheduler:
         """Initialize the scheduler."""
         if GEMINI_AVAILABLE and settings.GEMINI_API_KEY:
             self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
-            self.model_name = 'gemini-2.0-flash'
+            self.model_name = 'gemini-2.5-flash'
         else:
             self.client = None
             self.model_name = None
+
+    @retry_with_backoff(max_retries=3, base_delay=2.0, max_delay=30.0)
+    def _call_gemini(self, contents):
+        """Call Gemini API with retry logic for rate limits."""
+        return self.client.models.generate_content(
+            model=self.model_name,
+            contents=contents
+        )
 
     def generate_schedule(
         self,
@@ -541,7 +550,7 @@ Réponds avec:
 }}"""
 
         try:
-            response = self.client.models.generate_content(model=self.model_name, contents=prompt)
+            response = self._call_gemini(prompt)
             # For now, just log the suggestions
             logger.info(f"AI optimization suggestions: {response.text}")
         except Exception as e:

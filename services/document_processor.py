@@ -1,15 +1,20 @@
 """
-Document processing service using Google Gemini Vision.
+Document processing service using pdfplumber text extraction + LLM structuring.
+Fallback to Gemini Vision for scanned PDFs.
 """
+import base64
 import json
 import logging
 import re
 from io import BytesIO
-from typing import Optional
+from typing import Optional, Tuple
 
 import fitz  # PyMuPDF
 from PIL import Image
 from django.conf import settings
+
+# Import our new PDF text extractor
+from services.pdf_extractor import PDFTextExtractor
 
 try:
     from google import genai
@@ -18,8 +23,15 @@ try:
 except ImportError:
     GEMINI_AVAILABLE = False
 
+try:
+    from huggingface_hub import InferenceClient
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+
 from datetime import time as dt_time
 from core.models import UploadedDocument, RecurringBlock
+from utils.helpers import retry_with_backoff, run_in_background
 
 logger = logging.getLogger(__name__)
 
@@ -149,11 +161,11 @@ TOUJOURS format HH:MM (24h):
     "schedule_structure": "grid|list|other",
     "courses": [
         {
-            "name": "Nom COMPLET (inclure le code si présent, ex: INF1120 - Programmation)",
+            "name": "Nom LISIBLE du cours (si le code est illisible, utilise juste le nom simple ex: 'Programmation', 'Mathématiques', 'Projets')",
             "day": "lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche",
             "start_time": "HH:MM",
             "end_time": "HH:MM",
-            "location": "Salle/Local si visible",
+            "location": "Salle/Local (laisser null si pas visible ou illisible)",
             "professor": "Prof si visible",
             "course_code": "Code du cours si présent (ex: INF1120)"
         }
@@ -183,13 +195,82 @@ TOUJOURS format HH:MM (24h):
 === IMPORTANT ===
 - Lis TRÈS attentivement chaque case de la grille
 - Ne rate aucun cours/bloc
-- Vérifie que chaque jour de la semaine a été parcouru"""
+- Vérifie que chaque jour de la semaine a été parcouru
+- Pour le champ "name": préfère un nom COURT et LISIBLE. Ex: "Programmation" plutôt que "420KWAJQ-00001 Programmation I"
+- Si le code est incompréhensible (ex: 420KWAJQ), mets-le dans "course_code" et utilise juste le nom du cours dans "name"
+- Si location est illisible ou absent, mets null (pas "None" ou "-")"""
 
     EXTRACTION_PROMPTS = {
         'course_schedule': UNIFIED_EXTRACTION_PROMPT,
         'work_schedule': UNIFIED_EXTRACTION_PROMPT,
         'other': UNIFIED_EXTRACTION_PROMPT,
     }
+
+    # New prompt for TEXT-BASED extraction (pdfplumber output)
+    TEXT_STRUCTURING_PROMPT = """Tu es un expert en extraction de données d'emploi du temps.
+Je te donne le TEXTE BRUT extrait d'un PDF d'horaire. Analyse-le et structure les données en JSON.
+
+=== RÈGLES D'ANALYSE DU TEXTE ===
+
+1. STRUCTURE GRILLE (tableau horaire):
+   - Les jours sont généralement en colonnes: Lundi | Mardi | Mercredi | Jeudi | Vendredi
+   - Les heures sont à gauche: 8h, 9h, 10h, etc.
+   - Chaque cellule contient: [Code cours] [Nom] [Salle]
+
+2. LECTURE DES HORAIRES:
+   - "8h à 9h" ou "8h-9h" = start_time: "08:00", end_time: "09:00"
+   - Si un bloc couvre "8h à 10h" = 2 heures de cours
+   - Les créneaux qui se répètent (ex: même cours 8h-9h ET 9h-10h) = UN SEUL bloc de 8h à 10h
+
+3. ASSOCIATION JOUR/HORAIRE:
+   - Dans une grille, le contenu sous "Mardi" appartient au mardi
+   - Cherche la légende/tableau des cours pour les noms complets et profs
+
+=== CONVERSION DES JOURS ===
+- Lun/L/Mon → "lundi"
+- Mar/Ma/Tue → "mardi"
+- Mer/Me/Wed → "mercredi"
+- Jeu/Je/Thu → "jeudi"
+- Ven/Ve/Fri → "vendredi"
+- Sam/Sa/Sat → "samedi"
+- Dim/Di/Sun → "dimanche"
+
+=== FORMAT JSON REQUIS ===
+{{
+    "detected_type": "course_schedule|work_schedule|mixed",
+    "courses": [
+        {{
+            "name": "Nom du cours (ex: Programmation avancée)",
+            "day": "lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche",
+            "start_time": "HH:MM",
+            "end_time": "HH:MM",
+            "location": "Salle (ex: 316.1)",
+            "professor": "Nom du prof si trouvé",
+            "course_code": "Code du cours (ex: 420KWAJQ)"
+        }}
+    ],
+    "shifts": [
+        {{
+            "day": "lundi|mardi|...",
+            "start_time": "HH:MM",
+            "end_time": "HH:MM",
+            "role": "Poste si mentionné"
+        }}
+    ],
+    "events": []
+}}
+
+=== RÈGLES ABSOLUES ===
+1. UN CRÉNEAU PAR JOUR = UNE ENTRÉE (même cours lundi et mardi = 2 entrées)
+2. FUSIONNER les créneaux consécutifs du même cours le même jour (8h-9h + 9h-10h = 8h-10h)
+3. Extraire TOUS les cours/shifts visibles
+4. Si "Cours inclus à l'horaire" ou légende présente, utiliser les VRAIS NOMS des cours
+5. UNIQUEMENT le JSON, aucun texte avant/après
+
+=== TEXTE EXTRAIT DU PDF ===
+{text}
+
+Analyse ce texte et retourne le JSON structuré:"""
 
     # Extended day mapping with various abbreviations and formats
     DAY_MAPPING = {
@@ -214,18 +295,121 @@ TOUJOURS format HH:MM (24h):
     }
 
     def __init__(self):
-        """Initialize the document processor."""
+        """Initialize the document processor with pdfplumber + Gemini."""
+        # PDF Text Extractor (pdfplumber + OCR fallback)
+        self.pdf_extractor = PDFTextExtractor()
+
+        # Primary: Gemini (for text structuring + vision fallback)
         if GEMINI_AVAILABLE and settings.GEMINI_API_KEY:
-            self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
-            self.model_name = 'gemini-2.0-flash'
+            self.gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+            self.gemini_model = 'gemini-2.5-flash'
         else:
-            self.client = None
-            self.model_name = None
-            logger.warning("Gemini API not configured. Document processing will be limited.")
+            self.gemini_client = None
+            self.gemini_model = None
+
+        # Fallback: Hugging Face
+        if HF_AVAILABLE and settings.HF_API_KEY:
+            self.hf_client = InferenceClient(token=settings.HF_API_KEY)
+            self.hf_model = settings.HF_MODEL
+        else:
+            self.hf_client = None
+            self.hf_model = None
+
+        # Legacy alias
+        self.client = self.gemini_client
+        self.model_name = self.gemini_model
+
+        if not self.gemini_client and not self.hf_client:
+            logger.warning("No AI API configured. Document processing will be limited.")
+
+    @retry_with_backoff(max_retries=3, base_delay=2.0, max_delay=30.0)
+    def _call_gemini(self, contents):
+        """
+        Call Gemini API with retry logic for rate limits.
+
+        Args:
+            contents: Content to send to Gemini (prompt + images)
+
+        Returns:
+            Response from Gemini
+        """
+        return self.gemini_client.models.generate_content(
+            model=self.gemini_model,
+            contents=contents
+        )
+
+    @retry_with_backoff(max_retries=2, base_delay=3.0, max_delay=30.0)
+    def _call_hf_vision(self, prompt: str, images: list) -> str:
+        """
+        Call Hugging Face vision model as fallback.
+
+        Args:
+            prompt: Text prompt for the model
+            images: List of PIL Image objects
+
+        Returns:
+            str: Model response text
+        """
+        if not self.hf_client:
+            raise RuntimeError("Hugging Face client not configured")
+
+        # Prepare messages with images
+        content = [{"type": "text", "text": prompt}]
+
+        for img in images:
+            # Convert image to base64
+            img_bytes = BytesIO()
+            img.save(img_bytes, format='JPEG', quality=85)
+            img_b64 = base64.b64encode(img_bytes.getvalue()).decode('utf-8')
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+            })
+
+        messages = [{"role": "user", "content": content}]
+
+        response = self.hf_client.chat_completion(
+            model=self.hf_model,
+            messages=messages,
+            max_tokens=4096,
+        )
+
+        return response.choices[0].message.content
+
+    def process_document_async(self, document_id: int) -> None:
+        """
+        Process a document asynchronously in background.
+
+        Args:
+            document_id: ID of the UploadedDocument to process
+        """
+        run_in_background(self._process_document_by_id, document_id)
+
+    def _process_document_by_id(self, document_id: int) -> dict:
+        """
+        Process a document by its ID (for background processing).
+
+        Args:
+            document_id: ID of the document
+
+        Returns:
+            dict: Extracted data
+        """
+        from django.db import connection
+        # Close old connection to avoid issues in new thread
+        connection.close()
+
+        document = UploadedDocument.objects.get(id=document_id)
+        return self.process_document(document)
 
     def process_document(self, document: UploadedDocument) -> dict:
         """
         Process an uploaded document and extract schedule data.
+
+        NEW PIPELINE:
+        1. PDF → pdfplumber text extraction (preserves structure)
+        2. If text found → send TEXT to Gemini for structuring
+        3. If no text (scanned PDF) → fallback to Gemini Vision
 
         Args:
             document: The UploadedDocument instance to process
@@ -237,76 +421,35 @@ TOUJOURS format HH:MM (24h):
             file_path = document.file.path
             file_ext = file_path.lower().split('.')[-1]
 
-            # Extract content based on file type
+            response_text = None
+            extraction_method = None
+
             if file_ext == 'pdf':
-                content = self._extract_pdf_content(file_path)
+                # NEW: Try text extraction first (pdfplumber)
+                response_text, extraction_method = self._process_pdf_smart(file_path, document.document_type)
+
             elif file_ext in ['png', 'jpg', 'jpeg', 'webp', 'gif']:
-                content = self._load_image(file_path)
+                # Images always use vision
+                response_text, extraction_method = self._process_image(file_path, document.document_type)
+
             else:
                 raise ValueError(f"Type de fichier non supporté: {file_ext}")
 
-            # Get appropriate prompt
-            prompt = self._get_extraction_prompt(document.document_type)
-
-            # Process with Gemini
-            if self.client is None:
-                raise RuntimeError("Service Gemini non configuré")
-
-            if isinstance(content, list):
-                # Multiple images from PDF - convert PIL images to parts
-                # Add context about multiple pages
-                multi_page_prompt = f"""Ce document contient {len(content)} page(s). Analyse TOUTES les pages et combine les informations.
-
-{prompt}
-
-IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes les données dans une seule réponse JSON."""
-
-                parts = [multi_page_prompt]
-                for idx, img in enumerate(content):
-                    img_bytes = BytesIO()
-                    # Use higher quality JPEG for large images to reduce size while keeping quality
-                    if img.width > 2000 or img.height > 2000:
-                        img.save(img_bytes, format='JPEG', quality=95)
-                        mime_type = 'image/jpeg'
-                    else:
-                        img.save(img_bytes, format='PNG')
-                        mime_type = 'image/png'
-                    logger.info(f"Sending page {idx + 1}: {img.width}x{img.height}px as {mime_type}")
-                    parts.append(types.Part.from_bytes(data=img_bytes.getvalue(), mime_type=mime_type))
-
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=parts
-                )
-            elif isinstance(content, Image.Image):
-                # Single image - convert to bytes
-                img_bytes = BytesIO()
-                content.save(img_bytes, format='PNG')
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=[
-                        prompt,
-                        types.Part.from_bytes(data=img_bytes.getvalue(), mime_type='image/png')
-                    ]
-                )
-            else:
-                # Text content
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=f"{prompt}\n\nContenu du document:\n{content}"
-                )
+            if response_text is None:
+                raise RuntimeError("Aucun service AI disponible")
 
             # Parse response
-            logger.info(f"Raw Gemini response length: {len(response.text)} chars")
-            logger.debug(f"Raw response: {response.text[:500]}...")
+            logger.debug(f"Raw response ({extraction_method}): {response_text[:500]}...")
+            extracted_data = self._parse_response(response_text)
 
-            extracted_data = self._parse_response(response.text)
+            # Add extraction method to data
+            extracted_data['extraction_method'] = extraction_method
 
             # Log extraction results
             courses_count = len(extracted_data.get('courses', []))
             shifts_count = len(extracted_data.get('shifts', []))
             events_count = len(extracted_data.get('events', []))
-            logger.info(f"Extracted: {courses_count} courses, {shifts_count} shifts, {events_count} events")
+            logger.info(f"Extracted ({extraction_method}): {courses_count} courses, {shifts_count} shifts, {events_count} events")
 
             if courses_count == 0 and shifts_count == 0:
                 logger.warning(f"No schedule data extracted from document {document.id}")
@@ -330,6 +473,165 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
             document.processed = False
             document.save()
             raise
+
+    def _process_pdf_smart(self, file_path: str, doc_type: str) -> Tuple[Optional[str], str]:
+        """
+        Smart PDF processing: text extraction first, vision fallback.
+
+        Args:
+            file_path: Path to PDF file
+            doc_type: Document type for prompt selection
+
+        Returns:
+            Tuple of (response_text, extraction_method)
+        """
+        # Step 1: Try pdfplumber text extraction
+        logger.info(f"Extracting text from PDF with pdfplumber...")
+        extraction_result = self.pdf_extractor.extract(file_path)
+
+        extracted_text = extraction_result.get('text', '')
+        tables = extraction_result.get('tables', [])
+        method = extraction_result.get('method', 'unknown')
+
+        logger.info(f"PDF extraction method: {method}, text length: {len(extracted_text)}, tables: {len(tables)}")
+
+        # Step 2: Check if we got meaningful text
+        # Minimum threshold: at least 100 chars and contains some schedule-related words
+        has_meaningful_text = (
+            len(extracted_text.strip()) > 100 and
+            any(word in extracted_text.lower() for word in ['lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'monday', 'tuesday', 'cours', 'horaire', 'schedule', '8h', '9h', '10h', ':00'])
+        )
+
+        if has_meaningful_text:
+            # Use TEXT-BASED extraction (much more accurate!)
+            logger.info("Using TEXT-BASED extraction (pdfplumber + LLM structuring)")
+            return self._structure_text_with_llm(extracted_text, tables), f"text_{method}"
+        else:
+            # Fallback to VISION-BASED extraction
+            logger.info("Text extraction insufficient, falling back to VISION-BASED extraction")
+            return self._process_pdf_vision(file_path, doc_type), "vision"
+
+    def _structure_text_with_llm(self, text: str, tables: list = None) -> Optional[str]:
+        """
+        Send extracted text to LLM for structuring into JSON.
+
+        Args:
+            text: Extracted text from PDF
+            tables: Extracted tables (optional)
+
+        Returns:
+            LLM response with structured JSON
+        """
+        # Build the prompt with extracted text
+        prompt = self.TEXT_STRUCTURING_PROMPT.format(text=text[:15000])  # Limit to 15k chars
+
+        # Add tables if available
+        if tables:
+            table_text = "\n\n=== TABLEAUX EXTRAITS ===\n"
+            for i, table in enumerate(tables[:5]):  # Max 5 tables
+                table_text += f"\nTableau {i+1}:\n"
+                for row in table[:20]:  # Max 20 rows per table
+                    table_text += " | ".join(str(cell) for cell in row) + "\n"
+            prompt += table_text
+
+        if self.gemini_client:
+            try:
+                response = self._call_gemini(prompt)
+                return response.text
+            except Exception as e:
+                logger.error(f"Gemini text structuring failed: {e}")
+                raise
+
+        raise RuntimeError("No LLM available for text structuring")
+
+    def _process_pdf_vision(self, file_path: str, doc_type: str) -> Optional[str]:
+        """
+        Process PDF using vision (for scanned PDFs).
+
+        Args:
+            file_path: Path to PDF file
+            doc_type: Document type
+
+        Returns:
+            LLM response text
+        """
+        # Extract PDF as images
+        images = self._extract_pdf_content(file_path)
+
+        # Get vision prompt
+        prompt = self._get_extraction_prompt(doc_type)
+
+        if len(images) > 1:
+            full_prompt = f"""Ce document contient {len(images)} page(s). Analyse TOUTES les pages et combine les informations.
+
+{prompt}
+
+IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes les données dans une seule réponse JSON."""
+        else:
+            full_prompt = prompt
+
+        # Use Gemini Vision
+        if self.gemini_client:
+            try:
+                parts = [full_prompt]
+                for idx, img in enumerate(images):
+                    img_bytes = BytesIO()
+                    if img.width > 2000 or img.height > 2000:
+                        img.save(img_bytes, format='JPEG', quality=95)
+                        mime_type = 'image/jpeg'
+                    else:
+                        img.save(img_bytes, format='PNG')
+                        mime_type = 'image/png'
+                    logger.info(f"Vision: page {idx + 1}: {img.width}x{img.height}px as {mime_type}")
+                    parts.append(types.Part.from_bytes(data=img_bytes.getvalue(), mime_type=mime_type))
+                response = self._call_gemini(parts)
+                return response.text
+            except Exception as e:
+                logger.warning(f"Gemini vision failed: {e}")
+                # Try HF fallback
+                if self.hf_client:
+                    return self._call_hf_vision(full_prompt, images)
+                raise
+
+        # HF fallback
+        if self.hf_client:
+            return self._call_hf_vision(full_prompt, images)
+
+        return None
+
+    def _process_image(self, file_path: str, doc_type: str) -> Tuple[Optional[str], str]:
+        """
+        Process image file using vision.
+
+        Args:
+            file_path: Path to image file
+            doc_type: Document type
+
+        Returns:
+            Tuple of (response_text, extraction_method)
+        """
+        image = self._load_image(file_path)
+        prompt = self._get_extraction_prompt(doc_type)
+
+        if self.gemini_client:
+            try:
+                img_bytes = BytesIO()
+                image.save(img_bytes, format='PNG')
+                response = self._call_gemini([
+                    prompt,
+                    types.Part.from_bytes(data=img_bytes.getvalue(), mime_type='image/png')
+                ])
+                return response.text, "vision_gemini"
+            except Exception as e:
+                logger.warning(f"Gemini vision failed: {e}")
+                if self.hf_client:
+                    return self._call_hf_vision(prompt, [image]), "vision_hf"
+                raise
+
+        if self.hf_client:
+            return self._call_hf_vision(prompt, [image]), "vision_hf"
+
+        return None, "none"
 
     def _extract_pdf_content(self, file_path: str) -> list:
         """
@@ -469,8 +771,10 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                     logger.warning(f"Using default end time for course: {course.get('name', 'Unknown')}")
 
                 try:
-                    # Handle None values from JSON
+                    # Handle None values from JSON (including string "None" from Gemini)
                     location = course.get('location') or ''
+                    if location.lower() in ('none', 'n/a', 'null', '-'):
+                        location = ''
 
                     block = RecurringBlock.objects.create(
                         user=user,
@@ -510,8 +814,10 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                     end_time = dt_time(17, 0)
 
                 try:
-                    # Handle None values from JSON
+                    # Handle None values from JSON (including string "None" from Gemini)
                     role = shift.get('role') or ''
+                    if role.lower() in ('none', 'n/a', 'null', '-'):
+                        role = ''
                     title = f"Travail - {role}" if role else 'Travail'
 
                     # Auto-detect night shift based on times (more reliable than Gemini)
@@ -557,8 +863,10 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                     end_time = dt_time(10, 0)
 
                 try:
-                    # Handle None values from JSON
-                    title = event.get('title') or 'Événement'
+                    # Handle None values from JSON (including string "None" from Gemini)
+                    title = event.get('title') or ''
+                    if not title or title.lower() in ('none', 'n/a', 'null', '-'):
+                        title = 'Événement'
 
                     block = RecurringBlock.objects.create(
                         user=user,
