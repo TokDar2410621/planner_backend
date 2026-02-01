@@ -165,12 +165,10 @@ class ChatOrchestrator:
         # Step 2: Save user message
         self._save_message(user, sanitized_message, 'user', attachment)
 
-        # Step 3: Route to appropriate handler
+        # Step 3: Always use LLM-powered chat (like old ChatEngine)
+        # The AI decides when to complete onboarding via function calls
         try:
-            if not self.onboarding.is_onboarding_complete(user):
-                response = self._handle_onboarding(user, sanitized_message, attachment)
-            else:
-                response = self._handle_regular_chat(user, sanitized_message, attachment)
+            response = self._handle_regular_chat(user, sanitized_message, attachment)
 
             # Step 4: Save assistant response
             self._save_message(user, response.get('text', ''), 'assistant')
