@@ -9,6 +9,7 @@ from .views import (
     RegisterView,
     LoginView,
     MeView,
+    GoogleAuthView,
     # Profile
     ProfileView,
     OnboardingStatusView,
@@ -25,6 +26,17 @@ from .views import (
     ScheduledBlockView,
     # Conversation
     ConversationView,
+    # AI Insights
+    SuggestionsView,
+    PatternsView,
+    PredictDurationView,
+    ConflictsView,
+    SmartRescheduleView,
+    NaturalLanguageScheduleView,
+    # Share
+    ShareScheduleView,
+    ShareScheduleDetailView,
+    PublicScheduleView,
 )
 
 router = DefaultRouter()
@@ -37,6 +49,7 @@ urlpatterns = [
     # Auth endpoints
     path('auth/register/', RegisterView.as_view(), name='register'),
     path('auth/login/', LoginView.as_view(), name='login'),
+    path('auth/google/', GoogleAuthView.as_view(), name='google-auth'),
     path('auth/me/', MeView.as_view(), name='me'),
 
     # Profile endpoints
@@ -53,6 +66,19 @@ urlpatterns = [
 
     # Conversation history
     path('conversations/', ConversationView.as_view(), name='conversations'),
+
+    # AI Insights endpoints
+    path('insights/suggestions/', SuggestionsView.as_view(), name='suggestions'),
+    path('insights/patterns/', PatternsView.as_view(), name='patterns'),
+    path('insights/predict-duration/', PredictDurationView.as_view(), name='predict-duration'),
+    path('insights/conflicts/', ConflictsView.as_view(), name='conflicts'),
+    path('insights/smart-reschedule/', SmartRescheduleView.as_view(), name='smart-reschedule'),
+    path('insights/natural-language/', NaturalLanguageScheduleView.as_view(), name='natural-language'),
+
+    # Share endpoints
+    path('schedule/share/', ShareScheduleView.as_view(), name='share-schedule'),
+    path('schedule/share/<int:share_id>/', ShareScheduleDetailView.as_view(), name='share-schedule-detail'),
+    path('shared/<uuid:share_token>/', PublicScheduleView.as_view(), name='public-schedule'),
 
     # Router URLs (documents, recurring-blocks, tasks)
     path('', include(router.urls)),

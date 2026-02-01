@@ -132,8 +132,15 @@ CORS_ALLOWED_ORIGINS = [
 ]
 CORS_ALLOW_CREDENTIALS = True
 
+# Google OAuth
+GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID', '')
+
 # Gemini API
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
+
+# Hugging Face API (fallback for Gemini vision)
+HF_API_KEY = os.getenv('HF_API_KEY', '')
+HF_MODEL = os.getenv('HF_MODEL', 'Qwen/Qwen2.5-VL-72B-Instruct')
 
 # Cloudinary (for media storage in production)
 CLOUDINARY_CLOUD_NAME = os.getenv('CLOUDINARY_CLOUD_NAME', '')
