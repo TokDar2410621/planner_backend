@@ -8,6 +8,7 @@ from .views import (
     # Auth
     RegisterView,
     LoginView,
+    CheckEmailView,
     MeView,
     GoogleAuthView,
     # Profile
@@ -49,6 +50,7 @@ urlpatterns = [
     # Auth endpoints
     path('auth/register/', RegisterView.as_view(), name='register'),
     path('auth/login/', LoginView.as_view(), name='login'),
+    path('auth/check-email/', CheckEmailView.as_view(), name='check-email'),
     path('auth/google/', GoogleAuthView.as_view(), name='google-auth'),
     path('auth/me/', MeView.as_view(), name='me'),
 

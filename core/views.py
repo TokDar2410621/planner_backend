@@ -126,6 +126,30 @@ class LoginView(APIView):
         })
 
 
+class CheckEmailView(APIView):
+    """Check if email exists in database for lazy auth flow."""
+
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        """Check if email exists and return status."""
+        email = request.data.get('email', '').strip().lower()
+
+        if not email:
+            return Response(
+                {'error': 'Email requis.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Check if user exists with this email
+        exists = User.objects.filter(email=email).exists()
+
+        return Response({
+            'exists': exists,
+            'email': email,
+        })
+
+
 class MeView(APIView):
     """Get current user information."""
 
