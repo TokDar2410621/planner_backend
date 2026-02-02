@@ -371,7 +371,9 @@ def add_extracted_to_planning(user: User) -> dict:
         if recent_doc.extracted_data:
             courses = recent_doc.extracted_data.get('courses', [])
             shifts = recent_doc.extracted_data.get('shifts', [])
-            logger.info(f"Extracted: {len(courses)} courses, {len(shifts)} shifts")
+            events = recent_doc.extracted_data.get('events', [])
+            parse_error = recent_doc.extracted_data.get('parse_error', False)
+            logger.info(f"Extracted: {len(courses)} courses, {len(shifts)} shifts, {len(events)} events, parse_error={parse_error}")
 
     if not recent_doc or not recent_doc.extracted_data:
         logger.warning(f"No recent doc with extracted_data for user {user.id}")
@@ -379,6 +381,31 @@ def add_extracted_to_planning(user: User) -> dict:
             'text': "Je n'ai pas trouvé de document récent avec des données à ajouter. Envoie-moi ton emploi du temps!",
             'quick_replies': [
                 {'label': "📚 Envoyer mon emploi du temps", 'value': 'upload'},
+            ]
+        }
+
+    # Check for parse error in extracted data
+    if recent_doc.extracted_data.get('parse_error'):
+        logger.warning(f"Document {recent_doc.id} has parse_error in extracted_data")
+        return {
+            'text': "Je n'ai pas pu extraire les données de ce document. Le format n'est peut-être pas reconnu. Essaie avec un autre fichier ou décris-moi ton emploi du temps.",
+            'quick_replies': [
+                {'label': "📝 Décrire mes horaires", 'value': "Je vais te décrire mon emploi du temps"},
+                {'label': "📎 Autre fichier", 'value': 'upload'},
+            ]
+        }
+
+    # Check if there's actually any schedule data
+    courses = recent_doc.extracted_data.get('courses', [])
+    shifts = recent_doc.extracted_data.get('shifts', [])
+    events = recent_doc.extracted_data.get('events', [])
+    if not courses and not shifts and not events:
+        logger.warning(f"Document {recent_doc.id} has empty courses/shifts/events")
+        return {
+            'text': "Je n'ai pas trouvé d'emploi du temps dans ce document. Peux-tu me l'envoyer dans un autre format ou me décrire tes horaires?",
+            'quick_replies': [
+                {'label': "📝 Décrire mes horaires", 'value': "Je vais te décrire mon emploi du temps"},
+                {'label': "📎 Autre fichier", 'value': 'upload'},
             ]
         }
 
