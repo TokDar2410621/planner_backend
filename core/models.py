@@ -108,6 +108,7 @@ class RecurringBlock(models.Model):
         ('meal', 'Repas'),
         ('sport', 'Sport'),
         ('project', 'Projet'),
+        ('revision', 'Révision'),
         ('other', 'Autre'),
     ]
 

@@ -49,7 +49,7 @@ class SecurityService:
     ]
 
     # Valid block and task types
-    VALID_BLOCK_TYPES = ['course', 'work', 'sleep', 'meal', 'sport', 'project', 'other']
+    VALID_BLOCK_TYPES = ['course', 'work', 'sleep', 'meal', 'sport', 'project', 'revision', 'other']
     VALID_TASK_TYPES = ['deep_work', 'shallow', 'errand']
 
     def sanitize_input(self, message: str) -> Tuple[str, bool]:

@@ -179,6 +179,7 @@ class GeminiProvider(LLMProvider):
             LLMResponse with text and/or function calls
         """
         if not self.is_available():
+            logger.error("Gemini provider not available (client is None)")
             return LLMResponse(text="Service IA non disponible.")
 
         try:
@@ -201,6 +202,8 @@ class GeminiProvider(LLMProvider):
                     parts=[types.Part(text=msg["content"])]
                 ))
 
+            logger.debug(f"Gemini request: {len(contents)} content parts, tools={'yes' if tools else 'no'}")
+
             # Build config
             config = None
             if tools:
@@ -212,8 +215,11 @@ class GeminiProvider(LLMProvider):
                 )
 
             response = self._call_api(contents, config)
-            return self._parse_response(response)
+            parsed = self._parse_response(response)
+
+            logger.debug(f"Gemini response parsed: text_len={len(parsed.text)}, function_calls={len(parsed.function_calls)}")
+            return parsed
 
         except Exception as e:
-            logger.error(f"Gemini API error with history: {e}")
+            logger.error(f"Gemini API error with history: {e}", exc_info=True)
             return LLMResponse(text="Erreur lors de la communication avec l'IA.")

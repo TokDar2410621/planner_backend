@@ -2070,7 +2070,7 @@ Réponds en français."""
                             type="OBJECT",
                             properties={
                                 "title": types.Schema(type="STRING", description="Titre du bloc"),
-                                "block_type": types.Schema(type="STRING", description="Type: course|work|sleep|meal|sport|project|other"),
+                                "block_type": types.Schema(type="STRING", description="Type: course|work|sleep|meal|sport|project|revision|other"),
                                 "days": types.Schema(
                                     type="ARRAY",
                                     items=types.Schema(type="INTEGER"),

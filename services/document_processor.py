@@ -351,6 +351,8 @@ Analyse ce texte et retourne le JSON structuré:"""
 
         # Remote storage (Cloudinary) - download to temp file
         logger.info(f"Downloading file from remote storage: {document.file.name}")
+        file_url = document.file.url if hasattr(document.file, 'url') else None
+        logger.info(f"File URL: {file_url}")
 
         # Determine file extension
         file_name = document.file.name
@@ -363,10 +365,32 @@ Analyse ce texte et retourne le JSON structuré:"""
         try:
             # Download file content
             with os.fdopen(temp_fd, 'wb') as temp_file:
-                # Read from Cloudinary/remote storage
-                document.file.seek(0)
-                for chunk in document.file.chunks():
-                    temp_file.write(chunk)
+                total_bytes = 0
+
+                # Try chunks() method first
+                try:
+                    try:
+                        document.file.seek(0)
+                    except Exception as e:
+                        logger.warning(f"Could not seek file: {e}")
+
+                    for chunk in document.file.chunks():
+                        temp_file.write(chunk)
+                        total_bytes += len(chunk)
+                except Exception as chunks_error:
+                    logger.warning(f"chunks() failed: {chunks_error}, trying URL download...")
+
+                    # Fallback: download from URL using requests
+                    if file_url:
+                        import requests
+                        response = requests.get(file_url, timeout=60)
+                        response.raise_for_status()
+                        temp_file.write(response.content)
+                        total_bytes = len(response.content)
+                    else:
+                        raise RuntimeError("No URL available for file download")
+
+                logger.info(f"Downloaded {total_bytes} bytes to temp file")
 
             logger.info(f"Downloaded to temp file: {temp_path}")
             yield temp_path
@@ -564,8 +588,9 @@ Analyse ce texte et retourne le JSON structuré:"""
                     raise RuntimeError("Aucun service AI disponible")
 
                 # Parse response
-                logger.debug(f"Raw response ({extraction_method}): {response_text[:500]}...")
+                logger.info(f"Raw response ({extraction_method}): {response_text[:1000]}...")
                 extracted_data = self._parse_response(response_text)
+                logger.info(f"Parsed data keys: {list(extracted_data.keys())}")
 
                 # Add extraction method to data
                 extracted_data['extraction_method'] = extraction_method
@@ -872,8 +897,10 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                 document.save(update_fields=['document_type'])
 
         # Create blocks from courses
+        logger.info(f"Creating blocks from extracted data: courses={len(data.get('courses', []))}, shifts={len(data.get('shifts', []))}")
         if 'courses' in data and data['courses']:
-            for course in data['courses']:
+            for idx, course in enumerate(data['courses']):
+                logger.info(f"Processing course {idx}: {course}")
                 day_str = course.get('day', '')
                 if day_str:
                     day = self.DAY_MAPPING.get(day_str.lower().strip())

@@ -150,9 +150,21 @@ HF_API_KEY = os.getenv('HF_API_KEY', '')
 HF_MODEL = os.getenv('HF_MODEL', 'Qwen/Qwen2.5-VL-72B-Instruct')
 
 # Cloudinary (for media storage in production)
+# Supports both CLOUDINARY_URL format and separate variables
+CLOUDINARY_URL = os.getenv('CLOUDINARY_URL', '')
 CLOUDINARY_CLOUD_NAME = os.getenv('CLOUDINARY_CLOUD_NAME', '')
 CLOUDINARY_API_KEY = os.getenv('CLOUDINARY_API_KEY', '')
 CLOUDINARY_API_SECRET = os.getenv('CLOUDINARY_API_SECRET', '')
+
+# Parse CLOUDINARY_URL if separate vars not provided
+# Format: cloudinary://<api_key>:<api_secret>@<cloud_name>
+if CLOUDINARY_URL and not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY):
+    import re
+    match = re.match(r'cloudinary://([^:]+):([^@]+)@(.+)', CLOUDINARY_URL)
+    if match:
+        CLOUDINARY_API_KEY = match.group(1)
+        CLOUDINARY_API_SECRET = match.group(2)
+        CLOUDINARY_CLOUD_NAME = match.group(3)
 
 if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
     CLOUDINARY_STORAGE = {
