@@ -157,19 +157,30 @@ def run_in_background(func: Callable, *args, **kwargs) -> None:
     Usage:
         run_in_background(process_document, document_id=123)
     """
+    print(f"[BACKGROUND] run_in_background called for {func.__name__} with args={args}", flush=True)
+
     def wrapper():
+        print(f"[BACKGROUND] wrapper starting for {func.__name__}", flush=True)
         try:
             func(*args, **kwargs)
+            print(f"[BACKGROUND] {func.__name__} completed successfully", flush=True)
         except Exception as e:
+            print(f"[BACKGROUND] {func.__name__} FAILED with error: {e}", flush=True)
             logger.error(f"Background task {func.__name__} failed: {e}")
 
     try:
         import gevent
-        gevent.spawn(wrapper)
+        greenlet = gevent.spawn(wrapper)
+        # Yield to allow the greenlet to start executing
+        # This is critical for gevent's cooperative scheduling
+        gevent.sleep(0)
+        print(f"[BACKGROUND] Spawned gevent greenlet for {func.__name__}: {greenlet}", flush=True)
         logger.info(f"Started background greenlet: {func.__name__}")
     except ImportError:
+        print(f"[BACKGROUND] gevent not available, using threading", flush=True)
         # Fallback to threading if gevent not available
         import threading
         thread = threading.Thread(target=wrapper, daemon=True)
         thread.start()
+        print(f"[BACKGROUND] Started thread for {func.__name__}", flush=True)
         logger.info(f"Started background thread: {func.__name__}")
