@@ -519,9 +519,11 @@ Analyse ce texte et retourne le JSON structuré:"""
             dict: Extracted data
         """
         print(f"[DOC_PROCESSOR] _process_document_by_id called for doc {document_id}", flush=True)
-        from django.db import connection
-        # Close old connection to avoid issues in new thread
-        connection.close()
+        from django.db import connections
+        # Close ALL database connections to get fresh ones for this greenlet
+        # This is required for gevent greenlets to avoid "asynchronous query underway" errors
+        connections.close_all()
+        print(f"[DOC_PROCESSOR] Closed all DB connections for greenlet", flush=True)
 
         document = UploadedDocument.objects.get(id=document_id)
         print(f"[DOC_PROCESSOR] Document loaded: {document.file.name}", flush=True)
