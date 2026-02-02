@@ -291,8 +291,10 @@ class ChatView(APIView):
 
     def post(self, request):
         """Send a message and get AI response."""
+        print(f"[CHAT] POST request received from user {request.user.id}", flush=True)
         message = request.data.get('message', '')
         attachment_file = request.FILES.get('attachment')
+        print(f"[CHAT] message='{message[:50] if message else ''}', attachment={bool(attachment_file)}", flush=True)
 
         if not message and not attachment_file:
             return Response(
@@ -303,6 +305,7 @@ class ChatView(APIView):
         # Handle file upload
         attachment = None
         if attachment_file:
+            print(f"[CHAT] Processing attachment: {attachment_file.name}, size={attachment_file.size}", flush=True)
             doc_type = request.data.get('document_type', 'other')
             doc = UploadedDocument.objects.create(
                 user=request.user,
@@ -310,12 +313,15 @@ class ChatView(APIView):
                 document_type=doc_type,
             )
             attachment = doc
+            print(f"[CHAT] Document created with id={doc.id}", flush=True)
 
             # Process document ASYNCHRONOUSLY to avoid timeout
             try:
                 processor = DocumentProcessor()
                 processor.process_document_async(doc.id)
+                print(f"[CHAT] Async processing started for doc {doc.id}", flush=True)
             except Exception as e:
+                print(f"[CHAT] Document processing error: {e}", flush=True)
                 logger.error(f"Document processing error: {e}")
 
         # Generate chat response

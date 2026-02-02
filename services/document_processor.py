@@ -518,11 +518,13 @@ Analyse ce texte et retourne le JSON structuré:"""
         Returns:
             dict: Extracted data
         """
+        print(f"[DOC_PROCESSOR] _process_document_by_id called for doc {document_id}", flush=True)
         from django.db import connection
         # Close old connection to avoid issues in new thread
         connection.close()
 
         document = UploadedDocument.objects.get(id=document_id)
+        print(f"[DOC_PROCESSOR] Document loaded: {document.file.name}", flush=True)
         return self.process_document(document)
 
     def process_document(self, document: UploadedDocument) -> dict:
@@ -611,9 +613,12 @@ Analyse ce texte et retourne le JSON structuré:"""
                 document.processed = True
                 document.processing_error = None
                 document.save()
+                print(f"[DOC_PROCESSOR] Document {document.id} saved with extracted_data keys: {list(extracted_data.keys())}", flush=True)
+                print(f"[DOC_PROCESSOR] Courses: {len(extracted_data.get('courses', []))}, Shifts: {len(extracted_data.get('shifts', []))}", flush=True)
 
                 # Create recurring blocks from extracted data
-                self._create_recurring_blocks(document, extracted_data)
+                blocks = self._create_recurring_blocks(document, extracted_data)
+                print(f"[DOC_PROCESSOR] Created {len(blocks)} blocks for doc {document.id}", flush=True)
 
                 return extracted_data
 
