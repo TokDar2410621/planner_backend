@@ -168,19 +168,11 @@ def run_in_background(func: Callable, *args, **kwargs) -> None:
             print(f"[BACKGROUND] {func.__name__} FAILED with error: {e}", flush=True)
             logger.error(f"Background task {func.__name__} failed: {e}")
 
-    try:
-        import gevent
-        greenlet = gevent.spawn(wrapper)
-        # Yield to allow the greenlet to start executing
-        # This is critical for gevent's cooperative scheduling
-        gevent.sleep(0)
-        print(f"[BACKGROUND] Spawned gevent greenlet for {func.__name__}: {greenlet}", flush=True)
-        logger.info(f"Started background greenlet: {func.__name__}")
-    except ImportError:
-        print(f"[BACKGROUND] gevent not available, using threading", flush=True)
-        # Fallback to threading if gevent not available
-        import threading
-        thread = threading.Thread(target=wrapper, daemon=True)
-        thread.start()
-        print(f"[BACKGROUND] Started thread for {func.__name__}", flush=True)
-        logger.info(f"Started background thread: {func.__name__}")
+    # Always use threading for background tasks
+    # Threading works reliably with both sync and gevent gunicorn workers
+    # Gevent greenlets only work properly with gevent workers, which Railway doesn't use
+    import threading
+    thread = threading.Thread(target=wrapper, daemon=True)
+    thread.start()
+    print(f"[BACKGROUND] Started thread for {func.__name__}", flush=True)
+    logger.info(f"Started background thread: {func.__name__}")
