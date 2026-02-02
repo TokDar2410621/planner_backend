@@ -340,6 +340,8 @@ def add_extracted_to_planning(user: User) -> dict:
     from services.document_processor import DocumentProcessor
     from core.models import RecurringBlock, UploadedDocument
 
+    logger.info(f"add_extracted_to_planning called for user {user.id}")
+
     # Check for processing document
     ten_minutes_ago = timezone.now() - timedelta(minutes=10)
     processing_doc = UploadedDocument.objects.filter(
@@ -349,6 +351,7 @@ def add_extracted_to_planning(user: User) -> dict:
     ).order_by('-uploaded_at').first()
 
     if processing_doc:
+        logger.info(f"Found processing document {processing_doc.id}, uploaded at {processing_doc.uploaded_at}")
         return {
             'text': "Le document est encore en cours de traitement. Patiente quelques secondes!",
             'quick_replies': [
@@ -362,7 +365,16 @@ def add_extracted_to_planning(user: User) -> dict:
         processed=True
     ).order_by('-uploaded_at').first()
 
+    logger.info(f"Recent processed doc: {recent_doc.id if recent_doc else 'None'}")
+    if recent_doc:
+        logger.info(f"Doc extracted_data: {bool(recent_doc.extracted_data)}, keys: {list(recent_doc.extracted_data.keys()) if recent_doc.extracted_data else []}")
+        if recent_doc.extracted_data:
+            courses = recent_doc.extracted_data.get('courses', [])
+            shifts = recent_doc.extracted_data.get('shifts', [])
+            logger.info(f"Extracted: {len(courses)} courses, {len(shifts)} shifts")
+
     if not recent_doc or not recent_doc.extracted_data:
+        logger.warning(f"No recent doc with extracted_data for user {user.id}")
         return {
             'text': "Je n'ai pas trouvé de document récent avec des données à ajouter. Envoie-moi ton emploi du temps!",
             'quick_replies': [
@@ -372,6 +384,7 @@ def add_extracted_to_planning(user: User) -> dict:
 
     # Check if blocks already exist for this document
     existing_blocks = RecurringBlock.objects.filter(source_document=recent_doc).count()
+    logger.info(f"Existing blocks for doc {recent_doc.id}: {existing_blocks}")
     if existing_blocks > 0:
         return {
             'text': f"Les données de ce document ont déjà été ajoutées ({existing_blocks} blocs créés).",
@@ -383,8 +396,10 @@ def add_extracted_to_planning(user: User) -> dict:
 
     # Create blocks from extracted data
     try:
+        logger.info(f"Creating blocks from extracted_data: {recent_doc.extracted_data}")
         processor = DocumentProcessor()
         created_blocks = processor._create_recurring_blocks(recent_doc, recent_doc.extracted_data)
+        logger.info(f"Created {len(created_blocks)} blocks")
 
         if created_blocks:
             block_summary = []

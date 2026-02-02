@@ -530,6 +530,8 @@ class ChatOrchestrator:
             extracted_data__isnull=True
         ).order_by('-uploaded_at').first()
 
+        logger.info(f"_check_recently_processed_document: found={recent_doc.id if recent_doc else None}")
+
         if recent_doc and recent_doc.extracted_data:
             # Check if we already notified about this document
             from core.models import ConversationMessage
@@ -548,6 +550,8 @@ class ChatOrchestrator:
         """Handle document upload and show extracted data."""
         from core.models import RecurringBlock
 
+        logger.info(f"_handle_document_upload called for doc {attachment.id}, processed={attachment.processed}")
+
         if not attachment.processed:
             error = getattr(attachment, 'processing_error', None)
             if error:
@@ -563,6 +567,8 @@ class ChatOrchestrator:
             }
 
         extracted = attachment.extracted_data or {}
+        logger.info(f"Document {attachment.id} extracted_data keys: {list(extracted.keys()) if extracted else 'empty'}")
+        logger.info(f"Courses: {len(extracted.get('courses', []))}, Shifts: {len(extracted.get('shifts', []))}")
         summary_lines = []
         total_items = 0
 
