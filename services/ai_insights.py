@@ -536,10 +536,13 @@ class AIInsightsService:
             target_date = timezone.now().date()
 
         conflicts = []
+        profile = user.profile
+        transport_minutes = profile.transport_time_minutes or 0
 
         for day_offset in range(days_ahead):
             current_date = target_date + timedelta(days=day_offset)
             day_of_week = current_date.weekday()
+            previous_day_of_week = (day_of_week - 1) % 7
 
             # Get all blocks for this day
             recurring = list(RecurringBlock.objects.filter(
@@ -549,44 +552,103 @@ class AIInsightsService:
                 user=user, date=current_date
             ))
 
+            # Also get night shift blocks from previous day (they end today)
+            previous_night_blocks = list(RecurringBlock.objects.filter(
+                user=user, day_of_week=previous_day_of_week, active=True, is_night_shift=True
+            ))
+
             # Check for overlaps
             all_blocks = []
             for rb in recurring:
+                is_overnight = self._is_overnight_block(rb.start_time, rb.end_time)
                 all_blocks.append({
                     'id': rb.id,
                     'type': 'recurring',
                     'title': rb.title,
                     'start': rb.start_time,
                     'end': rb.end_time,
-                    'date': current_date
+                    'date': current_date,
+                    'is_overnight': is_overnight,
+                    'is_night_shift': rb.is_night_shift,
+                    'block_type': rb.block_type,
                 })
+
+            # Add previous day's night shift blocks (they end today morning)
+            for rb in previous_night_blocks:
+                # These blocks started yesterday but end today
+                all_blocks.append({
+                    'id': rb.id,
+                    'type': 'recurring_from_yesterday',
+                    'title': rb.title,
+                    'start': time(0, 0),  # Starts at midnight (continuation)
+                    'end': rb.end_time,   # Ends in the morning
+                    'date': current_date,
+                    'is_overnight': False,  # We're only looking at the morning part
+                    'is_night_shift': True,
+                    'block_type': rb.block_type,
+                    'real_start': rb.start_time,  # Original start from yesterday
+                })
+
             for sb in scheduled:
+                is_overnight = self._is_overnight_block(sb.start_time, sb.end_time)
                 all_blocks.append({
                     'id': sb.id,
                     'type': 'scheduled',
                     'title': sb.task.title,
                     'start': sb.start_time,
                     'end': sb.end_time,
-                    'date': current_date
+                    'date': current_date,
+                    'is_overnight': is_overnight,
+                    'is_night_shift': False,
+                    'block_type': 'task',
                 })
 
-            # Sort by start time
+            # Sort by start time (but overnight blocks that START today go at their start time)
             all_blocks.sort(key=lambda x: x['start'])
 
-            # Detect overlaps
-            for i in range(len(all_blocks) - 1):
-                block_a = all_blocks[i]
-                block_b = all_blocks[i + 1]
+            # Detect overlaps using the new overlap detection
+            for i, block_a in enumerate(all_blocks):
+                for j, block_b in enumerate(all_blocks):
+                    if i >= j:
+                        continue  # Avoid duplicate checks
 
-                if block_a['end'] > block_b['start']:
-                    overlap_minutes = self._time_diff_minutes(block_b['start'], block_a['end'])
-                    conflicts.append(Conflict(
-                        type='overlap',
-                        severity='high' if overlap_minutes > 30 else 'medium',
-                        message=f"Chevauchement de {overlap_minutes}min entre '{block_a['title']}' et '{block_b['title']}' le {current_date.strftime('%d/%m')}",
-                        blocks_involved=[block_a['id'], block_b['id']],
-                        suggested_resolution=f"Deplacer '{block_b['title']}' apres {block_a['end'].strftime('%H:%M')}"
-                    ))
+                    overlaps, overlap_minutes = self._blocks_overlap(
+                        block_a['start'], block_a['end'],
+                        block_b['start'], block_b['end'],
+                        block_a['is_overnight'], block_b['is_overnight']
+                    )
+
+                    if overlaps and overlap_minutes > 0:
+                        # Special handling for sleep vs work conflicts
+                        is_sleep_work_conflict = (
+                            (block_a.get('block_type') == 'sleep' and block_b.get('is_night_shift')) or
+                            (block_b.get('block_type') == 'sleep' and block_a.get('is_night_shift'))
+                        )
+
+                        if is_sleep_work_conflict:
+                            work_block = block_a if block_a.get('is_night_shift') else block_b
+                            sleep_block = block_b if block_a.get('is_night_shift') else block_a
+                            work_end = work_block['end']
+
+                            # Calculate suggested sleep time (after work + transport)
+                            suggested_start = (datetime.combine(date.today(), work_end) +
+                                             timedelta(minutes=transport_minutes)).time()
+
+                            conflicts.append(Conflict(
+                                type='overlap',
+                                severity='high',
+                                message=f"'{sleep_block['title']}' chevauche '{work_block['title']}'. Pour un travail de nuit, le sommeil doit etre apres la fin du travail.",
+                                blocks_involved=[block_a['id'], block_b['id']],
+                                suggested_resolution=f"Deplacer '{sleep_block['title']}' a {suggested_start.strftime('%H:%M')} (apres travail{' + ' + str(transport_minutes) + 'min trajet' if transport_minutes else ''})"
+                            ))
+                        else:
+                            conflicts.append(Conflict(
+                                type='overlap',
+                                severity='high' if overlap_minutes > 30 else 'medium',
+                                message=f"Chevauchement de {overlap_minutes}min entre '{block_a['title']}' et '{block_b['title']}' le {current_date.strftime('%d/%m')}",
+                                blocks_involved=[block_a['id'], block_b['id']],
+                                suggested_resolution=f"Deplacer '{block_b['title']}' apres {block_a['end'].strftime('%H:%M')}"
+                            ))
 
             # Check for deep work overload
             deep_work_minutes = 0
@@ -936,11 +998,64 @@ Jours: 0=Lundi, 1=Mardi, 2=Mercredi, 3=Jeudi, 4=Vendredi, 5=Samedi, 6=Dimanche
 
     # ==================== UTILITY METHODS ====================
 
-    def _time_diff_minutes(self, start: time, end: time) -> int:
-        """Calculate difference between two times in minutes."""
+    def _time_diff_minutes(self, start: time, end: time, allow_overnight: bool = False) -> int:
+        """
+        Calculate difference between two times in minutes.
+
+        Args:
+            start: Start time
+            end: End time
+            allow_overnight: If True, handles cases where end < start (crosses midnight)
+
+        Returns:
+            Duration in minutes (always positive if allow_overnight=True)
+        """
         start_minutes = start.hour * 60 + start.minute
         end_minutes = end.hour * 60 + end.minute
-        return end_minutes - start_minutes
+
+        diff = end_minutes - start_minutes
+
+        # If negative and overnight allowed, add 24 hours
+        if diff < 0 and allow_overnight:
+            diff += 24 * 60  # Add 24 hours in minutes
+
+        return diff
+
+    def _is_overnight_block(self, start: time, end: time) -> bool:
+        """Check if a block crosses midnight."""
+        return end < start
+
+    def _blocks_overlap(self, a_start: time, a_end: time, b_start: time, b_end: time,
+                        a_is_overnight: bool = False, b_is_overnight: bool = False) -> Tuple[bool, int]:
+        """
+        Check if two blocks overlap, handling overnight blocks.
+
+        Returns:
+            Tuple of (overlaps: bool, overlap_minutes: int)
+        """
+        # Convert to minutes from midnight, handling overnight
+        def to_range(start: time, end: time, is_overnight: bool) -> List[Tuple[int, int]]:
+            start_min = start.hour * 60 + start.minute
+            end_min = end.hour * 60 + end.minute
+
+            if is_overnight:
+                # Split into two ranges: start->midnight and midnight->end
+                return [(start_min, 24 * 60), (0, end_min)]
+            else:
+                return [(start_min, end_min)]
+
+        ranges_a = to_range(a_start, a_end, a_is_overnight)
+        ranges_b = to_range(b_start, b_end, b_is_overnight)
+
+        total_overlap = 0
+        for (a1, a2) in ranges_a:
+            for (b1, b2) in ranges_b:
+                overlap_start = max(a1, b1)
+                overlap_end = min(a2, b2)
+                if overlap_end > overlap_start:
+                    total_overlap += overlap_end - overlap_start
+
+        return (total_overlap > 0, total_overlap)
 
     def _get_energy_level(self, slot_time: time, preference: str) -> str:
         """Determine energy level for a given time."""
