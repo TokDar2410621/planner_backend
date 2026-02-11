@@ -128,7 +128,7 @@ SIMPLE_JWT = {
 # CORS Settings
 CORS_ALLOWED_ORIGINS = [
     origin.strip()
-    for origin in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:5173,https://day-wise-bot.vercel.app').split(',')
+    for origin in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:5173,http://localhost:8081,https://day-wise-bot.vercel.app').split(',')
 ]
 CORS_ALLOW_CREDENTIALS = True
 

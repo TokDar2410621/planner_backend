@@ -13,6 +13,7 @@ class FunctionCall:
     """Represents a function call from the LLM."""
     name: str
     args: dict = field(default_factory=dict)
+    call_id: str = ""  # Tool use ID (required for Claude multi-turn)
 
 
 @dataclass
@@ -21,6 +22,7 @@ class LLMResponse:
     text: str = ""
     function_calls: list[FunctionCall] = field(default_factory=list)
     raw_response: Any = None
+    raw_content: list = field(default_factory=list)  # Raw content blocks for multi-turn
 
     @property
     def has_function_calls(self) -> bool:

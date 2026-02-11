@@ -181,12 +181,7 @@ class ClaudeProvider(LLMProvider):
     def _parse_response(self, response) -> LLMResponse:
         """
         Parse Claude response into standardized LLMResponse.
-
-        Args:
-            response: Raw Claude response
-
-        Returns:
-            LLMResponse with extracted text and function calls
+        Preserves raw content blocks for multi-turn tool use.
         """
         text_parts = []
         function_calls = []
@@ -197,14 +192,16 @@ class ClaudeProvider(LLMProvider):
             elif block.type == "tool_use":
                 function_calls.append(FunctionCall(
                     name=block.name,
-                    args=block.input if block.input else {}
+                    args=block.input if block.input else {},
+                    call_id=block.id,
                 ))
-                logger.info(f"Tool use detected: {block.name} with args: {block.input}")
+                logger.info(f"Tool use detected: {block.name} (id={block.id}) with args: {block.input}")
 
         return LLMResponse(
             text="".join(text_parts),
             function_calls=function_calls,
-            raw_response=response
+            raw_response=response,
+            raw_content=response.content,
         )
 
     def generate_with_history(
@@ -216,28 +213,28 @@ class ClaudeProvider(LLMProvider):
         """
         Generate a response with conversation history.
 
-        Args:
-            messages: List of {"role": "user"|"assistant", "content": str}
-            tools: Optional list of tool definitions
-            system_prompt: Optional system prompt
-
-        Returns:
-            LLMResponse with text and/or function calls
+        Supports multi-turn tool use with these message formats:
+        - {"role": "user", "content": "text"}
+        - {"role": "assistant", "content": [content_blocks]}  (raw Claude blocks)
+        - {"role": "user", "content": [tool_result_blocks]}  (tool results)
         """
         if not self.is_available():
             return LLMResponse(text="Service IA non disponible.")
 
         try:
-            # Claude uses "assistant" role directly (unlike Gemini's "model")
             claude_messages = []
             for msg in messages:
                 role = msg["role"]
                 if role == "model":  # Gemini compatibility
                     role = "assistant"
-                claude_messages.append({
-                    "role": role,
-                    "content": msg["content"]
-                })
+
+                content = msg["content"]
+
+                # If content is already a list (raw blocks or tool results), pass directly
+                if isinstance(content, list):
+                    claude_messages.append({"role": role, "content": content})
+                else:
+                    claude_messages.append({"role": role, "content": content})
 
             claude_tools = self._convert_tools(tools) if tools else None
 
@@ -250,5 +247,5 @@ class ClaudeProvider(LLMProvider):
             return self._parse_response(response)
 
         except Exception as e:
-            logger.error(f"Claude API error with history: {e}")
+            logger.error(f"Claude API error with history: {e}", exc_info=True)
             return LLMResponse(text="Erreur lors de la communication avec l'IA.")

@@ -44,8 +44,9 @@ from .serializers import (
     SharedScheduleSerializer,
     CreateShareSerializer,
 )
-from services import DocumentProcessor, ChatOrchestrator, AIScheduler
+from services import DocumentProcessor, AIScheduler
 from services.ai_insights import AIInsightsService
+from services.agent import PlannerAgent
 
 logger = logging.getLogger(__name__)
 
@@ -348,13 +349,13 @@ class ChatView(APIView):
                 print(f"[CHAT] Document processing error: {e}", flush=True)
                 logger.error(f"Document processing error: {e}")
 
-        # Generate chat response
+        # Generate chat response via PlannerAgent
         try:
-            engine = ChatOrchestrator()
-            result = engine.generate_response(request.user, message or "J'ai uploadé un document.", attachment)
-            logger.info(f"Chat response generated successfully: {result.get('response', '')[:100]}...")
+            agent = PlannerAgent()
+            result = agent.process_message(request.user, message or "J'ai uploadé un document.", attachment)
+            logger.info(f"Agent response generated: {result.get('response', '')[:100]}...")
         except Exception as e:
-            logger.error(f"ChatOrchestrator error: {e}", exc_info=True)
+            logger.error(f"PlannerAgent error: {e}", exc_info=True)
             return Response(
                 {'error': f'Erreur interne: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -363,14 +364,14 @@ class ChatView(APIView):
         response_data = {
             'response': result['response'],
         }
-        if result.get('extracted_data'):
-            response_data['extracted_data'] = result['extracted_data']
-        if result.get('tasks_created'):
-            response_data['tasks_created'] = TaskSerializer(result['tasks_created'], many=True).data
         if result.get('quick_replies'):
             response_data['quick_replies'] = result['quick_replies']
         if result.get('interactive_inputs'):
             response_data['interactive_inputs'] = result['interactive_inputs']
+        if result.get('blocks_created'):
+            response_data['blocks_created'] = result['blocks_created']
+        if result.get('tasks_created'):
+            response_data['tasks_created'] = result['tasks_created']
 
         return Response(response_data)
 

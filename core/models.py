@@ -294,6 +294,40 @@ class ConversationMessage(models.Model):
         ordering = ['created_at']
 
 
+class Goal(models.Model):
+    """User goal (short or long term)."""
+
+    GOAL_TYPE_CHOICES = [
+        ('short_term', 'Court terme'),
+        ('long_term', 'Long terme'),
+    ]
+
+    STATUS_CHOICES = [
+        ('active', 'Actif'),
+        ('completed', 'Terminé'),
+        ('paused', 'En pause'),
+        ('cancelled', 'Annulé'),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='goals')
+    title = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    goal_type = models.CharField(max_length=20, choices=GOAL_TYPE_CHOICES, default='short_term')
+    deadline = models.DateField(null=True, blank=True)
+    progress = models.PositiveIntegerField(default=0)  # 0-100
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.title} ({self.get_status_display()})"
+
+    class Meta:
+        verbose_name = "Objectif"
+        verbose_name_plural = "Objectifs"
+        ordering = ['-created_at']
+
+
 class SharedSchedule(models.Model):
     """Shareable link for a user's schedule."""
 
