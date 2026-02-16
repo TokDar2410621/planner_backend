@@ -1006,3 +1006,30 @@ class PublicScheduleView(APIView):
             response_data['scheduled_tasks'] = ScheduledBlockSerializer(scheduled_tasks, many=True).data
 
         return Response(response_data)
+
+
+class PublicPlanningByUsernameView(APIView):
+    """View a user's planning by username (public, no auth required)."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request, username):
+        """Get a user's public planning data by username."""
+        try:
+            user = User.objects.get(username=username)
+        except User.DoesNotExist:
+            return Response(
+                {'error': 'Utilisateur introuvable.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        recurring_blocks = RecurringBlock.objects.filter(user=user, active=True)
+
+        return Response({
+            'title': f'Planning de {user.first_name or user.username}',
+            'owner': user.first_name or user.username,
+            'username': user.username,
+            'avatar_url': getattr(user.profile, 'avatar_url', None) if hasattr(user, 'profile') else None,
+            'recurring_blocks': RecurringBlockSerializer(recurring_blocks, many=True).data,
+            'scheduled_tasks': [],
+        })

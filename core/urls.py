@@ -38,6 +38,7 @@ from .views import (
     ShareScheduleView,
     ShareScheduleDetailView,
     PublicScheduleView,
+    PublicPlanningByUsernameView,
 )
 
 router = DefaultRouter()
@@ -81,6 +82,7 @@ urlpatterns = [
     path('schedule/share/', ShareScheduleView.as_view(), name='share-schedule'),
     path('schedule/share/<int:share_id>/', ShareScheduleDetailView.as_view(), name='share-schedule-detail'),
     path('shared/<uuid:share_token>/', PublicScheduleView.as_view(), name='public-schedule'),
+    path('planning/<str:username>/', PublicPlanningByUsernameView.as_view(), name='public-planning'),
 
     # Router URLs (documents, recurring-blocks, tasks)
     path('', include(router.urls)),
