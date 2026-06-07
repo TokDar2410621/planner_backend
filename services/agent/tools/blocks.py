@@ -4,6 +4,11 @@ RecurringBlock tools for the Planner AI agent.
 from django.contrib.auth.models import User
 
 from core.models import RecurringBlock
+from services.scheduling.overlap import (
+    find_recurring_conflicts,
+    is_overnight,
+    parse_time,
+)
 from .base import BaseTool, ToolResult
 
 DAY_NAMES = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
@@ -114,9 +119,15 @@ class CreateBlockTool(BaseTool):
         location = kwargs.get("location", "")
         is_night_shift = kwargs.get("is_night_shift", False)
 
-        # Auto-detect night shift
-        if not is_night_shift and end_time < start_time:
-            is_night_shift = True
+        # Parse + valide les heures une seule fois (format HH:MM).
+        try:
+            start_t = parse_time(start_time)
+            end_t = parse_time(end_time)
+        except ValueError as e:
+            return ToolResult(success=False, data={}, message=str(e))
+
+        # Détection night shift basée sur les minutes (pas une comparaison de chaînes).
+        is_night_shift = is_overnight(start_t, end_t, is_night_shift)
 
         created = []
         skipped = []
@@ -126,13 +137,12 @@ class CreateBlockTool(BaseTool):
                 skipped.append({"day": day, "reason": "Jour invalide"})
                 continue
 
-            # Check for overlap
-            existing = RecurringBlock.objects.filter(
-                user=user, day_of_week=day, active=True,
-                start_time__lt=end_time, end_time__gt=start_time,
+            # Contrôle de chevauchement (gère l'overnight, AUCUN contournement).
+            conflicts = find_recurring_conflicts(
+                user, day, start_t, end_t, is_night_shift
             )
-            if not is_night_shift and existing.exists():
-                overlap = existing.first()
+            if conflicts:
+                overlap = conflicts[0]
                 skipped.append({
                     "day": day,
                     "day_name": DAY_NAMES[day],
@@ -145,8 +155,8 @@ class CreateBlockTool(BaseTool):
                 title=title,
                 block_type=block_type,
                 day_of_week=day,
-                start_time=start_time,
-                end_time=end_time,
+                start_time=start_t,
+                end_time=end_t,
                 location=location,
                 is_night_shift=is_night_shift,
             )
@@ -195,9 +205,39 @@ class UpdateBlockTool(BaseTool):
         except RecurringBlock.DoesNotExist:
             return ToolResult(success=False, data={}, message=f"Bloc #{block_id} introuvable.")
 
-        for field in ["title", "start_time", "end_time", "location", "block_type"]:
-            if field in kwargs and kwargs[field] is not None:
-                setattr(block, field, kwargs[field])
+        # Heures effectives après modification (parse + valide si fournies).
+        try:
+            new_start = parse_time(kwargs["start_time"]) if kwargs.get("start_time") else block.start_time
+            new_end = parse_time(kwargs["end_time"]) if kwargs.get("end_time") else block.end_time
+        except ValueError as e:
+            return ToolResult(success=False, data={}, message=str(e))
+
+        night = is_overnight(new_start, new_end, block.is_night_shift)
+
+        # Contrôle de chevauchement (en s'excluant soi-même).
+        conflicts = find_recurring_conflicts(
+            user, block.day_of_week, new_start, new_end, night, exclude_id=block.id
+        )
+        if conflicts:
+            o = conflicts[0]
+            return ToolResult(
+                success=False,
+                data={},
+                message=(
+                    f"Modification annulée: chevauchement avec '{o.title}' "
+                    f"({o.start_time.strftime('%H:%M')}-{o.end_time.strftime('%H:%M')})."
+                ),
+            )
+
+        if kwargs.get("title") is not None:
+            block.title = kwargs["title"]
+        if kwargs.get("location") is not None:
+            block.location = kwargs["location"]
+        if kwargs.get("block_type") is not None:
+            block.block_type = kwargs["block_type"]
+        block.start_time = new_start
+        block.end_time = new_end
+        block.is_night_shift = night
 
         block.save()
         return ToolResult(

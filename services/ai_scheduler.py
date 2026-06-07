@@ -9,6 +9,7 @@ from typing import Optional
 
 from django.conf import settings
 from django.contrib.auth.models import User
+from django.db import transaction
 from django.utils import timezone
 
 try:
@@ -23,6 +24,7 @@ from core.models import (
     Task,
     ScheduledBlock,
 )
+from services.scheduling.overlap import MINUTES_PER_DAY
 from utils.helpers import retry_with_backoff
 
 logger = logging.getLogger(__name__)
@@ -90,6 +92,7 @@ class AIScheduler:
             contents=contents
         )
 
+    @transaction.atomic
     def generate_schedule(
         self,
         user: User,
@@ -178,8 +181,8 @@ class AIScheduler:
             current_date = start_date + timedelta(days=day_offset)
             day_of_week = current_date.weekday()
 
-            # Get blocked times for this day
-            blocked_times = self._get_blocked_times(user, day_of_week)
+            # Get blocked times for this day (récurrents + overnight + déjà planifiés)
+            blocked_times = self._get_blocked_times(user, current_date)
 
             # Add sleep/recovery block after night shift
             # Check if there was a night shift the day before
@@ -224,35 +227,68 @@ class AIScheduler:
 
         return slots
 
-    def _get_blocked_times(self, user: User, day_of_week: int) -> list:
-        """
-        Get all blocked time ranges for a specific day.
+    @staticmethod
+    def _min_to_time(m: int) -> time:
+        """Convertit des minutes (0..1440) en time, en bornant à 23:59:59."""
+        if m >= MINUTES_PER_DAY:
+            return time(23, 59, 59)
+        m = max(0, m)
+        return time(m // 60, m % 60)
 
-        Args:
-            user: The user
-            day_of_week: Day of week (0=Monday)
+    def _get_blocked_times(self, user: User, current_date: date) -> list:
+        """
+        Retourne TOUTES les plages occupées (dans la journée) pour une DATE donnée.
+
+        Inclut, correctement clippés à la journée :
+        - les blocs récurrents du jour (avec buffer transport), overnight géré ;
+        - la portion matinale d'un bloc de nuit de la VEILLE qui déborde ;
+        - les ScheduledBlock DÉJÀ planifiés à cette date (évite "tâche sur tâche").
 
         Returns:
-            list: List of (start_time, end_time) tuples
+            list: liste de tuples (start_time, end_time) avec end > start.
         """
-        blocks = RecurringBlock.objects.filter(
-            user=user,
-            day_of_week=day_of_week,
-            active=True
-        )
+        day_of_week = current_date.weekday()
+        prev_day = (day_of_week - 1) % 7
+        transport = user.profile.transport_time_minutes or 0
 
-        blocked = []
-        for block in blocks:
-            # Add transport buffer
-            transport_minutes = user.profile.transport_time_minutes
-            if transport_minutes > 0:
-                buffer_start = datetime.combine(date.today(), block.start_time) - timedelta(minutes=transport_minutes)
-                buffer_end = datetime.combine(date.today(), block.end_time) + timedelta(minutes=transport_minutes)
-                blocked.append((buffer_start.time(), buffer_end.time()))
+        blocked = []  # (start_min, end_min) bornés à [0, 1440]
+
+        def add(s: int, e: int):
+            s = max(0, s)
+            e = min(MINUTES_PER_DAY, e)
+            if e > s:
+                blocked.append((s, e))
+
+        def to_min(t: time) -> int:
+            return t.hour * 60 + t.minute
+
+        # Blocs récurrents du jour courant
+        for b in RecurringBlock.objects.filter(
+            user=user, day_of_week=day_of_week, active=True
+        ):
+            s, e = to_min(b.start_time), to_min(b.end_time)
+            if b.is_night_shift or e <= s:
+                add(s - transport, MINUTES_PER_DAY)  # part du jour J
             else:
-                blocked.append((block.start_time, block.end_time))
+                add(s - transport, e + transport)
 
-        return blocked
+        # Portion matinale d'un bloc de nuit commencé la VEILLE
+        for b in RecurringBlock.objects.filter(
+            user=user, day_of_week=prev_day, active=True
+        ):
+            s, e = to_min(b.start_time), to_min(b.end_time)
+            if b.is_night_shift or e <= s:
+                add(0, e + transport)
+
+        # Blocs DÉJÀ planifiés à cette date -> ne jamais empiler dessus
+        for sb in ScheduledBlock.objects.filter(user=user, date=current_date):
+            s, e = to_min(sb.start_time), to_min(sb.end_time)
+            if e <= s:
+                add(s, MINUTES_PER_DAY)
+            else:
+                add(s, e)
+
+        return [(self._min_to_time(s), self._min_to_time(e)) for s, e in blocked]
 
     def _find_free_slots(
         self,
