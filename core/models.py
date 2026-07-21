@@ -513,3 +513,26 @@ class SharedSchedule(models.Model):
         verbose_name = "Planning partagé"
         verbose_name_plural = "Plannings partagés"
         ordering = ['-created_at']
+
+
+class PushSubscription(models.Model):
+    """A Web Push (VAPID) subscription for a user's browser/PWA/device.
+
+    Used by the Planner PWA and by downstream apps (e.g. the tenant-management
+    app) to receive push notifications. One user can have several (multi-device).
+    """
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='push_subscriptions'
+    )
+    endpoint = models.URLField(max_length=1000, unique=True)
+    p256dh = models.CharField(max_length=255)  # client public key
+    auth = models.CharField(max_length=255)    # client auth secret
+    user_agent = models.CharField(max_length=300, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['user'])]
+
+    def __str__(self):
+        return f"PushSub {self.user.username} {self.endpoint[:40]}"

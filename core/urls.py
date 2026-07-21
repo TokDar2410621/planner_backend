@@ -11,6 +11,10 @@ from .views import (
     CheckEmailView,
     MeView,
     McpTokenView,
+    PushPublicKeyView,
+    PushSubscribeView,
+    PushUnsubscribeView,
+    PushTestView,
     GoogleAuthView,
     # Profile
     ProfileView,
@@ -56,6 +60,12 @@ urlpatterns = [
     path('auth/google/', GoogleAuthView.as_view(), name='google-auth'),
     path('auth/me/', MeView.as_view(), name='me'),
     path('auth/mcp-token/', McpTokenView.as_view(), name='mcp-token'),
+
+    # Web Push (VAPID)
+    path('push/vapid-key/', PushPublicKeyView.as_view(), name='push-vapid-key'),
+    path('push/subscribe/', PushSubscribeView.as_view(), name='push-subscribe'),
+    path('push/unsubscribe/', PushUnsubscribeView.as_view(), name='push-unsubscribe'),
+    path('push/test/', PushTestView.as_view(), name='push-test'),
 
     # Profile endpoints
     path('profile/', ProfileView.as_view(), name='profile'),

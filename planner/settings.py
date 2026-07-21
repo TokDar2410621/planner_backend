@@ -185,6 +185,13 @@ if not DEBUG:
 # Google OAuth
 GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID', '')
 
+# ============== Web Push (VAPID) ==============
+# Push notifications for the PWA and downstream apps. Generate a keypair once
+# and set these on Railway. Absent -> push disabled (degrades silently).
+VAPID_PUBLIC_KEY = os.getenv('VAPID_PUBLIC_KEY', '')
+VAPID_PRIVATE_KEY = os.getenv('VAPID_PRIVATE_KEY', '')
+VAPID_SUBJECT = os.getenv('VAPID_SUBJECT', 'mailto:tokamdarius@gmail.com')
+
 # ============== LLM Configuration ==============
 # Default LLM provider: 'gemini' or 'claude'
 LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'gemini')
