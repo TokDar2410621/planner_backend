@@ -1193,3 +1193,70 @@ class PublicPlanningByUsernameView(APIView):
             'recurring_blocks': blocks_data,
             'scheduled_tasks': [],
         })
+
+
+# ============== Web Push (VAPID) ==============
+class PushPublicKeyView(APIView):
+    """Return the public VAPID key so a client can subscribe."""
+
+    def get(self, request):
+        from django.conf import settings as _s
+        return Response({"publicKey": _s.VAPID_PUBLIC_KEY})
+
+
+class PushSubscribeView(APIView):
+    """Register (or refresh) a Web Push subscription for the current user."""
+
+    def post(self, request):
+        from core.models import PushSubscription
+        endpoint = request.data.get("endpoint")
+        keys = request.data.get("keys") or {}
+        p256dh = keys.get("p256dh") or request.data.get("p256dh")
+        auth = keys.get("auth") or request.data.get("auth")
+        if not (endpoint and p256dh and auth):
+            return Response(
+                {"error": "endpoint, keys.p256dh et keys.auth requis."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        _, created = PushSubscription.objects.update_or_create(
+            endpoint=endpoint,
+            defaults={
+                "user": request.user,
+                "p256dh": p256dh,
+                "auth": auth,
+                "user_agent": request.META.get("HTTP_USER_AGENT", "")[:300],
+            },
+        )
+        return Response(
+            {"ok": True, "created": created},
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class PushUnsubscribeView(APIView):
+    def post(self, request):
+        from core.models import PushSubscription
+        endpoint = request.data.get("endpoint")
+        if not endpoint:
+            return Response({"error": "endpoint requis."}, status=status.HTTP_400_BAD_REQUEST)
+        deleted, _ = PushSubscription.objects.filter(
+            user=request.user, endpoint=endpoint
+        ).delete()
+        return Response({"deleted": deleted})
+
+
+class PushTestView(APIView):
+    """Send a test push to the current user's devices."""
+
+    def post(self, request):
+        from services.push import push_configured, send_to_user
+        if not push_configured():
+            return Response(
+                {"error": "Web push non configuré (VAPID)."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        sent = send_to_user(
+            request.user, "Planner AI",
+            request.data.get("message") or "Notification de test ✅", url="/",
+        )
+        return Response({"sent": sent})
