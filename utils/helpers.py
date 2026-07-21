@@ -241,12 +241,14 @@ def run_in_background(func: Callable, *args, **kwargs) -> None:
     Usage:
         run_in_background(process_document, document_id=123)
     """
-    print(f"[BACKGROUND] run_in_background called for {func.__name__} with args={args}", flush=True)
+    # Log by function name only — never the args, which may carry user content
+    # or credentials.
+    logger.debug("run_in_background scheduling %s", func.__name__)
 
     on_error = kwargs.pop('on_error', None)
 
     def wrapper():
-        print(f"[BACKGROUND] wrapper starting for {func.__name__}", flush=True)
+        logger.debug("Background task %s starting", func.__name__)
         # A daemon thread runs outside Django's request/response cycle, so it
         # gets no automatic connection cleanup. Close any stale connections up
         # front (the thread may inherit a connection opened in the request) and,
@@ -256,9 +258,8 @@ def run_in_background(func: Callable, *args, **kwargs) -> None:
         close_old_connections()
         try:
             func(*args, **kwargs)
-            print(f"[BACKGROUND] {func.__name__} completed successfully", flush=True)
+            logger.debug("Background task %s completed successfully", func.__name__)
         except Exception as e:
-            print(f"[BACKGROUND] {func.__name__} FAILED with error: {e}", flush=True)
             logger.exception(f"Background task {func.__name__} failed: {e}")
             # Record the failure via the caller-supplied hook so a killed/failed
             # task can be marked (e.g. document.processing_error) instead of
@@ -279,5 +280,57 @@ def run_in_background(func: Callable, *args, **kwargs) -> None:
     import threading
     thread = threading.Thread(target=wrapper, daemon=True)
     thread.start()
-    print(f"[BACKGROUND] Started thread for {func.__name__}", flush=True)
     logger.info(f"Started background thread: {func.__name__}")
+
+
+def format_llm_usage(response, provider_name: Optional[str] = None) -> Optional[str]:
+    """
+    Build a compact one-line summary of an LLM response's token usage.
+
+    Reads ``response.usage`` ({'input_tokens', 'output_tokens'}) and
+    ``response.stop_reason`` defensively so it works with an
+    :class:`~services.llm.base.LLMResponse`, a bare object, or anything that
+    merely quacks like one. Returns ``None`` when no usage is present so the
+    caller can skip logging entirely.
+
+    Never logs message bodies or secrets — only token counts and the stop
+    reason, which are safe at INFO for cost/usage observability.
+    """
+    usage = getattr(response, 'usage', None)
+    if not usage:
+        return None
+
+    if isinstance(usage, dict):
+        input_tokens = usage.get('input_tokens')
+        output_tokens = usage.get('output_tokens')
+    else:
+        input_tokens = getattr(usage, 'input_tokens', None)
+        output_tokens = getattr(usage, 'output_tokens', None)
+
+    stop_reason = getattr(response, 'stop_reason', None)
+    prefix = f"[{provider_name}] " if provider_name else ""
+    return (
+        f"{prefix}LLM usage: input_tokens={input_tokens} "
+        f"output_tokens={output_tokens} stop_reason={stop_reason}"
+    )
+
+
+def log_llm_usage(
+    response,
+    provider_name: Optional[str] = None,
+    log: Optional[logging.Logger] = None,
+) -> None:
+    """
+    Log LLM token usage at INFO when the response carries it.
+
+    Safe to call unconditionally on any response (with or without ``.usage``):
+    it silently does nothing when usage is absent and never raises, so
+    observability logging can never break a request.
+    """
+    target = log or logger
+    try:
+        line = format_llm_usage(response, provider_name)
+        if line:
+            target.info(line)
+    except Exception:  # pragma: no cover - observability must never break a request
+        pass

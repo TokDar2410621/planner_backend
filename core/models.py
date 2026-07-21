@@ -41,6 +41,16 @@ class UserProfile(models.Model):
     transport_time_minutes = models.PositiveIntegerField(default=0)
     onboarding_completed = models.BooleanField(default=False)
     onboarding_step = models.PositiveIntegerField(default=0)
+    energy_levels = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Niveaux d'énergie par créneau (ex: {'morning': 'high', 'evening': 'low'})"
+    )
+    notification_preferences = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Préférences de notifications (canaux, horaires, types activés)"
+    )
     public_planning_enabled = models.BooleanField(
         default=False,
         help_text="Autorise le partage public du planning via /planning/<username>/"
@@ -151,6 +161,12 @@ class RecurringBlock(models.Model):
         verbose_name = "Bloc récurrent"
         verbose_name_plural = "Blocs récurrents"
         ordering = ['day_of_week', 'start_time']
+        indexes = [
+            models.Index(
+                fields=['user', 'day_of_week', 'active'],
+                name='recurblock_user_day_active_idx',
+            ),
+        ]
 
 
 class Task(models.Model):
@@ -190,10 +206,102 @@ class Task(models.Model):
             self.priority = 10
         super().save(*args, **kwargs)
 
+    def _ensure_task_history(self, actual_minutes=None):
+        """
+        Idempotently ensure a TaskHistory row exists for this completed task.
+
+        Dedup key is (user, task_title, completed_at). Because completed_at is
+        set once and preserved (never overwritten once present), this stays
+        stable across repeated calls, so no duplicate history is created.
+        """
+        from django.utils import timezone
+
+        completed_at = self.completed_at or timezone.now()
+        already = TaskHistory.objects.filter(
+            user=self.user,
+            task_title=self.title,
+            completed_at=completed_at,
+        ).exists()
+        if already:
+            return
+
+        block = self.scheduled_blocks.order_by('date', 'start_time').first()
+
+        if actual_minutes is not None:
+            actual = actual_minutes
+        elif block is not None and block.actual_duration_minutes is not None:
+            actual = block.actual_duration_minutes
+        elif self.estimated_duration_minutes is not None:
+            actual = self.estimated_duration_minutes
+        else:
+            actual = 0
+
+        if block is not None:
+            day_of_week = block.date.weekday()
+            scheduled_start = block.start_time
+        else:
+            day_of_week = timezone.localtime(completed_at).weekday()
+            scheduled_start = None
+
+        TaskHistory.objects.create(
+            user=self.user,
+            task_title=self.title,
+            task_type=self.task_type,
+            estimated_duration_minutes=self.estimated_duration_minutes,
+            actual_duration_minutes=actual,
+            scheduled_start_time=scheduled_start,
+            day_of_week=day_of_week,
+            completed_at=completed_at,
+        )
+
+    def mark_completed(self, actual_minutes=None):
+        """
+        Single source of truth for completing a Task.
+
+        Reconciles all four completion representations:
+          - Task.completed / Task.completed_at
+          - ScheduledBlock.actually_completed (+ actual_duration_minutes)
+          - a TaskHistory row
+
+        Idempotent: repeated calls do not duplicate history nor overwrite an
+        existing completed_at timestamp.
+        """
+        from django.utils import timezone
+
+        updated_fields = []
+        if not self.completed:
+            self.completed = True
+            updated_fields.append('completed')
+        if self.completed_at is None:
+            self.completed_at = timezone.now()
+            updated_fields.append('completed_at')
+        if updated_fields:
+            self.save(update_fields=updated_fields)
+
+        for block in self.scheduled_blocks.all():
+            changed = []
+            if not block.actually_completed:
+                block.actually_completed = True
+                changed.append('actually_completed')
+            if actual_minutes is not None and block.actual_duration_minutes is None:
+                block.actual_duration_minutes = actual_minutes
+                changed.append('actual_duration_minutes')
+            if changed:
+                block.save(update_fields=changed)
+
+        self._ensure_task_history(actual_minutes=actual_minutes)
+        return self
+
     class Meta:
         verbose_name = "Tâche"
         verbose_name_plural = "Tâches"
         ordering = ['-priority', 'deadline', '-created_at']
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(priority__gte=1) & models.Q(priority__lte=10),
+                name='task_priority_between_1_and_10',
+            ),
+        ]
 
 
 class ScheduledBlock(models.Model):
@@ -211,10 +319,34 @@ class ScheduledBlock(models.Model):
     def __str__(self):
         return f"{self.task.title} - {self.date} {self.start_time}"
 
+    def mark_completed(self, actual_minutes=None):
+        """
+        Single source of truth for completing a ScheduledBlock.
+
+        Sets actually_completed (+ optional actual_duration_minutes) and
+        delegates to the parent Task so Task.completed / completed_at and a
+        TaskHistory row stay reconciled. Idempotent.
+        """
+        changed = []
+        if not self.actually_completed:
+            self.actually_completed = True
+            changed.append('actually_completed')
+        if actual_minutes is not None and self.actual_duration_minutes is None:
+            self.actual_duration_minutes = actual_minutes
+            changed.append('actual_duration_minutes')
+        if changed:
+            self.save(update_fields=changed)
+
+        self.task.mark_completed(actual_minutes=actual_minutes)
+        return self
+
     class Meta:
         verbose_name = "Bloc planifié"
         verbose_name_plural = "Blocs planifiés"
         ordering = ['date', 'start_time']
+        indexes = [
+            models.Index(fields=['user', 'date'], name='schedblock_user_date_idx'),
+        ]
 
 
 class RecurringBlockCompletion(models.Model):
@@ -296,6 +428,9 @@ class ConversationMessage(models.Model):
         verbose_name = "Message"
         verbose_name_plural = "Messages"
         ordering = ['created_at']
+        indexes = [
+            models.Index(fields=['user', 'created_at'], name='convmsg_user_created_idx'),
+        ]
 
 
 class Goal(models.Model):
@@ -338,6 +473,12 @@ class Goal(models.Model):
         verbose_name = "Objectif"
         verbose_name_plural = "Objectifs"
         ordering = ['-created_at']
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(progress__gte=0) & models.Q(progress__lte=100),
+                name='goal_progress_between_0_and_100',
+            ),
+        ]
 
 
 class SharedSchedule(models.Model):

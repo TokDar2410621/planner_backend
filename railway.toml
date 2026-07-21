@@ -9,3 +9,28 @@ builder = "nixpacks"
 startCommand = "python manage.py migrate --noinput && python manage.py collectstatic --noinput && gunicorn planner.wsgi:application -k gevent -w ${WEB_CONCURRENCY:-3} -b 0.0.0.0:${PORT:-8000} --timeout 120"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
+
+# ---------------------------------------------------------------------------
+# T3 / D3 -- Durable document-processing backstop (Railway cron)
+# ---------------------------------------------------------------------------
+# The inline upload path processes documents in a background daemon thread,
+# which does NOT survive a redeploy or worker crash. To guarantee every
+# UploadedDocument eventually gets processed, run the management command
+# `process_pending_documents` on a schedule.
+#
+# DO NOT add the cron here (this file configures the WEB service, and its
+# startCommand above must stay as-is). Instead create a SEPARATE Railway
+# service in the same project/environment, sharing the same repo, env vars,
+# and DATABASE_URL, configured as a cron:
+#
+#   Service settings (Railway dashboard or `railway.toml` of that service):
+#     [deploy]
+#     startCommand   = "python manage.py process_pending_documents --min-age 60"
+#     cronSchedule   = "*/10 * * * *"   # every 10 minutes
+#     restartPolicyType = "never"       # cron: run to completion, don't restart
+#
+# The command is idempotent and per-document isolated: it is safe to run
+# concurrently with the inline path, skips docs already processed, and one bad
+# document never aborts the batch. `--min-age 60` avoids racing the inline
+# path on freshly uploaded documents.
+# ---------------------------------------------------------------------------
