@@ -97,6 +97,35 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
 class UploadedDocumentSerializer(serializers.ModelSerializer):
     """Serializer for UploadedDocument model."""
 
+    # Client-facing aliases for document_type. The /chat/ upload path is lenient
+    # (it stores the raw value and the processor normalizes it afterwards), so a
+    # client sending document_type="schedule" works there but used to 400 here.
+    # Normalizing before ChoiceField validation gives the /documents/ upload path
+    # the same contract. Unknown values still fail validation as before.
+    _DOC_TYPE_ALIASES = {
+        'schedule': 'course_schedule',
+        'course': 'course_schedule',
+        'cours': 'course_schedule',
+        'course_schedule': 'course_schedule',
+        'horaire': 'course_schedule',
+        'work': 'work_schedule',
+        'travail': 'work_schedule',
+        'work_schedule': 'work_schedule',
+        'other': 'other',
+        'autre': 'other',
+    }
+
+    def to_internal_value(self, data):
+        # Multipart payloads arrive as an immutable QueryDict; copy before edit.
+        if hasattr(data, 'copy'):
+            data = data.copy()
+        raw = data.get('document_type')
+        if raw:
+            data['document_type'] = self._DOC_TYPE_ALIASES.get(
+                str(raw).strip().lower(), raw
+            )
+        return super().to_internal_value(data)
+
     class Meta:
         model = UploadedDocument
         fields = [
