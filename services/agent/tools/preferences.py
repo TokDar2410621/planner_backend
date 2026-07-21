@@ -4,7 +4,10 @@ User preferences tools for the Planner AI agent.
 from django.contrib.auth.models import User
 
 from core.models import UserProfile
-from .base import BaseTool, ToolResult
+from .base import BaseTool, ToolResult, validate_choice
+
+# Enforced at the tool layer (not just in the JSON schema) before save().
+VALID_PRODUCTIVITY_TIMES = {c[0] for c in UserProfile.PRODUCTIVITY_CHOICES}
 
 
 class GetPreferencesTool(BaseTool):
@@ -74,6 +77,15 @@ class UpdatePreferencesTool(BaseTool):
     def execute(self, user: User, **kwargs) -> ToolResult:
         profile = user.profile
         updated = []
+
+        # Validation choices AVANT save() (le schéma JSON n'est qu'indicatif).
+        err = validate_choice(
+            kwargs.get("peak_productivity_time"),
+            VALID_PRODUCTIVITY_TIMES,
+            "peak_productivity_time",
+        )
+        if err:
+            return ToolResult(success=False, data={}, message=err)
 
         for field in ["min_sleep_hours", "peak_productivity_time", "transport_time_minutes",
                        "max_deep_work_hours_per_day", "onboarding_completed"]:

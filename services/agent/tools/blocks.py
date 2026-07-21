@@ -2,6 +2,7 @@
 RecurringBlock tools for the Planner AI agent.
 """
 from django.contrib.auth.models import User
+from django.db import transaction
 
 from core.models import RecurringBlock
 from services.scheduling.overlap import (
@@ -9,9 +10,14 @@ from services.scheduling.overlap import (
     is_overnight,
     parse_time,
 )
-from .base import BaseTool, ToolResult
+from .base import BaseTool, ToolResult, validate_choice, validate_max_length
 
 DAY_NAMES = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
+
+# Enforced at the tool layer (not just in the JSON schema) before any write.
+VALID_BLOCK_TYPES = {c[0] for c in RecurringBlock.BLOCK_TYPE_CHOICES}
+TITLE_MAX_LENGTH = RecurringBlock._meta.get_field("title").max_length
+LOCATION_MAX_LENGTH = RecurringBlock._meta.get_field("location").max_length
 
 
 def _block_to_dict(block: RecurringBlock) -> dict:
@@ -119,6 +125,16 @@ class CreateBlockTool(BaseTool):
         location = kwargs.get("location", "")
         is_night_shift = kwargs.get("is_night_shift", False)
 
+        # Validation choices/max_length AVANT toute écriture (le schéma JSON
+        # n'est qu'indicatif pour le LLM; SQLite n'applique pas ces contraintes).
+        err = (
+            validate_choice(block_type, VALID_BLOCK_TYPES, "block_type")
+            or validate_max_length(title, TITLE_MAX_LENGTH, "title")
+            or validate_max_length(location, LOCATION_MAX_LENGTH, "location")
+        )
+        if err:
+            return ToolResult(success=False, data={}, message=err)
+
         # Parse + valide les heures une seule fois (format HH:MM).
         try:
             start_t = parse_time(start_time)
@@ -132,35 +148,46 @@ class CreateBlockTool(BaseTool):
         created = []
         skipped = []
 
-        for day in days:
-            if day < 0 or day > 6:
-                skipped.append({"day": day, "reason": "Jour invalide"})
-                continue
+        # Opération multi-lignes: tout ou rien. Si une création échoue en cours
+        # de route, aucun bloc partiel ne subsiste (D5: transaction.atomic).
+        try:
+            with transaction.atomic():
+                for day in days:
+                    if day < 0 or day > 6:
+                        skipped.append({"day": day, "reason": "Jour invalide"})
+                        continue
 
-            # Contrôle de chevauchement (gère l'overnight, AUCUN contournement).
-            conflicts = find_recurring_conflicts(
-                user, day, start_t, end_t, is_night_shift
-            )
-            if conflicts:
-                overlap = conflicts[0]
-                skipped.append({
-                    "day": day,
-                    "day_name": DAY_NAMES[day],
-                    "reason": f"Chevauchement avec '{overlap.title}' ({overlap.start_time.strftime('%H:%M')}-{overlap.end_time.strftime('%H:%M')})",
-                })
-                continue
+                    # Contrôle de chevauchement (gère l'overnight, AUCUN contournement).
+                    conflicts = find_recurring_conflicts(
+                        user, day, start_t, end_t, is_night_shift
+                    )
+                    if conflicts:
+                        overlap = conflicts[0]
+                        skipped.append({
+                            "day": day,
+                            "day_name": DAY_NAMES[day],
+                            "reason": f"Chevauchement avec '{overlap.title}' ({overlap.start_time.strftime('%H:%M')}-{overlap.end_time.strftime('%H:%M')})",
+                        })
+                        continue
 
-            block = RecurringBlock.objects.create(
-                user=user,
-                title=title,
-                block_type=block_type,
-                day_of_week=day,
-                start_time=start_t,
-                end_time=end_t,
-                location=location,
-                is_night_shift=is_night_shift,
+                    block = RecurringBlock.objects.create(
+                        user=user,
+                        title=title,
+                        block_type=block_type,
+                        day_of_week=day,
+                        start_time=start_t,
+                        end_time=end_t,
+                        location=location,
+                        is_night_shift=is_night_shift,
+                    )
+                    created.append(_block_to_dict(block))
+        except Exception as e:
+            # Rollback déjà effectué par le context manager: aucune ligne partielle.
+            return ToolResult(
+                success=False,
+                data={},
+                message=f"Création annulée (aucun bloc créé): {e}",
             )
-            created.append(_block_to_dict(block))
 
         day_names = [DAY_NAMES[d] for d in days if 0 <= d <= 6]
         msg = f"{len(created)} bloc(s) créé(s): {title} ({start_time}-{end_time})"
@@ -204,6 +231,15 @@ class UpdateBlockTool(BaseTool):
             block = RecurringBlock.objects.get(id=block_id, user=user, active=True)
         except RecurringBlock.DoesNotExist:
             return ToolResult(success=False, data={}, message=f"Bloc #{block_id} introuvable.")
+
+        # Validation choices/max_length AVANT save() (idem CreateBlockTool).
+        err = (
+            validate_choice(kwargs.get("block_type"), VALID_BLOCK_TYPES, "block_type")
+            or validate_max_length(kwargs.get("title"), TITLE_MAX_LENGTH, "title")
+            or validate_max_length(kwargs.get("location"), LOCATION_MAX_LENGTH, "location")
+        )
+        if err:
+            return ToolResult(success=False, data={}, message=err)
 
         # Heures effectives après modification (parse + valide si fournies).
         try:
@@ -280,13 +316,26 @@ class DeleteBlockTool(BaseTool):
 
 class ClearAllBlocksTool(BaseTool):
     name = "clear_all_blocks"
-    description = "Supprime TOUS les blocs récurrents du planning. Action irréversible. N'utilise cet outil que si l'utilisateur le demande explicitement (ex: 'vide tout mon planning', 'recommencer à zéro')."
+    description = (
+        "Archive TOUS les blocs récurrents du planning (soft-delete réversible: "
+        "les blocs sont désactivés, pas détruits). Opération destructive à fort "
+        "impact: elle DOIT être confirmée par l'utilisateur hors-bande (via un "
+        "dialogue de confirmation côté frontend), jamais sur la seule initiative "
+        "du modèle. N'utilise cet outil que si l'utilisateur le demande "
+        "explicitement (ex: 'vide tout mon planning', 'recommencer à zéro')."
+    )
+    # Flag surfaced to the orchestration/frontend layer: this call must be gated
+    # by an explicit out-of-band human confirmation, not an LLM-supplied boolean.
+    requires_confirmation = True
     parameters = {
         "type": "object",
         "properties": {
             "confirm": {
                 "type": "boolean",
-                "description": "Doit être true pour confirmer la suppression totale",
+                "description": (
+                    "Doit être true. Ne mets true que si l'utilisateur a "
+                    "explicitement confirmé vouloir tout archiver."
+                ),
             },
         },
         "required": ["confirm"],
@@ -299,9 +348,17 @@ class ClearAllBlocksTool(BaseTool):
                 message="Suppression annulée: confirm doit être true.",
             )
 
-        count = RecurringBlock.objects.filter(user=user, active=True).update(active=False)
+        # Soft-delete (active=False) au lieu d'un DELETE: réversible, restaurable.
+        # Opération multi-lignes → atomique.
+        with transaction.atomic():
+            count = RecurringBlock.objects.filter(
+                user=user, active=True
+            ).update(active=False)
         return ToolResult(
             success=True,
-            data={"deleted_count": count},
-            message=f"{count} bloc(s) supprimé(s). Planning vidé.",
+            data={"deleted_count": count, "reversible": True},
+            message=(
+                f"{count} bloc(s) archivé(s). Planning vidé "
+                f"(action réversible: les blocs sont désactivés, pas détruits)."
+            ),
         )

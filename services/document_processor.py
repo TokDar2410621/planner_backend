@@ -18,8 +18,24 @@ import fitz  # PyMuPDF
 from PIL import Image
 from django.conf import settings
 
-# Import our new PDF text extractor
-from services.pdf_extractor import PDFTextExtractor
+# Import our new PDF text extractor + resource-cap guards (S4 hardening)
+from services.pdf_extractor import (
+    PDFTextExtractor,
+    MAX_PDF_PAGES,
+    MAX_RENDER_PIXELS,
+    max_zoom_for_page,
+)
+
+# S4: cap the streamed download size and the vision rasterization zoom.
+MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
+PDF_RENDER_ZOOM = 3  # ~216 DPI at zoom=3
+
+# Generic message persisted to / returned to the client on processing failure.
+# Raw exception strings must never leak to users (they can expose internals).
+GENERIC_PROCESSING_ERROR = (
+    "Le traitement du document a échoué. "
+    "Vérifiez le fichier et réessayez, ou contactez le support."
+)
 
 try:
     from google import genai
@@ -375,18 +391,37 @@ Analyse ce texte et retourne le JSON structuré:"""
                         logger.warning(f"Could not seek file: {e}")
 
                     for chunk in document.file.chunks():
-                        temp_file.write(chunk)
                         total_bytes += len(chunk)
+                        if total_bytes > MAX_DOWNLOAD_BYTES:
+                            raise ValueError(
+                                f"File exceeds maximum allowed size ({MAX_DOWNLOAD_BYTES} bytes)"
+                            )
+                        temp_file.write(chunk)
+                except ValueError:
+                    # Size-cap breach: do not fall back, re-raise to abort.
+                    raise
                 except Exception as chunks_error:
                     logger.warning(f"chunks() failed: {chunks_error}, trying URL download...")
 
-                    # Fallback: download from URL using requests
+                    # Fallback: stream download from URL with a size cap so a
+                    # "bomb" file cannot be read entirely into memory.
                     if file_url:
                         import requests
-                        response = requests.get(file_url, timeout=60)
-                        response.raise_for_status()
-                        temp_file.write(response.content)
-                        total_bytes = len(response.content)
+                        temp_file.seek(0)
+                        temp_file.truncate(0)
+                        total_bytes = 0
+                        with requests.get(file_url, timeout=60, stream=True) as response:
+                            response.raise_for_status()
+                            for chunk in response.iter_content(chunk_size=65536):
+                                if not chunk:
+                                    continue
+                                total_bytes += len(chunk)
+                                if total_bytes > MAX_DOWNLOAD_BYTES:
+                                    raise ValueError(
+                                        f"Downloaded file exceeds maximum allowed size "
+                                        f"({MAX_DOWNLOAD_BYTES} bytes)"
+                                    )
+                                temp_file.write(chunk)
                     else:
                         raise RuntimeError("No URL available for file download")
 
@@ -625,8 +660,12 @@ Analyse ce texte et retourne le JSON structuré:"""
                 return extracted_data
 
         except Exception as e:
-            logger.error(f"Error processing document {document.id}: {str(e)}")
-            document.processing_error = str(e)
+            # Log the real cause server-side, but never persist/return the raw
+            # exception string to the client (may leak paths, config, internals).
+            logger.error(
+                f"Error processing document {document.id}: {str(e)}", exc_info=True
+            )
+            document.processing_error = GENERIC_PROCESSING_ERROR
             document.processed = False
             document.save()
             raise
@@ -802,23 +841,37 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
         """
         images = []
         doc = fitz.open(file_path)
+        try:
+            page_count = len(doc)
+            # S4: reject PDF bombs before rendering any pixels.
+            if page_count > MAX_PDF_PAGES:
+                raise ValueError(
+                    f"PDF has too many pages ({page_count} > {MAX_PDF_PAGES})"
+                )
 
-        for page_num in range(len(doc)):
-            page = doc.load_page(page_num)
-            # Render page to image with HIGH resolution for better OCR
-            # 3x zoom = ~216 DPI, good balance between quality and file size
-            mat = fitz.Matrix(3, 3)
-            pix = page.get_pixmap(matrix=mat)
+            for page_num in range(page_count):
+                page = doc.load_page(page_num)
+                # Render at 3x zoom (~216 DPI) but downscale if the page is so
+                # large it would exceed the per-page pixel cap.
+                zoom = min(
+                    PDF_RENDER_ZOOM,
+                    max_zoom_for_page(page.rect.width, page.rect.height, MAX_RENDER_PIXELS),
+                )
+                mat = fitz.Matrix(zoom, zoom)
+                pix = page.get_pixmap(matrix=mat)
 
-            # Convert to PIL Image
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                # Convert to PIL Image
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-            # Log image dimensions for debugging
-            logger.info(f"PDF page {page_num + 1}: {img.width}x{img.height}px")
+                # Log image dimensions for debugging
+                logger.info(
+                    f"PDF page {page_num + 1}: {img.width}x{img.height}px (zoom={zoom:.2f})"
+                )
 
-            images.append(img)
+                images.append(img)
+        finally:
+            doc.close()
 
-        doc.close()
         logger.info(f"Extracted {len(images)} page(s) from PDF")
         return images
 

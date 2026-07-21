@@ -12,6 +12,96 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar('T')
 
+# Default set of HTTP status codes worth retrying. 529 = Anthropic "Overloaded"
+# (must be retried); 429 = rate limit; 5xx = transient server errors.
+DEFAULT_RETRYABLE_STATUS_CODES: tuple = (408, 409, 429, 500, 502, 503, 504, 529)
+
+# Exception TYPE names (not string contents) that represent transient failures.
+# Matched by class name to avoid importing optional SDKs (anthropic / google-genai)
+# at module import time. Covers both provider SDKs plus stdlib transport errors.
+_RETRYABLE_EXCEPTION_NAMES = frozenset({
+    # anthropic
+    'RateLimitError', 'InternalServerError', 'APITimeoutError',
+    'APIConnectionError', 'OverloadedError',
+    # google-genai
+    'ServerError', 'ServiceUnavailable', 'ResourceExhausted', 'DeadlineExceeded',
+    # generic httpx / requests transport
+    'ConnectTimeout', 'ReadTimeout', 'ConnectionError',
+})
+
+
+def _build_default_retryable_exceptions() -> tuple:
+    """
+    Build the default tuple of catchable exception types.
+
+    Deliberately NOT `(Exception,)`: a bare Exception would swallow genuine
+    programming errors (ValueError, KeyError, ...) and funnel them through the
+    retry path. We restrict to transport-level errors plus, when available, the
+    provider SDK base error classes.
+    """
+    excs: list = [TimeoutError, ConnectionError, OSError]
+    try:
+        import anthropic
+        excs.append(anthropic.APIError)
+    except Exception:  # pragma: no cover - SDK optional
+        pass
+    try:
+        from google.genai import errors as _genai_errors
+        excs.append(_genai_errors.APIError)
+    except Exception:  # pragma: no cover - SDK optional
+        pass
+    return tuple(excs)
+
+
+def _extract_status_code(exc: BaseException) -> Optional[int]:
+    """Pull an HTTP status code off an exception, checking common attributes."""
+    for attr in ('status_code', 'code', 'http_status', 'status'):
+        val = getattr(exc, attr, None)
+        if isinstance(val, bool):  # bool is an int subclass; ignore
+            continue
+        if isinstance(val, int):
+            return val
+    response = getattr(exc, 'response', None)
+    if response is not None:
+        val = getattr(response, 'status_code', None)
+        if isinstance(val, int) and not isinstance(val, bool):
+            return val
+    return None
+
+
+def is_retryable_error(
+    exc: BaseException,
+    retryable_status_codes: tuple = DEFAULT_RETRYABLE_STATUS_CODES,
+) -> bool:
+    """
+    Classify whether an exception should be retried, by TYPE and status_code.
+
+    This intentionally does NOT inspect ``str(exc)`` for substrings like '500'
+    or 'rate limit' (the old behaviour), which retried a ValueError('req_500')
+    and missed a typed 429/529 whose message lacked the magic token.
+
+    Args:
+        exc: The raised exception instance.
+        retryable_status_codes: Status codes considered transient.
+
+    Returns:
+        True if the error is a transient/retryable failure.
+    """
+    # Transport-level failures are always transient.
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+
+    # Typed provider/transport errors, matched by class name.
+    if type(exc).__name__ in _RETRYABLE_EXCEPTION_NAMES:
+        return True
+
+    # Fall back to the HTTP status code carried by the exception, if any.
+    code = _extract_status_code(exc)
+    if code is not None and code in retryable_status_codes:
+        return True
+
+    return False
+
 
 def retry_with_backoff(
     max_retries: int = 3,
@@ -19,11 +109,14 @@ def retry_with_backoff(
     max_delay: float = 60.0,
     exponential_base: float = 2.0,
     jitter: bool = True,
-    retryable_exceptions: tuple = (Exception,),
-    retryable_status_codes: tuple = (429, 500, 502, 503, 504),
+    retryable_exceptions: Optional[tuple] = None,
+    retryable_status_codes: tuple = DEFAULT_RETRYABLE_STATUS_CODES,
 ) -> Callable:
     """
     Decorator for retry with exponential backoff.
+
+    Retryability is decided by :func:`is_retryable_error` (exception type /
+    status code), never by substring matching on the error message.
 
     Args:
         max_retries: Maximum number of retry attempts
@@ -31,14 +124,19 @@ def retry_with_backoff(
         max_delay: Maximum delay in seconds
         exponential_base: Base for exponential calculation
         jitter: Add random jitter to prevent thundering herd
-        retryable_exceptions: Tuple of exceptions to retry on
-        retryable_status_codes: HTTP status codes to retry on (for API errors)
+        retryable_exceptions: Exception types to *catch*. Defaults to a curated
+            tuple of transport/provider errors (NOT bare Exception), so genuine
+            bugs surface immediately instead of being retried.
+        retryable_status_codes: HTTP status codes to retry on (includes 529).
 
     Usage:
         @retry_with_backoff(max_retries=3)
         def call_api():
             return client.generate_content(...)
     """
+    if retryable_exceptions is None:
+        retryable_exceptions = _build_default_retryable_exceptions()
+
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
         def wrapper(*args, **kwargs) -> T:
@@ -50,21 +148,7 @@ def retry_with_backoff(
                 except retryable_exceptions as e:
                     last_exception = e
 
-                    # Check if it's a rate limit or retryable error
-                    is_retryable = False
-                    error_str = str(e).lower()
-
-                    # Check for rate limit (429)
-                    if '429' in error_str or 'rate limit' in error_str or 'quota' in error_str:
-                        is_retryable = True
-                    # Check for server errors
-                    elif any(str(code) in error_str for code in retryable_status_codes):
-                        is_retryable = True
-                    # Check for timeout
-                    elif 'timeout' in error_str or 'timed out' in error_str:
-                        is_retryable = True
-
-                    if not is_retryable or attempt == max_retries:
+                    if not is_retryable_error(e, retryable_status_codes) or attempt == max_retries:
                         raise
 
                     # Calculate delay with exponential backoff
@@ -76,7 +160,7 @@ def retry_with_backoff(
 
                     logger.warning(
                         f"Retry {attempt + 1}/{max_retries} for {func.__name__} "
-                        f"after {delay:.1f}s (error: {e})"
+                        f"after {delay:.1f}s (error: {type(e).__name__}: {e})"
                     )
                     time_module.sleep(delay)
 
@@ -159,14 +243,35 @@ def run_in_background(func: Callable, *args, **kwargs) -> None:
     """
     print(f"[BACKGROUND] run_in_background called for {func.__name__} with args={args}", flush=True)
 
+    on_error = kwargs.pop('on_error', None)
+
     def wrapper():
         print(f"[BACKGROUND] wrapper starting for {func.__name__}", flush=True)
+        # A daemon thread runs outside Django's request/response cycle, so it
+        # gets no automatic connection cleanup. Close any stale connections up
+        # front (the thread may inherit a connection opened in the request) and,
+        # critically, again in `finally` so we never leak a DB connection when
+        # the task raises or the process is torn down mid-run (B17).
+        from django.db import close_old_connections
+        close_old_connections()
         try:
             func(*args, **kwargs)
             print(f"[BACKGROUND] {func.__name__} completed successfully", flush=True)
         except Exception as e:
             print(f"[BACKGROUND] {func.__name__} FAILED with error: {e}", flush=True)
-            logger.error(f"Background task {func.__name__} failed: {e}")
+            logger.exception(f"Background task {func.__name__} failed: {e}")
+            # Record the failure via the caller-supplied hook so a killed/failed
+            # task can be marked (e.g. document.processing_error) instead of
+            # silently staying stuck in a pending state.
+            if on_error is not None:
+                try:
+                    on_error(e)
+                except Exception:
+                    logger.exception(
+                        f"on_error hook for background task {func.__name__} itself failed"
+                    )
+        finally:
+            close_old_connections()
 
     # Always use threading for background tasks
     # Threading works reliably with both sync and gevent gunicorn workers

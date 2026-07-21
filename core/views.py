@@ -4,13 +4,16 @@ API Views for Planner AI backend.
 import logging
 from datetime import date, timedelta
 
+from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
+from django.core.exceptions import ImproperlyConfigured
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
@@ -49,6 +52,21 @@ from services.ai_insights import AIInsightsService
 from services.agent import PlannerAgent
 
 logger = logging.getLogger(__name__)
+
+
+class CheckEmailRateThrottle(ScopedRateThrottle):
+    """Scoped throttle for CheckEmailView (S8: account-existence oracle).
+
+    Uses the ``check_email`` scope that A1 wires into ``DEFAULT_THROTTLE_RATES``.
+    Falls back to a conservative default if that scope has not been configured
+    so the endpoint never raises ImproperlyConfigured (500) at runtime.
+    """
+
+    def get_rate(self):
+        try:
+            return super().get_rate()
+        except ImproperlyConfigured:
+            return '10/min'
 
 
 class HealthCheckView(APIView):
@@ -103,15 +121,10 @@ class LoginView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        try:
-            user = User.objects.get(username=username)
-        except User.DoesNotExist:
-            return Response(
-                {'error': 'Identifiants invalides.'},
-                status=status.HTTP_401_UNAUTHORIZED
-            )
-
-        if not user.check_password(password):
+        # Use Django's authenticate() so the auth backend enforces is_active:
+        # a deactivated account must never receive tokens (B24).
+        user = authenticate(request, username=username, password=password)
+        if user is None:
             return Response(
                 {'error': 'Identifiants invalides.'},
                 status=status.HTTP_401_UNAUTHORIZED
@@ -131,6 +144,8 @@ class CheckEmailView(APIView):
     """Check if email exists in database for lazy auth flow."""
 
     permission_classes = [AllowAny]
+    throttle_classes = [CheckEmailRateThrottle]
+    throttle_scope = 'check_email'
 
     def post(self, request):
         """Check if email exists and return status."""
@@ -205,27 +220,44 @@ class GoogleAuthView(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            # Get or create user
-            user, created = User.objects.get_or_create(
-                email=email,
-                defaults={
-                    'username': email.split('@')[0],
-                    'first_name': google_data.get('given_name', ''),
-                    'last_name': google_data.get('family_name', ''),
-                }
-            )
+            # S6: reject the token unless Google asserts the email is verified.
+            # Google tokeninfo returns email_verified as the string "true".
+            # Without this check an attacker can mint a token for an unverified
+            # address and get auto-linked to a victim's account (takeover).
+            email_verified = google_data.get('email_verified')
+            if email_verified not in (True, 'true', 'True'):
+                return Response(
+                    {'error': 'Adresse email Google non vérifiée.'},
+                    status=status.HTTP_401_UNAUTHORIZED
+                )
 
-            # Handle username conflict for new users
+            # S6: look the user up explicitly instead of get_or_create so a
+            # non-unique email (multiple accounts) is handled gracefully
+            # instead of raising MultipleObjectsReturned (500).
+            matching_users = User.objects.filter(email=email)
+            if matching_users.count() > 1:
+                return Response(
+                    {'error': 'Plusieurs comptes partagent cet email. '
+                              'Connectez-vous avec votre mot de passe.'},
+                    status=status.HTTP_409_CONFLICT
+                )
+
+            user = matching_users.first()
+            created = user is None
             if created:
-                # Make username unique if needed
+                # Build a unique username for the new account.
                 base_username = email.split('@')[0]
                 username = base_username
                 counter = 1
-                while User.objects.filter(username=username).exclude(id=user.id).exists():
+                while User.objects.filter(username=username).exists():
                     username = f"{base_username}{counter}"
                     counter += 1
-                user.username = username
-                user.save()
+                user = User.objects.create(
+                    username=username,
+                    email=email,
+                    first_name=google_data.get('given_name', ''),
+                    last_name=google_data.get('family_name', ''),
+                )
 
             # Update profile with Google data (avatar, name)
             profile = user.profile
@@ -331,6 +363,20 @@ class ChatView(APIView):
         attachment = None
         if attachment_file:
             print(f"[CHAT] Processing attachment: {attachment_file.name}, size={attachment_file.size}", flush=True)
+
+            # S4: validate the upload (size + extension allowlist + magic bytes)
+            # BEFORE persisting it, so a smuggled SVG/HTML/executable payload or
+            # an oversized file never reaches storage or the processor.
+            from core.validators import validate_upload_file
+            from rest_framework.exceptions import ValidationError as DRFValidationError
+            try:
+                validate_upload_file(attachment_file)
+            except DRFValidationError as exc:
+                return Response(
+                    {'error': 'Fichier invalide.', 'detail': exc.detail},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
             doc_type = request.data.get('document_type', 'other')
             doc = UploadedDocument.objects.create(
                 user=request.user,
@@ -355,9 +401,11 @@ class ChatView(APIView):
             result = agent.process_message(request.user, message or "J'ai uploadé un document.", attachment)
             logger.info(f"Agent response generated: {result.get('response', '')[:100]}...")
         except Exception as e:
+            # Log the detail server-side; never leak the raw exception string
+            # (paths, provider errors, tokens) to the client.
             logger.error(f"PlannerAgent error: {e}", exc_info=True)
             return Response(
-                {'error': f'Erreur interne: {str(e)}'},
+                {'error': 'Erreur interne lors du traitement du message.'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
@@ -1014,7 +1062,16 @@ class PublicPlanningByUsernameView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request, username):
-        """Get a user's public planning data by username."""
+        """Get a user's public planning data by username.
+
+        S2: this endpoint used to leak every user's schedule AND room/location
+        by username enumeration, bypassing the token-based share mechanism. It
+        is now gated behind an explicit per-user opt-in
+        (UserProfile.public_planning_enabled). Users who did not opt in are
+        indistinguishable from a non-existent user (404 either way), so the
+        endpoint can no longer be used to enumerate accounts. When a user did
+        opt in, exact location/room info is stripped from the response.
+        """
         try:
             user = User.objects.get(username=username)
         except User.DoesNotExist:
@@ -1023,13 +1080,26 @@ class PublicPlanningByUsernameView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
+        profile = getattr(user, 'profile', None)
+        if profile is None or not getattr(profile, 'public_planning_enabled', False):
+            # Do not reveal whether the account exists or simply did not opt in.
+            return Response(
+                {'error': 'Utilisateur introuvable.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
         recurring_blocks = RecurringBlock.objects.filter(user=user, active=True)
+        blocks_data = RecurringBlockSerializer(recurring_blocks, many=True).data
+
+        # Strip exact location/room info from the public payload.
+        for block in blocks_data:
+            block.pop('location', None)
 
         return Response({
             'title': f'Planning de {user.first_name or user.username}',
             'owner': user.first_name or user.username,
             'username': user.username,
-            'avatar_url': getattr(user.profile, 'avatar_url', None) if hasattr(user, 'profile') else None,
-            'recurring_blocks': RecurringBlockSerializer(recurring_blocks, many=True).data,
+            'avatar_url': getattr(profile, 'avatar_url', None),
+            'recurring_blocks': blocks_data,
             'scheduled_tasks': [],
         })

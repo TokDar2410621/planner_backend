@@ -4,6 +4,7 @@ Builds rich context for the Planner AI agent's system prompt.
 from datetime import timedelta
 
 from django.contrib.auth.models import User
+from django.core.exceptions import ObjectDoesNotExist
 from django.utils import timezone
 
 from core.models import RecurringBlock, Task, Goal
@@ -17,19 +18,36 @@ def build_context(user: User) -> dict:
 
     Returns a dict with keys: profile, today_schedule, pending_tasks, active_goals, stats.
     """
-    profile = user.profile
+    # Guard against a user without a related profile (do not crash).
+    try:
+        profile = user.profile
+    except ObjectDoesNotExist:
+        profile = None
+
     today = timezone.localdate()
     day_of_week = today.weekday()
 
-    # Profile summary
-    profile_data = {
-        "name": user.first_name or user.username or user.email.split("@")[0],
-        "min_sleep_hours": profile.min_sleep_hours,
-        "peak_productivity_time": profile.peak_productivity_time,
-        "transport_time_minutes": profile.transport_time_minutes,
-        "max_deep_work_hours": profile.max_deep_work_hours_per_day,
-        "onboarding_completed": profile.onboarding_completed,
-    }
+    display_name = user.first_name or user.username or (user.email or "").split("@")[0] or "toi"
+
+    # Profile summary (fall back to sane defaults when no profile exists)
+    if profile is not None:
+        profile_data = {
+            "name": display_name,
+            "min_sleep_hours": profile.min_sleep_hours,
+            "peak_productivity_time": profile.peak_productivity_time,
+            "transport_time_minutes": profile.transport_time_minutes,
+            "max_deep_work_hours": profile.max_deep_work_hours_per_day,
+            "onboarding_completed": profile.onboarding_completed,
+        }
+    else:
+        profile_data = {
+            "name": display_name,
+            "min_sleep_hours": 7,
+            "peak_productivity_time": "morning",
+            "transport_time_minutes": 0,
+            "max_deep_work_hours": 4,
+            "onboarding_completed": False,
+        }
 
     # Today's blocks
     today_blocks = RecurringBlock.objects.filter(

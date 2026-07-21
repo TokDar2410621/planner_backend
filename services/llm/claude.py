@@ -26,7 +26,10 @@ class ClaudeProvider(LLMProvider):
     Supports tool use (function calling) and retries with exponential backoff.
     """
 
-    DEFAULT_MODEL = 'claude-sonnet-4-20250514'
+    # NOTE: `claude-sonnet-4-20250514` was retired (404 not_found), which killed
+    # the chat (B1). Use the current, unversioned Sonnet alias as the default so
+    # it tracks the live model without a date suffix to rot.
+    DEFAULT_MODEL = 'claude-sonnet-5'
 
     def __init__(self, model_name: Optional[str] = None):
         """
@@ -102,7 +105,11 @@ class ClaudeProvider(LLMProvider):
         """
         if not self.is_available():
             logger.error("Claude provider not available")
-            return LLMResponse(text="Service IA non disponible.")
+            return LLMResponse(
+                text="Service IA non disponible.",
+                is_error=True,
+                error="provider_unavailable",
+            )
 
         try:
             messages = [{"role": "user", "content": prompt}]
@@ -120,7 +127,11 @@ class ClaudeProvider(LLMProvider):
 
         except Exception as e:
             logger.error(f"Claude API error: {e}")
-            return LLMResponse(text="Erreur lors de la communication avec l'IA.")
+            return LLMResponse(
+                text="Erreur lors de la communication avec l'IA.",
+                is_error=True,
+                error=str(e),
+            )
 
     def _convert_tools(self, tools: list) -> list:
         """
@@ -197,11 +208,29 @@ class ClaudeProvider(LLMProvider):
                 ))
                 logger.info(f"Tool use detected: {block.name} (id={block.id}) with args: {block.input}")
 
+        # D4: surface why generation stopped + token usage so callers can detect
+        # truncation instead of treating a cut-off answer as complete.
+        stop_reason = getattr(response, 'stop_reason', None)
+        usage = None
+        raw_usage = getattr(response, 'usage', None)
+        if raw_usage is not None:
+            usage = {
+                'input_tokens': getattr(raw_usage, 'input_tokens', None),
+                'output_tokens': getattr(raw_usage, 'output_tokens', None),
+            }
+
+        if stop_reason == 'max_tokens':
+            logger.warning(
+                "Claude response truncated (stop_reason=max_tokens); output is incomplete."
+            )
+
         return LLMResponse(
             text="".join(text_parts),
             function_calls=function_calls,
             raw_response=response,
             raw_content=response.content,
+            stop_reason=stop_reason,
+            usage=usage,
         )
 
     def generate_with_history(
@@ -219,7 +248,11 @@ class ClaudeProvider(LLMProvider):
         - {"role": "user", "content": [tool_result_blocks]}  (tool results)
         """
         if not self.is_available():
-            return LLMResponse(text="Service IA non disponible.")
+            return LLMResponse(
+                text="Service IA non disponible.",
+                is_error=True,
+                error="provider_unavailable",
+            )
 
         try:
             claude_messages = []
@@ -248,4 +281,8 @@ class ClaudeProvider(LLMProvider):
 
         except Exception as e:
             logger.error(f"Claude API error with history: {e}", exc_info=True)
-            return LLMResponse(text="Erreur lors de la communication avec l'IA.")
+            return LLMResponse(
+                text="Erreur lors de la communication avec l'IA.",
+                is_error=True,
+                error=str(e),
+            )

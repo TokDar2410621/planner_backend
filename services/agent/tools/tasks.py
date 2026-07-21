@@ -5,7 +5,11 @@ from django.contrib.auth.models import User
 from django.utils import timezone
 
 from core.models import Task
-from .base import BaseTool, ToolResult
+from .base import BaseTool, ToolResult, validate_choice, validate_max_length
+
+# Enforced at the tool layer (not just in the JSON schema) before any write.
+VALID_TASK_TYPES = {c[0] for c in Task.TASK_TYPE_CHOICES}
+TASK_TITLE_MAX_LENGTH = Task._meta.get_field("title").max_length
 
 
 def _task_to_dict(task: Task) -> dict:
@@ -107,6 +111,18 @@ class CreateTaskTool(BaseTool):
     }
 
     def execute(self, user: User, **kwargs) -> ToolResult:
+        task_type = kwargs.get("task_type", "shallow")
+        title = kwargs["title"]
+
+        # Validation choices/max_length AVANT create() (le schéma JSON n'est
+        # qu'indicatif; SQLite n'applique ni choices ni max_length).
+        err = (
+            validate_choice(task_type, VALID_TASK_TYPES, "task_type")
+            or validate_max_length(title, TASK_TITLE_MAX_LENGTH, "title")
+        )
+        if err:
+            return ToolResult(success=False, data={}, message=err)
+
         task = Task.objects.create(
             user=user,
             title=kwargs["title"],
@@ -146,6 +162,14 @@ class UpdateTaskTool(BaseTool):
         except Task.DoesNotExist:
             return ToolResult(success=False, data={}, message=f"Tâche #{task_id} introuvable.")
 
+        # Validation choices/max_length AVANT save().
+        err = (
+            validate_choice(kwargs.get("task_type"), VALID_TASK_TYPES, "task_type")
+            or validate_max_length(kwargs.get("title"), TASK_TITLE_MAX_LENGTH, "title")
+        )
+        if err:
+            return ToolResult(success=False, data={}, message=err)
+
         for field in ["title", "priority", "deadline", "description", "task_type"]:
             if field in kwargs and kwargs[field] is not None:
                 setattr(task, field, kwargs[field])
@@ -160,17 +184,49 @@ class UpdateTaskTool(BaseTool):
 
 class DeleteTaskTool(BaseTool):
     name = "delete_task"
-    description = "Supprime une tâche."
+    description = (
+        "Supprime définitivement une tâche (hard delete, cascade sur les blocs "
+        "planifiés associés). Opération destructive et IRRÉVERSIBLE: elle DOIT "
+        "être confirmée par l'utilisateur hors-bande (dialogue de confirmation "
+        "côté frontend), jamais sur la seule initiative du modèle. Passe "
+        "confirm=true uniquement après une confirmation explicite de "
+        "l'utilisateur. Pour marquer une tâche faite, préfère complete_task."
+    )
+    # Flag surfaced to the orchestration/frontend layer: this call must be gated
+    # by an explicit out-of-band human confirmation, not an LLM-supplied boolean.
+    requires_confirmation = True
     parameters = {
         "type": "object",
         "properties": {
             "task_id": {"type": "integer", "description": "ID de la tâche à supprimer"},
+            "confirm": {
+                "type": "boolean",
+                "description": (
+                    "Doit être true. Ne mets true que si l'utilisateur a "
+                    "explicitement confirmé vouloir supprimer cette tâche."
+                ),
+            },
         },
-        "required": ["task_id"],
+        "required": ["task_id", "confirm"],
     }
 
     def execute(self, user: User, **kwargs) -> ToolResult:
         task_id = kwargs["task_id"]
+
+        # Le modèle Task n'a pas de champ de soft-delete: la suppression est
+        # irréversible. On exige donc une confirmation explicite avant de
+        # détruire quoi que ce soit (S10).
+        if not kwargs.get("confirm"):
+            return ToolResult(
+                success=False,
+                data={"requires_confirmation": True},
+                message=(
+                    "Suppression annulée: confirm doit être true et la "
+                    "suppression doit être confirmée explicitement par "
+                    "l'utilisateur (action irréversible)."
+                ),
+            )
+
         try:
             task = Task.objects.get(id=task_id, user=user)
         except Task.DoesNotExist:

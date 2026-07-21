@@ -1,0 +1,11 @@
+# Railway deployment config for Planner AI backend (B6).
+# Boots gunicorn with gevent workers so the psycogreen patch in wsgi.py is
+# actually exercised and background document-processing greenlets can run.
+
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python manage.py migrate --noinput && python manage.py collectstatic --noinput && gunicorn planner.wsgi:application -k gevent -w ${WEB_CONCURRENCY:-3} -b 0.0.0.0:${PORT:-8000} --timeout 120"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
