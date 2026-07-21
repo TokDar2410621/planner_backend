@@ -34,6 +34,7 @@ from .serializers import (
     UserRegistrationSerializer,
     UserProfileSerializer,
     UploadedDocumentSerializer,
+    UserPlaceSerializer,
     RecurringBlockSerializer,
     RecurringBlockCompletionSerializer,
     TaskSerializer,
@@ -495,6 +496,26 @@ class DocumentViewSet(viewsets.ModelViewSet):
             logger.error(f"Document processing error: {e}")
 
 
+# ============== UserPlace Views ==============
+
+class UserPlaceViewSet(viewsets.ModelViewSet):
+    """CRUD for the user's places (travel-time engine, Phase 1).
+
+    Each place carries the usual trip duration from home; the scheduler derives
+    the latest-departure / unavailability window from it for any recurring
+    block attached to the place.
+    """
+
+    serializer_class = UserPlaceSerializer
+
+    def get_queryset(self):
+        from core.models import UserPlace
+        return UserPlace.objects.filter(user=self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
+
+
 # ============== RecurringBlock Views ==============
 
 class RecurringBlockViewSet(viewsets.ModelViewSet):
@@ -847,6 +868,9 @@ class ScheduleGenerateView(APIView):
         return Response({
             'created_blocks': ScheduledBlockSerializer(created_blocks, many=True).data,
             'count': len(created_blocks),
+            # Spec §10: never hide an impossible plan — surface what did not
+            # fit and why so the UI can propose compromises.
+            'unplaced': getattr(scheduler, 'last_unplaced', []),
         })
 
 

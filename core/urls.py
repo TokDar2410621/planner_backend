@@ -28,6 +28,7 @@ from .views import (
     ChatView,
     # ViewSets
     DocumentViewSet,
+    UserPlaceViewSet,
     RecurringBlockViewSet,
     RecurringBlockCompletionViewSet,
     TaskViewSet,
@@ -53,6 +54,7 @@ from .views import (
 
 router = DefaultRouter()
 router.register(r'documents', DocumentViewSet, basename='document')
+router.register(r'places', UserPlaceViewSet, basename='place')
 router.register(r'recurring-blocks', RecurringBlockViewSet, basename='recurring-block')
 router.register(r'recurring-completions', RecurringBlockCompletionViewSet, basename='recurring-completion')
 router.register(r'tasks', TaskViewSet, basename='task')

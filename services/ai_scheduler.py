@@ -83,6 +83,8 @@ class AIScheduler:
         else:
             self.client = None
             self.model_name = None
+        # Populated by generate_schedule: tasks that could not fit + why.
+        self.last_unplaced = []
 
     @retry_with_backoff(max_retries=3, base_delay=2.0, max_delay=30.0)
     def _call_gemini(self, contents):
@@ -155,6 +157,11 @@ class AIScheduler:
         deep_minutes_by_date: dict = {}
         max_deep_minutes = (user.profile.max_deep_work_hours_per_day or 0) * 60
 
+        # Honest-conflict report (spec §10): a task that cannot fit is never
+        # silently dropped; it lands here with the real remaining capacity so
+        # the API/UI can surface options instead of inventing an impossible plan.
+        self.last_unplaced = []
+
         # Schedule tasks
         created_blocks = []
         for task, score in scored_tasks:
@@ -166,6 +173,20 @@ class AIScheduler:
                 deep_minutes_by_date,
                 max_deep_minutes,
             )
+            if block is None:
+                needed = task.estimated_duration_minutes or 60
+                biggest = max((s.duration_minutes for s in available_slots), default=0)
+                self.last_unplaced.append({
+                    'task_id': task.id,
+                    'title': task.title,
+                    'needed_minutes': needed,
+                    'largest_free_slot_minutes': biggest,
+                    'reason': (
+                        'aucun créneau disponible'
+                        if biggest < 30 else
+                        f'demande {needed} min, plus grand créneau restant {biggest} min'
+                    ),
+                })
             if block:
                 block.save()
                 created_blocks.append(block)
@@ -274,7 +295,7 @@ class AIScheduler:
         """
         day_of_week = current_date.weekday()
         prev_day = (day_of_week - 1) % 7
-        transport = user.profile.transport_time_minutes or 0
+        profile = user.profile
 
         blocked = []  # (start_min, end_min) bornés à [0, 1440]
 
@@ -287,23 +308,31 @@ class AIScheduler:
         def to_min(t: time) -> int:
             return t.hour * 60 + t.minute
 
-        # Blocs récurrents du jour courant
+        # Blocs récurrents du jour courant. La fenêtre d'indisponibilité AVANT
+        # un bloc rattaché à un lieu suit la formule de la spec (préparation +
+        # trajet + marge de sécurité -> "début_indisponibilité"), et le retour
+        # bloque `trajet` minutes APRÈS. Sans lieu: buffer transport plat (legacy).
+        from services.commute import block_commute_minutes
+
         for b in RecurringBlock.objects.filter(
             user=user, day_of_week=day_of_week, active=True
-        ):
+        ).select_related('place'):
+            before, after = block_commute_minutes(b, profile)
             s, e = to_min(b.start_time), to_min(b.end_time)
             if b.is_night_shift or e <= s:
-                add(s - transport, MINUTES_PER_DAY)  # part du jour J
+                add(s - before, MINUTES_PER_DAY)  # part du jour J
             else:
-                add(s - transport, e + transport)
+                add(s - before, e + after)
 
-        # Portion matinale d'un bloc de nuit commencé la VEILLE
+        # Portion matinale d'un bloc de nuit commencé la VEILLE (le retour
+        # bloque `trajet` minutes après la fin du shift)
         for b in RecurringBlock.objects.filter(
             user=user, day_of_week=prev_day, active=True
-        ):
+        ).select_related('place'):
+            _, after = block_commute_minutes(b, profile)
             s, e = to_min(b.start_time), to_min(b.end_time)
             if b.is_night_shift or e <= s:
-                add(0, e + transport)
+                add(0, e + after)
 
         # Blocs DÉJÀ planifiés à cette date -> ne jamais empiler dessus
         for sb in ScheduledBlock.objects.filter(user=user, date=current_date):
