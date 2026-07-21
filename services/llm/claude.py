@@ -7,7 +7,7 @@ from typing import Optional
 from django.conf import settings
 
 from .base import LLMProvider, LLMResponse, FunctionCall
-from utils.helpers import retry_with_backoff
+from utils.helpers import retry_with_backoff, log_llm_usage
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +224,7 @@ class ClaudeProvider(LLMProvider):
                 "Claude response truncated (stop_reason=max_tokens); output is incomplete."
             )
 
-        return LLMResponse(
+        parsed = LLMResponse(
             text="".join(text_parts),
             function_calls=function_calls,
             raw_response=response,
@@ -232,6 +232,9 @@ class ClaudeProvider(LLMProvider):
             stop_reason=stop_reason,
             usage=usage,
         )
+        # Cost/usage observability: token counts at INFO when present (T4).
+        log_llm_usage(parsed, provider_name=self.name)
+        return parsed
 
     def generate_with_history(
         self,

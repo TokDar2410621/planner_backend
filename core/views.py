@@ -54,6 +54,29 @@ from services.agent import PlannerAgent
 logger = logging.getLogger(__name__)
 
 
+def _as_bool(value):
+    """Coerce a request value (bool, int, or string) to a boolean.
+
+    Form-encoded payloads deliver booleans as strings ("true", "1"), while
+    JSON payloads deliver real booleans; both must be interpreted the same way.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ('true', '1', 'yes', 'on')
+
+
+def _as_int_or_none(value):
+    """Coerce a request value to an int, or None when empty/invalid."""
+    if value is None or value == '':
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class CheckEmailRateThrottle(ScopedRateThrottle):
     """Scoped throttle for CheckEmailView (S8: account-existence oracle).
 
@@ -348,10 +371,14 @@ class ChatView(APIView):
 
     def post(self, request):
         """Send a message and get AI response."""
-        print(f"[CHAT] POST request received from user {request.user.id}", flush=True)
+        logger.debug("Chat POST received from user %s", request.user.id)
         message = request.data.get('message', '')
         attachment_file = request.FILES.get('attachment')
-        print(f"[CHAT] message='{message[:50] if message else ''}', attachment={bool(attachment_file)}", flush=True)
+        logger.debug(
+            "Chat message len=%s attachment=%s",
+            len(message) if message else 0,
+            bool(attachment_file),
+        )
 
         if not message and not attachment_file:
             return Response(
@@ -362,7 +389,11 @@ class ChatView(APIView):
         # Handle file upload
         attachment = None
         if attachment_file:
-            print(f"[CHAT] Processing attachment: {attachment_file.name}, size={attachment_file.size}", flush=True)
+            logger.debug(
+                "Chat attachment name=%s size=%s",
+                attachment_file.name,
+                attachment_file.size,
+            )
 
             # S4: validate the upload (size + extension allowlist + magic bytes)
             # BEFORE persisting it, so a smuggled SVG/HTML/executable payload or
@@ -384,15 +415,14 @@ class ChatView(APIView):
                 document_type=doc_type,
             )
             attachment = doc
-            print(f"[CHAT] Document created with id={doc.id}", flush=True)
+            logger.debug("Chat document created id=%s", doc.id)
 
             # Process document ASYNCHRONOUSLY to avoid timeout
             try:
                 processor = DocumentProcessor()
                 processor.process_document_async(doc.id)
-                print(f"[CHAT] Async processing started for doc {doc.id}", flush=True)
+                logger.debug("Chat async processing started for doc %s", doc.id)
             except Exception as e:
-                print(f"[CHAT] Document processing error: {e}", flush=True)
                 logger.error(f"Document processing error: {e}")
 
         # Generate chat response via PlannerAgent
@@ -595,16 +625,32 @@ class TaskViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def complete(self, request, pk=None):
-        """Mark a task as completed."""
+        """Mark a task as completed.
+
+        D9: routes through ``Task.mark_completed`` (the canonical sync helper
+        added by T1) so ``Task.completed`` / ``completed_at``, the active
+        ``ScheduledBlock.actually_completed`` and the ``TaskHistory`` record
+        never diverge. The helper is idempotent and records history itself, so
+        the view no longer touches those representations directly. A fallback
+        replicates the same reconciliation on schemas without the helper.
+        """
         task = self.get_object()
 
         serializer = TaskCompleteSerializer(data=request.data)
-        if serializer.is_valid():
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        actual_duration = serializer.validated_data.get('actual_duration_minutes')
+
+        if hasattr(task, 'mark_completed'):
+            task.mark_completed(actual_minutes=actual_duration)
+        else:
+            # Fallback for environments without the T1 sync helpers: keep the
+            # exact prior behaviour (mark task, sync the active block, record
+            # history) so the four representations stay consistent.
             task.completed = True
             task.completed_at = timezone.now()
 
-            # Update scheduled block if exists
-            actual_duration = serializer.validated_data.get('actual_duration_minutes')
             scheduled_time = None
             was_rescheduled = False
             reschedule_count = 0
@@ -619,26 +665,21 @@ class TaskViewSet(viewsets.ModelViewSet):
                     scheduled_block.save()
                     scheduled_time = scheduled_block.start_time
 
-                    # Check if task was rescheduled
                     reschedule_count = task.scheduled_blocks.count() - 1
                     was_rescheduled = reschedule_count > 0
 
-            # Record task history for AI predictions
-            if actual_duration:
-                insights = AIInsightsService()
-                insights.record_task_completion(
+                AIInsightsService().record_task_completion(
                     user=request.user,
                     task=task,
                     actual_duration=actual_duration,
                     scheduled_time=scheduled_time,
                     was_rescheduled=was_rescheduled,
-                    reschedule_count=reschedule_count
+                    reschedule_count=reschedule_count,
                 )
 
             task.save()
-            return Response(TaskSerializer(task).data)
 
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        return Response(TaskSerializer(task).data)
 
 
 # ============== Schedule Views ==============
@@ -728,7 +769,14 @@ class ScheduledBlockView(APIView):
     """Update a scheduled block (for drag & drop)."""
 
     def patch(self, request, block_id):
-        """Update a scheduled block."""
+        """Update a scheduled block.
+
+        D9: when the PATCH marks the block completed, the completion is applied
+        through ``ScheduledBlock.mark_completed`` (the canonical sync helper
+        added by T1) instead of a raw field write, so the parent ``Task`` and
+        the ``TaskHistory`` record stay in sync. Other field updates (drag &
+        drop of ``start_time`` / ``end_time``) still flow through the serializer.
+        """
         try:
             block = ScheduledBlock.objects.get(id=block_id, user=request.user)
         except ScheduledBlock.DoesNotExist:
@@ -737,11 +785,34 @@ class ScheduledBlockView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        serializer = ScheduledBlockSerializer(block, data=request.data, partial=True)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        data = {key: request.data[key] for key in request.data}
+        completing = _as_bool(data.get('actually_completed'))
+        completion_minutes = None
+        if completing:
+            # Route the completion transition through the helper rather than the
+            # serializer so Task + TaskHistory are reconciled canonically.
+            data.pop('actually_completed', None)
+            completion_minutes = _as_int_or_none(data.pop('actual_duration_minutes', None))
+
+        serializer = ScheduledBlockSerializer(block, data=data, partial=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        serializer.save()
+
+        if completing:
+            block.refresh_from_db()
+            if hasattr(block, 'mark_completed'):
+                block.mark_completed(actual_minutes=completion_minutes)
+            else:
+                # Fallback: preserve prior behaviour (flag-only write) on
+                # schemas without the T1 sync helpers.
+                block.actually_completed = True
+                if completion_minutes is not None:
+                    block.actual_duration_minutes = completion_minutes
+                block.save()
+            block.refresh_from_db()
+
+        return Response(ScheduledBlockSerializer(block).data)
 
 
 # ============== Conversation Views ==============

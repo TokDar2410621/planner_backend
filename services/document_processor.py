@@ -553,15 +553,15 @@ Analyse ce texte et retourne le JSON structuré:"""
         Returns:
             dict: Extracted data
         """
-        print(f"[DOC_PROCESSOR] _process_document_by_id called for doc {document_id}", flush=True)
+        logger.info(f"_process_document_by_id called for doc {document_id}")
         from django.db import connections
         # Close ALL database connections to get fresh ones for this greenlet
         # This is required for gevent greenlets to avoid "asynchronous query underway" errors
         connections.close_all()
-        print(f"[DOC_PROCESSOR] Closed all DB connections for greenlet", flush=True)
+        logger.debug("Closed all DB connections for greenlet")
 
         document = UploadedDocument.objects.get(id=document_id)
-        print(f"[DOC_PROCESSOR] Document loaded: {document.file.name}", flush=True)
+        logger.info(f"Document loaded: {document.file.name}")
         return self.process_document(document)
 
     def process_document(self, document: UploadedDocument) -> dict:
@@ -650,12 +650,17 @@ Analyse ce texte et retourne le JSON structuré:"""
                 document.processed = True
                 document.processing_error = None
                 document.save()
-                print(f"[DOC_PROCESSOR] Document {document.id} saved with extracted_data keys: {list(extracted_data.keys())}", flush=True)
-                print(f"[DOC_PROCESSOR] Courses: {len(extracted_data.get('courses', []))}, Shifts: {len(extracted_data.get('shifts', []))}", flush=True)
+                logger.info(
+                    f"Document {document.id} saved with extracted_data keys: "
+                    f"{list(extracted_data.keys())} "
+                    f"(courses={len(extracted_data.get('courses', []))}, "
+                    f"shifts={len(extracted_data.get('shifts', []))})"
+                )
 
-                # Create recurring blocks from extracted data
+                # Create recurring blocks from extracted data (idempotent: skips
+                # creation when blocks already exist for this document).
                 blocks = self._create_recurring_blocks(document, extracted_data)
-                print(f"[DOC_PROCESSOR] Created {len(blocks)} blocks for doc {document.id}", flush=True)
+                logger.info(f"Created {len(blocks)} blocks for doc {document.id}")
 
                 return extracted_data
 

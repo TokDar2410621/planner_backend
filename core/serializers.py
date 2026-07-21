@@ -19,7 +19,18 @@ from .models import (
 
 
 class UserProfileSerializer(serializers.ModelSerializer):
-    """Serializer for UserProfile model."""
+    """Serializer for UserProfile model.
+
+    B23: exposes the ``energy_levels`` and ``notification_preferences``
+    JSONFields (added by T1) as read/write fields so the frontend
+    ``PATCH /profile/`` actually persists them. They are declared explicitly
+    (rather than relying on ``Meta.fields`` auto-mapping) and dropped in
+    ``get_fields`` when the underlying model does not yet carry them, so the
+    serializer stays usable against an older schema without raising.
+    """
+
+    energy_levels = serializers.JSONField(required=False)
+    notification_preferences = serializers.JSONField(required=False)
 
     class Meta:
         model = UserProfile
@@ -31,12 +42,22 @@ class UserProfileSerializer(serializers.ModelSerializer):
             'peak_productivity_time',
             'max_deep_work_hours_per_day',
             'transport_time_minutes',
+            'energy_levels',
+            'notification_preferences',
             'onboarding_completed',
             'onboarding_step',
             'created_at',
             'updated_at',
         ]
         read_only_fields = ['created_at', 'updated_at']
+
+    def get_fields(self):
+        fields = super().get_fields()
+        model_field_names = {f.name for f in UserProfile._meta.get_fields()}
+        for name in ('energy_levels', 'notification_preferences'):
+            if name not in model_field_names:
+                fields.pop(name, None)
+        return fields
 
 
 class UserSerializer(serializers.ModelSerializer):
