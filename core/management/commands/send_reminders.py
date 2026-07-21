@@ -43,11 +43,22 @@ class Command(BaseCommand):
             start_time__lte=end,
         ).select_related("user")
 
+        from services.webhooks import dispatch
+
         sent = 0
         for block in blocks:
             body = f"{block.title} à {block.start_time.strftime('%H:%M')}"
             if block.location:
                 body += f" ({block.location})"
             sent += send_to_user(block.user, f"Bientôt : {block.title}", body, url="/schedule")
+            # Let automations react to the reminder too (n8n, etc.).
+            dispatch(block.user, "reminder.sent", {
+                "block": {
+                    "id": block.id,
+                    "title": block.title,
+                    "start_time": block.start_time.strftime("%H:%M"),
+                    "location": block.location,
+                },
+            })
 
         self.stdout.write(f"Reminders: {blocks.count()} block(s), {sent} push(es) sent.")

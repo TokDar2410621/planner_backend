@@ -15,6 +15,11 @@ from .views import (
     PushSubscribeView,
     PushUnsubscribeView,
     PushTestView,
+    CalendarFeedView,
+    CalendarICSView,
+    WebhookEndpointView,
+    WebhookEndpointDetailView,
+    WebhookTestView,
     GoogleAuthView,
     # Profile
     ProfileView,
@@ -66,6 +71,15 @@ urlpatterns = [
     path('push/subscribe/', PushSubscribeView.as_view(), name='push-subscribe'),
     path('push/unsubscribe/', PushUnsubscribeView.as_view(), name='push-unsubscribe'),
     path('push/test/', PushTestView.as_view(), name='push-test'),
+
+    # iCal calendar feed (subscribe from Google/Apple/Outlook)
+    path('calendar/feed/', CalendarFeedView.as_view(), name='calendar-feed'),
+    path('calendar/<uuid:token>.ics', CalendarICSView.as_view(), name='calendar-ics'),
+
+    # Outbound webhooks (n8n / automation)
+    path('webhooks/', WebhookEndpointView.as_view(), name='webhooks'),
+    path('webhooks/test/', WebhookTestView.as_view(), name='webhooks-test'),
+    path('webhooks/<int:hook_id>/', WebhookEndpointDetailView.as_view(), name='webhooks-detail'),
 
     # Profile endpoints
     path('profile/', ProfileView.as_view(), name='profile'),
