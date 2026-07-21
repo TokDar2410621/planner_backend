@@ -8,6 +8,7 @@ from rest_framework import serializers
 
 from .models import (
     UserProfile,
+    UserPlace,
     UploadedDocument,
     RecurringBlock,
     RecurringBlockCompletion,
@@ -42,6 +43,8 @@ class UserProfileSerializer(serializers.ModelSerializer):
             'peak_productivity_time',
             'max_deep_work_hours_per_day',
             'transport_time_minutes',
+            'prep_time_minutes',
+            'safety_margin_minutes',
             'energy_levels',
             'notification_preferences',
             'onboarding_completed',
@@ -140,11 +143,29 @@ class UploadedDocumentSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'extracted_data', 'processed', 'processing_error', 'uploaded_at']
 
 
+class UserPlaceSerializer(serializers.ModelSerializer):
+    """Serializer for UserPlace (travel-time engine, Phase 1)."""
+
+    class Meta:
+        model = UserPlace
+        fields = ['id', 'name', 'kind', 'address', 'travel_minutes', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+
 class RecurringBlockSerializer(serializers.ModelSerializer):
     """Serializer for RecurringBlock model."""
 
     day_of_week_display = serializers.CharField(source='get_day_of_week_display', read_only=True)
     block_type_display = serializers.CharField(source='get_block_type_display', read_only=True)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Scope `place` choices to the requesting user's own places (no IDOR).
+        request = self.context.get('request')
+        if request is not None and 'place' in self.fields:
+            user = getattr(request, 'user', None)
+            if user is not None and user.is_authenticated:
+                self.fields['place'].queryset = UserPlace.objects.filter(user=user)
 
     class Meta:
         model = RecurringBlock
@@ -158,6 +179,7 @@ class RecurringBlockSerializer(serializers.ModelSerializer):
             'start_time',
             'end_time',
             'location',
+            'place',
             'is_night_shift',
             'source_document',
             'active',

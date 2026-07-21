@@ -39,6 +39,14 @@ class UserProfile(models.Model):
     )
     max_deep_work_hours_per_day = models.PositiveIntegerField(default=4)
     transport_time_minutes = models.PositiveIntegerField(default=0)
+    prep_time_minutes = models.PositiveIntegerField(
+        default=15,
+        help_text="Temps de préparation avant de partir (minutes).",
+    )
+    safety_margin_minutes = models.PositiveIntegerField(
+        default=10,
+        help_text="Marge de sécurité contre les retards (minutes).",
+    )
     onboarding_completed = models.BooleanField(default=False)
     onboarding_step = models.PositiveIntegerField(default=0)
     energy_levels = models.JSONField(
@@ -112,6 +120,46 @@ class UploadedDocument(models.Model):
         ordering = ['-uploaded_at']
 
 
+class UserPlace(models.Model):
+    """A place the user goes to (work, school, gym...) with its travel time.
+
+    Phase 1 of the planning engine: travel_minutes is the user-declared usual
+    trip duration from home. A later phase can refresh it live from a maps API
+    (traffic-aware) without changing the scheduling formula that consumes it:
+
+        heure_de_depart      = début_événement - trajet - marge_de_sécurité
+        début_indisponibilité = heure_de_depart - temps_de_préparation
+    """
+
+    KIND_CHOICES = [
+        ('home', 'Maison'),
+        ('school', 'École'),
+        ('work', 'Travail'),
+        ('other', 'Autre'),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='places')
+    name = models.CharField(max_length=100)
+    kind = models.CharField(max_length=10, choices=KIND_CHOICES, default='other')
+    address = models.CharField(max_length=300, blank=True)
+    travel_minutes = models.PositiveIntegerField(
+        default=0,
+        help_text="Durée habituelle du trajet depuis la maison (minutes).",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.name} ({self.travel_minutes} min) - {self.user.username}"
+
+    class Meta:
+        verbose_name = "Lieu"
+        verbose_name_plural = "Lieux"
+        ordering = ['name']
+        constraints = [
+            models.UniqueConstraint(fields=['user', 'name'], name='userplace_user_name_unique'),
+        ]
+
+
 class VisibleRecurringBlockManager(models.Manager):
     """Default manager that hides blocks awaiting confirmation.
 
@@ -165,6 +213,14 @@ class RecurringBlock(models.Model):
     start_time = models.TimeField()
     end_time = models.TimeField()
     location = models.CharField(max_length=200, blank=True)
+    place = models.ForeignKey(
+        UserPlace,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='recurring_blocks',
+        help_text="Lieu de l'activité ; son travel_minutes pilote l'heure limite de départ.",
+    )
     is_night_shift = models.BooleanField(default=False)
     source_document = models.ForeignKey(
         UploadedDocument,
