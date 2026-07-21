@@ -515,6 +515,88 @@ class SharedSchedule(models.Model):
         ordering = ['-created_at']
 
 
+class CalendarFeed(models.Model):
+    """A stable, token-secured iCal (.ics) subscription URL for a user.
+
+    Unlike SharedSchedule (a one-off HTML share), this is a long-lived feed the
+    user pastes into Google/Apple/Outlook Calendar once; those apps re-fetch it
+    on their own cadence, so Planner blocks stay synced. Rotating the token
+    (regenerate) instantly revokes every existing subscription.
+    """
+    user = models.OneToOneField(
+        User, on_delete=models.CASCADE, related_name='calendar_feed'
+    )
+    token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    include_tasks = models.BooleanField(
+        default=True,
+        help_text="Inclure les tâches planifiées et les échéances, pas seulement les blocs récurrents.",
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_accessed_at = models.DateTimeField(null=True, blank=True)
+    access_count = models.PositiveIntegerField(default=0)
+
+    def __str__(self):
+        return f"CalendarFeed {self.token} - {self.user.username}"
+
+    @property
+    def feed_path(self):
+        return f"/api/calendar/{self.token}.ics"
+
+    class Meta:
+        verbose_name = "Flux calendrier"
+        verbose_name_plural = "Flux calendrier"
+
+
+class WebhookEndpoint(models.Model):
+    """A user-registered outbound webhook (n8n, Zapier, Make, custom).
+
+    When Planner events fire (task created/completed, block completed, reminder),
+    a signed JSON POST is sent to `url`. This is the generic automation bridge:
+    the user wires Planner into any no-code/low-code flow without Planner needing
+    a per-integration connector.
+    """
+    EVENT_CHOICES = [
+        ('task.created', 'Tâche créée'),
+        ('task.completed', 'Tâche complétée'),
+        ('block.completed', 'Bloc récurrent complété'),
+        ('schedule.generated', 'Horaire généré'),
+        ('reminder.sent', 'Rappel envoyé'),
+    ]
+
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='webhook_endpoints'
+    )
+    url = models.URLField(max_length=1000)
+    secret = models.CharField(
+        max_length=64, blank=True,
+        help_text="Signe chaque payload en HMAC-SHA256 (header X-Planner-Signature).",
+    )
+    events = models.JSONField(
+        default=list, blank=True,
+        help_text="Liste d'événements souscrits; vide = tous.",
+    )
+    description = models.CharField(max_length=200, blank=True)
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_triggered_at = models.DateTimeField(null=True, blank=True)
+    last_status = models.CharField(max_length=40, blank=True)
+    failure_count = models.PositiveIntegerField(default=0)
+
+    def __str__(self):
+        return f"Webhook {self.user.username} -> {self.url[:50]}"
+
+    def wants(self, event: str) -> bool:
+        """True if this endpoint should receive `event` (empty list = all)."""
+        return self.active and (not self.events or event in self.events)
+
+    class Meta:
+        verbose_name = "Webhook"
+        verbose_name_plural = "Webhooks"
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['user', 'active'])]
+
+
 class PushSubscription(models.Model):
     """A Web Push (VAPID) subscription for a user's browser/PWA/device.
 

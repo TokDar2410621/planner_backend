@@ -6,7 +6,7 @@ from datetime import date, timedelta
 
 from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
-from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -627,6 +627,21 @@ class TaskViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         task = serializer.save(user=self.request.user)
 
+        # Fan out to any automation the user wired up (n8n, etc.).
+        try:
+            from services.webhooks import dispatch
+            dispatch(self.request.user, "task.created", {
+                "task": {
+                    "id": task.id,
+                    "title": task.title,
+                    "deadline": task.deadline.isoformat() if task.deadline else None,
+                    "priority": task.priority,
+                    "task_type": task.task_type,
+                },
+            })
+        except Exception as e:
+            logger.error(f"Webhook dispatch (task.created) failed: {e}")
+
         # Auto-schedule the task if it has a deadline or estimated duration
         if task.deadline or task.estimated_duration_minutes:
             try:
@@ -697,6 +712,19 @@ class TaskViewSet(viewsets.ModelViewSet):
                 )
 
             task.save()
+
+        try:
+            from services.webhooks import dispatch
+            dispatch(request.user, "task.completed", {
+                "task": {
+                    "id": task.id,
+                    "title": task.title,
+                    "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+                    "actual_duration_minutes": actual_duration,
+                },
+            })
+        except Exception as e:
+            logger.error(f"Webhook dispatch (task.completed) failed: {e}")
 
         return Response(TaskSerializer(task).data)
 
@@ -1260,3 +1288,185 @@ class PushTestView(APIView):
             request.data.get("message") or "Notification de test ✅", url="/",
         )
         return Response({"sent": sent})
+
+
+# ============== iCal calendar feed ==============
+class CalendarFeedView(APIView):
+    """Manage the current user's stable iCal subscription URL.
+
+    GET  -> feed metadata + absolute https/webcal URLs (creates the feed lazily).
+    POST -> rotate the token (revokes every existing calendar subscription).
+    PATCH-> toggle include_tasks / is_active.
+    """
+
+    def _payload(self, request, feed):
+        https_url = request.build_absolute_uri(feed.feed_path)
+        return {
+            "token": str(feed.token),
+            "include_tasks": feed.include_tasks,
+            "is_active": feed.is_active,
+            "url": https_url,
+            "webcal_url": https_url.replace("https://", "webcal://").replace(
+                "http://", "webcal://"
+            ),
+            "access_count": feed.access_count,
+            "last_accessed_at": feed.last_accessed_at,
+        }
+
+    def get(self, request):
+        from core.models import CalendarFeed
+        feed, _ = CalendarFeed.objects.get_or_create(user=request.user)
+        return Response(self._payload(request, feed))
+
+    def post(self, request):
+        import uuid as _uuid
+        from core.models import CalendarFeed
+        feed, _ = CalendarFeed.objects.get_or_create(user=request.user)
+        feed.token = _uuid.uuid4()
+        feed.is_active = True
+        feed.save(update_fields=["token", "is_active"])
+        return Response(self._payload(request, feed))
+
+    def patch(self, request):
+        from core.models import CalendarFeed
+        feed, _ = CalendarFeed.objects.get_or_create(user=request.user)
+        if "include_tasks" in request.data:
+            feed.include_tasks = bool(request.data["include_tasks"])
+        if "is_active" in request.data:
+            feed.is_active = bool(request.data["is_active"])
+        feed.save(update_fields=["include_tasks", "is_active"])
+        return Response(self._payload(request, feed))
+
+
+class CalendarICSView(APIView):
+    """Public, token-secured .ics feed that calendar apps subscribe to."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request, token):
+        from django.http import HttpResponse
+        from django.db.models import F
+        from core.models import CalendarFeed
+        from services.ical import build_calendar
+
+        try:
+            feed = CalendarFeed.objects.select_related("user").get(token=token)
+        except (CalendarFeed.DoesNotExist, ValueError, ValidationError):
+            return Response(
+                {"error": "Flux calendrier introuvable."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        if not feed.is_active:
+            return Response(
+                {"error": "Ce flux a été désactivé."}, status=status.HTTP_410_GONE
+            )
+
+        ics = build_calendar(feed.user, include_tasks=feed.include_tasks)
+
+        CalendarFeed.objects.filter(id=feed.id).update(
+            access_count=F("access_count") + 1, last_accessed_at=timezone.now()
+        )
+
+        resp = HttpResponse(ics, content_type="text/calendar; charset=utf-8")
+        resp["Content-Disposition"] = 'inline; filename="planner.ics"'
+        resp["Cache-Control"] = "no-cache, max-age=0"
+        return resp
+
+
+# ============== Outbound webhooks (n8n / automation) ==============
+class WebhookEndpointView(APIView):
+    """List and create the current user's outbound webhooks."""
+
+    def get(self, request):
+        from core.models import WebhookEndpoint
+        hooks = WebhookEndpoint.objects.filter(user=request.user)
+        return Response([_webhook_dict(h) for h in hooks])
+
+    def post(self, request):
+        import secrets as _secrets
+        from core.models import WebhookEndpoint
+
+        url = (request.data.get("url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            return Response(
+                {"error": "Une URL http(s) valide est requise."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        valid_events = {c[0] for c in WebhookEndpoint.EVENT_CHOICES}
+        events = request.data.get("events") or []
+        if not isinstance(events, list) or any(e not in valid_events for e in events):
+            return Response(
+                {"error": f"events doit être une liste parmi {sorted(valid_events)}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        hook = WebhookEndpoint.objects.create(
+            user=request.user,
+            url=url,
+            secret=request.data.get("secret") or _secrets.token_hex(16),
+            events=events,
+            description=(request.data.get("description") or "")[:200],
+        )
+        return Response(_webhook_dict(hook, reveal_secret=True), status=status.HTTP_201_CREATED)
+
+
+class WebhookEndpointDetailView(APIView):
+    """Update or delete a specific webhook."""
+
+    def _get(self, request, hook_id):
+        from core.models import WebhookEndpoint
+        return WebhookEndpoint.objects.filter(id=hook_id, user=request.user).first()
+
+    def patch(self, request, hook_id):
+        hook = self._get(request, hook_id)
+        if hook is None:
+            return Response({"error": "Webhook introuvable."}, status=status.HTTP_404_NOT_FOUND)
+        if "active" in request.data:
+            hook.active = bool(request.data["active"])
+        if "url" in request.data:
+            hook.url = request.data["url"]
+        if "events" in request.data:
+            hook.events = request.data["events"]
+        hook.save()
+        return Response(_webhook_dict(hook))
+
+    def delete(self, request, hook_id):
+        hook = self._get(request, hook_id)
+        if hook is None:
+            return Response({"error": "Webhook introuvable."}, status=status.HTTP_404_NOT_FOUND)
+        hook.delete()
+        return Response({"deleted": 1})
+
+
+class WebhookTestView(APIView):
+    """Fire a sample event to the user's webhooks synchronously and report status."""
+
+    def post(self, request):
+        from services.webhooks import dispatch_sync
+        results = dispatch_sync(
+            request.user,
+            "task.completed",
+            {"test": True, "task": {"id": 0, "title": "Webhook de test Planner AI"}},
+        )
+        return Response(
+            {"delivered_to": len(results), "results": [{"id": i, "status": s} for i, s in results]}
+        )
+
+
+def _webhook_dict(hook, reveal_secret=False):
+    data = {
+        "id": hook.id,
+        "url": hook.url,
+        "events": hook.events,
+        "description": hook.description,
+        "active": hook.active,
+        "created_at": hook.created_at,
+        "last_triggered_at": hook.last_triggered_at,
+        "last_status": hook.last_status,
+        "failure_count": hook.failure_count,
+        "has_secret": bool(hook.secret),
+    }
+    if reveal_secret:
+        # Returned once, at creation, so the user can configure their receiver.
+        data["secret"] = hook.secret
+    return data
