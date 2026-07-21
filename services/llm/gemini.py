@@ -110,9 +110,10 @@ class GeminiProvider(LLMProvider):
         try:
             # Build config if tools are provided
             config = None
-            if tools:
+            gemini_tools = self._to_gemini_tools(tools)
+            if gemini_tools:
                 config = types.GenerateContentConfig(
-                    tools=tools,
+                    tools=gemini_tools,
                     tool_config=types.ToolConfig(
                         function_calling_config=types.FunctionCallingConfig(mode='AUTO')
                     )
@@ -172,30 +173,65 @@ class GeminiProvider(LLMProvider):
                 stop_reason,
             )
 
+        # raw_content lets the assistant's function-call turn round-trip back to
+        # Gemini on the next request (B19). Without it, Gemini never sees that it
+        # already called the tool and re-calls it (the duplicate-write bug).
+        raw_content = []
         for part in response.parts:
             # Check for function calls
             fc = getattr(part, 'function_call', None)
             if fc:
-                function_calls.append(FunctionCall(
-                    name=fc.name,
-                    args=dict(fc.args) if fc.args else {}
-                ))
-                logger.info(f"Function call detected: {fc.name} with args: {dict(fc.args) if fc.args else {}}")
+                args = dict(fc.args) if fc.args else {}
+                # call_id = the function name: Gemini correlates a function
+                # response to its call by NAME (there is no separate call id),
+                # so the matching tool_result must carry that same name.
+                function_calls.append(FunctionCall(name=fc.name, args=args, call_id=fc.name))
+                raw_content.append({"type": "tool_use", "name": fc.name, "input": args})
+                logger.info(f"Function call detected: {fc.name} with args: {args}")
 
             # Check for text
             if hasattr(part, 'text') and part.text:
                 text_parts.append(part.text)
+                raw_content.append({"type": "text", "text": part.text})
 
         parsed = LLMResponse(
             text="".join(text_parts),
             function_calls=function_calls,
             raw_response=response,
+            raw_content=raw_content,
             stop_reason=stop_reason,
             usage=usage,
         )
         # Cost/usage observability: token counts at INFO when present (T4).
         log_llm_usage(parsed, provider_name=self.name)
         return parsed
+
+    def _to_gemini_tools(self, tools):
+        """Convert Claude-format tool dicts ({name, description, input_schema})
+        into google-genai Tool/FunctionDeclaration objects.
+
+        Newer google-genai (>=1.7x) rejects the raw dicts with pydantic errors
+        ('Input should be callable' / 'Extra inputs are not permitted'); wrapping
+        them makes function-calling work across google-genai versions.
+        """
+        if not tools:
+            return None
+        if types is not None and all(isinstance(t, types.Tool) for t in tools):
+            return tools  # already converted
+        declarations = []
+        for t in tools:
+            if isinstance(t, dict) and t.get("name"):
+                try:
+                    declarations.append(types.FunctionDeclaration(
+                        name=t["name"],
+                        description=t.get("description", ""),
+                        parameters=t.get("input_schema") or t.get("parameters"),
+                    ))
+                except Exception as e:  # noqa: BLE001 - skip a malformed tool, keep the rest
+                    logger.warning(f"Skipping tool {t.get('name')} for Gemini: {e}")
+        if not declarations:
+            return None
+        return [types.Tool(function_declarations=declarations)]
 
     def generate_with_history(
         self,
@@ -242,9 +278,10 @@ class GeminiProvider(LLMProvider):
 
             # Build config
             config = None
-            if tools:
+            gemini_tools = self._to_gemini_tools(tools)
+            if gemini_tools:
                 config = types.GenerateContentConfig(
-                    tools=tools,
+                    tools=gemini_tools,
                     tool_config=types.ToolConfig(
                         function_calling_config=types.FunctionCallingConfig(mode='AUTO')
                     )

@@ -165,6 +165,7 @@ class PlannerAgent:
         final_text = ""
         had_error = False
         tool_calls_made = []
+        executed_calls = {}  # (name, args) -> result string; skips duplicate tool calls
         interactive_inputs = None  # Captured from present_form tool
         ai_quick_replies = None    # Captured from present_quick_replies tool
 
@@ -192,10 +193,29 @@ class PlannerAgent:
 
             # Execute each tool and build tool results
             tool_results = []
+            new_execution = False
             for fc in response.function_calls:
+                # Idempotency guard: some providers (notably Gemini) re-emit an
+                # identical tool call across turns when the round-trip is not
+                # perfectly conveyed. Never execute the same (name, args) twice
+                # in one message - that is what created duplicate tasks/blocks.
+                call_key = (fc.name, json.dumps(fc.args or {}, sort_keys=True, default=str))
+                if call_key in executed_calls:
+                    logger.warning(f"Skipping duplicate tool call: {fc.name}({fc.args})")
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": fc.call_id,
+                        "name": fc.name,
+                        "content": executed_calls[call_key],
+                    })
+                    continue
+
                 logger.info(f"Executing tool: {fc.name}({fc.args})")
                 result = execute_tool(fc.name, user, fc.args)
                 logger.info(f"Tool result: {result.message}")
+                result_string = result.to_string()
+                executed_calls[call_key] = result_string
+                new_execution = True
 
                 tool_calls_made.append({
                     "tool": fc.name,
@@ -212,7 +232,8 @@ class PlannerAgent:
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": fc.call_id,
-                    "content": result.to_string(),
+                    "name": fc.name,
+                    "content": result_string,
                 })
 
             # Add tool results as a user message (Claude's convention)
@@ -220,6 +241,14 @@ class PlannerAgent:
                 "role": "user",
                 "content": tool_results,
             })
+
+            # If the model only repeated already-executed calls this turn, it is
+            # stuck looping - stop instead of burning turns / API cost.
+            if not new_execution:
+                logger.warning("Agentic loop made no new tool execution; stopping.")
+                if not final_text:
+                    final_text = response.text or "C'est fait."
+                break
 
             # Capture any text from intermediate turns
             if response.text:
