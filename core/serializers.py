@@ -161,9 +161,14 @@ class RecurringBlockSerializer(serializers.ModelSerializer):
             'is_night_shift',
             'source_document',
             'active',
+            'status',
+            'confidence',
             'created_at',
         ]
-        read_only_fields = ['id', 'created_at', 'day_of_week_display', 'block_type_display']
+        read_only_fields = [
+            'id', 'created_at', 'day_of_week_display', 'block_type_display',
+            'status', 'confidence',
+        ]
 
     def validate(self, attrs):
         start_time = attrs.get('start_time')

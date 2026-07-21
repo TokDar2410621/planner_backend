@@ -503,15 +503,53 @@ class RecurringBlockViewSet(viewsets.ModelViewSet):
     serializer_class = RecurringBlockSerializer
 
     def get_queryset(self):
+        # Default manager hides 'pending' blocks, so the normal list/detail
+        # endpoints only ever expose confirmed blocks.
         return RecurringBlock.objects.filter(user=self.request.user)
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
 
+    @action(detail=False, methods=['get'])
+    def pending(self, request):
+        """List blocks awaiting confirmation (low-confidence extractions)."""
+        qs = RecurringBlock.all_objects.filter(
+            user=request.user, status=RecurringBlock.STATUS_PENDING
+        )
+        return Response(RecurringBlockSerializer(qs, many=True).data)
+
+    @action(detail=True, methods=['post'])
+    def confirm(self, request, pk=None):
+        """Confirm a pending block -> it becomes active (visible in the planning)."""
+        block = RecurringBlock.all_objects.filter(user=request.user, pk=pk).first()
+        if block is None:
+            return Response({'error': 'Bloc introuvable.'}, status=status.HTTP_404_NOT_FOUND)
+        if block.status != RecurringBlock.STATUS_ACTIVE:
+            block.status = RecurringBlock.STATUS_ACTIVE
+            block.save(update_fields=['status'])
+        return Response(RecurringBlockSerializer(block).data)
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        """Reject a pending (or any) block -> deleted."""
+        block = RecurringBlock.all_objects.filter(user=request.user, pk=pk).first()
+        if block is None:
+            return Response({'error': 'Bloc introuvable.'}, status=status.HTTP_404_NOT_FOUND)
+        block.delete()
+        return Response({'deleted': 1})
+
+    @action(detail=False, methods=['post'])
+    def confirm_all(self, request):
+        """Confirm every pending block at once (bulk 1-tap accept)."""
+        updated = RecurringBlock.all_objects.filter(
+            user=request.user, status=RecurringBlock.STATUS_PENDING
+        ).update(status=RecurringBlock.STATUS_ACTIVE)
+        return Response({'confirmed': updated})
+
     @action(detail=False, methods=['delete'])
     def clear_all(self, request):
-        """Delete all recurring blocks for the current user."""
-        deleted_count, _ = RecurringBlock.objects.filter(user=request.user).delete()
+        """Delete all recurring blocks for the current user (incl. pending)."""
+        deleted_count, _ = RecurringBlock.all_objects.filter(user=request.user).delete()
 
         # Also delete associated completions
         RecurringBlockCompletion.objects.filter(user=request.user).delete()
