@@ -52,9 +52,39 @@ except ImportError:
 
 from datetime import time as dt_time
 from core.models import UploadedDocument, RecurringBlock
+from services.schedule_intent import has_schedule_signal
 from utils.helpers import retry_with_backoff, run_in_background
 
 logger = logging.getLogger(__name__)
+
+# Below this extraction confidence, a block is created as 'pending' (hidden from
+# the planning until the user confirms it) instead of activated silently.
+PENDING_CONFIDENCE_THRESHOLD = 0.6
+
+
+def compute_block_confidence(*, start_defaulted, end_defaulted, title_generic, llm_confidence=None):
+    """Confidence 0-1 that an extracted block is correct.
+
+    Deterministic completeness score (penalise defaulted times / a generic
+    title), optionally blended with the model's own per-item confidence when the
+    extraction JSON provides one. Kept pure + module-level so it is unit-testable.
+    """
+    score = 1.0
+    if start_defaulted:
+        score -= 0.35
+    if end_defaulted:
+        score -= 0.20
+    if title_generic:
+        score -= 0.25
+    score = max(0.0, min(1.0, score))
+    if llm_confidence is not None:
+        try:
+            lc = float(llm_confidence)
+            if 0.0 <= lc <= 1.0:
+                score = (score + lc) / 2.0
+        except (TypeError, ValueError):
+            pass
+    return round(score, 3)
 
 
 def parse_time_string(time_str: str) -> Optional[dt_time]:
@@ -696,11 +726,11 @@ Analyse ce texte et retourne le JSON structuré:"""
 
         logger.info(f"PDF extraction method: {method}, text length: {len(extracted_text)}, tables: {len(tables)}")
 
-        # Step 2: Check if we got meaningful text
-        # Minimum threshold: at least 100 chars and contains some schedule-related words
+        # Step 2: Check if we got meaningful text. Intent gate: enough text AND
+        # a real schedule signal (days + times + vocab). Reuses the shared
+        # detector so the same heuristic gates text everywhere.
         has_meaningful_text = (
-            len(extracted_text.strip()) > 100 and
-            any(word in extracted_text.lower() for word in ['lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'monday', 'tuesday', 'cours', 'horaire', 'schedule', '8h', '9h', '10h', ':00'])
+            len(extracted_text.strip()) > 100 and has_schedule_signal(extracted_text)
         )
 
         if has_meaningful_text:
@@ -934,6 +964,25 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
             logger.warning(f"JSON decode error: {e}")
             return {"raw_response": response_text, "parse_error": True}
 
+    def _confidence_status(self, *, start_defaulted, end_defaulted, title_generic, llm_confidence=None):
+        """Return (confidence, status) for one extracted block.
+
+        Blocks below PENDING_CONFIDENCE_THRESHOLD are created as 'pending' so
+        they stay out of the planning until the user confirms them.
+        """
+        conf = compute_block_confidence(
+            start_defaulted=start_defaulted,
+            end_defaulted=end_defaulted,
+            title_generic=title_generic,
+            llm_confidence=llm_confidence,
+        )
+        status = (
+            RecurringBlock.STATUS_PENDING
+            if conf < PENDING_CONFIDENCE_THRESHOLD
+            else RecurringBlock.STATUS_ACTIVE
+        )
+        return conf, status
+
     def _create_recurring_blocks(self, document: UploadedDocument, data: dict) -> list:
         """
         Create RecurringBlock instances from ALL extracted data types.
@@ -948,8 +997,9 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
         created_blocks = []
         user = document.user
 
-        # Check if blocks already exist for this document (prevent duplicates)
-        existing_blocks = RecurringBlock.objects.filter(source_document=document)
+        # Check if blocks already exist for this document (prevent duplicates).
+        # Use all_objects so pending blocks from a prior run also count.
+        existing_blocks = RecurringBlock.all_objects.filter(source_document=document)
         if existing_blocks.exists():
             logger.info(f"Blocks already exist for document {document.id}, skipping creation")
             return list(existing_blocks)
@@ -979,6 +1029,8 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                 # Parse time strings to time objects
                 start_time = parse_time_string(course.get('start_time', ''))
                 end_time = parse_time_string(course.get('end_time', ''))
+                start_defaulted = start_time is None
+                end_defaulted = end_time is None
 
                 if start_time is None:
                     start_time = dt_time(9, 0)  # Default 09:00
@@ -993,6 +1045,13 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                     if location.lower() in ('none', 'n/a', 'null', '-'):
                         location = ''
 
+                    confidence, block_status = self._confidence_status(
+                        start_defaulted=start_defaulted,
+                        end_defaulted=end_defaulted,
+                        title_generic=not (course.get('name') or '').strip(),
+                        llm_confidence=course.get('confidence'),
+                    )
+
                     block = RecurringBlock.objects.create(
                         user=user,
                         title=course.get('name') or 'Cours',
@@ -1002,9 +1061,11 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                         end_time=end_time,
                         location=location,
                         source_document=document,
+                        confidence=confidence,
+                        status=block_status,
                     )
                     created_blocks.append(block)
-                    logger.info(f"Created course block: {block.title} on day {day}")
+                    logger.info(f"Created course block: {block.title} (conf={confidence}, {block_status}) on day {day}")
                 except Exception as e:
                     logger.error(f"Error creating course block '{course.get('name', 'Unknown')}': {e}")
 
@@ -1024,6 +1085,8 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                 # Parse time strings to time objects
                 start_time = parse_time_string(shift.get('start_time', ''))
                 end_time = parse_time_string(shift.get('end_time', ''))
+                start_defaulted = start_time is None
+                end_defaulted = end_time is None
 
                 if start_time is None:
                     start_time = dt_time(9, 0)
@@ -1042,6 +1105,13 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                     if is_night:
                         logger.info(f"Auto-detected night shift: {start_time}-{end_time}")
 
+                    confidence, block_status = self._confidence_status(
+                        start_defaulted=start_defaulted,
+                        end_defaulted=end_defaulted,
+                        title_generic=not role,
+                        llm_confidence=shift.get('confidence'),
+                    )
+
                     block = RecurringBlock.objects.create(
                         user=user,
                         title=title,
@@ -1051,9 +1121,11 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                         end_time=end_time,
                         is_night_shift=is_night,
                         source_document=document,
+                        confidence=confidence,
+                        status=block_status,
                     )
                     created_blocks.append(block)
-                    logger.info(f"Created work block: {title} on day {day}")
+                    logger.info(f"Created work block: {title} (conf={confidence}, {block_status}) on day {day}")
                 except Exception as e:
                     logger.error(f"Error creating work block: {e}")
 
@@ -1073,6 +1145,8 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                 # Parse time strings to time objects
                 start_time = parse_time_string(event.get('start_time', ''))
                 end_time = parse_time_string(event.get('end_time', ''))
+                start_defaulted = start_time is None
+                end_defaulted = end_time is None
 
                 if start_time is None:
                     start_time = dt_time(9, 0)
@@ -1081,9 +1155,16 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
 
                 try:
                     # Handle None values from JSON (including string "None" from Gemini)
-                    title = event.get('title') or ''
-                    if not title or title.lower() in ('none', 'n/a', 'null', '-'):
-                        title = 'Événement'
+                    raw_title = event.get('title') or ''
+                    title_generic = not raw_title.strip() or raw_title.lower() in ('none', 'n/a', 'null', '-')
+                    title = 'Événement' if title_generic else raw_title
+
+                    confidence, block_status = self._confidence_status(
+                        start_defaulted=start_defaulted,
+                        end_defaulted=end_defaulted,
+                        title_generic=title_generic,
+                        llm_confidence=event.get('confidence'),
+                    )
 
                     block = RecurringBlock.objects.create(
                         user=user,
@@ -1093,9 +1174,11 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                         start_time=start_time,
                         end_time=end_time,
                         source_document=document,
+                        confidence=confidence,
+                        status=block_status,
                     )
                     created_blocks.append(block)
-                    logger.info(f"Created event block: {block.title} on day {day}")
+                    logger.info(f"Created event block: {block.title} (conf={confidence}, {block_status}) on day {day}")
                 except Exception as e:
                     logger.error(f"Error creating event block '{event.get('title', 'Unknown')}': {e}")
 

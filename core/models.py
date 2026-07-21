@@ -112,8 +112,30 @@ class UploadedDocument(models.Model):
         ordering = ['-uploaded_at']
 
 
+class VisibleRecurringBlockManager(models.Manager):
+    """Default manager that hides blocks awaiting confirmation.
+
+    Extraction can create low-confidence blocks with status='pending'. They must
+    NOT appear in the planning, the iCal feed, reminders, public shares, or the
+    agent context until the user confirms them. Making this the default manager
+    excludes pending blocks from every existing ``RecurringBlock.objects`` query
+    by construction, so no read site can accidentally leak them. Use
+    ``RecurringBlock.all_objects`` to reach pending blocks (confirm/reject flow).
+    """
+
+    def get_queryset(self):
+        return super().get_queryset().exclude(status=RecurringBlock.STATUS_PENDING)
+
+
 class RecurringBlock(models.Model):
     """Recurring time block (course, work, sleep, etc.)."""
+
+    STATUS_ACTIVE = 'active'
+    STATUS_PENDING = 'pending'
+    STATUS_CHOICES = [
+        (STATUS_ACTIVE, 'Actif'),
+        (STATUS_PENDING, 'À confirmer'),
+    ]
 
     BLOCK_TYPE_CHOICES = [
         ('course', 'Cours'),
@@ -152,7 +174,23 @@ class RecurringBlock(models.Model):
         related_name='recurring_blocks'
     )
     active = models.BooleanField(default=True)
+    status = models.CharField(
+        max_length=10,
+        choices=STATUS_CHOICES,
+        default=STATUS_ACTIVE,
+        db_index=True,
+        help_text="'pending' = extrait mais en attente de confirmation utilisateur.",
+    )
+    confidence = models.FloatField(
+        null=True,
+        blank=True,
+        help_text="Confiance d'extraction 0-1 (null si créé manuellement).",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
+
+    # Default manager hides pending blocks; all_objects sees everything.
+    objects = VisibleRecurringBlockManager()
+    all_objects = models.Manager()
 
     def __str__(self):
         return f"{self.title} - {self.get_day_of_week_display()} {self.start_time}"
@@ -161,6 +199,8 @@ class RecurringBlock(models.Model):
         verbose_name = "Bloc récurrent"
         verbose_name_plural = "Blocs récurrents"
         ordering = ['day_of_week', 'start_time']
+        # Cascade deletes / integrity must see pending blocks too.
+        base_manager_name = 'all_objects'
         indexes = [
             models.Index(
                 fields=['user', 'day_of_week', 'active'],
