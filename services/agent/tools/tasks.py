@@ -1,6 +1,8 @@
 """
 Task tools for the Planner AI agent.
 """
+from datetime import date, datetime
+
 from django.contrib.auth.models import User
 from django.utils import timezone
 
@@ -12,6 +14,50 @@ VALID_TASK_TYPES = {c[0] for c in Task.TASK_TYPE_CHOICES}
 TASK_TITLE_MAX_LENGTH = Task._meta.get_field("title").max_length
 
 
+def _parse_deadline(value):
+    """Parse a deadline provided by the LLM (usually 'YYYY-MM-DD') into an aware
+    datetime. Returns None if empty/unparseable.
+
+    Without this, ``Task.objects.create(deadline='2026-07-22')`` keeps the raw
+    string on the in-memory instance, so serializing it crashes with
+    "'str' object has no attribute 'isoformat'" and the tool wrongly reports a
+    failure (the model then apologizes even though the task was created). It also
+    stored a naive datetime under USE_TZ.
+    """
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, date):
+        dt = datetime(value.year, value.month, value.day)
+    elif isinstance(value, str):
+        v = value.strip()
+        dt = None
+        try:
+            dt = datetime.fromisoformat(v)
+        except ValueError:
+            for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    dt = datetime.strptime(v, fmt)
+                    break
+                except ValueError:
+                    continue
+        if dt is None:
+            return None
+    else:
+        return None
+    if timezone.is_naive(dt):
+        dt = timezone.make_aware(dt, timezone.get_current_timezone())
+    return dt
+
+
+def _deadline_iso(deadline):
+    """Serialize a deadline that may be a datetime or (defensively) a raw str."""
+    if not deadline:
+        return None
+    return deadline.isoformat() if hasattr(deadline, "isoformat") else str(deadline)
+
+
 def _task_to_dict(task: Task) -> dict:
     return {
         "id": task.id,
@@ -19,7 +65,7 @@ def _task_to_dict(task: Task) -> dict:
         "description": task.description or None,
         "task_type": task.task_type,
         "priority": task.priority,
-        "deadline": task.deadline.isoformat() if task.deadline else None,
+        "deadline": _deadline_iso(task.deadline),
         "estimated_duration_minutes": task.estimated_duration_minutes,
         "completed": task.completed,
     }
@@ -143,7 +189,7 @@ class CreateTaskTool(BaseTool):
             task_type=kwargs.get("task_type", "shallow"),
             priority=kwargs.get("priority", 5),
             description=kwargs.get("description", ""),
-            deadline=kwargs.get("deadline"),
+            deadline=_parse_deadline(kwargs.get("deadline")),
             estimated_duration_minutes=kwargs.get("estimated_duration_minutes"),
         )
         return ToolResult(
@@ -184,9 +230,11 @@ class UpdateTaskTool(BaseTool):
         if err:
             return ToolResult(success=False, data={}, message=err)
 
-        for field in ["title", "priority", "deadline", "description", "task_type"]:
+        for field in ["title", "priority", "description", "task_type"]:
             if field in kwargs and kwargs[field] is not None:
                 setattr(task, field, kwargs[field])
+        if kwargs.get("deadline") is not None:
+            task.deadline = _parse_deadline(kwargs["deadline"])
 
         task.save()
         return ToolResult(

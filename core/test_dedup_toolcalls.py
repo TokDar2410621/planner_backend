@@ -79,3 +79,24 @@ class CreateTaskIdempotencyTest(TestCase):
         Task.objects.filter(user=self.user, title="Courses").update(completed=True)
         tool.execute(self.user, title="Courses")  # a new active one is allowed
         self.assertEqual(Task.objects.filter(user=self.user, title="Courses").count(), 2)
+
+
+class CreateTaskDeadlineTest(TestCase):
+    """A string deadline ('YYYY-MM-DD') must not crash serialization: the bug
+    made create_task return an error ('str' object has no attribute 'isoformat')
+    even though the task was created, so the model apologized."""
+
+    def setUp(self):
+        self.user = User.objects.create_user('deadline_user', password='pw-dl-12345')
+
+    def test_string_deadline_succeeds_and_is_aware(self):
+        from django.utils import timezone as tz
+        from services.agent.tools.tasks import CreateTaskTool
+
+        r = CreateTaskTool().execute(self.user, title="Réviser les maths", deadline="2026-07-22")
+        self.assertTrue(r.success, msg=f"tool reported failure: {r.message}")
+        self.assertTrue(r.data["task"]["deadline"].startswith("2026-07-22"))
+
+        task = Task.objects.get(id=r.data["task"]["id"])
+        self.assertIsNotNone(task.deadline)
+        self.assertFalse(tz.is_naive(task.deadline))  # aware under USE_TZ
