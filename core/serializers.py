@@ -136,6 +136,32 @@ class RecurringBlockCompletionSerializer(serializers.ModelSerializer):
         fields = ['id', 'recurring_block', 'date', 'completed_at']
         read_only_fields = ['id', 'completed_at']
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # S7: scope the recurring_block choices to blocks owned by the
+        # requesting user so a user cannot create a completion that
+        # references another user's block (IDOR).
+        request = self.context.get('request')
+        if request is not None and 'recurring_block' in self.fields:
+            user = getattr(request, 'user', None)
+            if user is not None and user.is_authenticated:
+                self.fields['recurring_block'].queryset = (
+                    RecurringBlock.objects.filter(user=user)
+                )
+
+    def validate_recurring_block(self, value):
+        # Defense in depth: even if the field queryset was not scoped
+        # (e.g. serializer used without request context), reject blocks
+        # that belong to another user.
+        request = self.context.get('request')
+        if request is not None:
+            user = getattr(request, 'user', None)
+            if user is not None and user.is_authenticated and value.user_id != user.id:
+                raise serializers.ValidationError(
+                    "Ce bloc récurrent ne vous appartient pas."
+                )
+        return value
+
 
 class TaskSerializer(serializers.ModelSerializer):
     """Serializer for Task model."""

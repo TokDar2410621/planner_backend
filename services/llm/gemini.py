@@ -96,7 +96,11 @@ class GeminiProvider(LLMProvider):
         """
         if not self.is_available():
             logger.error("Gemini provider not available")
-            return LLMResponse(text="Service IA non disponible.")
+            return LLMResponse(
+                text="Service IA non disponible.",
+                is_error=True,
+                error="provider_unavailable",
+            )
 
         # Combine system prompt with user prompt if provided
         full_prompt = prompt
@@ -122,7 +126,11 @@ class GeminiProvider(LLMProvider):
 
         except Exception as e:
             logger.error(f"Gemini API error: {e}")
-            return LLMResponse(text="Erreur lors de la communication avec l'IA.")
+            return LLMResponse(
+                text="Erreur lors de la communication avec l'IA.",
+                is_error=True,
+                error=str(e),
+            )
 
     def _parse_response(self, response) -> LLMResponse:
         """
@@ -141,6 +149,29 @@ class GeminiProvider(LLMProvider):
             logger.warning("Gemini returned no candidates")
             return LLMResponse(text="", raw_response=response)
 
+        # D4: capture finish_reason + token usage. Gemini exposes finish_reason
+        # on the candidate (e.g. STOP, MAX_TOKENS, SAFETY) and usage on
+        # usage_metadata.
+        stop_reason = None
+        candidate = response.candidates[0]
+        fr = getattr(candidate, 'finish_reason', None)
+        if fr is not None:
+            stop_reason = getattr(fr, 'name', None) or str(fr)
+
+        usage = None
+        um = getattr(response, 'usage_metadata', None)
+        if um is not None:
+            usage = {
+                'input_tokens': getattr(um, 'prompt_token_count', None),
+                'output_tokens': getattr(um, 'candidates_token_count', None),
+            }
+
+        if stop_reason and str(stop_reason).lower() in ('max_tokens', 'length'):
+            logger.warning(
+                "Gemini response truncated (finish_reason=%s); output is incomplete.",
+                stop_reason,
+            )
+
         for part in response.parts:
             # Check for function calls
             fc = getattr(part, 'function_call', None)
@@ -158,7 +189,9 @@ class GeminiProvider(LLMProvider):
         return LLMResponse(
             text="".join(text_parts),
             function_calls=function_calls,
-            raw_response=response
+            raw_response=response,
+            stop_reason=stop_reason,
+            usage=usage,
         )
 
     def generate_with_history(
@@ -180,7 +213,11 @@ class GeminiProvider(LLMProvider):
         """
         if not self.is_available():
             logger.error("Gemini provider not available (client is None)")
-            return LLMResponse(text="Service IA non disponible.")
+            return LLMResponse(
+                text="Service IA non disponible.",
+                is_error=True,
+                error="provider_unavailable",
+            )
 
         try:
             # Build conversation content
@@ -196,11 +233,7 @@ class GeminiProvider(LLMProvider):
                 ))
 
             for msg in messages:
-                role = "user" if msg["role"] == "user" else "model"
-                contents.append(types.Content(
-                    role=role,
-                    parts=[types.Part(text=msg["content"])]
-                ))
+                contents.append(self._message_to_content(msg))
 
             logger.debug(f"Gemini request: {len(contents)} content parts, tools={'yes' if tools else 'no'}")
 
@@ -222,4 +255,100 @@ class GeminiProvider(LLMProvider):
 
         except Exception as e:
             logger.error(f"Gemini API error with history: {e}", exc_info=True)
-            return LLMResponse(text="Erreur lors de la communication avec l'IA.")
+            return LLMResponse(
+                text="Erreur lors de la communication avec l'IA.",
+                is_error=True,
+                error=str(e),
+            )
+
+    # ------------------------------------------------------------------
+    # Multi-turn / tool round-trip helpers (B19)
+    # ------------------------------------------------------------------
+    def _message_to_content(self, msg: dict) -> "types.Content":
+        """
+        Convert one history message into a Gemini ``Content``.
+
+        Handles plain text as well as tool round-trip blocks so that
+        function-call (assistant) and function-response (tool-result) turns
+        survive a full request cycle instead of being flattened to text.
+
+        Accepted ``content`` shapes:
+          - ``str`` -> a single text part
+          - ``list`` -> a list of blocks, each of which may be a genai
+            ``Part``, a ``FunctionCall`` dataclass, or a dict describing a
+            text / function_call / function_response / Claude-style tool block.
+        """
+        role = "model" if msg.get("role") in ("assistant", "model") else "user"
+        content = msg.get("content", "")
+
+        if isinstance(content, str):
+            return types.Content(role=role, parts=[types.Part(text=content)])
+
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                part = self._block_to_part(block)
+                if part is not None:
+                    parts.append(part)
+            if not parts:
+                parts = [types.Part(text="")]
+            return types.Content(role=role, parts=parts)
+
+        # Unknown shape: stringify defensively.
+        return types.Content(role=role, parts=[types.Part(text=str(content))])
+
+    def _block_to_part(self, block) -> Optional["types.Part"]:
+        """Convert a single content block into a Gemini ``Part`` (or None)."""
+        # Already a genai Part.
+        if types is not None and isinstance(block, types.Part):
+            return block
+
+        # FunctionCall dataclass from base.py.
+        if isinstance(block, FunctionCall):
+            return types.Part.from_function_call(name=block.name, args=block.args or {})
+
+        if isinstance(block, str):
+            return types.Part(text=block)
+
+        if isinstance(block, dict):
+            # Explicit function_call block.
+            fc = block.get("function_call")
+            if fc:
+                return types.Part.from_function_call(
+                    name=fc.get("name", ""),
+                    args=fc.get("args") or fc.get("arguments") or {},
+                )
+
+            # Explicit function_response block.
+            fr = block.get("function_response")
+            if fr:
+                resp = fr.get("response")
+                if not isinstance(resp, dict):
+                    resp = {"result": resp}
+                return types.Part.from_function_response(
+                    name=fr.get("name", ""),
+                    response=resp,
+                )
+
+            # Claude-style blocks (raw_content round-trip).
+            btype = block.get("type")
+            if btype == "tool_use":
+                return types.Part.from_function_call(
+                    name=block.get("name", ""),
+                    args=block.get("input") or {},
+                )
+            if btype == "tool_result":
+                raw = block.get("content")
+                if isinstance(raw, dict):
+                    resp = raw
+                else:
+                    resp = {"result": raw}
+                return types.Part.from_function_response(
+                    name=block.get("name") or block.get("tool_use_id", ""),
+                    response=resp,
+                )
+            if btype == "text" or "text" in block:
+                return types.Part(text=block.get("text", ""))
+
+        # Fallback: stringify.
+        return types.Part(text=str(block))

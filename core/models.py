@@ -41,6 +41,10 @@ class UserProfile(models.Model):
     transport_time_minutes = models.PositiveIntegerField(default=0)
     onboarding_completed = models.BooleanField(default=False)
     onboarding_step = models.PositiveIntegerField(default=0)
+    public_planning_enabled = models.BooleanField(
+        default=False,
+        help_text="Autorise le partage public du planning via /planning/<username>/"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -321,6 +325,14 @@ class Goal(models.Model):
 
     def __str__(self):
         return f"{self.title} ({self.get_status_display()})"
+
+    def save(self, *args, **kwargs):
+        # Clamp progress between 0 and 100
+        if self.progress is None or self.progress < 0:
+            self.progress = 0
+        elif self.progress > 100:
+            self.progress = 100
+        super().save(*args, **kwargs)
 
     class Meta:
         verbose_name = "Objectif"

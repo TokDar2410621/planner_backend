@@ -71,7 +71,6 @@ class TenantIsolationTest(APITestCase):
         )
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
-    @unittest.expectedFailure
     def test_user_cannot_complete_others_recurring_block(self):
         """REPRODUCES BUG: recurring-completions IDOR (views.py:456-477).
 
@@ -104,7 +103,6 @@ class PublicEndpointTest(APITestCase):
             location="Building B, Room 205",
         )
 
-    @unittest.expectedFailure
     def test_planning_by_username_is_not_public_without_optin(self):
         """REPRODUCES BUG: PublicPlanningByUsernameView PII leak (views.py:1011).
 
@@ -159,7 +157,6 @@ class ChatEndpointTest(APITestCase):
 # ---------------------------------------------------------------------------
 class LLMProviderConfigTest(SimpleTestCase):
 
-    @unittest.expectedFailure
     def test_claude_default_model_is_not_retired(self):
         """REPRODUCES BUG: claude.py:29 pins a retired model id.
 
@@ -173,7 +170,6 @@ class LLMProviderConfigTest(SimpleTestCase):
 
 class AgentProviderSelectionTest(TestCase):
 
-    @unittest.expectedFailure
     def test_agent_respects_configured_provider(self):
         """REPRODUCES BUG: agent.py:38 hardcodes ClaudeProvider().
 
@@ -243,7 +239,6 @@ class ScheduleGenerationCorrectnessTest(APITestCase):
 # ---------------------------------------------------------------------------
 class DeploymentConfigTest(SimpleTestCase):
 
-    @unittest.expectedFailure
     def test_token_blacklist_app_installed(self):
         """REPRODUCES BUG: settings enable BLACKLIST_AFTER_ROTATION but the
         token_blacklist app is not installed (settings.py:124), so rotated

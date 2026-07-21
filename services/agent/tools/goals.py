@@ -4,7 +4,12 @@ Goal tools for the Planner AI agent.
 from django.contrib.auth.models import User
 
 from core.models import Goal
-from .base import BaseTool, ToolResult
+from .base import BaseTool, ToolResult, validate_choice, validate_max_length
+
+# Enforced at the tool layer (not just in the JSON schema) before any write.
+VALID_GOAL_TYPES = {c[0] for c in Goal.GOAL_TYPE_CHOICES}
+VALID_GOAL_STATUSES = {c[0] for c in Goal.STATUS_CHOICES}
+GOAL_TITLE_MAX_LENGTH = Goal._meta.get_field("title").max_length
 
 
 def _goal_to_dict(goal: Goal) -> dict:
@@ -79,6 +84,14 @@ class CreateGoalTool(BaseTool):
     }
 
     def execute(self, user: User, **kwargs) -> ToolResult:
+        # Validation choices/max_length AVANT create().
+        err = (
+            validate_choice(kwargs.get("goal_type"), VALID_GOAL_TYPES, "goal_type")
+            or validate_max_length(kwargs.get("title"), GOAL_TITLE_MAX_LENGTH, "title")
+        )
+        if err:
+            return ToolResult(success=False, data={}, message=err)
+
         goal = Goal.objects.create(
             user=user,
             title=kwargs["title"],
@@ -127,6 +140,14 @@ class UpdateGoalTool(BaseTool):
             goal = Goal.objects.get(id=goal_id, user=user)
         except Goal.DoesNotExist:
             return ToolResult(success=False, data={}, message=f"Objectif #{goal_id} introuvable.")
+
+        # Validation choices/max_length AVANT save().
+        err = (
+            validate_choice(kwargs.get("status"), VALID_GOAL_STATUSES, "status")
+            or validate_max_length(kwargs.get("title"), GOAL_TITLE_MAX_LENGTH, "title")
+        )
+        if err:
+            return ToolResult(success=False, data={}, message=err)
 
         for field in ["title", "description", "progress", "status", "deadline"]:
             if field in kwargs and kwargs[field] is not None:

@@ -23,10 +23,26 @@ class LLMResponse:
     function_calls: list[FunctionCall] = field(default_factory=list)
     raw_response: Any = None
     raw_content: list = field(default_factory=list)  # Raw content blocks for multi-turn
+    # Error signalling (B3): an LLM failure must NOT be indistinguishable from a
+    # normal assistant reply. `text` still carries a human-readable string, but
+    # callers MUST check `is_error` before persisting/using the reply.
+    is_error: bool = False
+    error: Optional[str] = None  # machine-readable error detail (exception str / code)
+    # Completion metadata (D4): expose why generation stopped and token usage so
+    # callers can detect truncation instead of treating it as a complete answer.
+    stop_reason: Optional[str] = None  # e.g. 'end_turn', 'tool_use', 'max_tokens', 'STOP', 'MAX_TOKENS'
+    usage: Optional[dict] = None  # {'input_tokens': int, 'output_tokens': int}
 
     @property
     def has_function_calls(self) -> bool:
         return len(self.function_calls) > 0
+
+    @property
+    def is_truncated(self) -> bool:
+        """True when the model hit the output cap and the reply is incomplete."""
+        if not self.stop_reason:
+            return False
+        return str(self.stop_reason).lower() in ('max_tokens', 'length')
 
 
 class LLMProvider(ABC):

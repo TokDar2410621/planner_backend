@@ -115,7 +115,13 @@ class AIScheduler:
             list: List of ScheduledBlock instances created
         """
         if start_date is None:
-            start_date = timezone.now().date()
+            # Use local date (Europe/Paris) so the schedule starts on the
+            # user's "today", not the UTC day which rolls over at 01:00/02:00.
+            start_date = timezone.localdate()
+
+        # Reference date pinned once per run so every scoring/placement
+        # decision within this call uses the same "today".
+        reference_date = start_date
 
         if tasks is None:
             tasks = list(Task.objects.filter(
@@ -139,18 +145,37 @@ class AIScheduler:
 
         # Score and sort tasks
         scored_tasks = [
-            (task, self._calculate_task_priority(task, start_date))
+            (task, self._calculate_task_priority(task, reference_date))
             for task in tasks
         ]
         scored_tasks.sort(key=lambda x: x[1], reverse=True)
 
+        # Deep-work minutes already placed per date, so we never exceed the
+        # user's max_deep_work_hours_per_day in the deterministic placement.
+        deep_minutes_by_date: dict = {}
+        max_deep_minutes = (user.profile.max_deep_work_hours_per_day or 0) * 60
+
         # Schedule tasks
         created_blocks = []
         for task, score in scored_tasks:
-            block = self._match_task_to_slot(task, available_slots, user.profile)
+            block = self._match_task_to_slot(
+                task,
+                available_slots,
+                user.profile,
+                reference_date,
+                deep_minutes_by_date,
+                max_deep_minutes,
+            )
             if block:
                 block.save()
                 created_blocks.append(block)
+
+                # Track deep-work load for the day the block landed on.
+                if task.task_type == 'deep_work':
+                    placed = self._time_diff_minutes(block.start_time, block.end_time)
+                    deep_minutes_by_date[block.date] = (
+                        deep_minutes_by_date.get(block.date, 0) + placed
+                    )
 
                 # Remove used slot time
                 self._update_available_slots(available_slots, block)
@@ -394,7 +419,10 @@ class AIScheduler:
 
         # Deadline urgency
         if task.deadline:
-            days_until = (task.deadline.date() - reference_date).days
+            # Compare in local time so the deadline bucket matches the user's
+            # calendar day, not the UTC date.
+            deadline_local_date = timezone.localtime(task.deadline).date()
+            days_until = (deadline_local_date - reference_date).days
             if days_until <= 0:
                 score += 100  # Overdue
             elif days_until <= 1:
@@ -414,7 +442,10 @@ class AIScheduler:
         self,
         task: Task,
         slots: list,
-        profile: UserProfile
+        profile: UserProfile,
+        reference_date: Optional[date] = None,
+        deep_minutes_by_date: Optional[dict] = None,
+        max_deep_minutes: int = 0,
     ) -> Optional[ScheduledBlock]:
         """
         Find the best slot for a task and create a ScheduledBlock.
@@ -423,12 +454,20 @@ class AIScheduler:
             task: Task to schedule
             slots: Available time slots
             profile: User profile
+            reference_date: The run's pinned "today" (local date)
+            deep_minutes_by_date: Deep-work minutes already placed per date
+            max_deep_minutes: Cap of deep-work minutes allowed per day (0 = off)
 
         Returns:
             ScheduledBlock or None if no suitable slot found
         """
         if not slots:
             return None
+
+        if reference_date is None:
+            reference_date = timezone.localdate()
+        if deep_minutes_by_date is None:
+            deep_minutes_by_date = {}
 
         duration = task.estimated_duration_minutes or 60  # Default 1 hour
 
@@ -441,12 +480,44 @@ class AIScheduler:
                 return None
             duration = min(duration, max(s.duration_minutes for s in fitting_slots))
 
+        is_deep_work = task.task_type == 'deep_work'
+
+        # B12: enforce the daily deep-work cap in the deterministic placement.
+        # Drop slots whose date has no remaining deep-work budget for this task.
+        if is_deep_work and max_deep_minutes > 0:
+            capped = [
+                s for s in fitting_slots
+                if deep_minutes_by_date.get(s.date, 0) + duration <= max_deep_minutes
+            ]
+            if not capped:
+                # No day can host this deep-work task without exceeding the cap.
+                return None
+            fitting_slots = capped
+
+        # B11: honor the deadline TIME-of-day, not only the date. A slot that
+        # starts after the deadline instant places the task late; prefer slots
+        # that start before the deadline whenever any exist.
+        deadline_local = None
+        if task.deadline:
+            deadline_local = timezone.localtime(task.deadline)
+
+        def slot_start_dt(slot: TimeSlot) -> datetime:
+            # Slot start as an aware datetime in the same tz as the deadline,
+            # so the comparison respects the deadline's time-of-day.
+            naive = datetime.combine(slot.date, slot.start_time)
+            return timezone.make_aware(naive, deadline_local.tzinfo)
+
+        if deadline_local is not None:
+            on_time = [s for s in fitting_slots if slot_start_dt(s) < deadline_local]
+            if on_time:
+                fitting_slots = on_time
+
         # Score slots
         def slot_score(slot: TimeSlot) -> float:
             score = 0
 
             # Match task type with energy level
-            if task.task_type == 'deep_work':
+            if is_deep_work:
                 if slot.energy_level == 'high':
                     score += 50
                 elif slot.energy_level == 'medium':
@@ -457,13 +528,16 @@ class AIScheduler:
                 elif slot.energy_level == 'medium':
                     score += 20
 
-            # Prefer earlier dates
-            days_from_start = (slot.date - timezone.now().date()).days
+            # Prefer earlier dates (relative to the run's pinned reference date)
+            days_from_start = (slot.date - reference_date).days
             score -= days_from_start * 5
 
-            # If task has deadline, prefer slots closer to but before deadline
-            if task.deadline:
-                days_to_deadline = (task.deadline.date() - slot.date).days
+            # If task has deadline, prefer slots closer to but before deadline.
+            # A slot that starts after the deadline instant is penalized hard.
+            if deadline_local is not None:
+                if slot_start_dt(slot) >= deadline_local:
+                    score -= 1000  # Late placement: last resort only
+                days_to_deadline = (deadline_local.date() - slot.date).days
                 if days_to_deadline < 0:
                     score -= 100  # After deadline is bad
                 elif days_to_deadline <= 1:

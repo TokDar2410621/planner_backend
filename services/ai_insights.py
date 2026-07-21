@@ -75,6 +75,10 @@ class AIInsightsService:
     AI-powered insights and suggestions for scheduling.
     """
 
+    # Upper bound for conflict-detection horizon to avoid unbounded N+1 query
+    # storms from an attacker-controlled days_ahead (B16).
+    MAX_CONFLICT_DAYS_AHEAD = 90
+
     # Energy levels by time of day
     ENERGY_LEVELS = {
         'morning': {
@@ -338,7 +342,11 @@ class AIInsightsService:
         by_hour = defaultdict(list)
         for h in type_history:
             hour = h.scheduled_start_time.hour
-            efficiency = h.estimated_duration_minutes / h.actual_duration_minutes if h.estimated_duration_minutes else 1
+            # Guard against ZeroDivision when actual_duration_minutes is 0 (B15)
+            if h.estimated_duration_minutes and h.actual_duration_minutes:
+                efficiency = h.estimated_duration_minutes / h.actual_duration_minutes
+            else:
+                efficiency = 1
             by_hour[hour].append(efficiency)
 
         # Find hour with best efficiency
@@ -466,8 +474,15 @@ class AIInsightsService:
         """
         history = TaskHistory.objects.filter(user=user)
 
-        # 1. Look for similar task titles
-        similar_tasks = history.filter(task_title__icontains=task_title.split()[0] if task_title else '')
+        # 1. Look for similar task titles.
+        # Guard against a whitespace-only title: "   " is truthy but "   ".split()
+        # returns [] so [0] would raise IndexError (B15).
+        title_keyword = ''
+        if task_title:
+            title_parts = task_title.split()
+            if title_parts:
+                title_keyword = title_parts[0]
+        similar_tasks = history.filter(task_title__icontains=title_keyword)
 
         if similar_tasks.count() >= 3:
             avg_duration = similar_tasks.aggregate(avg=Avg('actual_duration_minutes'))['avg']
@@ -535,6 +550,13 @@ class AIInsightsService:
         if target_date is None:
             target_date = timezone.now().date()
 
+        # Clamp days_ahead to a sane range to avoid unbounded N+1 queries (B16)
+        try:
+            days_ahead = int(days_ahead)
+        except (TypeError, ValueError):
+            days_ahead = 7
+        days_ahead = max(1, min(days_ahead, self.MAX_CONFLICT_DAYS_AHEAD))
+
         conflicts = []
         profile = user.profile
         transport_minutes = profile.transport_time_minutes or 0
@@ -550,7 +572,7 @@ class AIInsightsService:
             ))
             scheduled = list(ScheduledBlock.objects.filter(
                 user=user, date=current_date
-            ))
+            ).select_related('task'))
 
             # Also get night shift blocks from previous day (they end today)
             previous_night_blocks = list(RecurringBlock.objects.filter(
@@ -734,25 +756,54 @@ class AIInsightsService:
         current_shift = timedelta(minutes=overflow_minutes)
 
         for block in affected_blocks:
-            new_start = (datetime.combine(date.today(), block.start_time) + current_shift).time()
-            new_end = (datetime.combine(date.today(), block.end_time) + current_shift).time()
+            base_date = block.date
+            # Compute the shifted placement as full datetimes so a rollover past
+            # midnight is preserved instead of being silently truncated by .time().
+            start_dt = datetime.combine(base_date, block.start_time) + current_shift
+            end_dt = datetime.combine(base_date, block.end_time) + current_shift
 
-            # Check if new end exceeds end of day
-            if new_end > time(23, 0):
-                # Need to move to next day
-                next_day = overflowed.date + timedelta(days=1)
+            end_of_day_cutoff = datetime.combine(base_date, time(23, 0))
+            crosses_midnight = start_dt.date() > base_date or end_dt.date() > base_date
+            exceeds_cutoff = end_dt > end_of_day_cutoff
+
+            if crosses_midnight or exceeds_cutoff:
+                # Overflow past the end of the day: move the whole block to the next
+                # day, preserving its duration, and PERSIST the change (B13).
+                next_day = base_date + timedelta(days=1)
+                duration = timedelta(
+                    minutes=self._time_diff_minutes(
+                        block.start_time, block.end_time, allow_overnight=True
+                    )
+                )
+                new_start_dt = datetime.combine(next_day, block.start_time)
+                new_end_dt = new_start_dt + duration
+
+                old_date = block.date
+                block.date = next_day
+                block.start_time = new_start_dt.time()
+                # Guard: never persist a block whose end_time < start_time. If the
+                # duration would roll past midnight again, clamp to end of day (B14).
+                if new_end_dt.date() > new_start_dt.date():
+                    block.end_time = time(23, 59)
+                else:
+                    block.end_time = new_end_dt.time()
+                block.save()
+
                 rescheduled.append({
                     'block_id': block.id,
                     'task_title': block.task.title,
                     'action': 'move_to_next_day',
+                    'old_date': old_date.isoformat(),
                     'new_date': next_day.isoformat(),
+                    'new_start': block.start_time.isoformat(),
+                    'new_end': block.end_time.isoformat(),
                     'message': f"'{block.task.title}' deplace au {next_day.strftime('%d/%m')}"
                 })
             else:
                 # Just shift within the day
                 old_start = block.start_time
-                block.start_time = new_start
-                block.end_time = new_end
+                block.start_time = start_dt.time()
+                block.end_time = end_dt.time()
                 block.save()
 
                 rescheduled.append({
@@ -760,7 +811,7 @@ class AIInsightsService:
                     'task_title': block.task.title,
                     'action': 'shifted',
                     'old_start': old_start.isoformat(),
-                    'new_start': new_start.isoformat(),
+                    'new_start': block.start_time.isoformat(),
                     'shift_minutes': overflow_minutes,
                     'message': f"'{block.task.title}' decale de {overflow_minutes}min"
                 })

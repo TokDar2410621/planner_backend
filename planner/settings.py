@@ -12,9 +12,19 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-change-me-in-production')
-
 DEBUG = os.getenv('DEBUG', 'False').lower() in ('true', '1', 'yes')
+
+# SECRET_KEY (S1): never ship a hardcoded fallback in production.
+# Fail fast at boot when SECRET_KEY is missing and DEBUG is off; keep an
+# insecure default ONLY for local development (DEBUG=True).
+SECRET_KEY = os.getenv('SECRET_KEY')
+if not SECRET_KEY:
+    if DEBUG:
+        SECRET_KEY = 'django-insecure-dev-only-not-for-production'
+    else:
+        raise RuntimeError(
+            'SECRET_KEY environment variable is required when DEBUG is False.'
+        )
 
 ALLOWED_HOSTS = [h.strip() for h in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')]
 
@@ -28,6 +38,7 @@ INSTALLED_APPS = [
     # Third party
     'rest_framework',
     'rest_framework_simplejwt',
+    'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
     'cloudinary_storage',
     'cloudinary',
@@ -38,6 +49,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -114,6 +126,19 @@ REST_FRAMEWORK = {
     ),
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
+    # Throttling (S3): default per-user and per-anon limits + tight scopes on
+    # the expensive AI endpoints (chat / upload) to prevent cost abuse / DoS.
+    'DEFAULT_THROTTLE_CLASSES': (
+        'rest_framework.throttling.UserRateThrottle',
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.ScopedRateThrottle',
+    ),
+    'DEFAULT_THROTTLE_RATES': {
+        'user': os.getenv('THROTTLE_RATE_USER', '1000/day'),
+        'anon': os.getenv('THROTTLE_RATE_ANON', '50/day'),
+        'chat': os.getenv('THROTTLE_RATE_CHAT', '30/min'),
+        'upload': os.getenv('THROTTLE_RATE_UPLOAD', '20/min'),
+    },
 }
 
 # JWT Settings
@@ -131,6 +156,29 @@ CORS_ALLOWED_ORIGINS = [
     for origin in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:5173,http://localhost:8081,https://day-wise-bot.vercel.app').split(',')
 ]
 CORS_ALLOW_CREDENTIALS = True
+
+# ============== Security hardening (S5) ==============
+# Trust the X-Forwarded-Proto header from the Railway proxy so Django knows
+# requests are HTTPS. Everything below only hardens when DEBUG=False so local
+# HTTP development is unaffected.
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        'CSRF_TRUSTED_ORIGINS',
+        'https://day-wise-bot.vercel.app',
+    ).split(',')
+    if origin.strip()
+]
+
+if not DEBUG:
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    SECURE_SSL_REDIRECT = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = 31536000  # 1 year
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
 
 # Google OAuth
 GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID', '')
@@ -166,19 +214,36 @@ if CLOUDINARY_URL and not (CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY):
         CLOUDINARY_API_SECRET = match.group(2)
         CLOUDINARY_CLOUD_NAME = match.group(3)
 
+# STORAGES (B5): Django 5.1+ removed DEFAULT_FILE_STORAGE / STATICFILES_STORAGE
+# in favor of the STORAGES dict. Default to local media + WhiteNoise static;
+# switch the "default" backend to Cloudinary when its credentials are present.
+STORAGES = {
+    'default': {
+        'BACKEND': 'django.core.files.storage.FileSystemStorage',
+    },
+    'staticfiles': {
+        'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
+    },
+}
+
 if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
     CLOUDINARY_STORAGE = {
         'CLOUD_NAME': CLOUDINARY_CLOUD_NAME,
         'API_KEY': CLOUDINARY_API_KEY,
         'API_SECRET': CLOUDINARY_API_SECRET,
     }
-    DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
+    STORAGES['default'] = {
+        'BACKEND': 'cloudinary_storage.storage.MediaCloudinaryStorage',
+    }
 
 # File Upload Settings
 FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10 MB
 DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10 MB
 
 # Logging
+# D6: never force services/core loggers to DEBUG in production (can leak
+# sensitive payloads). Gate the verbose level on DEBUG.
+APP_LOG_LEVEL = 'DEBUG' if DEBUG else 'INFO'
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
@@ -206,12 +271,12 @@ LOGGING = {
         },
         'services': {
             'handlers': ['console'],
-            'level': 'DEBUG',
+            'level': APP_LOG_LEVEL,
             'propagate': False,
         },
         'core': {
             'handlers': ['console'],
-            'level': 'DEBUG',
+            'level': APP_LOG_LEVEL,
             'propagate': False,
         },
     },
