@@ -172,24 +172,32 @@ class GeminiProvider(LLMProvider):
                 stop_reason,
             )
 
+        # raw_content lets the assistant's function-call turn round-trip back to
+        # Gemini on the next request (B19). Without it, Gemini never sees that it
+        # already called the tool and re-calls it (the duplicate-write bug).
+        raw_content = []
         for part in response.parts:
             # Check for function calls
             fc = getattr(part, 'function_call', None)
             if fc:
-                function_calls.append(FunctionCall(
-                    name=fc.name,
-                    args=dict(fc.args) if fc.args else {}
-                ))
-                logger.info(f"Function call detected: {fc.name} with args: {dict(fc.args) if fc.args else {}}")
+                args = dict(fc.args) if fc.args else {}
+                # call_id = the function name: Gemini correlates a function
+                # response to its call by NAME (there is no separate call id),
+                # so the matching tool_result must carry that same name.
+                function_calls.append(FunctionCall(name=fc.name, args=args, call_id=fc.name))
+                raw_content.append({"type": "tool_use", "name": fc.name, "input": args})
+                logger.info(f"Function call detected: {fc.name} with args: {args}")
 
             # Check for text
             if hasattr(part, 'text') and part.text:
                 text_parts.append(part.text)
+                raw_content.append({"type": "text", "text": part.text})
 
         parsed = LLMResponse(
             text="".join(text_parts),
             function_calls=function_calls,
             raw_response=response,
+            raw_content=raw_content,
             stop_reason=stop_reason,
             usage=usage,
         )

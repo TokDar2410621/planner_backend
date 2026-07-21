@@ -123,6 +123,20 @@ class CreateTaskTool(BaseTool):
         if err:
             return ToolResult(success=False, data={}, message=err)
 
+        # Idempotency: guard against the model re-creating a task it already
+        # mentioned earlier in the conversation. If an ACTIVE (non-completed)
+        # task with the same title already exists, return it instead of
+        # duplicating.
+        existing = Task.objects.filter(
+            user=user, completed=False, title__iexact=title.strip()
+        ).first()
+        if existing is not None:
+            return ToolResult(
+                success=True,
+                data={"task": _task_to_dict(existing)},
+                message=f"Tâche '{existing.title}' déjà présente (non dupliquée).",
+            )
+
         task = Task.objects.create(
             user=user,
             title=kwargs["title"],
