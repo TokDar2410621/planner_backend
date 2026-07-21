@@ -10,6 +10,7 @@ from .views import (
     LoginView,
     CheckEmailView,
     MeView,
+    McpTokenView,
     GoogleAuthView,
     # Profile
     ProfileView,
@@ -54,6 +55,7 @@ urlpatterns = [
     path('auth/check-email/', CheckEmailView.as_view(), name='check-email'),
     path('auth/google/', GoogleAuthView.as_view(), name='google-auth'),
     path('auth/me/', MeView.as_view(), name='me'),
+    path('auth/mcp-token/', McpTokenView.as_view(), name='mcp-token'),
 
     # Profile endpoints
     path('profile/', ProfileView.as_view(), name='profile'),

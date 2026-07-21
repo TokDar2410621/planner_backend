@@ -15,6 +15,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
+from rest_framework.authtoken.models import Token
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import (
@@ -195,6 +196,24 @@ class MeView(APIView):
     def get(self, request):
         """Return current user data."""
         return Response(UserSerializer(request.user).data)
+
+
+class McpTokenView(APIView):
+    """Long-lived per-user API token for the MCP server.
+
+    Authenticated via the normal session (JWT). GET returns the caller's token
+    (creating it on first use); POST rotates it. The MCP server then calls the
+    Planner API on the user's behalf with 'Authorization: Token <key>'.
+    """
+
+    def get(self, request):
+        token, _ = Token.objects.get_or_create(user=request.user)
+        return Response({"token": token.key, "username": request.user.username})
+
+    def post(self, request):
+        Token.objects.filter(user=request.user).delete()
+        token = Token.objects.create(user=request.user)
+        return Response({"token": token.key, "username": request.user.username})
 
 
 class GoogleAuthView(APIView):
