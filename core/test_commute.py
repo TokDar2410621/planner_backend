@@ -142,6 +142,22 @@ class UnplacedReportTest(TestCase):
         self.assertEqual(entry['needed_minutes'], 120)
         self.assertIn('reason', entry)
 
+    def test_deep_work_cap_gets_accurate_reason(self):
+        """Découvert en prod: une tâche deep-work refusée par le PLAFOND
+        quotidien doit dire 'plafond', pas 'créneau trop petit' (spec §10)."""
+        user = User.objects.create_user('capreason', password='pw-capr-12345')
+        # max_deep_work_hours_per_day = 4 (défaut) -> 240 min/jour.
+        task = Task.objects.create(
+            user=user, title='Marathon 10h', task_type='deep_work',
+            estimated_duration_minutes=600, priority=9,
+        )
+        scheduler = AIScheduler()
+        created = scheduler.generate_schedule(user, tasks=[task])
+        self.assertEqual(created, [])
+        entry = scheduler.last_unplaced[0]
+        self.assertIn('plafond', entry['reason'])
+        self.assertIn('240', entry['reason'])
+
 
 class PlacesAPITest(APITestCase):
     def setUp(self):
