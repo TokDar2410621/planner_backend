@@ -275,17 +275,22 @@ class GoogleAuthView(APIView):
                 )
 
             # S6: look the user up explicitly instead of get_or_create so a
-            # non-unique email (multiple accounts) is handled gracefully
+            # non-unique email (legacy duplicate accounts) is handled gracefully
             # instead of raising MultipleObjectsReturned (500).
-            matching_users = User.objects.filter(email=email)
-            if matching_users.count() > 1:
-                return Response(
-                    {'error': 'Plusieurs comptes partagent cet email. '
-                              'Connectez-vous avec votre mot de passe.'},
-                    status=status.HTTP_409_CONFLICT
-                )
+            #
+            # A Google-verified email has a single real owner, so several local
+            # accounts on that email are the SAME person's duplicates. Rather
+            # than hard-blocking (409, which left users stuck), sign them into
+            # the account that actually holds their data (most recurring blocks,
+            # then most recent). New duplicates are prevented at registration.
+            from django.db.models import Count
 
-            user = matching_users.first()
+            matching_users = list(
+                User.objects.filter(email__iexact=email)
+                .annotate(_nblocks=Count('recurring_blocks'))
+                .order_by('-_nblocks', '-last_login', '-date_joined')
+            )
+            user = matching_users[0] if matching_users else None
             created = user is None
             if created:
                 # Build a unique username for the new account.
