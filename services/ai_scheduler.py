@@ -185,7 +185,7 @@ class AIScheduler:
                 ):
                     reason = (
                         f'dépasse le plafond quotidien de travail intense '
-                        f'({max_deep_minutes} min/jour) — fractionner la tâche '
+                        f'({max_deep_minutes} min/jour) : fractionner la tâche '
                         f'ou augmenter le plafond'
                     )
                 elif biggest < 30:
