@@ -101,7 +101,8 @@ class AIScheduler:
         tasks: Optional[list] = None,
         start_date: Optional[date] = None,
         num_days: int = 7,
-        force: bool = False
+        force: bool = False,
+        earliest_start: Optional[dict] = None,
     ) -> list:
         """
         Generate an optimal schedule for the user's tasks.
@@ -142,8 +143,11 @@ class AIScheduler:
                 date__lt=start_date + timedelta(days=num_days)
             ).delete()
 
-        # Get available time slots
-        available_slots = self._get_available_slots(user, start_date, num_days)
+        # Get available time slots (earliest_start floors out already-elapsed
+        # or in-progress time on a partial replan: "rien avant la reprise").
+        available_slots = self._get_available_slots(
+            user, start_date, num_days, earliest_start=earliest_start
+        )
 
         # Score and sort tasks
         scored_tasks = [
@@ -219,7 +223,8 @@ class AIScheduler:
         self,
         user: User,
         start_date: date,
-        num_days: int
+        num_days: int,
+        earliest_start: Optional[dict] = None,
     ) -> list:
         """
         Get all available time slots for the user.
@@ -274,6 +279,14 @@ class AIScheduler:
                     wake_time
                 ))
                 logger.info(f"Blocked recovery time after night shift until {wake_time}")
+
+            # Partial-replan floor: block everything before the resume time on
+            # this date so no flexible activity is placed in already-elapsed or
+            # in-progress time. earliest_start maps date -> time.
+            if earliest_start:
+                floor = earliest_start.get(current_date)
+                if floor and floor > time(0, 0):
+                    blocked_times.append((time(0, 0), floor))
 
             # Generate available slots
             day_slots = self._find_free_slots(

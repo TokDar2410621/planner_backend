@@ -1,9 +1,14 @@
 """
-Send Web Push reminders for recurring blocks starting soon.
+Send Web Push reminders + departure alerts for recurring blocks.
 
 Run on a Railway cron at the same cadence as --lead (e.g. every 15 min with
---lead 15) so each block is reminded once. Degrades silently if push is not
-configured. This is the proactive "effector" of the life-assistant layer.
+--lead 15). Two passes:
+  1. "Bientôt : <bloc>" when a block starts within --lead minutes.
+  2. Departure alerts for blocks tied to a place (spec §9): "commence à te
+     préparer" at début_indisponibilité, "pars maintenant" at l'heure limite de
+     départ, computed from the commute engine (trajet + marge + préparation).
+
+Degrades silently if push is not configured.
 """
 from datetime import timedelta
 
@@ -11,11 +16,18 @@ from django.core.management.base import BaseCommand
 from django.utils import timezone
 
 from core.models import PushSubscription, RecurringBlock
+from services.commute import commute_window
 from services.push import push_configured, send_to_user
 
 
+def _fmt(minutes: int) -> str:
+    """Minutes-since-midnight -> 'HH:MM' (clamped to the day)."""
+    minutes = max(0, min(minutes, 23 * 60 + 59))
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
 class Command(BaseCommand):
-    help = "Send push reminders for recurring blocks starting within --lead minutes."
+    help = "Push reminders + departure alerts for blocks within --lead minutes."
 
     def add_arguments(self, parser):
         parser.add_argument("--lead", type=int, default=15, help="Minutes ahead to remind.")
@@ -27,23 +39,29 @@ class Command(BaseCommand):
 
         lead = opts["lead"]
         now = timezone.localtime()
-        start = now.time()
-        end = (now + timedelta(minutes=lead)).time()
-        if start > end:
+        now_min = now.hour * 60 + now.minute
+        end_min = now_min + lead
+        if end_min >= 24 * 60:
             # Window crosses midnight; skip this edge for the simple v1 cron.
             self.stdout.write("Reminder window crosses midnight; skipped.")
             return
 
-        user_ids = PushSubscription.objects.values_list("user_id", flat=True).distinct()
+        from services.webhooks import dispatch
+
+        user_ids = list(
+            PushSubscription.objects.values_list("user_id", flat=True).distinct()
+        )
+        start = now.time()
+        end = (now + timedelta(minutes=lead)).time()
+
+        # --- Pass 1: "Bientôt" reminders (block starting within the window) ----
         blocks = RecurringBlock.objects.filter(
-            user_id__in=list(user_ids),
+            user_id__in=user_ids,
             active=True,
-            day_of_week=now.weekday(),  # 0 = Monday
+            day_of_week=now.weekday(),
             start_time__gte=start,
             start_time__lte=end,
         ).select_related("user")
-
-        from services.webhooks import dispatch
 
         sent = 0
         for block in blocks:
@@ -51,7 +69,6 @@ class Command(BaseCommand):
             if block.location:
                 body += f" ({block.location})"
             sent += send_to_user(block.user, f"Bientôt : {block.title}", body, url="/schedule")
-            # Let automations react to the reminder too (n8n, etc.).
             dispatch(block.user, "reminder.sent", {
                 "block": {
                     "id": block.id,
@@ -61,4 +78,49 @@ class Command(BaseCommand):
                 },
             })
 
-        self.stdout.write(f"Reminders: {blocks.count()} block(s), {sent} push(es) sent.")
+        # --- Pass 2: departure alerts for blocks tied to a place --------------
+        prep_alerts = leave_alerts = 0
+        placed_blocks = RecurringBlock.objects.filter(
+            user_id__in=user_ids,
+            active=True,
+            day_of_week=now.weekday(),
+            place__isnull=False,
+        ).select_related("user", "user__profile", "place")
+
+        for block in placed_blocks:
+            travel = block.place.travel_minutes or 0
+            if travel <= 0:
+                continue
+            profile = block.user.profile
+            start_bmin = block.start_time.hour * 60 + block.start_time.minute
+            w = commute_window(
+                start_bmin,
+                travel,
+                profile.safety_margin_minutes or 0,
+                profile.prep_time_minutes or 0,
+            )
+
+            # "Commence à te préparer" when prep-start falls in this window.
+            if now_min <= w.unavailability_start <= end_min:
+                prep_alerts += send_to_user(
+                    block.user,
+                    "Prépare-toi",
+                    f"Commence à te préparer pour {block.title}. "
+                    f"Départ à {_fmt(w.departure)} ({travel} min de trajet).",
+                    url="/schedule",
+                )
+
+            # "Pars maintenant" when the latest-departure time falls in the window.
+            if now_min <= w.departure <= end_min:
+                leave_alerts += send_to_user(
+                    block.user,
+                    "Pars maintenant",
+                    f"Pour {block.title} à {block.start_time.strftime('%H:%M')}, "
+                    f"pars maintenant pour arriver à l'heure.",
+                    url="/schedule",
+                )
+
+        self.stdout.write(
+            f"Reminders: {blocks.count()} bloc(s), {sent} push. "
+            f"Départs: {prep_alerts} prépa, {leave_alerts} départ."
+        )

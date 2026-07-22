@@ -874,6 +874,33 @@ class ScheduleGenerateView(APIView):
         })
 
 
+class ScheduleReplanView(APIView):
+    """Partial replan after a delay (spec §7).
+
+    Body: {"resume_time": "HH:MM"} or {"delay_minutes": 30}. Locks fixed events
+    and already-started activities, moves only the displaced flexible blocks
+    after the resume time, and explains what changed.
+    """
+
+    def post(self, request):
+        from services.replan import replan_after_delay
+
+        resume_time = request.data.get('resume_time')
+        delay_minutes = request.data.get('delay_minutes')
+        if delay_minutes is not None:
+            try:
+                delay_minutes = int(delay_minutes)
+            except (TypeError, ValueError):
+                return Response(
+                    {'error': 'delay_minutes doit être un entier.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        result = replan_after_delay(
+            request.user, resume_time=resume_time, delay_minutes=delay_minutes
+        )
+        return Response(result)
+
+
 class ScheduledBlockView(APIView):
     """Update a scheduled block (for drag & drop)."""
 
