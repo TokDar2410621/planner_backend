@@ -176,16 +176,28 @@ class AIScheduler:
             if block is None:
                 needed = task.estimated_duration_minutes or 60
                 biggest = max((s.duration_minutes for s in available_slots), default=0)
+                # Diagnose the REAL blocker so the explanation is accurate
+                # (spec §10): deep-work daily cap vs. no room in the days.
+                if (
+                    task.task_type == 'deep_work'
+                    and max_deep_minutes > 0
+                    and needed > max_deep_minutes
+                ):
+                    reason = (
+                        f'dépasse le plafond quotidien de travail intense '
+                        f'({max_deep_minutes} min/jour) — fractionner la tâche '
+                        f'ou augmenter le plafond'
+                    )
+                elif biggest < 30:
+                    reason = 'aucun créneau disponible'
+                else:
+                    reason = f'demande {needed} min, plus grand créneau restant {biggest} min'
                 self.last_unplaced.append({
                     'task_id': task.id,
                     'title': task.title,
                     'needed_minutes': needed,
                     'largest_free_slot_minutes': biggest,
-                    'reason': (
-                        'aucun créneau disponible'
-                        if biggest < 30 else
-                        f'demande {needed} min, plus grand créneau restant {biggest} min'
-                    ),
+                    'reason': reason,
                 })
             if block:
                 block.save()
