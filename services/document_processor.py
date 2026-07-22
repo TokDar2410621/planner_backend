@@ -53,6 +53,7 @@ except ImportError:
 from datetime import time as dt_time
 from core.models import UploadedDocument, RecurringBlock
 from services.schedule_intent import has_schedule_signal
+from services.scheduling.overlap import find_recurring_conflicts
 from utils.helpers import retry_with_backoff, run_in_background
 
 logger = logging.getLogger(__name__)
@@ -1045,6 +1046,14 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                     if location.lower() in ('none', 'n/a', 'null', '-'):
                         location = ''
 
+                    # Skip a course that overlaps an existing block (prevents
+                    # duplicates on re-upload and internal overlaps).
+                    if find_recurring_conflicts(
+                        user, day, start_time, end_time, night_flag=(end_time <= start_time)
+                    ):
+                        logger.info("Skip overlapping course '%s' day %s", course.get('name'), day)
+                        continue
+
                     confidence, block_status = self._confidence_status(
                         start_defaulted=start_defaulted,
                         end_defaulted=end_defaulted,
@@ -1105,6 +1114,10 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                     if is_night:
                         logger.info(f"Auto-detected night shift: {start_time}-{end_time}")
 
+                    if find_recurring_conflicts(user, day, start_time, end_time, night_flag=is_night):
+                        logger.info("Skip overlapping shift day %s", day)
+                        continue
+
                     confidence, block_status = self._confidence_status(
                         start_defaulted=start_defaulted,
                         end_defaulted=end_defaulted,
@@ -1158,6 +1171,10 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                     raw_title = event.get('title') or ''
                     title_generic = not raw_title.strip() or raw_title.lower() in ('none', 'n/a', 'null', '-')
                     title = 'Événement' if title_generic else raw_title
+
+                    if find_recurring_conflicts(user, day, start_time, end_time, night_flag=(end_time <= start_time)):
+                        logger.info("Skip overlapping event '%s' day %s", raw_title, day)
+                        continue
 
                     confidence, block_status = self._confidence_status(
                         start_defaulted=start_defaulted,
