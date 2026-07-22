@@ -86,6 +86,16 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         model = User
         fields = ['username', 'email', 'password', 'password_confirm', 'first_name', 'last_name']
 
+    def validate_email(self, value):
+        # Django's User has no unique email; enforce it here so a second account
+        # can't be created on the same address (root cause of the Google-login
+        # 409 "plusieurs comptes partagent cet email"). Case-insensitive.
+        if value and User.objects.filter(email__iexact=value).exists():
+            raise serializers.ValidationError(
+                "Un compte existe déjà avec cet email. Connectez-vous."
+            )
+        return value
+
     def validate(self, attrs):
         if attrs['password'] != attrs['password_confirm']:
             raise serializers.ValidationError({

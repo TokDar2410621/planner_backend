@@ -182,7 +182,9 @@ def test_google_auth_accepts_verified_email():
 @pytest.mark.django_db
 @override_settings(GOOGLE_CLIENT_ID='test-client-id')
 def test_google_auth_duplicate_email_no_500():
-    """Two accounts sharing an email must not crash Google auth with a 500."""
+    """Two accounts sharing a (Google-verified) email must not crash, and must
+    not hard-block: sign into one of them deterministically (a verified email
+    has a single owner, so the accounts are the same person's duplicates)."""
     User.objects.create_user(username='dup1', email='dup@example.com', password='x1234567')
     User.objects.create_user(username='dup2', email='dup@example.com', password='x1234567')
 
@@ -196,8 +198,9 @@ def test_google_auth_duplicate_email_no_500():
     with mock.patch('requests.get', return_value=_fake_google_response(payload)):
         resp = client.post(url, {'credential': 'fake-token'})
 
-    assert resp.status_code == status.HTTP_409_CONFLICT
+    assert resp.status_code == status.HTTP_200_OK
     assert resp.status_code != status.HTTP_500_INTERNAL_SERVER_ERROR
+    assert resp.data['user']['username'] in {'dup1', 'dup2'}
 
 
 # --------------------------------------------------------------------------- #
