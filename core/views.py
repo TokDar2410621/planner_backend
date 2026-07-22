@@ -565,6 +565,12 @@ class RecurringBlockViewSet(viewsets.ModelViewSet):
         return Response({'deleted': 1})
 
     @action(detail=False, methods=['post'])
+    def deduplicate(self, request):
+        """Remove exact-duplicate recurring blocks (same day/time/type)."""
+        from services.blocks_maintenance import dedupe_recurring_blocks
+        return Response(dedupe_recurring_blocks(request.user))
+
+    @action(detail=False, methods=['post'])
     def confirm_all(self, request):
         """Confirm every pending block at once (bulk 1-tap accept)."""
         updated = RecurringBlock.all_objects.filter(
