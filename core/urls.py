@@ -36,6 +36,8 @@ from .views import (
     ScheduleView,
     ScheduleGenerateView,
     ScheduleReplanView,
+    ScheduleProposalApplyView,
+    ScheduleUndoView,
     ScheduledBlockView,
     # Conversation
     ConversationView,
@@ -95,6 +97,8 @@ urlpatterns = [
     path('schedule/', ScheduleView.as_view(), name='schedule'),
     path('schedule/generate/', ScheduleGenerateView.as_view(), name='schedule-generate'),
     path('schedule/replan/', ScheduleReplanView.as_view(), name='schedule-replan'),
+    path('schedule/proposal/apply/', ScheduleProposalApplyView.as_view(), name='schedule-proposal-apply'),
+    path('schedule/undo/', ScheduleUndoView.as_view(), name='schedule-undo'),
     path('schedule/<int:block_id>/', ScheduledBlockView.as_view(), name='schedule-block'),
 
     # Conversation history

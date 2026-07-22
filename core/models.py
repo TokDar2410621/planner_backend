@@ -17,6 +17,12 @@ class UserProfile(models.Model):
         ('evening', 'Soir'),
     ]
 
+    AUTOMATION_CHOICES = [
+        ('suggestion', 'Suggestion (tout est proposé)'),
+        ('semi_auto', 'Semi-automatique (petits changements auto)'),
+        ('automatic', 'Automatique (déplace, explique, annulable)'),
+    ]
+
     LLM_CHOICES = [
         ('gemini', 'Gemini (Google)'),
         ('claude', 'Claude (Anthropic)'),
@@ -46,6 +52,16 @@ class UserProfile(models.Model):
     safety_margin_minutes = models.PositiveIntegerField(
         default=10,
         help_text="Marge de sécurité contre les retards (minutes).",
+    )
+    automation_mode = models.CharField(
+        max_length=12,
+        choices=AUTOMATION_CHOICES,
+        default='semi_auto',
+        help_text="Niveau d'automatisation des réajustements (spec §8).",
+    )
+    auto_apply_threshold_minutes = models.PositiveIntegerField(
+        default=60,
+        help_text="En semi-auto: un déplacement au-delà de ce seuil est 'important' (proposé, pas appliqué).",
     )
     onboarding_completed = models.BooleanField(default=False)
     onboarding_step = models.PositiveIntegerField(default=0)
@@ -443,6 +459,42 @@ class ScheduledBlock(models.Model):
         indexes = [
             models.Index(fields=['user', 'date'], name='schedblock_user_date_idx'),
         ]
+
+
+class SchedulePlanChange(models.Model):
+    """A reversible schedule adjustment (spec §8 automation modes).
+
+    Stores the day's ScheduledBlocks BEFORE and the computed target AFTER, so a
+    change can be: proposed (suggestion mode / important change in semi-auto),
+    applied (automatic / small semi-auto), and undone. `before`/`after` are lists
+    of {task_id, start_time, end_time, actually_completed, actual_duration_minutes}.
+    """
+
+    STATUS_CHOICES = [
+        ('proposed', 'Proposé'),
+        ('applied', 'Appliqué'),
+        ('undone', 'Annulé'),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='plan_changes')
+    token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    date = models.DateField()
+    before = models.JSONField(default=list)
+    after = models.JSONField(default=list)
+    moved = models.JSONField(default=list, blank=True)
+    unplaced = models.JSONField(default=list, blank=True)
+    message = models.TextField(blank=True)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='proposed')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"PlanChange {self.token} [{self.status}] - {self.user.username}"
+
+    class Meta:
+        verbose_name = "Changement de planning"
+        verbose_name_plural = "Changements de planning"
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['user', 'status'])]
 
 
 class RecurringBlockCompletion(models.Model):

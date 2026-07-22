@@ -45,6 +45,8 @@ class UserProfileSerializer(serializers.ModelSerializer):
             'transport_time_minutes',
             'prep_time_minutes',
             'safety_margin_minutes',
+            'automation_mode',
+            'auto_apply_threshold_minutes',
             'energy_levels',
             'notification_preferences',
             'onboarding_completed',

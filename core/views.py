@@ -901,6 +901,40 @@ class ScheduleReplanView(APIView):
         return Response(result)
 
 
+class ScheduleProposalApplyView(APIView):
+    """Apply a previously-proposed schedule change (spec §8 suggestion/semi-auto)."""
+
+    def post(self, request):
+        from services.replan import apply_proposal
+        token = request.data.get('token')
+        if not token:
+            return Response({'error': 'token requis.'}, status=status.HTTP_400_BAD_REQUEST)
+        result = apply_proposal(request.user, token)
+        if result is None:
+            return Response(
+                {'error': 'Proposition introuvable ou déjà traitée.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(result)
+
+
+class ScheduleUndoView(APIView):
+    """Undo an applied schedule change (spec §8: automatique = annulable)."""
+
+    def post(self, request):
+        from services.replan import undo_change
+        token = request.data.get('token')
+        if not token:
+            return Response({'error': 'token requis.'}, status=status.HTTP_400_BAD_REQUEST)
+        result = undo_change(request.user, token)
+        if result is None:
+            return Response(
+                {'error': 'Changement introuvable ou déjà annulé.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(result)
+
+
 class ScheduledBlockView(APIView):
     """Update a scheduled block (for drag & drop)."""
 
