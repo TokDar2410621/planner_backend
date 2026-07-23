@@ -304,6 +304,7 @@ class ScheduledBlockSerializer(serializers.ModelSerializer):
             'end_time',
             'actually_completed',
             'actual_duration_minutes',
+            'locked',
             'created_at',
         ]
         read_only_fields = ['id', 'task', 'task_title', 'created_at']

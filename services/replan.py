@@ -29,6 +29,11 @@ from services.ai_scheduler import AIScheduler
 
 logger = logging.getLogger(__name__)
 
+# Anti-thrash guardrails (spec "super flexible mais stable"): the fill re-flows,
+# but not for nothing and not endlessly, so habits can anchor on a stable frame.
+MIN_SHIFT_MINUTES = 10        # hysteresis: a trivial delay is not worth reshuffling
+MAX_AUTO_CHANGES_PER_DAY = 6  # past this, auto stops silently reshuffling and proposes
+
 
 def _parse_hhmm(value):
     if not value:
@@ -152,11 +157,21 @@ def replan_after_delay(user, resume_time=None, delay_minutes=None, apply=None):
     mode = profile.automation_mode
     threshold = profile.auto_apply_threshold_minutes or 0
 
+    # Hysteresis: a trivial delay is not worth reshuffling the day.
+    if delay_minutes is not None and 0 < int(delay_minutes) < MIN_SHIFT_MINUTES:
+        return {
+            'applied': True, 'mode': mode,
+            'resume_time': resume_time.strftime('%H:%M'),
+            'moved': [], 'unplaced': [],
+            'message': "Décalage minime, rien à bouger.",
+            'token': None,
+        }
+
     # Flexible, not-yet-done blocks today that the delay invalidated — deduped
-    # to one entry PER TASK (a task is re-placed once, never N times).
+    # to one entry PER TASK. Locked blocks are sanctuaries: never displaced.
     displaced_qs = ScheduledBlock.objects.filter(
         user=user, date=today, actually_completed=False, start_time__lt=resume_time,
-    ).select_related('task')
+    ).exclude(locked=True).select_related('task')
 
     seen = set()
     tasks_to_replace = []
@@ -204,6 +219,15 @@ def replan_after_delay(user, resume_time=None, delay_minutes=None, apply=None):
 
     if apply is None:
         apply = mode == 'automatic' or (mode == 'semi_auto' and not important)
+
+    # Anti-thrash budget: once the day has already auto-reshuffled enough, stop
+    # doing it silently and PROPOSE instead (a moving target kills habits).
+    if apply and mode == 'automatic':
+        changes_today = SchedulePlanChange.objects.filter(
+            user=user, date=today, status='applied'
+        ).count()
+        if changes_today >= MAX_AUTO_CHANGES_PER_DAY:
+            apply = False
 
     message = _build_message(resume_time, moved, unplaced, applied=apply)
 

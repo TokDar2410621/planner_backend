@@ -426,6 +426,10 @@ class ScheduledBlock(models.Model):
     end_time = models.TimeField()
     actually_completed = models.BooleanField(default=False)
     actual_duration_minutes = models.PositiveIntegerField(null=True, blank=True)
+    locked = models.BooleanField(
+        default=False,
+        help_text="Sanctuaire : la replanification ne déplace jamais ce bloc.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
@@ -661,6 +665,38 @@ class SharedSchedule(models.Model):
         verbose_name = "Planning partagé"
         verbose_name_plural = "Plannings partagés"
         ordering = ['-created_at']
+
+
+class Connection(models.Model):
+    """A connection (friend link) between two users.
+
+    Planner's structural superpower: it knows the REAL free slots of several
+    users, so it can propose co-presence / body-doubling / study groups on the
+    actual common availability (fin de cours, retour maison). A directed request
+    (from_user -> to_user) that becomes mutual once accepted.
+    """
+
+    STATUS_CHOICES = [
+        ('pending', 'En attente'),
+        ('accepted', 'Accepté'),
+    ]
+
+    from_user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='sent_connections')
+    to_user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='received_connections')
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
+    created_at = models.DateTimeField(auto_now_add=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.from_user.username} -> {self.to_user.username} ({self.status})"
+
+    class Meta:
+        verbose_name = "Connexion"
+        verbose_name_plural = "Connexions"
+        constraints = [
+            models.UniqueConstraint(fields=['from_user', 'to_user'], name='connection_unique_pair'),
+        ]
+        indexes = [models.Index(fields=['to_user', 'status'])]
 
 
 class CalendarFeed(models.Model):

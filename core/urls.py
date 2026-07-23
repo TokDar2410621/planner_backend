@@ -20,6 +20,10 @@ from .views import (
     WebhookEndpointView,
     WebhookEndpointDetailView,
     WebhookTestView,
+    SocialConnectView,
+    SocialConnectionsView,
+    SocialAcceptView,
+    SocialAvailabilityView,
     GoogleAuthView,
     # Profile
     ProfileView,
@@ -84,6 +88,12 @@ urlpatterns = [
     # iCal calendar feed (subscribe from Google/Apple/Outlook)
     path('calendar/feed/', CalendarFeedView.as_view(), name='calendar-feed'),
     path('calendar/<uuid:token>.ics', CalendarICSView.as_view(), name='calendar-ics'),
+
+    # Social co-presence
+    path('social/connect/', SocialConnectView.as_view(), name='social-connect'),
+    path('social/connections/', SocialConnectionsView.as_view(), name='social-connections'),
+    path('social/connections/<int:connection_id>/accept/', SocialAcceptView.as_view(), name='social-accept'),
+    path('social/availability/', SocialAvailabilityView.as_view(), name='social-availability'),
 
     # Outbound webhooks (n8n / automation)
     path('webhooks/', WebhookEndpointView.as_view(), name='webhooks'),
