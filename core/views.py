@@ -7,6 +7,7 @@ from datetime import date, timedelta
 from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
 from django.core.exceptions import ImproperlyConfigured, ValidationError
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -960,9 +961,10 @@ class ScheduleResetDayView(APIView):
     def post(self, request):
         today = timezone.localdate()
         now_t = timezone.localtime().time()
-        # Drop today's not-yet-done blocks, keep completed work, regenerate.
+        # Drop today's not-yet-done blocks, keep completed AND locked (sanctuary)
+        # work, then regenerate around what remains.
         ScheduledBlock.objects.filter(
-            user=request.user, date=today, actually_completed=False
+            user=request.user, date=today, actually_completed=False, locked=False
         ).delete()
         scheduler = AIScheduler()
         created = scheduler.generate_schedule(
@@ -1631,6 +1633,108 @@ class WebhookTestView(APIView):
         return Response(
             {"delivered_to": len(results), "results": [{"id": i, "status": s} for i, s in results]}
         )
+
+
+# ============== Social co-presence ==============
+class SocialConnectView(APIView):
+    """Send a connection (friend) request by username; auto-accepts a reverse one."""
+
+    def post(self, request):
+        from core.models import Connection
+        username = (request.data.get('username') or '').strip()
+        if not username:
+            return Response({'error': 'username requis.'}, status=status.HTTP_400_BAD_REQUEST)
+        target = User.objects.filter(username__iexact=username).first()
+        if target is None:
+            return Response({'error': 'Utilisateur introuvable.'}, status=status.HTTP_404_NOT_FOUND)
+        if target.id == request.user.id:
+            return Response({'error': 'Impossible de se connecter à soi-même.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # If they already sent me a request, accept it (mutual).
+        reverse_c = Connection.objects.filter(from_user=target, to_user=request.user).first()
+        if reverse_c:
+            if reverse_c.status != 'accepted':
+                reverse_c.status = 'accepted'
+                reverse_c.accepted_at = timezone.now()
+                reverse_c.save(update_fields=['status', 'accepted_at'])
+            return Response({'status': 'accepted', 'connection_id': reverse_c.id})
+
+        conn, created = Connection.objects.get_or_create(from_user=request.user, to_user=target)
+        return Response(
+            {'status': conn.status, 'connection_id': conn.id},
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class SocialConnectionsView(APIView):
+    """List accepted friends + incoming pending requests."""
+
+    def get(self, request):
+        from core.models import Connection
+        accepted = Connection.objects.filter(status='accepted').filter(
+            Q(from_user=request.user) | Q(to_user=request.user)
+        ).select_related('from_user', 'to_user')
+        friends = []
+        for c in accepted:
+            other = c.to_user if c.from_user_id == request.user.id else c.from_user
+            friends.append({'user_id': other.id, 'username': other.username, 'connection_id': c.id})
+        incoming = Connection.objects.filter(
+            to_user=request.user, status='pending'
+        ).select_related('from_user')
+        pending = [
+            {'connection_id': c.id, 'from_user_id': c.from_user_id, 'from_username': c.from_user.username}
+            for c in incoming
+        ]
+        return Response({'friends': friends, 'pending_incoming': pending})
+
+
+class SocialAcceptView(APIView):
+    """Accept a received pending connection request."""
+
+    def post(self, request, connection_id):
+        from core.models import Connection
+        conn = Connection.objects.filter(
+            id=connection_id, to_user=request.user, status='pending'
+        ).first()
+        if conn is None:
+            return Response({'error': 'Demande introuvable.'}, status=status.HTTP_404_NOT_FOUND)
+        conn.status = 'accepted'
+        conn.accepted_at = timezone.now()
+        conn.save(update_fields=['status', 'accepted_at'])
+        return Response({'status': 'accepted', 'connection_id': conn.id})
+
+
+class SocialAvailabilityView(APIView):
+    """Common free slots with an accepted friend on a date (co-presence)."""
+
+    def get(self, request):
+        from core.models import Connection
+        from services.social import common_free
+
+        friend_id = request.query_params.get('friend')
+        if not friend_id:
+            return Response({'error': 'friend requis.'}, status=status.HTTP_400_BAD_REQUEST)
+        is_friend = Connection.objects.filter(status='accepted').filter(
+            Q(from_user=request.user, to_user_id=friend_id)
+            | Q(from_user_id=friend_id, to_user=request.user)
+        ).exists()
+        if not is_friend:
+            return Response(
+                {'error': "Cette personne n'est pas dans tes amis."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        friend = User.objects.filter(id=friend_id).first()
+        if friend is None:
+            return Response({'error': 'Introuvable.'}, status=status.HTTP_404_NOT_FOUND)
+
+        date_str = request.query_params.get('date')
+        try:
+            target = date.fromisoformat(date_str) if date_str else timezone.localdate()
+        except ValueError:
+            return Response({'error': 'date invalide (YYYY-MM-DD).'}, status=status.HTTP_400_BAD_REQUEST)
+
+        slots = common_free(request.user, friend, target)
+        return Response({'friend': friend.username, 'date': str(target), 'common_free': slots})
 
 
 def _webhook_dict(hook, reveal_secret=False):
