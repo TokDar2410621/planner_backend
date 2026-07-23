@@ -162,7 +162,15 @@ class UserPlace(models.Model):
         default=0,
         help_text="Durée habituelle du trajet depuis la maison (minutes).",
     )
+    # Coordonnées géocodées depuis `address` (rappels basés sur la localisation,
+    # Phase 0). Peuplées au mieux via Nominatim; null si géocodage indisponible.
+    latitude = models.FloatField(null=True, blank=True)
+    longitude = models.FloatField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    @property
+    def has_coordinates(self) -> bool:
+        return self.latitude is not None and self.longitude is not None
 
     def __str__(self):
         return f"{self.name} ({self.travel_minutes} min) - {self.user.username}"
@@ -295,6 +303,15 @@ class Task(models.Model):
     description = models.TextField(blank=True)
     deadline = models.DateTimeField(null=True, blank=True)
     estimated_duration_minutes = models.PositiveIntegerField(null=True, blank=True)
+    # Lieu du rendez-vous (rappels de départ basés sur la localisation, Phase 0/1):
+    # une tâche "Réunion 14h à l'UQAC" porte un UserPlace -> trajet + coords.
+    place = models.ForeignKey(
+        UserPlace,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='tasks',
+    )
     task_type = models.CharField(
         max_length=20,
         choices=TASK_TYPE_CHOICES,

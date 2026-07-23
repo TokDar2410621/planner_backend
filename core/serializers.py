@@ -157,12 +157,14 @@ class UploadedDocumentSerializer(serializers.ModelSerializer):
 
 
 class UserPlaceSerializer(serializers.ModelSerializer):
-    """Serializer for UserPlace (travel-time engine, Phase 1)."""
+    """Serializer for UserPlace (travel-time engine + geo coordinates)."""
 
     class Meta:
         model = UserPlace
-        fields = ['id', 'name', 'kind', 'address', 'travel_minutes', 'created_at']
-        read_only_fields = ['id', 'created_at']
+        fields = ['id', 'name', 'kind', 'address', 'travel_minutes',
+                  'latitude', 'longitude', 'created_at']
+        # lat/lng are populated server-side by geocoding, never client-supplied.
+        read_only_fields = ['id', 'latitude', 'longitude', 'created_at']
 
 
 class RecurringBlockSerializer(serializers.ModelSerializer):
@@ -287,6 +289,18 @@ class TaskSerializer(serializers.ModelSerializer):
     """Serializer for Task model."""
 
     task_type_display = serializers.CharField(source='get_task_type_display', read_only=True)
+    # Nested read-only venue so the frontend can show distance / departure for a
+    # located task (ex: "Réunion 14h à l'UQAC"). `place` (write) sets the FK.
+    place_detail = UserPlaceSerializer(source='place', read_only=True)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Scope `place` choices to the requesting user's own places (no IDOR).
+        request = self.context.get('request')
+        if request is not None and 'place' in self.fields:
+            user = getattr(request, 'user', None)
+            if user is not None and user.is_authenticated:
+                self.fields['place'].queryset = UserPlace.objects.filter(user=user)
 
     class Meta:
         model = Task
@@ -300,15 +314,26 @@ class TaskSerializer(serializers.ModelSerializer):
             'task_type_display',
             'priority',
             'related_course',
+            'place',
+            'place_detail',
             'completed',
             'completed_at',
             'created_at',
         ]
-        read_only_fields = ['id', 'completed_at', 'created_at', 'task_type_display']
+        read_only_fields = ['id', 'completed_at', 'created_at', 'task_type_display', 'place_detail']
 
     def validate_priority(self, value):
         if value < 1 or value > 10:
             raise serializers.ValidationError("La priorité doit être entre 1 et 10.")
+        return value
+
+    def validate_place(self, value):
+        # Defense in depth against IDOR even without request-scoped queryset.
+        request = self.context.get('request')
+        if value is not None and request is not None:
+            user = getattr(request, 'user', None)
+            if user is not None and user.is_authenticated and value.user_id != user.id:
+                raise serializers.ValidationError("Ce lieu ne vous appartient pas.")
         return value
 
 
