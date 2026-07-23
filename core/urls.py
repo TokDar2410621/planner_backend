@@ -38,6 +38,10 @@ from .views import (
     ScheduleReplanView,
     ScheduleProposalApplyView,
     ScheduleUndoView,
+    ScheduleRollOverView,
+    ScheduleResetDayView,
+    StreakView,
+    WeeklySummaryView,
     ScheduledBlockView,
     # Conversation
     ConversationView,
@@ -99,6 +103,8 @@ urlpatterns = [
     path('schedule/replan/', ScheduleReplanView.as_view(), name='schedule-replan'),
     path('schedule/proposal/apply/', ScheduleProposalApplyView.as_view(), name='schedule-proposal-apply'),
     path('schedule/undo/', ScheduleUndoView.as_view(), name='schedule-undo'),
+    path('schedule/rollover/', ScheduleRollOverView.as_view(), name='schedule-rollover'),
+    path('schedule/reset-day/', ScheduleResetDayView.as_view(), name='schedule-reset-day'),
     path('schedule/<int:block_id>/', ScheduledBlockView.as_view(), name='schedule-block'),
 
     # Conversation history
@@ -111,6 +117,8 @@ urlpatterns = [
     path('insights/conflicts/', ConflictsView.as_view(), name='conflicts'),
     path('insights/smart-reschedule/', SmartRescheduleView.as_view(), name='smart-reschedule'),
     path('insights/natural-language/', NaturalLanguageScheduleView.as_view(), name='natural-language'),
+    path('insights/streak/', StreakView.as_view(), name='streak'),
+    path('insights/weekly-summary/', WeeklySummaryView.as_view(), name='weekly-summary'),
 
     # Share endpoints
     path('schedule/share/', ShareScheduleView.as_view(), name='share-schedule'),

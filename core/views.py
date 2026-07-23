@@ -946,6 +946,52 @@ class ScheduleUndoView(APIView):
         return Response(result)
 
 
+class ScheduleRollOverView(APIView):
+    """Roll missed blocks forward (structural forgiveness — no red, no debt)."""
+
+    def post(self, request):
+        from services.rollover import roll_over_missed
+        return Response(roll_over_missed(request.user))
+
+
+class ScheduleResetDayView(APIView):
+    """'Remettre à plat': rebase today on reality (bankruptcy antidote)."""
+
+    def post(self, request):
+        today = timezone.localdate()
+        now_t = timezone.localtime().time()
+        # Drop today's not-yet-done blocks, keep completed work, regenerate.
+        ScheduledBlock.objects.filter(
+            user=request.user, date=today, actually_completed=False
+        ).delete()
+        scheduler = AIScheduler()
+        created = scheduler.generate_schedule(
+            request.user, start_date=today, num_days=1,
+            earliest_start={today: now_t},
+        )
+        return Response({
+            'created_blocks': ScheduledBlockSerializer(created, many=True).data,
+            'count': len(created),
+            'unplaced': getattr(scheduler, 'last_unplaced', []),
+        })
+
+
+class StreakView(APIView):
+    """Forgiving elastic streak (days you followed OR adjusted your plan)."""
+
+    def get(self, request):
+        from services.streak import compute_streak
+        return Response(compute_streak(request.user))
+
+
+class WeeklySummaryView(APIView):
+    """Positive peak-end weekly summary (accomplishments only, tied to a stake)."""
+
+    def get(self, request):
+        from services.progress import weekly_summary
+        return Response(weekly_summary(request.user))
+
+
 class ScheduledBlockView(APIView):
     """Update a scheduled block (for drag & drop)."""
 
