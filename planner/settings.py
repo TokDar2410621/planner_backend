@@ -184,6 +184,9 @@ if not DEBUG:
 
 # Google OAuth
 GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID', '')
+# Sign in with Apple audience(s): web Services ID and/or native bundle ID,
+# comma-separated (e.g. "com.planner.web,com.planner.app").
+APPLE_CLIENT_ID = os.getenv('APPLE_CLIENT_ID', '')
 
 # ============== Web Push (VAPID) ==============
 # Push notifications for the PWA and downstream apps. Generate a keypair once

@@ -275,38 +275,17 @@ class GoogleAuthView(APIView):
                     status=status.HTTP_401_UNAUTHORIZED
                 )
 
-            # S6: look the user up explicitly instead of get_or_create so a
-            # non-unique email (legacy duplicate accounts) is handled gracefully
-            # instead of raising MultipleObjectsReturned (500).
-            #
-            # A Google-verified email has a single real owner, so several local
-            # accounts on that email are the SAME person's duplicates. Rather
-            # than hard-blocking (409, which left users stuck), sign them into
-            # the account that actually holds their data (most recurring blocks,
-            # then most recent). New duplicates are prevented at registration.
-            from django.db.models import Count
+            # Shared account resolution (dedupe-aware): a Google-verified email
+            # has one owner, so duplicates are the same person -> sign into the
+            # account holding their data instead of hard-blocking. See
+            # services/social_login.resolve_social_user (also used by Apple).
+            from services.social_login import resolve_social_user
 
-            matching_users = list(
-                User.objects.filter(email__iexact=email)
-                .annotate(_nblocks=Count('recurring_blocks'))
-                .order_by('-_nblocks', '-last_login', '-date_joined')
+            user, created = resolve_social_user(
+                email,
+                first_name=google_data.get('given_name', ''),
+                last_name=google_data.get('family_name', ''),
             )
-            user = matching_users[0] if matching_users else None
-            created = user is None
-            if created:
-                # Build a unique username for the new account.
-                base_username = email.split('@')[0]
-                username = base_username
-                counter = 1
-                while User.objects.filter(username=username).exists():
-                    username = f"{base_username}{counter}"
-                    counter += 1
-                user = User.objects.create(
-                    username=username,
-                    email=email,
-                    first_name=google_data.get('given_name', ''),
-                    last_name=google_data.get('family_name', ''),
-                )
 
             # Update profile with Google data (avatar, name)
             profile = user.profile
@@ -338,6 +317,60 @@ class GoogleAuthView(APIView):
                 {'error': 'Erreur lors de l\'authentification Google.'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+
+class AppleAuthView(APIView):
+    """Sign in with Apple: verify the identity token, then login/register."""
+
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        from services.apple_auth import apple_configured, verify_apple_identity_token
+        from services.social_login import resolve_social_user
+
+        if not apple_configured():
+            return Response(
+                {'error': "Connexion Apple non configurée."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        id_token = request.data.get('id_token') or request.data.get('identityToken')
+        if not id_token:
+            return Response({'error': 'id_token requis.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            claims = verify_apple_identity_token(id_token)
+        except Exception as e:  # noqa: BLE001 - never leak the raw reason
+            logger.warning("Apple auth failed: %s", e)
+            return Response({'error': 'Token Apple invalide.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        email = claims.get('email')
+        if not email:
+            return Response(
+                {'error': 'Email non fourni par Apple.'}, status=status.HTTP_400_BAD_REQUEST
+            )
+        # Apple sends email_verified as bool True or the string "true" (private
+        # relay addresses are verified). Reject anything else.
+        if claims.get('email_verified') not in (True, 'true', 'True'):
+            return Response(
+                {'error': 'Adresse email Apple non vérifiée.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        # Apple only sends the name on the FIRST authorization, in the client
+        # payload (not the token). Accept it if present.
+        name = request.data.get('name') or {}
+        first_name = (name.get('firstName') or name.get('given_name') or '') if isinstance(name, dict) else ''
+        last_name = (name.get('lastName') or name.get('family_name') or '') if isinstance(name, dict) else ''
+
+        user, created = resolve_social_user(email, first_name=first_name, last_name=last_name)
+
+        refresh = RefreshToken.for_user(user)
+        return Response({
+            'user': UserSerializer(user).data,
+            'tokens': {'refresh': str(refresh), 'access': str(refresh.access_token)},
+            'created': created,
+        })
 
 
 # ============== Profile Views ==============

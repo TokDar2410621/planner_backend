@@ -11,6 +11,7 @@ from .views import (
     CheckEmailView,
     MeView,
     McpTokenView,
+    AppleAuthView,
     PushPublicKeyView,
     PushSubscribeView,
     PushUnsubscribeView,
@@ -76,6 +77,7 @@ urlpatterns = [
     path('auth/login/', LoginView.as_view(), name='login'),
     path('auth/check-email/', CheckEmailView.as_view(), name='check-email'),
     path('auth/google/', GoogleAuthView.as_view(), name='google-auth'),
+    path('auth/apple/', AppleAuthView.as_view(), name='apple-auth'),
     path('auth/me/', MeView.as_view(), name='me'),
     path('auth/mcp-token/', McpTokenView.as_view(), name='mcp-token'),
 
