@@ -77,13 +77,24 @@ def intervals_conflict(a: Iterable[tuple[int, int]],
     return False
 
 
-def find_recurring_conflicts(user, day_of_week: int, start, end,
-                             night_flag: bool = False, exclude_id=None):
+def find_recurring_conflicts(
+    user,
+    day_of_week: int,
+    start,
+    end,
+    night_flag: bool = False,
+    exclude_id=None,
+    *,
+    new_is_flexible: bool = False,
+):
     """Retourne les RecurringBlock actifs en chevauchement avec le bloc proposé.
 
     `start`/`end` peuvent être des time ou des chaînes 'HH:MM'. Gère l'overnight
     et le débordement sur le jour adjacent (donc on inspecte J-1, J, J+1).
     """
+    if new_is_flexible:
+        return []
+
     from core.models import RecurringBlock
 
     start_t = parse_time(start)
@@ -100,7 +111,10 @@ def find_recurring_conflicts(user, day_of_week: int, start, end,
         (day_of_week - 1) % 7,
     }
     qs = RecurringBlock.objects.filter(
-        user=user, active=True, day_of_week__in=candidate_days
+        user=user,
+        active=True,
+        day_of_week__in=candidate_days,
+        flexibility='fixed',
     )
     if exclude_id is not None:
         qs = qs.exclude(id=exclude_id)

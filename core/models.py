@@ -220,6 +220,13 @@ class RecurringBlock(models.Model):
         ('other', 'Autre'),
     ]
 
+    FLEXIBILITY_FIXED = 'fixed'
+    FLEXIBILITY_FLEXIBLE = 'flexible'
+    FLEXIBILITY_CHOICES = [
+        (FLEXIBILITY_FIXED, 'Fixe'),
+        (FLEXIBILITY_FLEXIBLE, 'Souple'),
+    ]
+
     DAY_CHOICES = [
         (0, 'Lundi'),
         (1, 'Mardi'),
@@ -236,6 +243,18 @@ class RecurringBlock(models.Model):
     day_of_week = models.PositiveIntegerField(choices=DAY_CHOICES)
     start_time = models.TimeField()
     end_time = models.TimeField()
+    flexibility = models.CharField(
+        max_length=10,
+        choices=FLEXIBILITY_CHOICES,
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+    duration_minutes = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Durée cible d'un bloc souple; si null, dérivée de end-start.",
+    )
     location = models.CharField(max_length=200, blank=True)
     place = models.ForeignKey(
         UserPlace,
@@ -271,6 +290,39 @@ class RecurringBlock(models.Model):
     # Default manager hides pending blocks; all_objects sees everything.
     objects = VisibleRecurringBlockManager()
     all_objects = models.Manager()
+
+    @classmethod
+    def default_flexibility_for(cls, block_type):
+        return (
+            cls.FLEXIBILITY_FIXED
+            if block_type in {'work', 'course'}
+            else cls.FLEXIBILITY_FLEXIBLE
+        )
+
+    @property
+    def is_flexible(self):
+        return (
+            self.flexibility or self.default_flexibility_for(self.block_type)
+        ) == self.FLEXIBILITY_FLEXIBLE
+
+    def effective_duration_minutes(self):
+        if self.duration_minutes is not None:
+            return self.duration_minutes
+
+        start_minutes = self.start_time.hour * 60 + self.start_time.minute
+        end_minutes = self.end_time.hour * 60 + self.end_time.minute
+        duration = end_minutes - start_minutes
+        if duration <= 0:
+            duration += 24 * 60
+        return duration
+
+    def save(self, *args, **kwargs):
+        if self.flexibility is None:
+            self.flexibility = self.default_flexibility_for(self.block_type)
+            update_fields = kwargs.get('update_fields')
+            if update_fields is not None:
+                kwargs['update_fields'] = set(update_fields) | {'flexibility'}
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.title} - {self.get_day_of_week_display()} {self.start_time}"
