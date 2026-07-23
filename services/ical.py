@@ -92,7 +92,7 @@ def build_calendar(user, include_tasks: bool = False, cal_name: str | None = Non
     """Return the full .ics document (str) for a user's schedule."""
     # Local import keeps this module importable without Django app-loading order
     # concerns during migrations.
-    from core.models import RecurringBlock, ScheduledBlock, Task
+    from core.models import RecurringBlock, RecurringBlockException, ScheduledBlock, Task
 
     now = timezone.now()
     dtstamp = _dt_utc(now)
@@ -130,6 +130,14 @@ def build_calendar(user, include_tasks: bool = False, cal_name: str | None = Non
             f"DTSTART:{_dt_floating(start_date, b.start_time)}",
             f"DTEND:{_dt_floating(end_date, b.end_time)}",
             f"RRULE:FREQ=WEEKLY;BYDAY={_BYDAY[b.day_of_week]}",
+        ]
+        # Occurrences ignorées (skip) -> EXDATE, pour que le calendrier abonné
+        # n'affiche pas ce jour-là (heure flottante alignée sur DTSTART).
+        for exd in RecurringBlockException.objects.filter(
+            user=user, recurring_block=b, date__gte=today
+        ).values_list("date", flat=True):
+            lines.append(f"EXDATE:{_dt_floating(exd, b.start_time)}")
+        lines += [
             f"SUMMARY:{_esc(b.title)}",
             f"CATEGORIES:{_esc(label)}",
         ]

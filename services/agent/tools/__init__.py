@@ -10,7 +10,15 @@ from typing import Optional
 from django.contrib.auth.models import User
 
 from .base import BaseTool, ToolResult
-from .blocks import ListBlocksTool, CreateBlockTool, UpdateBlockTool, DeleteBlockTool, ClearAllBlocksTool
+from .blocks import (
+    ListBlocksTool,
+    CreateBlockTool,
+    UpdateBlockTool,
+    DeleteBlockTool,
+    ClearAllBlocksTool,
+    SkipBlockOccurrenceTool,
+    RestoreBlockOccurrenceTool,
+)
 from .tasks import ListTasksTool, CreateTaskTool, UpdateTaskTool, DeleteTaskTool, CompleteTaskTool
 from .schedule import GetTodayScheduleTool, GetWeekScheduleTool, FindFreeSlotsTool
 from .preferences import GetPreferencesTool, UpdatePreferencesTool
@@ -29,6 +37,8 @@ ALL_TOOLS: list[BaseTool] = [
     UpdateBlockTool(),
     DeleteBlockTool(),
     ClearAllBlocksTool(),
+    SkipBlockOccurrenceTool(),
+    RestoreBlockOccurrenceTool(),
     # Tasks
     ListTasksTool(),
     CreateTaskTool(),

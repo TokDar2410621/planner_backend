@@ -1,10 +1,12 @@
 """
 RecurringBlock tools for the Planner AI agent.
 """
+from datetime import datetime
+
 from django.contrib.auth.models import User
 from django.db import transaction
 
-from core.models import RecurringBlock
+from core.models import RecurringBlock, RecurringBlockException
 from services.scheduling.overlap import (
     find_recurring_conflicts,
     is_overnight,
@@ -361,4 +363,162 @@ class ClearAllBlocksTool(BaseTool):
                 f"{count} bloc(s) archivé(s). Planning vidé "
                 f"(action réversible: les blocs sont désactivés, pas détruits)."
             ),
+        )
+
+
+_BLOCK_TYPE_ENUM = ["course", "work", "sleep", "meal", "sport", "project", "revision", "other"]
+
+# Champ `date` partagé par skip/restore: le modèle résout la date lui-même à
+# partir de la DATE du jour (présente dans le system prompt), jamais un ID.
+_OCCURRENCE_PARAMS = {
+    "type": "object",
+    "properties": {
+        "date": {
+            "type": "string",
+            "description": "Date de l'occurrence (YYYY-MM-DD). Déduis-la toi-même de la DATE du jour (ex: 'ce vendredi').",
+        },
+        "block_type": {
+            "type": "string",
+            "enum": _BLOCK_TYPE_ENUM,
+            "description": "Type du bloc concerné ce jour-là (ex: 'work'). Fortement recommandé pour cibler le bon bloc.",
+        },
+        "title": {
+            "type": "string",
+            "description": "Titre (ou fragment) du bloc, si plusieurs blocs partagent le même jour.",
+        },
+    },
+    "required": ["date"],
+}
+
+
+def _resolve_day_blocks(user, target_date, block_type=None, title=None):
+    """Blocs récurrents actifs dont le jour == weekday(target_date), filtrés."""
+    qs = RecurringBlock.objects.filter(
+        user=user, active=True, day_of_week=target_date.weekday()
+    )
+    if block_type:
+        qs = qs.filter(block_type=block_type)
+    if title:
+        qs = qs.filter(title__icontains=title)
+    return list(qs.order_by("start_time"))
+
+
+def _candidates_payload(blocks, dow):
+    return [
+        {
+            "title": b.title,
+            "day_name": DAY_NAMES[dow],
+            "start_time": b.start_time.strftime("%H:%M"),
+            "end_time": b.end_time.strftime("%H:%M"),
+            "block_type": b.block_type,
+        }
+        for b in blocks
+    ]
+
+
+def _parse_occurrence(kwargs):
+    """(target_date, error) — parse la date + valide block_type. error=ToolResult|None."""
+    try:
+        target_date = datetime.strptime(kwargs["date"], "%Y-%m-%d").date()
+    except (ValueError, KeyError, TypeError):
+        return None, ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.")
+    err = validate_choice(kwargs.get("block_type"), VALID_BLOCK_TYPES, "block_type")
+    if err:
+        return None, ToolResult(success=False, data={}, message=err)
+    return target_date, None
+
+
+class SkipBlockOccurrenceTool(BaseTool):
+    name = "skip_block_occurrence"
+    description = (
+        "Ignore/annule UNE SEULE occurrence d'un bloc récurrent pour une date précise "
+        "(ex: 'ce vendredi je ne travaille pas', 'pas de sport demain'). Le bloc récurrent "
+        "reste en place les autres semaines. Résous toi-même le bon bloc avec la date + le "
+        "type (et le titre si plusieurs blocs le même jour). Ne demande JAMAIS d'identifiant. "
+        "N'utilise ni delete_block ni update_block pour annuler un seul jour."
+    )
+    parameters = _OCCURRENCE_PARAMS
+
+    def execute(self, user: User, **kwargs) -> ToolResult:
+        target_date, err = _parse_occurrence(kwargs)
+        if err:
+            return err
+
+        dow = target_date.weekday()
+        block_type = kwargs.get("block_type")
+        matches = _resolve_day_blocks(user, target_date, block_type, kwargs.get("title"))
+
+        if not matches:
+            kind = f" '{block_type}'" if block_type else ""
+            return ToolResult(
+                success=False,
+                data={},
+                message=f"Aucun bloc récurrent{kind} le {DAY_NAMES[dow]} {target_date.isoformat()}. Rien à ignorer.",
+            )
+        if len(matches) > 1:
+            candidates = _candidates_payload(matches, dow)
+            listing = "; ".join(f"{c['title']} ({c['start_time']}-{c['end_time']})" for c in candidates)
+            return ToolResult(
+                success=False,
+                data={"candidates": candidates},
+                message=f"Plusieurs blocs le {DAY_NAMES[dow]}: {listing}. Précise lequel (par titre).",
+            )
+
+        block = matches[0]
+        RecurringBlockException.objects.get_or_create(
+            user=user, recurring_block=block, date=target_date
+        )
+        return ToolResult(
+            success=True,
+            data={"date": target_date.isoformat(), "title": block.title, "block_type": block.block_type},
+            message=f"'{block.title}' ignoré le {DAY_NAMES[dow]} {target_date.isoformat()}. Le bloc récurrent reste actif les autres semaines.",
+        )
+
+
+class RestoreBlockOccurrenceTool(BaseTool):
+    name = "restore_block_occurrence"
+    description = (
+        "Rétablit une occurrence précédemment ignorée d'un bloc récurrent (annule un skip). "
+        "Ex: 'finalement je travaille ce vendredi'. Résous le bon bloc par date + type; "
+        "ne demande jamais d'identifiant."
+    )
+    parameters = _OCCURRENCE_PARAMS
+
+    def execute(self, user: User, **kwargs) -> ToolResult:
+        target_date, err = _parse_occurrence(kwargs)
+        if err:
+            return err
+
+        dow = target_date.weekday()
+        block_type = kwargs.get("block_type")
+        matches = _resolve_day_blocks(user, target_date, block_type, kwargs.get("title"))
+
+        if not matches:
+            kind = f" '{block_type}'" if block_type else ""
+            return ToolResult(
+                success=False,
+                data={},
+                message=f"Aucun bloc récurrent{kind} le {DAY_NAMES[dow]} {target_date.isoformat()}.",
+            )
+        if len(matches) > 1:
+            candidates = _candidates_payload(matches, dow)
+            listing = "; ".join(f"{c['title']} ({c['start_time']}-{c['end_time']})" for c in candidates)
+            return ToolResult(
+                success=False,
+                data={"candidates": candidates},
+                message=f"Plusieurs blocs le {DAY_NAMES[dow]}: {listing}. Précise lequel (par titre).",
+            )
+
+        block = matches[0]
+        deleted, _ = RecurringBlockException.objects.filter(
+            user=user, recurring_block=block, date=target_date
+        ).delete()
+        if deleted:
+            msg = f"'{block.title}' rétabli le {DAY_NAMES[dow]} {target_date.isoformat()}."
+        else:
+            msg = f"'{block.title}' a bien lieu le {DAY_NAMES[dow]} {target_date.isoformat()} (aucune annulation à retirer)."
+        return ToolResult(
+            success=True,
+            data={"date": target_date.isoformat(), "title": block.title, "restored": bool(deleted)},
+            message=msg,
         )

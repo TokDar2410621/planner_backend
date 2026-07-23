@@ -36,6 +36,7 @@ from .views import (
     UserPlaceViewSet,
     RecurringBlockViewSet,
     RecurringBlockCompletionViewSet,
+    RecurringBlockExceptionViewSet,
     TaskViewSet,
     # Schedule
     ScheduleView,
@@ -69,6 +70,7 @@ router.register(r'documents', DocumentViewSet, basename='document')
 router.register(r'places', UserPlaceViewSet, basename='place')
 router.register(r'recurring-blocks', RecurringBlockViewSet, basename='recurring-block')
 router.register(r'recurring-completions', RecurringBlockCompletionViewSet, basename='recurring-completion')
+router.register(r'recurring-exceptions', RecurringBlockExceptionViewSet, basename='recurring-exception')
 router.register(r'tasks', TaskViewSet, basename='task')
 
 urlpatterns = [

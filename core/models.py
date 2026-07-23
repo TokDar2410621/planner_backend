@@ -523,6 +523,39 @@ class RecurringBlockCompletion(models.Model):
         ordering = ['-date', '-completed_at']
 
 
+class RecurringBlockException(models.Model):
+    """Une occurrence d'un bloc récurrent ignorée/annulée pour UNE date précise.
+
+    Marqueur NÉGATIF par date ("cette occurrence n'a pas lieu"), miroir de
+    RecurringBlockCompletion (marqueur POSITIF "fait"). Modèle séparé exprès:
+    les compteurs streak/progress/analytics comptent les complétions et ne
+    doivent JAMAIS être pollués par des skips.
+
+    La `date` est la date de DÉBUT de l'occurrence, c.-à-d. la date dont le jour
+    de semaine == recurring_block.day_of_week (pour un bloc de nuit, c'est le
+    soir où il commence, pas le matin où il finit).
+    """
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='recurring_exceptions')
+    recurring_block = models.ForeignKey(
+        RecurringBlock,
+        on_delete=models.CASCADE,
+        related_name='exceptions'
+    )
+    date = models.DateField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"SKIP {self.recurring_block.title} - {self.date}"
+
+    class Meta:
+        verbose_name = "Exception bloc récurrent"
+        verbose_name_plural = "Exceptions blocs récurrents"
+        unique_together = ['recurring_block', 'date']
+        ordering = ['-date', '-created_at']
+        indexes = [models.Index(fields=['user', 'date'])]
+
+
 class TaskHistory(models.Model):
     """Historical data for completed tasks - used for AI predictions."""
 
