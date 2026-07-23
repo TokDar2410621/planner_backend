@@ -12,6 +12,7 @@ from .models import (
     UploadedDocument,
     RecurringBlock,
     RecurringBlockCompletion,
+    RecurringBlockException,
     Task,
     ScheduledBlock,
     ConversationMessage,
@@ -242,6 +243,36 @@ class RecurringBlockCompletionSerializer(serializers.ModelSerializer):
         # Defense in depth: even if the field queryset was not scoped
         # (e.g. serializer used without request context), reject blocks
         # that belong to another user.
+        request = self.context.get('request')
+        if request is not None:
+            user = getattr(request, 'user', None)
+            if user is not None and user.is_authenticated and value.user_id != user.id:
+                raise serializers.ValidationError(
+                    "Ce bloc récurrent ne vous appartient pas."
+                )
+        return value
+
+
+class RecurringBlockExceptionSerializer(serializers.ModelSerializer):
+    """Serializer for RecurringBlockException (a skipped/cancelled occurrence)."""
+
+    class Meta:
+        model = RecurringBlockException
+        fields = ['id', 'recurring_block', 'date', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # S7: scope recurring_block choices to the requesting user's blocks (IDOR).
+        request = self.context.get('request')
+        if request is not None and 'recurring_block' in self.fields:
+            user = getattr(request, 'user', None)
+            if user is not None and user.is_authenticated:
+                self.fields['recurring_block'].queryset = (
+                    RecurringBlock.objects.filter(user=user)
+                )
+
+    def validate_recurring_block(self, value):
         request = self.context.get('request')
         if request is not None:
             user = getattr(request, 'user', None)

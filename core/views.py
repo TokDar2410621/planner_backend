@@ -24,6 +24,7 @@ from .models import (
     UploadedDocument,
     RecurringBlock,
     RecurringBlockCompletion,
+    RecurringBlockException,
     Task,
     ScheduledBlock,
     ConversationMessage,
@@ -38,6 +39,7 @@ from .serializers import (
     UserPlaceSerializer,
     RecurringBlockSerializer,
     RecurringBlockCompletionSerializer,
+    RecurringBlockExceptionSerializer,
     TaskSerializer,
     TaskCompleteSerializer,
     ScheduledBlockSerializer,
@@ -703,6 +705,72 @@ class RecurringBlockCompletionViewSet(viewsets.ModelViewSet):
         )
 
 
+# ============== RecurringBlockException Views ==============
+
+class RecurringBlockExceptionViewSet(viewsets.ModelViewSet):
+    """ViewSet for recurring block exceptions (skipped/cancelled occurrences)."""
+
+    serializer_class = RecurringBlockExceptionSerializer
+    http_method_names = ['get', 'post', 'delete']
+
+    def get_queryset(self):
+        queryset = RecurringBlockException.objects.filter(user=self.request.user)
+        start_date = self.request.query_params.get('start_date')
+        end_date = self.request.query_params.get('end_date')
+        if start_date:
+            queryset = queryset.filter(date__gte=start_date)
+        if end_date:
+            queryset = queryset.filter(date__lte=end_date)
+        return queryset
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
+
+    def create(self, request, *args, **kwargs):
+        """Create or return existing exception (idempotent)."""
+        recurring_block_id = request.data.get('recurring_block')
+        date_str = request.data.get('date')
+
+        existing = RecurringBlockException.objects.filter(
+            user=request.user,
+            recurring_block_id=recurring_block_id,
+            date=date_str
+        ).first()
+
+        if existing:
+            return Response(
+                RecurringBlockExceptionSerializer(existing).data,
+                status=status.HTTP_200_OK
+            )
+
+        return super().create(request, *args, **kwargs)
+
+    @action(detail=False, methods=['delete'])
+    def restore(self, request):
+        """Remove an exception by block and date (un-skip the occurrence)."""
+        recurring_block_id = request.query_params.get('recurring_block')
+        date_str = request.query_params.get('date')
+
+        if not recurring_block_id or not date_str:
+            return Response(
+                {'error': 'recurring_block et date requis.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        deleted, _ = RecurringBlockException.objects.filter(
+            user=request.user,
+            recurring_block_id=recurring_block_id,
+            date=date_str
+        ).delete()
+
+        if deleted:
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        return Response(
+            {'error': 'Exception non trouvée.'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+
 # ============== Task Views ==============
 
 class TaskViewSet(viewsets.ModelViewSet):
@@ -881,11 +949,19 @@ class ScheduleView(APIView):
             date__lt=end_date
         )
 
+        # Get recurring block exceptions (skipped occurrences) for the week
+        recurring_exceptions = RecurringBlockException.objects.filter(
+            user=request.user,
+            date__gte=start_date,
+            date__lt=end_date
+        )
+
         data = {
             'recurring_blocks': RecurringBlockSerializer(recurring_blocks, many=True).data,
             'scheduled_tasks': ScheduledBlockSerializer(scheduled_tasks, many=True).data,
             'unscheduled_tasks': TaskSerializer(unscheduled_tasks, many=True).data,
             'recurring_completions': RecurringBlockCompletionSerializer(recurring_completions, many=True).data,
+            'recurring_exceptions': RecurringBlockExceptionSerializer(recurring_exceptions, many=True).data,
         }
 
         return Response(data)

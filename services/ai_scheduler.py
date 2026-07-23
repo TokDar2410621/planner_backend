@@ -12,6 +12,8 @@ from django.contrib.auth.models import User
 from django.db import transaction
 from django.utils import timezone
 
+from services.scheduling.exceptions import skipped_block_ids
+
 try:
     from google import genai
     GEMINI_AVAILABLE = True
@@ -339,9 +341,13 @@ class AIScheduler:
         # bloque `trajet` minutes APRÈS. Sans lieu: buffer transport plat (legacy).
         from services.commute import block_commute_minutes
 
+        # Occurrences ignorées (skip) à ne pas considérer comme occupées.
+        skipped_today = skipped_block_ids(user, current_date)
+        skipped_prev = skipped_block_ids(user, current_date - timedelta(days=1))
+
         for b in RecurringBlock.objects.filter(
             user=user, day_of_week=day_of_week, active=True
-        ).select_related('place'):
+        ).exclude(id__in=skipped_today).select_related('place'):
             before, after = block_commute_minutes(b, profile)
             s, e = to_min(b.start_time), to_min(b.end_time)
             if b.is_night_shift or e <= s:
@@ -353,7 +359,7 @@ class AIScheduler:
         # bloque `trajet` minutes après la fin du shift)
         for b in RecurringBlock.objects.filter(
             user=user, day_of_week=prev_day, active=True
-        ).select_related('place'):
+        ).exclude(id__in=skipped_prev).select_related('place'):
             _, after = block_commute_minutes(b, profile)
             s, e = to_min(b.start_time), to_min(b.end_time)
             if b.is_night_shift or e <= s:

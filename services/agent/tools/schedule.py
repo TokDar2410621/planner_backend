@@ -7,6 +7,7 @@ from django.contrib.auth.models import User
 from django.utils import timezone
 
 from core.models import RecurringBlock, ScheduledBlock, Task
+from services.scheduling.exceptions import skipped_block_ids
 from .base import BaseTool, ToolResult
 
 DAY_NAMES = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
@@ -50,9 +51,11 @@ class GetTodayScheduleTool(BaseTool):
         day_of_week = target_date.weekday()
         day_name = DAY_NAMES[day_of_week]
 
-        # Recurring blocks for this day
+        # Recurring blocks for this day (moins les occurrences ignorées ce jour-là)
         recurring = RecurringBlock.objects.filter(
             user=user, day_of_week=day_of_week, active=True
+        ).exclude(
+            id__in=skipped_block_ids(user, target_date)
         ).order_by("start_time")
 
         blocks = []
@@ -183,7 +186,7 @@ class GetWeekScheduleTool(BaseTool):
 
             blocks = RecurringBlock.objects.filter(
                 user=user, day_of_week=day_of_week, active=True
-            )
+            ).exclude(id__in=skipped_block_ids(user, day))
 
             day_minutes = 0
             block_list = []
@@ -243,9 +246,11 @@ class FindFreeSlotsTool(BaseTool):
         day_of_week = target_date.weekday()
         min_duration = kwargs.get("min_duration_minutes", 30)
 
-        # Get all blocks for this day
+        # Get all blocks for this day (moins les occurrences ignorées ce jour-là)
         blocks = RecurringBlock.objects.filter(
             user=user, day_of_week=day_of_week, active=True
+        ).exclude(
+            id__in=skipped_block_ids(user, target_date)
         ).order_by("start_time")
 
         occupied = []

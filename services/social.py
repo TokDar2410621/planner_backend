@@ -8,7 +8,10 @@ stake replaces app guilt (spec / recherche nature humaine).
 
 Interval math in minutes-since-midnight, clipped to a waking window.
 """
+from datetime import timedelta
+
 from services.scheduling.overlap import MINUTES_PER_DAY
+from services.scheduling.exceptions import skipped_block_ids
 
 DAY_START_MIN = 8 * 60   # default waking window for co-presence suggestions
 DAY_END_MIN = 22 * 60
@@ -35,12 +38,19 @@ def busy_intervals(user, date, day_start=DAY_START_MIN, day_end=DAY_END_MIN):
     dow = date.weekday()
     prev = (dow - 1) % 7
     raw = []
+    skipped_today = skipped_block_ids(user, date)
+    skipped_prev = skipped_block_ids(user, date - timedelta(days=1))
 
-    for b in RecurringBlock.objects.filter(user=user, active=True, day_of_week=dow):
+    for b in RecurringBlock.objects.filter(
+        user=user, active=True, day_of_week=dow
+    ).exclude(id__in=skipped_today):
         s, e = _to_min(b.start_time), _to_min(b.end_time)
         raw.append((s, MINUTES_PER_DAY) if (b.is_night_shift or e <= s) else (s, e))
-    # Previous-day overnight block spilling into this morning.
-    for b in RecurringBlock.objects.filter(user=user, active=True, day_of_week=prev):
+    # Previous-day overnight block spilling into this morning (skip if that
+    # previous-day occurrence was cancelled).
+    for b in RecurringBlock.objects.filter(
+        user=user, active=True, day_of_week=prev
+    ).exclude(id__in=skipped_prev):
         s, e = _to_min(b.start_time), _to_min(b.end_time)
         if b.is_night_shift or e <= s:
             raw.append((0, e))
