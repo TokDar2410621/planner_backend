@@ -162,6 +162,53 @@ def free_gaps(
     return gaps
 
 
+def occupied_intervals(
+    user,
+    date,
+    day_start: int = 0,
+    day_end: int = MINUTES_PER_DAY,
+) -> list[tuple[int, int]]:
+    """Return fixed walls plus placed flexible blocks within ``[day_start, day_end]``."""
+    raw = list(fixed_busy_intervals(user, date))
+
+    for placement in place_day(user, date, day_start, day_end):
+        if placement["skipped"]:
+            continue
+
+        start = placement["start_min"]
+        end = placement["end_min"]
+        if start is None or end is None:
+            continue
+        if end <= start:
+            end = day_end
+
+        clipped = _clip_interval(start, end, day_start, day_end)
+        if clipped is not None:
+            raw.append(clipped)
+
+    clipped = [
+        clipped_interval
+        for start, end in raw
+        if (clipped_interval := _clip_interval(start, end, day_start, day_end))
+        is not None
+    ]
+    return _merge_intervals(clipped)
+
+
+def open_intervals(
+    user,
+    date,
+    day_start: int,
+    day_end: int,
+) -> list[tuple[int, int]]:
+    """Return the complement of placed occupancy within ``[day_start, day_end]``."""
+    return free_gaps(
+        occupied_intervals(user, date, day_start, day_end),
+        day_start,
+        day_end,
+    )
+
+
 def _sort_key(result: dict) -> tuple[int, int, int]:
     if result["skipped"]:
         return 1, MINUTES_PER_DAY + 1, result["block_id"]

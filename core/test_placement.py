@@ -4,7 +4,12 @@ from django.contrib.auth.models import User
 from django.test import TestCase
 
 from core.models import RecurringBlock, RecurringBlockException, ScheduledBlock, Task
-from services.scheduling.placement import fixed_busy_intervals, place_day
+from services.scheduling.placement import (
+    fixed_busy_intervals,
+    occupied_intervals,
+    open_intervals,
+    place_day,
+)
 
 
 MONDAY = date(2026, 7, 20)
@@ -169,6 +174,64 @@ class PlacementEngineTest(TestCase):
         self.assertEqual(
             fixed_busy_intervals(self.user, SUNDAY),
             [(0, 7 * 60), (10 * 60, 11 * 60)],
+        )
+
+    def test_occupied_intervals_include_placed_flexible_blocks(self):
+        self._recurring(
+            "Saturday Night Work",
+            "work",
+            SATURDAY.weekday(),
+            time(19, 0),
+            time(7, 0),
+            is_night_shift=True,
+        )
+        self._recurring(
+            "Sunday Sleep",
+            "sleep",
+            SUNDAY.weekday(),
+            time(0, 0),
+            time(7, 0),
+        )
+
+        self.assertEqual(
+            occupied_intervals(self.user, SUNDAY),
+            [(0, 14 * 60)],
+        )
+
+    def test_open_intervals_are_complement_of_placed_occupancy(self):
+        self._recurring(
+            "Saturday Night Work",
+            "work",
+            SATURDAY.weekday(),
+            time(19, 0),
+            time(7, 0),
+            is_night_shift=True,
+        )
+        self._recurring(
+            "Sunday Sleep",
+            "sleep",
+            SUNDAY.weekday(),
+            time(0, 0),
+            time(7, 0),
+        )
+
+        self.assertEqual(
+            open_intervals(self.user, SUNDAY, 7 * 60, 23 * 60),
+            [(14 * 60, 23 * 60)],
+        )
+
+    def test_occupied_intervals_clip_overnight_kept_today_piece(self):
+        self._recurring(
+            "Overnight Sleep",
+            "sleep",
+            MONDAY.weekday(),
+            time(23, 0),
+            time(7, 0),
+        )
+
+        self.assertEqual(
+            occupied_intervals(self.user, MONDAY, 22 * 60, 24 * 60),
+            [(23 * 60, 24 * 60)],
         )
 
     def test_skipped_blocks_are_absent_from_walls_and_placements(self):

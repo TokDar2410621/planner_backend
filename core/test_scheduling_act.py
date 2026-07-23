@@ -50,6 +50,53 @@ class NightShiftFreeSlotsTests(TestCase):
         self.assertTrue(all(s["end_time"] <= "19:00" for s in res.data["free_slots"]))
 
 
+class FlexiblePlacementReadToolTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="placed", password="x")
+        self.saturday = _weekday_on_or_after(5)
+        self.sunday = self.saturday + timedelta(days=1)
+        RecurringBlock.objects.create(
+            user=self.user, title="Travail", block_type="work",
+            day_of_week=self.saturday.weekday(), start_time=time(19, 0),
+            end_time=time(7, 0), is_night_shift=True,
+        )
+        RecurringBlock.objects.create(
+            user=self.user, title="Sommeil", block_type="sleep",
+            day_of_week=self.sunday.weekday(), start_time=time(0, 0),
+            end_time=time(7, 0),
+        )
+
+    def test_get_today_schedule_shows_placed_flexible_sleep(self):
+        res = GetTodayScheduleTool().execute(self.user, date=self.sunday.isoformat())
+
+        self.assertTrue(res.success, res.message)
+        sleep = next(b for b in res.data["blocks"] if b["title"] == "Sommeil")
+        self.assertEqual(sleep["start_time"], "07:00")
+        self.assertEqual(sleep["end_time"], "14:00")
+
+    def test_find_free_slots_excludes_placed_sleep_window(self):
+        res = FindFreeSlotsTool().execute(self.user, date=self.sunday.isoformat())
+
+        self.assertTrue(res.success, res.message)
+        self.assertEqual(
+            res.data["free_slots"],
+            [{"start_time": "14:00", "end_time": "23:00", "duration_minutes": 540}],
+        )
+
+    def test_schedule_task_rejects_overlap_with_placed_sleep(self):
+        res = ScheduleTaskAtTool().execute(
+            self.user, title="Lecture", date=self.sunday.isoformat(),
+            start_time="08:00", end_time="09:00",
+        )
+
+        self.assertFalse(res.success)
+        self.assertEqual(
+            res.data["conflict"],
+            {"start_time": "00:00", "end_time": "14:00"},
+        )
+        self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 0)
+
+
 class ScheduleTaskAtTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user(username="oneoff", password="x")

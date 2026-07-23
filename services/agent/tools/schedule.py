@@ -9,7 +9,7 @@ from django.utils import timezone
 from core.models import RecurringBlock, ScheduledBlock, Task
 from services.scheduling.exceptions import skipped_block_ids
 from services.scheduling.overlap import parse_time
-from services.social import busy_intervals, free_intervals
+from services.scheduling.placement import open_intervals, occupied_intervals, place_day
 from .base import BaseTool, ToolResult, validate_choice
 
 DAY_NAMES = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
@@ -79,15 +79,28 @@ class GetTodayScheduleTool(BaseTool):
             id__in=skipped_block_ids(user, target_date)
         ).order_by("start_time")
 
+        placements = {
+            p["block_id"]: p
+            for p in place_day(user, target_date)
+        }
         blocks = []
         for b in recurring:
+            start_time = b.start_time.strftime("%H:%M")
+            end_time = b.end_time.strftime("%H:%M")
+            if b.is_flexible:
+                placement = placements.get(b.id)
+                if placement is None or placement["skipped"]:
+                    continue
+                start_time = placement["start_time"]
+                end_time = placement["end_time"]
+
             blocks.append({
                 "id": b.id,
                 "title": b.title,
                 "type": "recurring",
                 "block_type": b.block_type,
-                "start_time": b.start_time.strftime("%H:%M"),
-                "end_time": b.end_time.strftime("%H:%M"),
+                "start_time": start_time,
+                "end_time": end_time,
                 "location": b.location or None,
             })
 
@@ -114,7 +127,7 @@ class GetTodayScheduleTool(BaseTool):
         # correctement un quart de nuit du jour ET le débordement de la veille,
         # + les blocs déjà planifiés). Corrige le faux "libre 7h-23h".
         free_slots = _free_slots_from_intervals(
-            free_intervals(user, target_date, DAY_START_MIN, DAY_END_MIN), 30
+            open_intervals(user, target_date, DAY_START_MIN, DAY_END_MIN), 30
         )
 
         return ToolResult(
@@ -229,7 +242,7 @@ class FindFreeSlotsTool(BaseTool):
         # de nuit (ex: 19h-07h) occupe bien la soirée, le débordement de la veille
         # occupe le matin, et les blocs déjà planifiés comptent aussi.
         free = _free_slots_from_intervals(
-            free_intervals(user, target_date, DAY_START_MIN, DAY_END_MIN), min_duration
+            open_intervals(user, target_date, DAY_START_MIN, DAY_END_MIN), min_duration
         )
 
         return ToolResult(
@@ -304,7 +317,7 @@ class ScheduleTaskAtTool(BaseTool):
 
         # Chevauchement avec l'occupation RÉELLE du jour (récurrents overnight +
         # débordement de la veille + blocs déjà planifiés), fenêtre pleine 0-24h.
-        for bs, be in busy_intervals(user, target_date, day_start=0, day_end=24 * 60):
+        for bs, be in occupied_intervals(user, target_date, 0, 24 * 60):
             if s < be and bs < e:
                 return ToolResult(
                     success=False,
