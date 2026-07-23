@@ -146,6 +146,7 @@ class CreateBlockTool(BaseTool):
 
         # Détection night shift basée sur les minutes (pas une comparaison de chaînes).
         is_night_shift = is_overnight(start_t, end_t, is_night_shift)
+        nf = RecurringBlock.default_flexibility_for(block_type) == RecurringBlock.FLEXIBILITY_FLEXIBLE
 
         created = []
         skipped = []
@@ -161,7 +162,12 @@ class CreateBlockTool(BaseTool):
 
                     # Contrôle de chevauchement (gère l'overnight, AUCUN contournement).
                     conflicts = find_recurring_conflicts(
-                        user, day, start_t, end_t, is_night_shift
+                        user,
+                        day,
+                        start_t,
+                        end_t,
+                        is_night_shift,
+                        new_is_flexible=nf,
                     )
                     if conflicts:
                         overlap = conflicts[0]
@@ -254,7 +260,13 @@ class UpdateBlockTool(BaseTool):
 
         # Contrôle de chevauchement (en s'excluant soi-même).
         conflicts = find_recurring_conflicts(
-            user, block.day_of_week, new_start, new_end, night, exclude_id=block.id
+            user,
+            block.day_of_week,
+            new_start,
+            new_end,
+            night,
+            exclude_id=block.id,
+            new_is_flexible=block.is_flexible,
         )
         if conflicts:
             o = conflicts[0]
