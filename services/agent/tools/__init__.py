@@ -20,7 +20,12 @@ from .blocks import (
     RestoreBlockOccurrenceTool,
 )
 from .tasks import ListTasksTool, CreateTaskTool, UpdateTaskTool, DeleteTaskTool, CompleteTaskTool
-from .schedule import GetTodayScheduleTool, GetWeekScheduleTool, FindFreeSlotsTool
+from .schedule import (
+    GetTodayScheduleTool,
+    GetWeekScheduleTool,
+    FindFreeSlotsTool,
+    ScheduleTaskAtTool,
+)
 from .preferences import GetPreferencesTool, UpdatePreferencesTool
 from .goals import ListGoalsTool, CreateGoalTool, UpdateGoalTool
 from .planning import SuggestOptimizationTool, DetectConflictsTool
@@ -49,6 +54,7 @@ ALL_TOOLS: list[BaseTool] = [
     GetTodayScheduleTool(),
     GetWeekScheduleTool(),
     FindFreeSlotsTool(),
+    ScheduleTaskAtTool(),
     # Preferences
     GetPreferencesTool(),
     UpdatePreferencesTool(),

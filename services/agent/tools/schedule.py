@@ -8,9 +8,16 @@ from django.utils import timezone
 
 from core.models import RecurringBlock, ScheduledBlock, Task
 from services.scheduling.exceptions import skipped_block_ids
-from .base import BaseTool, ToolResult
+from services.scheduling.overlap import parse_time
+from services.social import busy_intervals, free_intervals
+from .base import BaseTool, ToolResult, validate_choice
 
 DAY_NAMES = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
+VALID_TASK_TYPES = {c[0] for c in Task.TASK_TYPE_CHOICES}
+
+# Fenêtre "éveillée" par défaut pour les créneaux libres proposés (7h-23h).
+DAY_START_MIN = 7 * 60
+DAY_END_MIN = 23 * 60
 
 
 def _time_to_minutes(t: time) -> int:
@@ -21,6 +28,20 @@ def _minutes_to_str(minutes: int) -> str:
     h = minutes // 60
     m = minutes % 60
     return f"{h:02d}:{m:02d}"
+
+
+def _free_slots_from_intervals(intervals, min_duration: int) -> list:
+    """(start,end)-minutes -> dicts de créneaux libres, filtrés par durée min."""
+    out = []
+    for s, e in intervals:
+        duration = e - s
+        if duration >= min_duration:
+            out.append({
+                "start_time": _minutes_to_str(s),
+                "end_time": _minutes_to_str(e),
+                "duration_minutes": duration,
+            })
+    return out
 
 
 class GetTodayScheduleTool(BaseTool):
@@ -89,8 +110,12 @@ class GetTodayScheduleTool(BaseTool):
         # Sort all blocks by start time
         blocks.sort(key=lambda x: x["start_time"])
 
-        # Find free slots (between 7:00 and 23:00)
-        free_slots = self._find_free_slots(blocks, 7 * 60, 23 * 60)
+        # Créneaux libres 7h-23h via la logique unique overnight-aware (compte
+        # correctement un quart de nuit du jour ET le débordement de la veille,
+        # + les blocs déjà planifiés). Corrige le faux "libre 7h-23h".
+        free_slots = _free_slots_from_intervals(
+            free_intervals(user, target_date, DAY_START_MIN, DAY_END_MIN), 30
+        )
 
         return ToolResult(
             success=True,
@@ -104,52 +129,6 @@ class GetTodayScheduleTool(BaseTool):
             },
             message=f"Planning du {day_name} {target_date.isoformat()}: {len(blocks)} bloc(s), {len(free_slots)} créneau(x) libre(s).",
         )
-
-    def _find_free_slots(self, blocks, day_start_min, day_end_min):
-        """Find free time slots between blocks."""
-        occupied = []
-        for b in blocks:
-            parts = b["start_time"].split(":")
-            start = int(parts[0]) * 60 + int(parts[1])
-            parts = b["end_time"].split(":")
-            end = int(parts[0]) * 60 + int(parts[1])
-            if end > start:  # Skip overnight blocks
-                occupied.append((start, end))
-
-        occupied.sort()
-
-        # Merge overlapping
-        merged = []
-        for start, end in occupied:
-            if merged and start <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-            else:
-                merged.append((start, end))
-
-        # Find gaps
-        free = []
-        current = day_start_min
-        for start, end in merged:
-            if start > current:
-                duration = start - current
-                if duration >= 30:  # Only slots >= 30 min
-                    free.append({
-                        "start_time": _minutes_to_str(current),
-                        "end_time": _minutes_to_str(start),
-                        "duration_minutes": duration,
-                    })
-            current = max(current, end)
-
-        if current < day_end_min:
-            duration = day_end_min - current
-            if duration >= 30:
-                free.append({
-                    "start_time": _minutes_to_str(current),
-                    "end_time": _minutes_to_str(day_end_min),
-                    "duration_minutes": duration,
-                })
-
-        return free
 
 
 class GetWeekScheduleTool(BaseTool):
@@ -246,53 +225,12 @@ class FindFreeSlotsTool(BaseTool):
         day_of_week = target_date.weekday()
         min_duration = kwargs.get("min_duration_minutes", 30)
 
-        # Get all blocks for this day (moins les occurrences ignorées ce jour-là)
-        blocks = RecurringBlock.objects.filter(
-            user=user, day_of_week=day_of_week, active=True
-        ).exclude(
-            id__in=skipped_block_ids(user, target_date)
-        ).order_by("start_time")
-
-        occupied = []
-        for b in blocks:
-            start = _time_to_minutes(b.start_time)
-            end = _time_to_minutes(b.end_time)
-            if end > start:
-                occupied.append((start, end))
-
-        # Merge overlapping
-        occupied.sort()
-        merged = []
-        for start, end in occupied:
-            if merged and start <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-            else:
-                merged.append((start, end))
-
-        # Find gaps (7:00 - 23:00)
-        free = []
-        current = 7 * 60
-        day_end = 23 * 60
-
-        for start, end in merged:
-            if start > current:
-                duration = start - current
-                if duration >= min_duration:
-                    free.append({
-                        "start_time": _minutes_to_str(current),
-                        "end_time": _minutes_to_str(start),
-                        "duration_minutes": duration,
-                    })
-            current = max(current, end)
-
-        if current < day_end:
-            duration = day_end - current
-            if duration >= min_duration:
-                free.append({
-                    "start_time": _minutes_to_str(current),
-                    "end_time": _minutes_to_str(day_end),
-                    "duration_minutes": duration,
-                })
+        # Créneaux libres 7h-23h via la logique unique overnight-aware: un quart
+        # de nuit (ex: 19h-07h) occupe bien la soirée, le débordement de la veille
+        # occupe le matin, et les blocs déjà planifiés comptent aussi.
+        free = _free_slots_from_intervals(
+            free_intervals(user, target_date, DAY_START_MIN, DAY_END_MIN), min_duration
+        )
 
         return ToolResult(
             success=True,
@@ -303,4 +241,107 @@ class FindFreeSlotsTool(BaseTool):
                 "total_free_minutes": sum(s["duration_minutes"] for s in free),
             },
             message=f"{len(free)} créneau(x) libre(s) le {DAY_NAMES[day_of_week]} {target_date.isoformat()} (min {min_duration}min).",
+        )
+
+
+class ScheduleTaskAtTool(BaseTool):
+    name = "schedule_task_at"
+    description = (
+        "Planifie un événement PONCTUEL daté à une heure précise (ex: 'lecture ce "
+        "samedi 9h-11h', 'rdv mardi 14h-15h'). C'est l'outil pour un événement UNIQUE "
+        "sur une date donnée: il crée directement le créneau (verrouillé, la "
+        "replanification ne le bouge pas). N'utilise PAS create_block (qui crée une "
+        "habitude répétée CHAQUE semaine) pour un événement ponctuel. Si l'utilisateur "
+        "ne donne pas d'heure, choisis toi-même un créneau libre (find_free_slots) au "
+        "lieu de lui demander."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Titre de l'événement (ex: 'Lecture')."},
+            "date": {"type": "string", "description": "Date de l'événement (YYYY-MM-DD). Déduis-la de la DATE du jour."},
+            "start_time": {"type": "string", "description": "Heure de début (HH:MM)."},
+            "end_time": {"type": "string", "description": "Heure de fin (HH:MM), après le début."},
+            "task_type": {
+                "type": "string",
+                "enum": ["deep_work", "shallow", "errand"],
+                "description": "Type (optionnel, défaut shallow).",
+            },
+            "priority": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Priorité 1-10 (optionnel)."},
+            "description": {"type": "string", "description": "Détails (optionnel)."},
+        },
+        "required": ["title", "date", "start_time", "end_time"],
+    }
+
+    def execute(self, user: User, **kwargs) -> ToolResult:
+        title = (kwargs.get("title") or "").strip()
+        if not title:
+            return ToolResult(success=False, data={}, message="Titre requis.")
+
+        try:
+            target_date = datetime.strptime(kwargs["date"], "%Y-%m-%d").date()
+        except (ValueError, KeyError, TypeError):
+            return ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.")
+
+        try:
+            start_t = parse_time(kwargs["start_time"])
+            end_t = parse_time(kwargs["end_time"])
+        except (ValueError, KeyError):
+            return ToolResult(success=False, data={}, message="Heure invalide (attendu HH:MM).")
+
+        s = _time_to_minutes(start_t)
+        e = _time_to_minutes(end_t)
+        if e <= s:
+            return ToolResult(
+                success=False,
+                data={},
+                message="L'heure de fin doit être après l'heure de début (un événement ponctuel ne passe pas minuit ici).",
+            )
+
+        err = validate_choice(kwargs.get("task_type"), VALID_TASK_TYPES, "task_type")
+        if err:
+            return ToolResult(success=False, data={}, message=err)
+
+        # Chevauchement avec l'occupation RÉELLE du jour (récurrents overnight +
+        # débordement de la veille + blocs déjà planifiés), fenêtre pleine 0-24h.
+        for bs, be in busy_intervals(user, target_date, day_start=0, day_end=24 * 60):
+            if s < be and bs < e:
+                return ToolResult(
+                    success=False,
+                    data={"conflict": {"start_time": _minutes_to_str(bs), "end_time": _minutes_to_str(be)}},
+                    message=(
+                        f"Ce créneau ({_minutes_to_str(s)}-{_minutes_to_str(e)}) chevauche une "
+                        f"occupation existante ({_minutes_to_str(bs)}-{_minutes_to_str(be)}). "
+                        f"Choisis un autre horaire libre."
+                    ),
+                )
+
+        # Réutilise une tâche active du même titre (idempotence), sinon la crée.
+        task = Task.objects.filter(user=user, completed=False, title__iexact=title).first()
+        if task is None:
+            task = Task.objects.create(
+                user=user,
+                title=title,
+                task_type=kwargs.get("task_type", "shallow"),
+                priority=kwargs.get("priority", 5),
+                description=kwargs.get("description", ""),
+            )
+
+        sb = ScheduledBlock.objects.create(
+            user=user, task=task, date=target_date,
+            start_time=start_t, end_time=end_t, locked=True,
+        )
+        return ToolResult(
+            success=True,
+            data={"scheduled_block": {
+                "id": sb.id,
+                "title": task.title,
+                "date": target_date.isoformat(),
+                "start_time": start_t.strftime("%H:%M"),
+                "end_time": end_t.strftime("%H:%M"),
+            }},
+            message=(
+                f"'{task.title}' planifié le {DAY_NAMES[target_date.weekday()]} "
+                f"{target_date.isoformat()} de {start_t.strftime('%H:%M')} à {end_t.strftime('%H:%M')}."
+            ),
         )
