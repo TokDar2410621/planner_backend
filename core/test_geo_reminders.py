@@ -19,6 +19,7 @@ from core.models import (
     UserProfile, UserPlace, Task, ScheduledBlock, PushSubscription,
 )
 from services.geocoding import geocode_address
+from services.agent.tools.tasks import CreateTaskTool, UpdateTaskTool
 
 
 class _FakeResp:
@@ -180,3 +181,44 @@ class SendRemindersTaskTests(TestCase):
         self.place.save()
         mock_send = self._run_at(12, 15)
         self.assertEqual(mock_send.call_count, 0)
+
+
+class AgentTaskPlaceTests(TestCase):
+    """The chat agent can attach a geocoded place to a task by name (no ID)."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="agtask", password="x")
+
+    @patch("services.geocoding.geocode_address", return_value=(48.42, -71.05))
+    def test_create_task_with_place_geocodes_and_attaches(self, _mock):
+        res = CreateTaskTool().execute(
+            self.user, title="Réunion M. YEPRI", place_name="UQAC", place_address="Chicoutimi"
+        )
+        self.assertTrue(res.success, res.message)
+        task = Task.objects.get(user=self.user, title="Réunion M. YEPRI")
+        self.assertIsNotNone(task.place)
+        self.assertEqual(task.place.name, "UQAC")
+        self.assertTrue(task.place.has_coordinates)
+        self.assertEqual(task.place.latitude, 48.42)
+        self.assertEqual(res.data["task"]["place"]["name"], "UQAC")
+
+    @patch("services.geocoding.geocode_address", return_value=(48.42, -71.05))
+    def test_place_reused_not_duplicated(self, _mock):
+        CreateTaskTool().execute(self.user, title="T1", place_name="UQAC")
+        CreateTaskTool().execute(self.user, title="T2", place_name="UQAC")
+        self.assertEqual(UserPlace.objects.filter(user=self.user, name="UQAC").count(), 1)
+
+    @patch("services.geocoding.geocode_address", return_value=None)
+    def test_create_task_without_place(self, _mock):
+        res = CreateTaskTool().execute(self.user, title="Sans lieu")
+        self.assertTrue(res.success)
+        self.assertIsNone(Task.objects.get(user=self.user, title="Sans lieu").place)
+
+    @patch("services.geocoding.geocode_address", return_value=(46.8, -71.2))
+    def test_update_task_adds_place(self, _mock):
+        task = Task.objects.create(user=self.user, title="Réunion")
+        res = UpdateTaskTool().execute(self.user, task_id=task.id, place_name="Bureau")
+        self.assertTrue(res.success, res.message)
+        task.refresh_from_db()
+        self.assertEqual(task.place.name, "Bureau")
+        self.assertTrue(task.place.has_coordinates)
