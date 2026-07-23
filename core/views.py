@@ -554,7 +554,25 @@ class UserPlaceViewSet(viewsets.ModelViewSet):
         return UserPlace.objects.filter(user=self.request.user)
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+        place = serializer.save(user=self.request.user)
+        self._geocode(place)
+
+    def perform_update(self, serializer):
+        address_changed = 'address' in serializer.validated_data
+        place = serializer.save()
+        if address_changed or not place.has_coordinates:
+            self._geocode(place)
+
+    @staticmethod
+    def _geocode(place):
+        """Best-effort: renseigne lat/lng depuis l'adresse (rappels géoloc)."""
+        if not place.address:
+            return
+        from services.geocoding import geocode_address
+        coords = geocode_address(place.address)
+        if coords:
+            place.latitude, place.longitude = coords
+            place.save(update_fields=['latitude', 'longitude'])
 
 
 # ============== RecurringBlock Views ==============

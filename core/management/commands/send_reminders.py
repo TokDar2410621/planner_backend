@@ -15,7 +15,7 @@ from datetime import timedelta
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
-from core.models import PushSubscription, RecurringBlock
+from core.models import PushSubscription, RecurringBlock, ScheduledBlock
 from services.commute import commute_window
 from services.push import push_configured, send_to_user
 
@@ -120,7 +120,51 @@ class Command(BaseCommand):
                     url="/schedule",
                 )
 
+        # --- Pass 3: departure alerts for SCHEDULED TASKS tied to a place -----
+        # Une tâche planifiée avec un lieu (ex: "Réunion 14h à l'UQAC") déclenche
+        # les mêmes alertes de départ que les blocs récurrents (rappels géoloc).
+        task_prep = task_leave = 0
+        placed_tasks = ScheduledBlock.objects.filter(
+            user_id__in=user_ids,
+            date=now.date(),
+            task__place__isnull=False,
+        ).select_related("user", "user__profile", "task", "task__place")
+
+        for sb in placed_tasks:
+            travel = sb.task.place.travel_minutes or 0
+            if travel <= 0:
+                continue
+            profile = sb.user.profile
+            start_bmin = sb.start_time.hour * 60 + sb.start_time.minute
+            w = commute_window(
+                start_bmin,
+                travel,
+                profile.safety_margin_minutes or 0,
+                profile.prep_time_minutes or 0,
+            )
+            label = sb.task.title
+            place_name = sb.task.place.name
+
+            if now_min <= w.unavailability_start <= end_min:
+                task_prep += send_to_user(
+                    sb.user,
+                    "Prépare-toi",
+                    f"Commence à te préparer pour {label} ({place_name}). "
+                    f"Départ à {_fmt(w.departure)} ({travel} min de trajet).",
+                    url="/schedule",
+                )
+
+            if now_min <= w.departure <= end_min:
+                task_leave += send_to_user(
+                    sb.user,
+                    "Pars maintenant",
+                    f"Pour {label} à {sb.start_time.strftime('%H:%M')} ({place_name}), "
+                    f"pars maintenant pour arriver à l'heure.",
+                    url="/schedule",
+                )
+
         self.stdout.write(
             f"Reminders: {blocks.count()} bloc(s), {sent} push. "
-            f"Départs: {prep_alerts} prépa, {leave_alerts} départ."
+            f"Départs blocs: {prep_alerts} prépa, {leave_alerts} départ. "
+            f"Départs tâches: {task_prep} prépa, {task_leave} départ."
         )
