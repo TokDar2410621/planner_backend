@@ -974,12 +974,31 @@ class ScheduleView(APIView):
             date__lt=end_date
         )
 
+        # Placement quotidien des blocs SOUPLES (sommeil/repas/sport placés autour
+        # du fixe), pour que l'agenda les affiche à leur heure RÉELLE du jour (et
+        # pas à l'heure figée du template). Les blocs fixes n'apparaissent pas ici
+        # (ils gardent leur heure). start_time/end_time sont None si `skipped`.
+        from services.scheduling.placement import place_day
+        recurring_placements = []
+        day_cursor = start_date
+        while day_cursor < end_date:
+            for placement in place_day(request.user, day_cursor):
+                recurring_placements.append({
+                    'date': day_cursor.isoformat(),
+                    'recurring_block': placement['block_id'],
+                    'start_time': placement['start_time'],
+                    'end_time': placement['end_time'],
+                    'skipped': placement['skipped'],
+                })
+            day_cursor += timedelta(days=1)
+
         data = {
             'recurring_blocks': RecurringBlockSerializer(recurring_blocks, many=True).data,
             'scheduled_tasks': ScheduledBlockSerializer(scheduled_tasks, many=True).data,
             'unscheduled_tasks': TaskSerializer(unscheduled_tasks, many=True).data,
             'recurring_completions': RecurringBlockCompletionSerializer(recurring_completions, many=True).data,
             'recurring_exceptions': RecurringBlockExceptionSerializer(recurring_exceptions, many=True).data,
+            'recurring_placements': recurring_placements,
         }
 
         return Response(data)
