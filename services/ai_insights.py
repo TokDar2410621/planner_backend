@@ -934,16 +934,24 @@ Jours: 0=Lundi, 1=Mardi, 2=Mercredi, 3=Jeudi, 4=Vendredi, 5=Samedi, 6=Dimanche
             task_type = parsed_request.get('task_type', 'shallow')
             raw_duration = parsed_request.get('duration_minutes')
             assumptions = []
-            if raw_duration:
-                duration = raw_duration
-            else:
+            duration = self._coerce_positive_int(raw_duration)
+            if duration is None:
                 duration = 60
                 assumptions.append({
                     'field': 'duration_minutes',
                     'value': 60,
                     'reason': "durée absente dans la demande",
                 })
-            days = parsed_request.get('days') or [timezone.now().weekday()]
+            raw_days = parsed_request.get('days')
+            days = self._normalize_weekdays(raw_days)
+            if not days:
+                days = [timezone.now().weekday()]
+                if raw_days not in (None, '', []):
+                    assumptions.append({
+                        'field': 'days',
+                        'value': days,
+                        'reason': "jours invalides dans la demande",
+                    })
 
             # Create the task
             task = Task.objects.create(
@@ -1045,6 +1053,56 @@ Jours: 0=Lundi, 1=Mardi, 2=Mercredi, 3=Jeudi, 4=Vendredi, 5=Samedi, 6=Dimanche
         return {'status': 'unknown_action', 'action': action}
 
     # ==================== UTILITY METHODS ====================
+
+    @staticmethod
+    def _coerce_positive_int(value) -> Optional[int]:
+        """Return a positive integer from loose LLM/user values, else None."""
+        if value in (None, '') or isinstance(value, bool):
+            return None
+        if isinstance(value, str):
+            match = re.search(r'\d+', value)
+            if not match:
+                return None
+            value = match.group(0)
+        try:
+            coerced = int(value)
+        except (TypeError, ValueError):
+            return None
+        return coerced if coerced > 0 else None
+
+    @staticmethod
+    def _normalize_weekdays(value) -> List[int]:
+        """Normalize LLM weekday outputs to unique ints, where Monday is 0."""
+        if value in (None, ''):
+            return []
+        if not isinstance(value, (list, tuple, set)):
+            value = [value]
+
+        names = {
+            'lundi': 0, 'monday': 0, 'mon': 0,
+            'mardi': 1, 'tuesday': 1, 'tue': 1,
+            'mercredi': 2, 'wednesday': 2, 'wed': 2,
+            'jeudi': 3, 'thursday': 3, 'thu': 3,
+            'vendredi': 4, 'friday': 4, 'fri': 4,
+            'samedi': 5, 'saturday': 5, 'sat': 5,
+            'dimanche': 6, 'sunday': 6, 'sun': 6,
+        }
+        days = []
+        for raw in value:
+            day = None
+            if isinstance(raw, bool):
+                day = None
+            elif isinstance(raw, int):
+                day = raw
+            elif isinstance(raw, str):
+                key = raw.strip().lower()
+                if key.isdigit():
+                    day = int(key)
+                else:
+                    day = names.get(key)
+            if day is not None and 0 <= day <= 6 and day not in days:
+                days.append(day)
+        return days
 
     def _time_diff_minutes(self, start: time, end: time, allow_overnight: bool = False) -> int:
         """

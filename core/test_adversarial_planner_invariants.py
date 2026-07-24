@@ -326,3 +326,22 @@ def test_natural_language_missing_duration_reports_visible_assumption():
 
     assert result["assumptions"]
     assert result["assumptions"][0]["field"] == "duration_minutes"
+
+
+@pytest.mark.django_db
+def test_natural_language_execution_normalizes_llm_string_days_and_duration():
+    user = User.objects.create_user("qa-nl-llm-coercion", password="pw")
+    _profile(user)
+    _block(user, "Travail soir", "work", 0, time(18), time(22))
+
+    result = AIInsightsService().execute_scheduling_request(user, {
+        "action": "schedule",
+        "task_title": "Sport soir",
+        "duration_minutes": "60",
+        "days": ["lundi"],
+        "preferred_time": "evening",
+    })
+
+    assert result["status"] == "unplaced"
+    assert result["unplaced"]
+    assert result["unplaced"][0]["date"] == MONDAY.isoformat()

@@ -240,13 +240,27 @@ class RecurringBlockSerializer(serializers.ModelSerializer):
         # préexistant: des blocs qui se chevauchent existent en base (l'extraction
         # de documents et les outils agent créent via l'ORM, hors ce serializer),
         # et l'utilisateur doit pouvoir les renommer/désactiver pour les résoudre.
+        target_active = attrs.get('active')
+        if target_active is None:
+            target_active = self.instance.active if self.instance is not None else True
+
+        active_changed_to_true = (
+            self.instance is not None
+            and attrs.get('active') is True
+            and not self.instance.active
+        )
         scheduling_fields = {'start_time', 'end_time', 'day_of_week', 'block_type', 'is_night_shift'}
         is_create = self.instance is None
-        scheduling_changed = is_create or bool(scheduling_fields & set(attrs))
+        scheduling_changed = (
+            is_create
+            or active_changed_to_true
+            or bool(scheduling_fields & set(attrs))
+        )
 
         if (
             user is not None
             and user.is_authenticated
+            and target_active
             and scheduling_changed
             and start_time
             and end_time

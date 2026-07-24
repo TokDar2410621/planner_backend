@@ -140,3 +140,39 @@ class RecurringOverlapUpdateTests(TestCase):
             format="json",
         )
         self.assertEqual(r.status_code, 400, r.content)
+
+    def test_reactivating_inactive_fixed_overlap_is_rejected(self):
+        # Regression from prod retest: active=False is metadata when disabling,
+        # but active=True reintroduces a fixed wall and must be schedule-checked.
+        inactive = self.client.post(
+            reverse("recurring-block-list"),
+            {
+                "title": "Dormant Work",
+                "block_type": "work",
+                "day_of_week": 4,
+                "start_time": "09:00",
+                "end_time": "11:00",
+                "active": False,
+            },
+            format="json",
+        )
+        self.assertEqual(inactive.status_code, 201, inactive.content)
+        active = self.client.post(
+            reverse("recurring-block-list"),
+            {
+                "title": "Active Work",
+                "block_type": "work",
+                "day_of_week": 4,
+                "start_time": "10:00",
+                "end_time": "12:00",
+            },
+            format="json",
+        )
+        self.assertEqual(active.status_code, 201, active.content)
+
+        url = reverse("recurring-block-detail", kwargs={"pk": inactive.data["id"]})
+        r = self.client.patch(url, {"active": True}, format="json")
+
+        self.assertEqual(r.status_code, 400, r.content)
+        block = RecurringBlock.all_objects.get(id=inactive.data["id"])
+        self.assertFalse(block.active)
