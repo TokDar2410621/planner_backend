@@ -399,6 +399,14 @@ class PlannerAgent:
                 for tc in tool_calls_made:
                     final_text += f"\n- {tc['result'].get('message', tc['tool'])}"
 
+        # Filet: ne JAMAIS renvoyer une réponse vide (ex: un LLM qui renvoie un
+        # candidat sans texte ni outil). Mieux vaut inviter à reformuler qu'un
+        # message blanc côté utilisateur.
+        if not had_error and not (final_text or "").strip():
+            final_text = (
+                "Je n'ai pas bien saisi ta demande. Peux-tu la reformuler en une phrase ?"
+            )
+
         if (
             not had_error
             and _attempted_mutation(tool_calls_made)

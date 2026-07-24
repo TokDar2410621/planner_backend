@@ -30,6 +30,15 @@ class GeminiProvider(LLMProvider):
 
     DEFAULT_MODEL = 'gemini-2.5-flash'
 
+    # Un thinking_budget EXPLICITE est REQUIS. En mode dynamique (défaut -1),
+    # avec des outils + un gros system prompt, gemini-2.5-flash renvoie par
+    # moments un candidat VIDE (finish=STOP, aucune part, output_tokens=None) ->
+    # l'agent ne fait rien (réponse blanche, ou "Erreur IA" quand le failover
+    # était vivant). Un budget FIXE (même modéré) supprime ce comportement tout
+    # en gardant du raisonnement. Reproduit et vérifié: budget 0/512/1024/2048
+    # renvoient tous une part; seul le mode dynamique produisait le vide.
+    THINKING_BUDGET = 1024
+
     def __init__(self, model_name: Optional[str] = None):
         """
         Initialize the Gemini provider.
@@ -53,6 +62,24 @@ class GeminiProvider(LLMProvider):
     @property
     def name(self) -> str:
         return f"Gemini ({self.model_name})"
+
+    def _build_config(self, gemini_tools=None):
+        """Config Gemini avec un thinking_budget explicite (anti candidat vide).
+
+        Toujours renvoyer une config (même sans outils) pour garantir le budget
+        de pensée fixe. Garde de compat: si ThinkingConfig manque (skew de
+        version), on n'ajoute pas le champ plutôt que de planter.
+        """
+        kwargs = {}
+        thinking_cls = getattr(types, "ThinkingConfig", None)
+        if thinking_cls is not None:
+            kwargs["thinking_config"] = thinking_cls(thinking_budget=self.THINKING_BUDGET)
+        if gemini_tools:
+            kwargs["tools"] = gemini_tools
+            kwargs["tool_config"] = types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode='AUTO')
+            )
+        return types.GenerateContentConfig(**kwargs)
 
     @retry_with_backoff(max_retries=3, base_delay=2.0, max_delay=30.0)
     def _call_api(self, contents, config=None):
@@ -108,16 +135,7 @@ class GeminiProvider(LLMProvider):
             full_prompt = f"{system_prompt}\n\n{prompt}"
 
         try:
-            # Build config if tools are provided
-            config = None
-            gemini_tools = self._to_gemini_tools(tools)
-            if gemini_tools:
-                config = types.GenerateContentConfig(
-                    tools=gemini_tools,
-                    tool_config=types.ToolConfig(
-                        function_calling_config=types.FunctionCallingConfig(mode='AUTO')
-                    )
-                )
+            config = self._build_config(self._to_gemini_tools(tools))
 
             # Call the API
             response = self._call_api(full_prompt, config)
@@ -284,19 +302,22 @@ class GeminiProvider(LLMProvider):
 
             logger.debug(f"Gemini request: {len(contents)} content parts, tools={'yes' if tools else 'no'}")
 
-            # Build config
-            config = None
-            gemini_tools = self._to_gemini_tools(tools)
-            if gemini_tools:
-                config = types.GenerateContentConfig(
-                    tools=gemini_tools,
-                    tool_config=types.ToolConfig(
-                        function_calling_config=types.FunctionCallingConfig(mode='AUTO')
-                    )
-                )
+            # Build config (thinking_budget explicite: anti candidat vide)
+            config = self._build_config(self._to_gemini_tools(tools))
 
-            response = self._call_api(contents, config)
-            parsed = self._parse_response(response)
+            # Retry sur candidat VIDE: même avec un budget fixe, Gemini peut
+            # renvoyer par intermittence un candidat sans texte ni outil (STOP,
+            # 0 part). Un blanc = l'agent ne fait rien; on redemande jusqu'à 3x.
+            parsed = None
+            for attempt in range(3):
+                response = self._call_api(contents, config)
+                parsed = self._parse_response(response)
+                if parsed.function_calls or parsed.text.strip() or parsed.is_truncated:
+                    break
+                logger.warning(
+                    "Gemini a renvoyé un candidat vide (essai %d/3, stop=%s); nouvel essai.",
+                    attempt + 1, parsed.stop_reason,
+                )
 
             logger.debug(f"Gemini response parsed: text_len={len(parsed.text)}, function_calls={len(parsed.function_calls)}")
             return parsed

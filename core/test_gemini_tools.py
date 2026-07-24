@@ -35,6 +35,29 @@ class GeminiToolConversionTest(SimpleTestCase):
         self.assertIsNone(GeminiProvider()._to_gemini_tools([]))
 
 
+class GeminiThinkingConfigTest(SimpleTestCase):
+    """Regression: un thinking_budget EXPLICITE est requis. En mode dynamique
+    (défaut -1), gemini-2.5-flash + outils + gros system prompt renvoie par
+    intermittence un candidat VIDE (STOP, 0 part) et l'agent reste muet. Un
+    budget fixe supprime ce comportement (reproduit: dynamique = vide,
+    0/512/1024/2048 = OK)."""
+
+    def test_build_config_sets_explicit_non_dynamic_thinking_budget(self):
+        from services.llm.gemini import GeminiProvider
+        cfg = GeminiProvider()._build_config(gemini_tools=None)
+        self.assertIsNotNone(getattr(cfg, "thinking_config", None))
+        self.assertEqual(cfg.thinking_config.thinking_budget, GeminiProvider.THINKING_BUDGET)
+        self.assertGreaterEqual(GeminiProvider.THINKING_BUDGET, 0)  # jamais -1 (dynamique)
+
+    def test_build_config_keeps_tools_and_budget_together(self):
+        from services.llm.gemini import GeminiProvider
+        from services.agent.tools import get_tools_for_claude
+        p = GeminiProvider()
+        cfg = p._build_config(p._to_gemini_tools(get_tools_for_claude()))
+        self.assertIsNotNone(getattr(cfg, "thinking_config", None))
+        self.assertTrue(cfg.tools)
+
+
 class GeminiParseResponseRobustnessTest(SimpleTestCase):
     """Regression: a candidate that exposes no parts (SAFETY / RECITATION /
     MAX_TOKENS with empty content, or content=None) yields response.parts=None.
