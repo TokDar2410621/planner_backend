@@ -17,7 +17,7 @@ from core.models import RecurringBlock, ScheduledBlock, Task
 from services.agent.agent import PlannerAgent
 from services.agent.tools.blocks import CreateBlockTool, UpdateBlockTool
 from services.agent.tools.schedule import ScheduleTaskAtTool
-from services.llm.base import LLMProvider, LLMResponse
+from services.llm.base import FunctionCall, LLMProvider, LLMResponse
 from services.replan import replan_after_delay
 from services.scheduling.placement import fixed_busy_intervals, place_day
 
@@ -237,18 +237,70 @@ class _StaticProvider(LLMProvider):
         return "static"
 
 
-class AgentActionTruthTests(TestCase):
-    """Conversation contract: no successful write tool means no fake success."""
+class _ScriptedProvider(LLMProvider):
+    """Rend une séquence de réponses (un tour d'outil, puis un tour de texte)."""
 
-    def test_claimed_planning_without_write_is_marked_as_not_applied(self):
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self._i = 0
+
+    def _next(self):
+        r = self._responses[min(self._i, len(self._responses) - 1)]
+        self._i += 1
+        return r
+
+    def generate(self, prompt, tools=None, system_prompt=None):
+        return self._next()
+
+    def generate_with_history(self, messages, tools=None, system_prompt=None):
+        return self._next()
+
+    def is_available(self):
+        return True
+
+    @property
+    def name(self):
+        return "scripted"
+
+
+class AgentActionTruthTests(TestCase):
+    """Conversation contract: a write ATTEMPTED this turn that fails must never be
+    spun as a success; but a true recap of a PAST action (no tool this turn) passes."""
+
+    def test_failed_write_claimed_as_success_is_replaced(self):
         user = User.objects.create_user("qa2_truth", password="pw")
-        provider = _StaticProvider("J'ai bloqué ta lecture lundi de 09h00 à 10h00.")
+        # Tour 1: le LLM tente create_block avec un type invalide -> échec (success=False).
+        # Tour 2: il prétend malgré tout avoir bloqué le créneau.
+        responses = [
+            LLMResponse(function_calls=[FunctionCall(
+                name="create_block",
+                args={"title": "Lecture", "block_type": "invalid_type",
+                      "days": [0], "start_time": "09:00", "end_time": "10:00"},
+                call_id="c1",
+            )]),
+            LLMResponse(text="J'ai bloqué ta lecture lundi de 09h00 à 10h00."),
+        ]
+        provider = _ScriptedProvider(responses)
 
         with patch("services.agent.agent.get_provider", return_value=provider):
-            result = PlannerAgent().process_message(user, "Planifie ma lecture lundi")
+            result = PlannerAgent().process_message(user, "Bloque ma lecture lundi de 9h à 10h")
 
-        self.assertIn("Je n'ai pas modifie ton planning", result["response"])
-        self.assertEqual(ScheduledBlock.objects.filter(user=user).count(), 0)
+        # La garde REMPLACE le faux succès: la phrase mensongère ("bloqué") ne
+        # subsiste pas (sinon message contradictoire), et rien n'est créé.
+        self.assertIn("échoué", result["response"])
+        self.assertNotIn("bloqué", result["response"])
+        self.assertEqual(RecurringBlock.objects.filter(user=user).count(), 0)
+
+    def test_past_recap_without_write_is_left_intact(self):
+        # Régression (revue adversariale): un récapitulatif VRAI d'une action
+        # passée n'appelle aucun outil ce tour -> la garde ne doit PAS le démentir.
+        user = User.objects.create_user("qa2_recap", password="pw")
+        provider = _StaticProvider("Oui, j'ai créé ton bloc sport hier à 18h.")
+
+        with patch("services.agent.agent.get_provider", return_value=provider):
+            result = PlannerAgent().process_message(user, "Tu as bien créé mon bloc sport hier ?")
+
+        self.assertEqual(result["response"], "Oui, j'ai créé ton bloc sport hier à 18h.")
 
     def test_plain_proposal_without_write_is_left_as_proposal(self):
         user = User.objects.create_user("qa2_proposal", password="pw")

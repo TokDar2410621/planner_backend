@@ -56,8 +56,12 @@ MUTATION_TOOLS = {
 COMPLETED_MUTATION_RE = re.compile(
     r"\b(?:j'ai|je t'ai|c'est note)\b[^.!?\n]{0,80}"
     r"\b(?:cree|creee|creees|ajoute|ajoutee|bloque|bloquee|planifie|"
-    r"planifiee|programme|programmee|ajuste|ajustee|modifie|modifiee|"
-    r"mis\s+a\s+jour|mise\s+a\s+jour|deplace|deplacee|decale|decalee)\b",
+    r"planifiee|programme|programmee|reprogramme|reprogrammee|ajuste|ajustee|"
+    r"modifie|modifiee|mis\s+a\s+jour|mise\s+a\s+jour|deplace|deplacee|"
+    r"decale|decalee|prolonge|prolongee|rallonge|rallongee|allonge|allongee|"
+    r"etendu|etendue|raccourci|raccourcie|reduit|reduite|supprime|supprimee|"
+    r"enleve|enlevee|retire|retiree|avance|avancee|reporte|reportee|"
+    r"reserve|reservee|verrouille|verrouillee|fixe|fixee)\b",
     re.IGNORECASE,
 )
 
@@ -70,6 +74,17 @@ def _successful_mutation(tool_calls: list) -> bool:
         if result.get("success"):
             return True
     return False
+
+
+def _attempted_mutation(tool_calls: list) -> bool:
+    """Un outil d'écriture a-t-il été APPELÉ ce tour (succès ou échec)?
+
+    La garde anti faux-succès ne se déclenche que si une écriture a été TENTÉE
+    ce tour-ci sans succès: sinon on risquerait de démentir à tort un
+    récapitulatif VRAI d'une action passée ("oui, je t'ai déplacé ta lecture
+    hier"), qui n'appelle aucun outil ce tour et doit passer intact.
+    """
+    return any(call.get("tool") in MUTATION_TOOLS for call in tool_calls)
 
 
 def _claims_completed_mutation(text: str) -> bool:
@@ -307,13 +322,19 @@ class PlannerAgent:
 
         if (
             not had_error
+            and _attempted_mutation(tool_calls_made)
             and _claims_completed_mutation(final_text)
             and not _successful_mutation(tool_calls_made)
         ):
+            # Le LLM a TENTÉ une écriture qui a échoué mais prétend l'avoir
+            # réussie. On REMPLACE le message (au lieu de le préfixer): préfixer
+            # produisait une réponse qui se contredit ("Je n'ai pas modifié...
+            # J'ai ajusté..."). On ne se déclenche que si une mutation a été
+            # tentée ce tour, pour ne jamais démentir à tort un récapitulatif
+            # VRAI d'une action passée (qui n'appelle aucun outil ce tour).
             final_text = (
-                "Je n'ai pas modifie ton planning: aucune action d'ecriture "
-                "n'a ete confirmee. "
-                f"{final_text}"
+                "Je n'ai pas pu appliquer la modification à ton planning "
+                "(l'action a échoué). Dis-moi si tu veux que je réessaie."
             )
 
         # 7. Save assistant response — but never persist an LLM-failure message

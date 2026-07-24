@@ -7,7 +7,7 @@ from django.contrib.auth.models import User
 from django.core.exceptions import ObjectDoesNotExist
 from django.utils import timezone
 
-from core.models import RecurringBlock, Task, Goal
+from core.models import RecurringBlock, ScheduledBlock, Task, Goal
 
 DAY_NAMES = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
 
@@ -49,16 +49,32 @@ def build_context(user: User) -> dict:
             "onboarding_completed": False,
         }
 
-    # Today's blocks
+    # Today's schedule = recurring blocks (template hours) + dated one-off events.
+    # We inject ScheduledBlock too: otherwise the agent is blind to the slots it
+    # placed itself (schedule_task_at / replan) and answers from memory (Q01/OR2).
     today_blocks = RecurringBlock.objects.filter(
         user=user, day_of_week=day_of_week, active=True
     ).order_by("start_time")
 
-    today_schedule = []
+    today_entries = []
     for b in today_blocks:
-        today_schedule.append(
-            f"  {b.start_time.strftime('%H:%M')}-{b.end_time.strftime('%H:%M')} {b.title} ({b.get_block_type_display()})"
-        )
+        today_entries.append((
+            b.start_time,
+            f"  {b.start_time.strftime('%H:%M')}-{b.end_time.strftime('%H:%M')} {b.title} ({b.get_block_type_display()})",
+        ))
+
+    today_scheduled = ScheduledBlock.objects.filter(
+        user=user, date=today
+    ).select_related("task").order_by("start_time")
+    for sb in today_scheduled:
+        lock = " [verrouillé]" if sb.locked else ""
+        today_entries.append((
+            sb.start_time,
+            f"  {sb.start_time.strftime('%H:%M')}-{sb.end_time.strftime('%H:%M')} {sb.task.title} (planifié){lock}",
+        ))
+
+    today_entries.sort(key=lambda e: e[0])
+    today_schedule = [line for _, line in today_entries]
 
     # Total blocks count
     total_blocks = RecurringBlock.objects.filter(user=user, active=True).count()
