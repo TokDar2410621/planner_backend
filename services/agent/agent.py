@@ -305,7 +305,6 @@ class PlannerAgent:
         tool_calls_made = []
         executed_calls = {}  # (name, args) -> result string; skips duplicate tool calls
         interactive_inputs = None  # Captured from present_form tool
-        ai_quick_replies = None    # Captured from present_quick_replies tool
 
         for turn in range(self.MAX_TOOL_TURNS):
             logger.info(f"Agent turn {turn + 1}/{self.MAX_TOOL_TURNS}")
@@ -364,8 +363,6 @@ class PlannerAgent:
                 # Capture interactive UI data from tools
                 if fc.name == "present_form" and result.success:
                     interactive_inputs = result.data.get("interactive_inputs")
-                if fc.name == "present_quick_replies" and result.success:
-                    ai_quick_replies = result.data.get("quick_replies")
 
                 tool_results.append({
                     "type": "tool_result",
@@ -445,7 +442,7 @@ class PlannerAgent:
 
         # 8. Build response
         # Use AI-generated quick replies if available, otherwise auto-generate
-        quick_replies = ai_quick_replies or self._generate_quick_replies(tool_calls_made, context)
+        quick_replies = self._generate_quick_replies(tool_calls_made, context)
 
         result = {
             "response": response_text,

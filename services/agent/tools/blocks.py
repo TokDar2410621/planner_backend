@@ -82,7 +82,7 @@ class ListBlocksTool(BaseTool):
 
 class CreateBlockTool(BaseTool):
     name = "create_block"
-    description = "Crée un ou plusieurs blocs récurrents dans le planning. Spécifie les jours comme une liste (ex: [0,1,2,3,4] pour lundi à vendredi). Un bloc séparé sera créé pour chaque jour."
+    description = "Crée un ou plusieurs blocs récurrents HEBDOMADAIRES (une habitude qui revient chaque semaine: cours, travail, sport, sommeil...). Jours = liste (ex: [0,1,2,3,4] = lundi à vendredi); un bloc séparé par jour. Appelle-le DÈS que l'utilisateur décrit un horaire habituel. N'utilise JAMAIS create_block pour un événement unique daté ('ce samedi', une date précise) -> schedule_task_at. Les conflits sont détectés et renvoyés automatiquement."
     parameters = {
         "type": "object",
         "properties": {
@@ -227,7 +227,7 @@ class CreateBlockTool(BaseTool):
 
 class UpdateBlockTool(BaseTool):
     name = "update_block"
-    description = "Modifie un bloc récurrent existant (titre, horaires, lieu, etc.)."
+    description = "Modifie un bloc récurrent existant (titre, horaires, lieu, flexibilité). Résous le bloc par son nom/jour/heure via list_blocks; ne demande JAMAIS un identifiant à l'utilisateur. flexibility='fixed' verrouille/protège le bloc ('ne déplace jamais mon sport') = il devient un mur infranchissable; flexibility='flexible' le rend déplaçable. Pour annuler/ignorer UN SEUL jour, n'utilise PAS update_block -> skip_block_occurrence."
     parameters = {
         "type": "object",
         "properties": {
@@ -328,7 +328,7 @@ class UpdateBlockTool(BaseTool):
 
 class DeleteBlockTool(BaseTool):
     name = "delete_block"
-    description = "Supprime un bloc récurrent du planning."
+    description = "Supprime TOUTE la série d'un bloc récurrent. Résous le bloc par nom/jour/heure; ne demande jamais d'identifiant à l'utilisateur. Pour annuler un seul jour, utilise skip_block_occurrence, PAS delete_block."
     parameters = {
         "type": "object",
         "properties": {

@@ -51,7 +51,7 @@ def _free_slots_from_intervals(intervals, min_duration: int) -> list:
 
 class GetTodayScheduleTool(BaseTool):
     name = "get_today_schedule"
-    description = "Récupère le planning complet d'aujourd'hui : blocs récurrents, tâches planifiées, et créneaux libres."
+    description = "Récupère le planning EFFECTIF d'un jour (blocs récurrents aux heures PLACÉES, tâches planifiées, créneaux libres). Consulte-le avant d'affirmer où se trouve une activité ou si elle a bougé, et parle des heures effectives — jamais de mémoire ni d'après l'historique (un bloc souple peut être placé à une autre heure que son heure habituelle)."
     parameters = {
         "type": "object",
         "properties": {
@@ -217,7 +217,7 @@ class GetWeekScheduleTool(BaseTool):
 
 class FindFreeSlotsTool(BaseTool):
     name = "find_free_slots"
-    description = "Trouve les créneaux libres sur un jour donné, avec une durée minimum optionnelle."
+    description = "Trouve les créneaux libres d'un jour (overnight-aware: un quart de nuit occupe la soirée, le travail de la veille occupe le matin), avec une durée minimum optionnelle. Appelle-le AVANT de déclarer un jour 'libre' ou de choisir un créneau toi-même (ne demande pas l'heure à l'utilisateur si tu peux la trancher)."
     parameters = {
         "type": "object",
         "properties": {
@@ -271,7 +271,9 @@ class ScheduleTaskAtTool(BaseTool):
         "replanification ne le bouge pas). N'utilise PAS create_block (qui crée une "
         "habitude répétée CHAQUE semaine) pour un événement ponctuel. Si l'utilisateur "
         "ne donne pas d'heure, choisis toi-même un créneau libre (find_free_slots) au "
-        "lieu de lui demander."
+        "lieu de lui demander. Pour AJUSTER un événement déjà planifié (durée/heure: "
+        "'finalement 45 min'), ré-appelle schedule_task_at avec le même titre et la "
+        "même date: ça MET À JOUR l'événement (upsert), ce n'est pas un doublon."
     )
     parameters = {
         "type": "object",
