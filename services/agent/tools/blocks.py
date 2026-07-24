@@ -82,7 +82,7 @@ class ListBlocksTool(BaseTool):
 
 class CreateBlockTool(BaseTool):
     name = "create_block"
-    description = "Crée un ou plusieurs blocs récurrents HEBDOMADAIRES (une habitude qui revient chaque semaine: cours, travail, sport, sommeil...). Jours = liste (ex: [0,1,2,3,4] = lundi à vendredi); un bloc séparé par jour. Appelle-le DÈS que l'utilisateur décrit un horaire habituel. N'utilise JAMAIS create_block pour un événement unique daté ('ce samedi', une date précise) -> schedule_task_at. Les conflits sont détectés et renvoyés automatiquement."
+    description = "Crée un ou plusieurs blocs récurrents HEBDOMADAIRES (une habitude qui revient chaque semaine: cours, travail, sport, sommeil...). Jours = liste (ex: [0,1,2,3,4] = lundi à vendredi); un bloc séparé par jour. Appelle-le DÈS que l'utilisateur décrit un horaire habituel. N'utilise JAMAIS create_block pour un événement unique daté ('ce samedi', une date précise) -> schedule_task_at. Gère un quart de nuit récurrent qui traverse minuit (ex: travail 22:00-06:00 chaque lundi): mets start_time/end_time tels quels, le passage de minuit est détecté automatiquement. Les conflits sont détectés et renvoyés automatiquement."
     parameters = {
         "type": "object",
         "properties": {

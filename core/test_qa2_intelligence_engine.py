@@ -4,7 +4,7 @@ These tests cover invariants from ``serie-tests-planner-ia`` that do not need a
 live LLM: metamorphic idempotence, locked-block sanctuaries, and one-off event
 upserts exposed through the agent tools.
 """
-from datetime import date, time
+from datetime import date, time, timedelta
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
@@ -121,6 +121,103 @@ class ScheduleTaskAtIdempotenceTests(TestCase):
         block = ScheduledBlock.objects.get(user=self.user)
         self.assertEqual(block.start_time, time(9, 0))
         self.assertEqual(block.end_time, time(9, 45))
+
+
+class OvernightScheduleTaskAtTests(TestCase):
+    """#8: schedule_task_at gère un événement ponctuel qui traverse minuit, stocké
+    en deux morceaux within-day (frontend-safe): [start,23:59] + [00:00,end]."""
+
+    def setUp(self):
+        self.user = User.objects.create_user("qa2_overnight", password="pw")
+        self.tool = ScheduleTaskAtTool()
+        self.tuesday = MONDAY + timedelta(days=1)
+
+    def test_overnight_one_off_creates_two_within_day_pieces(self):
+        res = self.tool.execute(
+            self.user, title="Quart de nuit", date=MONDAY.isoformat(),
+            start_time="22:00", end_time="06:00")
+
+        self.assertTrue(res.success, res.message)
+        self.assertTrue(res.data["scheduled_block"]["overnight"])
+        blocks = list(ScheduledBlock.objects.filter(user=self.user).order_by("date", "start_time"))
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(
+            (blocks[0].date, blocks[0].start_time, blocks[0].end_time),
+            (MONDAY, time(22, 0), time(23, 59)))
+        self.assertEqual(
+            (blocks[1].date, blocks[1].start_time, blocks[1].end_time),
+            (self.tuesday, time(0, 0), time(6, 0)))
+        self.assertTrue(all(b.locked for b in blocks))
+        self.assertEqual(len({b.task_id for b in blocks}), 1)  # même événement
+
+    def test_overnight_conflict_detected_on_next_day(self):
+        RecurringBlock.objects.create(
+            user=self.user, title="Cours", block_type="course",
+            day_of_week=self.tuesday.weekday(), start_time=time(5, 0), end_time=time(8, 0))
+
+        res = self.tool.execute(
+            self.user, title="Quart de nuit", date=MONDAY.isoformat(),
+            start_time="22:00", end_time="06:00")
+
+        self.assertFalse(res.success)  # le morceau 00:00-06:00 chevauche 05:00-08:00
+        self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 0)
+
+    def test_invalid_task_type_is_coerced_not_rejected(self):
+        # Le LLM envoie souvent 'work' (invalide) pour un quart de nuit: on ne doit
+        # PAS rejeter toute la planification pour un champ optionnel.
+        res = self.tool.execute(
+            self.user, title="Quart", date=MONDAY.isoformat(),
+            start_time="09:00", end_time="10:00", task_type="work")
+
+        self.assertTrue(res.success, res.message)
+        self.assertEqual(Task.objects.get(user=self.user, title="Quart").task_type, "shallow")
+
+    def test_overnight_upsert_does_not_duplicate(self):
+        first = self.tool.execute(
+            self.user, title="Quart", date=MONDAY.isoformat(), start_time="22:00", end_time="06:00")
+        self.assertTrue(first.success)
+
+        second = self.tool.execute(
+            self.user, title="Quart", date=MONDAY.isoformat(), start_time="22:00", end_time="05:00")
+
+        self.assertTrue(second.success, second.message)
+        self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 2)
+        nxt = ScheduledBlock.objects.get(user=self.user, date=self.tuesday)
+        self.assertEqual(nxt.end_time, time(5, 0))
+
+    def test_end_at_midnight_is_same_day_no_phantom_next_day(self):
+        # Blocker (revue): 22:00->00:00 ne doit PAS créer un [00:00,00:00] le
+        # lendemain (fixed_busy_intervals le lirait comme un mur toute la journée).
+        res = self.tool.execute(
+            self.user, title="Fin minuit", date=MONDAY.isoformat(),
+            start_time="22:00", end_time="00:00")
+
+        self.assertTrue(res.success, res.message)
+        self.assertFalse(res.data["scheduled_block"]["overnight"])
+        blocks = list(ScheduledBlock.objects.filter(user=self.user))
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(
+            (blocks[0].date, blocks[0].start_time, blocks[0].end_time),
+            (MONDAY, time(22, 0), time(23, 59)))
+
+    def test_adjusting_overnight_to_same_day_removes_orphan_tail(self):
+        # Blocker (revue): ajuster un overnight en même-jour doit supprimer le
+        # morceau [00:00,end] du lendemain (sinon bloc fantôme verrouillé).
+        first = self.tool.execute(
+            self.user, title="Quart", date=MONDAY.isoformat(), start_time="22:00", end_time="06:00")
+        self.assertTrue(first.success)
+        self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 2)
+
+        second = self.tool.execute(
+            self.user, title="Quart", date=MONDAY.isoformat(), start_time="22:00", end_time="23:00")
+
+        self.assertTrue(second.success, second.message)
+        blocks = list(ScheduledBlock.objects.filter(user=self.user))
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(
+            (blocks[0].date, blocks[0].start_time, blocks[0].end_time),
+            (MONDAY, time(22, 0), time(23, 0)))
+        self.assertFalse(ScheduledBlock.objects.filter(user=self.user, date=self.tuesday).exists())
 
 
 class ReplanLockedBlockTests(TestCase):

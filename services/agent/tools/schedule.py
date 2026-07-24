@@ -262,6 +262,52 @@ class FindFreeSlotsTool(BaseTool):
         )
 
 
+def _window_conflict(user, target_date, s, e, exclude_scheduled_id=None):
+    """ToolResult d'erreur si la fenêtre [s,e] (minutes) du jour target_date
+    chevauche un mur fixe ou le sommeil protégé; sinon None. Réutilisable pour
+    chaque moitié d'un événement ponctuel qui traverse minuit."""
+    for bs, be in fixed_busy_intervals(user, target_date, exclude_scheduled_id=exclude_scheduled_id):
+        if s < be and bs < e:
+            return ToolResult(
+                success=False,
+                data={"conflict": {"start_time": _minutes_to_str(bs), "end_time": _minutes_to_str(be)}},
+                message=(
+                    f"Ce créneau ({_minutes_to_str(s)}-{_minutes_to_str(e)}) chevauche une "
+                    f"occupation existante ({_minutes_to_str(bs)}-{_minutes_to_str(be)}). "
+                    f"Choisis un autre horaire libre."
+                ),
+            )
+    for placement in place_day(user, target_date):
+        if placement["skipped"] or placement["block_type"] != "sleep":
+            continue
+        ps = placement["start_min"]
+        pe = placement["end_min"]
+        if ps is None or pe is None:
+            continue
+        sleep_pieces = [(ps, pe)] if pe > ps else [(ps, 24 * 60), (0, pe)]
+        for bs, be in sleep_pieces:
+            if s < be and bs < e:
+                conflict_start, conflict_end = bs, be
+                for os, oe in occupied_intervals(user, target_date, 0, 24 * 60):
+                    if s < oe and os < e:
+                        conflict_start, conflict_end = os, oe
+                        break
+                return ToolResult(
+                    success=False,
+                    data={"conflict": {
+                        "start_time": _minutes_to_str(conflict_start),
+                        "end_time": _minutes_to_str(conflict_end),
+                    }},
+                    message=(
+                        f"Ce créneau ({_minutes_to_str(s)}-{_minutes_to_str(e)}) "
+                        f"chevauche le sommeil protégé "
+                        f"({_minutes_to_str(conflict_start)}-{_minutes_to_str(conflict_end)}). "
+                        f"Choisis un autre horaire libre."
+                    ),
+                )
+    return None
+
+
 class ScheduleTaskAtTool(BaseTool):
     name = "schedule_task_at"
     description = (
@@ -273,7 +319,10 @@ class ScheduleTaskAtTool(BaseTool):
         "ne donne pas d'heure, choisis toi-même un créneau libre (find_free_slots) au "
         "lieu de lui demander. Pour AJUSTER un événement déjà planifié (durée/heure: "
         "'finalement 45 min'), ré-appelle schedule_task_at avec le même titre et la "
-        "même date: ça MET À JOUR l'événement (upsert), ce n'est pas un doublon."
+        "même date: ça MET À JOUR l'événement (upsert), ce n'est pas un doublon. "
+        "Gère aussi un événement qui traverse minuit (ex: quart de nuit PONCTUEL "
+        "'ce lundi 22h-06h'). Pour un quart de nuit RÉCURRENT (chaque semaine), "
+        "utilise plutôt create_block."
     )
     parameters = {
         "type": "object",
@@ -281,7 +330,7 @@ class ScheduleTaskAtTool(BaseTool):
             "title": {"type": "string", "description": "Titre de l'événement (ex: 'Lecture')."},
             "date": {"type": "string", "description": "Date de l'événement (YYYY-MM-DD). Déduis-la de la DATE du jour."},
             "start_time": {"type": "string", "description": "Heure de début (HH:MM)."},
-            "end_time": {"type": "string", "description": "Heure de fin (HH:MM), après le début."},
+            "end_time": {"type": "string", "description": "Heure de fin (HH:MM). Peut passer minuit pour un événement ponctuel qui traverse la nuit (ex: 22:00 -> 06:00)."},
             "task_type": {
                 "type": "string",
                 "enum": ["deep_work", "shallow", "errand"],
@@ -311,100 +360,71 @@ class ScheduleTaskAtTool(BaseTool):
 
         s = _time_to_minutes(start_t)
         e = _time_to_minutes(end_t)
-        if e <= s:
-            return ToolResult(
-                success=False,
-                data={},
-                message="L'heure de fin doit être après l'heure de début (un événement ponctuel ne passe pas minuit ici).",
-            )
+        if s == e:
+            return ToolResult(success=False, data={}, message="La durée doit être non nulle (fin différente du début).")
 
-        err = validate_choice(kwargs.get("task_type"), VALID_TASK_TYPES, "task_type")
-        if err:
-            return ToolResult(success=False, data={}, message=err)
+        # task_type est OPTIONNEL: un type invalide (ex: le LLM envoie 'work' pour
+        # un quart de nuit) ne doit PAS faire échouer toute la planification.
+        task_type = kwargs.get("task_type") or "shallow"
+        if task_type not in VALID_TASK_TYPES:
+            task_type = "shallow"
 
-        # Upsert support: a same-title locked one-off on the same date is this
-        # tool's own prior write. Exclude it from conflict checks and update it
-        # below instead of reporting a self-conflict.
+        next_date = target_date + timedelta(days=1)
+        # Un événement qui traverse minuit (ex: quart de nuit 22h-06h) est stocké
+        # en DEUX morceaux within-day, frontend-safe: [start, 23:59] sur la date +
+        # [00:00, end] le lendemain. Chaque morceau garde fin > début (jamais
+        # end<=start, que fixed_busy_intervals lirait comme un mur toute la
+        # journée). "Fin à minuit exact" (end=00:00) n'est PAS un passage de
+        # minuit: c'est un même-jour clampé à 23:59, sans morceau du lendemain.
+        crosses_midnight = e < s and e > 0
+        main_end_t = end_t if e > s else time(23, 59)
+        main_win_end = e if e > s else 24 * 60  # le conflit du soir couvre jusqu'à minuit
+        has_main = _time_to_minutes(main_end_t) > s
+
+        # Morceaux verrouillés du MÊME événement, à exclure des conflits / à
+        # réconcilier. La queue overnight commence TOUJOURS à 00:00: on la cible
+        # précisément pour ne pas toucher un autre événement du lendemain.
         task = Task.objects.filter(user=user, completed=False, title__iexact=title).first()
-        existing_block = None
+        existing_main = existing_tail = None
         if task is not None:
-            existing_block = ScheduledBlock.objects.filter(
-                user=user,
-                task=task,
-                date=target_date,
-                locked=True,
+            existing_main = ScheduledBlock.objects.filter(
+                user=user, task=task, date=target_date, locked=True,
             ).order_by("start_time", "id").first()
-        exclude_scheduled_id = existing_block.id if existing_block is not None else None
+            existing_tail = ScheduledBlock.objects.filter(
+                user=user, task=task, date=next_date, locked=True, start_time=time(0, 0),
+            ).order_by("id").first()
 
-        # Chevauchement avec les murs RÉELS du jour (fixes + blocs datés déjà
-        # planifiés), fenêtre pleine 0-24h. Les récurrents souples ne sont pas
-        # des murs: l'événement ponctuel verrouillé les fera se replacer.
-        for bs, be in fixed_busy_intervals(
-            user, target_date, exclude_scheduled_id=exclude_scheduled_id
-        ):
-            if s < be and bs < e:
-                return ToolResult(
-                    success=False,
-                    data={"conflict": {"start_time": _minutes_to_str(bs), "end_time": _minutes_to_str(be)}},
-                    message=(
-                        f"Ce créneau ({_minutes_to_str(s)}-{_minutes_to_str(e)}) chevauche une "
-                        f"occupation existante ({_minutes_to_str(bs)}-{_minutes_to_str(be)}). "
-                        f"Choisis un autre horaire libre."
-                    ),
-                )
-
-        # Sleep is a protected flexible block: a one-off urgent event may move
-        # ordinary flexible habits, but it must not silently eat sleep.
-        for placement in place_day(user, target_date):
-            if placement["skipped"] or placement["block_type"] != "sleep":
-                continue
-            ps = placement["start_min"]
-            pe = placement["end_min"]
-            if ps is None or pe is None:
-                continue
-            sleep_pieces = [(ps, pe)] if pe > ps else [(ps, 24 * 60), (0, pe)]
-            for bs, be in sleep_pieces:
-                if s < be and bs < e:
-                    conflict_start, conflict_end = bs, be
-                    for os, oe in occupied_intervals(user, target_date, 0, 24 * 60):
-                        if s < oe and os < e:
-                            conflict_start, conflict_end = os, oe
-                            break
-                    return ToolResult(
-                        success=False,
-                        data={
-                            "conflict": {
-                                "start_time": _minutes_to_str(conflict_start),
-                                "end_time": _minutes_to_str(conflict_end),
-                            }
-                        },
-                        message=(
-                            f"Ce créneau ({_minutes_to_str(s)}-{_minutes_to_str(e)}) "
-                            f"chevauche le sommeil protégé "
-                            f"({_minutes_to_str(conflict_start)}-"
-                            f"{_minutes_to_str(conflict_end)}). "
-                            f"Choisis un autre horaire libre."
-                        ),
-                    )
+        if has_main:
+            c = _window_conflict(user, target_date, s, main_win_end,
+                                 existing_main.id if existing_main is not None else None)
+            if c is not None:
+                return c
+        if crosses_midnight:
+            c = _window_conflict(user, next_date, 0, e,
+                                 existing_tail.id if existing_tail is not None else None)
+            if c is not None:
+                return c
 
         # Réutilise une tâche active du même titre (idempotence), sinon la crée.
         if task is None:
             task = Task.objects.create(
                 user=user,
                 title=title,
-                task_type=kwargs.get("task_type", "shallow"),
+                task_type=task_type,
                 priority=kwargs.get("priority", 5),
                 description=kwargs.get("description", ""),
             )
 
-        if existing_block is not None:
-            sb = existing_block
+        # Morceau principal (jour de départ): met à jour l'existant (garde l'id,
+        # upsert N06) sinon crée.
+        sb = existing_main
+        if sb is not None:
             changed_fields = []
             if sb.start_time != start_t:
                 sb.start_time = start_t
                 changed_fields.append("start_time")
-            if sb.end_time != end_t:
-                sb.end_time = end_t
+            if sb.end_time != main_end_t:
+                sb.end_time = main_end_t
                 changed_fields.append("end_time")
             if not sb.locked:
                 sb.locked = True
@@ -414,8 +434,27 @@ class ScheduleTaskAtTool(BaseTool):
         else:
             sb = ScheduledBlock.objects.create(
                 user=user, task=task, date=target_date,
-                start_time=start_t, end_time=end_t, locked=True,
+                start_time=start_t, end_time=main_end_t, locked=True,
             )
+
+        # Morceau du lendemain UNIQUEMENT si l'événement traverse minuit. Sinon on
+        # SUPPRIME une éventuelle queue orpheline d'une version overnight
+        # précédente (sinon bloc fantôme verrouillé le matin suivant, immunisé au
+        # replan).
+        if crosses_midnight:
+            if existing_tail is not None:
+                if existing_tail.end_time != end_t:
+                    existing_tail.end_time = end_t
+                    existing_tail.save(update_fields=["end_time"])
+            else:
+                ScheduledBlock.objects.create(
+                    user=user, task=task, date=next_date,
+                    start_time=time(0, 0), end_time=end_t, locked=True,
+                )
+        elif existing_tail is not None:
+            existing_tail.delete()
+
+        span = f" (traverse minuit, jusqu'au {DAY_NAMES[next_date.weekday()]})" if crosses_midnight else ""
         return ToolResult(
             success=True,
             data={"scheduled_block": {
@@ -424,9 +463,11 @@ class ScheduleTaskAtTool(BaseTool):
                 "date": target_date.isoformat(),
                 "start_time": start_t.strftime("%H:%M"),
                 "end_time": end_t.strftime("%H:%M"),
+                "overnight": crosses_midnight,
             }},
             message=(
                 f"'{task.title}' planifié le {DAY_NAMES[target_date.weekday()]} "
-                f"{target_date.isoformat()} de {start_t.strftime('%H:%M')} à {end_t.strftime('%H:%M')}."
+                f"{target_date.isoformat()} de {start_t.strftime('%H:%M')} à "
+                f"{end_t.strftime('%H:%M')}{span}."
             ),
         )
