@@ -94,6 +94,85 @@ def _claims_completed_mutation(text: str) -> bool:
     return bool(COMPLETED_MUTATION_RE.search(normalized.lower()))
 
 
+_DAY_NAMES_FR = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
+
+
+def _schedule_reality_footer(user, tool_calls: list) -> str:
+    """Après une planification datée réussie, annexe l'état RÉEL du/des jour(s).
+
+    Sourcé de la base (placements effectifs, skip-aware) et PAS de la prose du
+    LLM: l'utilisateur n'est jamais induit en erreur par un créneau annoncé mais
+    non réellement bloqué (OR2). Couvre schedule_task_at (daté) ET create_block
+    (prochaine occurrence du jour). S'affiche si le jour touché a >= 2 blocs OU
+    si >= 2 schedule_task_at ont été tentés pour ce jour ce tour (plusieurs
+    créneaux annoncés — cas OR2 même sur une journée peu chargée).
+    """
+    from datetime import date as _date, timedelta
+    from django.utils import timezone
+    from services.scheduling.day_view import effective_day_blocks
+
+    today = timezone.localdate()
+
+    def _next_date_for_weekday(dow):
+        try:
+            dow = int(dow)
+        except (TypeError, ValueError):
+            return None
+        if not 0 <= dow <= 6:
+            return None
+        return today + timedelta(days=(dow - today.weekday()) % 7)
+
+    dates = []
+    attempts = {}  # date iso -> nb de schedule_task_at tentés ce tour
+
+    def _add(ds):
+        if ds and ds not in dates:
+            dates.append(ds)
+
+    for call in tool_calls:
+        tool = call.get("tool")
+        result = call.get("result") or {}
+        if tool == "schedule_task_at":
+            ds = (call.get("args") or {}).get("date")
+            if ds:
+                attempts[ds] = attempts.get(ds, 0) + 1
+                if result.get("success"):
+                    _add(ds)
+        elif tool == "create_block" and result.get("success"):
+            # Un seul jour ciblé = placement type OR2 ("ajoute X ce/chaque lundi").
+            # Un create multi-jours = description d'habitude (onboarding): pas de
+            # footer, sinon on annexe une ligne par jour (spam).
+            days = (call.get("args") or {}).get("days") or []
+            if len(days) == 1:
+                d = _next_date_for_weekday(days[0])
+                if d is not None:
+                    _add(d.isoformat())
+    # Une journée avec >= 2 planifications datées tentées est ambiguë (plusieurs
+    # créneaux annoncés) même si la base n'en retient qu'un: on force le footer.
+    for ds, n in attempts.items():
+        if n >= 2:
+            _add(ds)
+
+    lines = []
+    for ds in dates:
+        try:
+            d = _date.fromisoformat(ds)
+        except (TypeError, ValueError):
+            continue
+        entries = effective_day_blocks(user, d)
+        if len(entries) < 2 and attempts.get(ds, 0) < 2:
+            continue
+        human = f"{_DAY_NAMES_FR[d.weekday()]} {d.strftime('%d/%m')}"
+        if entries:
+            listing = " ; ".join(
+                f"{e['start_time']}-{e['end_time']} {e['title']}" for e in entries
+            )
+        else:
+            listing = "(aucun bloc placé)"
+        lines.append(f"\U0001F4C5 Planning réel du {human} : {listing}")
+    return "\n".join(lines)
+
+
 class PlannerAgent:
     """
     The main AI agent for Planner AI.
@@ -344,12 +423,24 @@ class PlannerAgent:
                 user=user, role="assistant", content=final_text
             )
 
+        # Ancrage factuel (OR2): après une planification datée, annexe l'état
+        # RÉEL du/des jour(s) touché(s), calculé depuis la base, à la RÉPONSE
+        # rendue — mais PAS au message persisté ci-dessus. Sinon le LLM apprend
+        # le format "📅 Planning réel" et le ré-émet lui-même un tour SANS
+        # écriture (donc sans footer déterministe), réintroduisant des créneaux
+        # fantômes sous un format devenu "de confiance".
+        response_text = final_text
+        if not had_error:
+            footer = _schedule_reality_footer(user, tool_calls_made)
+            if footer:
+                response_text = f"{final_text}\n\n{footer}"
+
         # 8. Build response
         # Use AI-generated quick replies if available, otherwise auto-generate
         quick_replies = ai_quick_replies or self._generate_quick_replies(tool_calls_made, context)
 
         result = {
-            "response": final_text,
+            "response": response_text,
             "quick_replies": quick_replies,
             "blocks_created": [
                 tc["result"]["data"].get("created", [])

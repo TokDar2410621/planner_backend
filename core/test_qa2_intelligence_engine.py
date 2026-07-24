@@ -14,11 +14,12 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from core.models import RecurringBlock, ScheduledBlock, Task
-from services.agent.agent import PlannerAgent
+from services.agent.agent import PlannerAgent, _schedule_reality_footer
 from services.agent.tools.blocks import CreateBlockTool, UpdateBlockTool
 from services.agent.tools.schedule import ScheduleTaskAtTool
 from services.llm.base import FunctionCall, LLMProvider, LLMResponse
 from services.replan import replan_after_delay
+from services.scheduling.day_view import effective_day_blocks
 from services.scheduling.placement import fixed_busy_intervals, place_day
 
 
@@ -310,6 +311,117 @@ class AgentActionTruthTests(TestCase):
             result = PlannerAgent().process_message(user, "Propose un creneau")
 
         self.assertEqual(result["response"], "Je propose de bloquer ta lecture lundi de 09h00 à 10h00.")
+
+
+class ScheduleRealityFooterTests(TestCase):
+    """OR2: après une planification datée, la vérité du planning (calculée depuis
+    la base) est annexée, pour que la prose du LLM ne puisse pas induire en erreur."""
+
+    def _saturated_monday(self, user):
+        RecurringBlock.objects.create(
+            user=user, title="Cours", block_type="course",
+            day_of_week=MONDAY.weekday(), start_time=time(8, 0), end_time=time(17, 0))
+        RecurringBlock.objects.create(
+            user=user, title="Travail", block_type="work",
+            day_of_week=MONDAY.weekday(), start_time=time(18, 0), end_time=time(22, 0))
+
+    def test_effective_day_blocks_sorted_by_start(self):
+        user = User.objects.create_user("qa2_effday", password="pw")
+        self._saturated_monday(user)
+        titles = [e["title"] for e in effective_day_blocks(user, MONDAY)]
+        self.assertEqual(titles, ["Cours", "Travail"])
+
+    def test_footer_lists_real_blocks_for_a_dated_write(self):
+        user = User.objects.create_user("qa2_footer", password="pw")
+        self._saturated_monday(user)
+        ScheduleTaskAtTool().execute(
+            user, title="Etude", date=MONDAY.isoformat(),
+            start_time="17:00", end_time="18:00")
+        tool_calls = [{"tool": "schedule_task_at", "result": {"success": True},
+                       "args": {"date": MONDAY.isoformat()}}]
+
+        footer = _schedule_reality_footer(user, tool_calls)
+
+        self.assertIn("Planning réel", footer)
+        self.assertIn("08:00-17:00 Cours", footer)
+        self.assertIn("17:00-18:00 Etude", footer)
+        self.assertIn("18:00-22:00 Travail", footer)
+        # Aucun créneau fantôme "07:00-08:00" ne peut apparaître: la source est la base.
+        self.assertNotIn("07:00-08:00", footer)
+
+    def test_no_footer_when_day_has_a_single_block(self):
+        user = User.objects.create_user("qa2_footer_single", password="pw")
+        ScheduleTaskAtTool().execute(
+            user, title="Lecture", date=MONDAY.isoformat(),
+            start_time="09:00", end_time="10:00")
+        tool_calls = [{"tool": "schedule_task_at", "result": {"success": True},
+                       "args": {"date": MONDAY.isoformat()}}]
+        self.assertEqual(_schedule_reality_footer(user, tool_calls), "")
+
+    def test_no_footer_for_create_block_without_resolvable_days(self):
+        user = User.objects.create_user("qa2_footer_none", password="pw")
+        self._saturated_monday(user)
+        # create_block sans 'days' exploitables ne cible aucune date -> pas de footer.
+        tool_calls = [{"tool": "create_block", "result": {"success": True}, "args": {}}]
+        self.assertEqual(_schedule_reality_footer(user, tool_calls), "")
+
+    def test_create_block_triggers_footer_on_next_occurrence(self):
+        # Chemin "habitude" (create_block): le footer se lève sur la prochaine
+        # occurrence du jour touché (revue adversariale: OR2 passe souvent par create_block).
+        user = User.objects.create_user("qa2_footer_cb", password="pw")
+        self._saturated_monday(user)  # cours + travail le lundi (weekday 0)
+        tool_calls = [{"tool": "create_block", "result": {"success": True}, "args": {"days": [0]}}]
+
+        footer = _schedule_reality_footer(user, tool_calls)
+
+        self.assertIn("Planning réel du lundi", footer)
+        self.assertIn("Cours", footer)
+        self.assertIn("Travail", footer)
+
+    def test_two_dated_attempts_trigger_footer_on_light_day(self):
+        # Revue adversariale: le gate ">= 2 blocs" ratait OR2 quand la journée est
+        # peu chargée mais que la prose annonce plusieurs créneaux. Deux
+        # schedule_task_at tentés pour la même date forcent le footer (vérité).
+        user = User.objects.create_user("qa2_footer_attempts", password="pw")
+        ScheduleTaskAtTool().execute(
+            user, title="Lecture", date=MONDAY.isoformat(),
+            start_time="09:00", end_time="10:00")
+        tool_calls = [
+            {"tool": "schedule_task_at", "result": {"success": True}, "args": {"date": MONDAY.isoformat()}},
+            {"tool": "schedule_task_at", "result": {"success": False}, "args": {"date": MONDAY.isoformat()}},
+        ]
+
+        footer = _schedule_reality_footer(user, tool_calls)
+
+        self.assertIn("Planning réel du lundi", footer)
+        self.assertIn("09:00-10:00 Lecture", footer)
+
+    def test_footer_is_returned_but_not_persisted_in_history(self):
+        # Revue adversariale (blocker évité): persister le footer apprend au LLM
+        # le format "📅 Planning réel" -> il le ré-émettrait sans garde-fou. Il
+        # doit être dans la réponse rendue mais ABSENT du message sauvegardé.
+        from core.models import ConversationMessage
+        user = User.objects.create_user("qa2_footer_persist", password="pw")
+        self._saturated_monday(user)
+        responses = [
+            LLMResponse(function_calls=[FunctionCall(
+                name="schedule_task_at",
+                args={"title": "Etude", "date": MONDAY.isoformat(),
+                      "start_time": "17:00", "end_time": "18:00"},
+                call_id="c1",
+            )]),
+            LLMResponse(text="C'est fait, j'ai bloqué ton étude."),
+        ]
+        provider = _ScriptedProvider(responses)
+
+        with patch("services.agent.agent.get_provider", return_value=provider):
+            result = PlannerAgent().process_message(user, "Bloque 1h d'étude lundi à 17h")
+
+        self.assertIn("Planning réel", result["response"])
+        last = ConversationMessage.objects.filter(
+            user=user, role="assistant").order_by("-id").first()
+        self.assertIsNotNone(last)
+        self.assertNotIn("Planning réel", last.content)
 
 
 class RecurringProtectionToolTests(TestCase):
