@@ -208,14 +208,83 @@ class RecurringBlockSerializer(serializers.ModelSerializer):
         ]
 
     def validate(self, attrs):
-        start_time = attrs.get('start_time')
-        end_time = attrs.get('end_time')
+        start_time = attrs.get('start_time') or (
+            self.instance.start_time if self.instance is not None else None
+        )
+        end_time = attrs.get('end_time') or (
+            self.instance.end_time if self.instance is not None else None
+        )
+        is_night_shift = attrs.get('is_night_shift')
+        if is_night_shift is None and self.instance is not None:
+            is_night_shift = self.instance.is_night_shift
+        block_type = attrs.get('block_type') or (
+            self.instance.block_type if self.instance is not None else None
+        )
+        day_of_week = attrs.get('day_of_week')
+        if day_of_week is None and self.instance is not None:
+            day_of_week = self.instance.day_of_week
 
         if start_time and end_time:
             # Allow overnight blocks for night shifts
-            if not attrs.get('is_night_shift') and start_time >= end_time:
+            if not is_night_shift and start_time >= end_time:
                 raise serializers.ValidationError({
                     'end_time': "L'heure de fin doit être après l'heure de début."
+                })
+
+        request = self.context.get('request')
+        user = getattr(request, 'user', None) if request is not None else None
+
+        # Ne contrôle le chevauchement QUE si un champ pertinent pour l'horaire
+        # change (ou à la création). Un PATCH de métadonnées seules (title, active,
+        # location, place) ne doit JAMAIS être bloqué par un chevauchement
+        # préexistant: des blocs qui se chevauchent existent en base (l'extraction
+        # de documents et les outils agent créent via l'ORM, hors ce serializer),
+        # et l'utilisateur doit pouvoir les renommer/désactiver pour les résoudre.
+        scheduling_fields = {'start_time', 'end_time', 'day_of_week', 'block_type', 'is_night_shift'}
+        is_create = self.instance is None
+        scheduling_changed = is_create or bool(scheduling_fields & set(attrs))
+
+        if (
+            user is not None
+            and user.is_authenticated
+            and scheduling_changed
+            and start_time
+            and end_time
+            and day_of_week is not None
+            and block_type
+        ):
+            from services.scheduling.overlap import find_recurring_conflicts
+
+            # Flexibilité RÉSOLUE: si le type change (ou création), suit le défaut
+            # du NOUVEAU type; sinon respecte l'instance (override éventuel). Évite
+            # le trou (sport->work chevauchant qui passait) et la sur-restriction
+            # (work->sport chevauchant qui était refusé alors que le souple cède).
+            if is_create or 'block_type' in attrs:
+                is_flexible = (
+                    RecurringBlock.default_flexibility_for(block_type)
+                    == RecurringBlock.FLEXIBILITY_FLEXIBLE
+                )
+            else:
+                is_flexible = self.instance.is_flexible
+            conflicts = find_recurring_conflicts(
+                user,
+                day_of_week,
+                start_time,
+                end_time,
+                bool(is_night_shift),
+                exclude_id=getattr(self.instance, 'id', None),
+                new_is_flexible=is_flexible,
+            )
+            if conflicts:
+                overlap = conflicts[0]
+                raise serializers.ValidationError({
+                    'non_field_errors': [
+                        (
+                            f"Chevauchement avec '{overlap.title}' "
+                            f"({overlap.start_time.strftime('%H:%M')}-"
+                            f"{overlap.end_time.strftime('%H:%M')})."
+                        )
+                    ]
                 })
         return attrs
 

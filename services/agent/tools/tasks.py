@@ -416,9 +416,12 @@ class CompleteTaskTool(BaseTool):
         except Task.DoesNotExist:
             return ToolResult(success=False, data={}, message=f"Tâche #{task_id} introuvable.")
 
-        task.completed = True
-        task.completed_at = timezone.now()
-        task.save()
+        if hasattr(task, "mark_completed"):
+            task.mark_completed()
+        else:
+            task.completed = True
+            task.completed_at = timezone.now()
+            task.save()
         return ToolResult(
             success=True,
             data={"task": _task_to_dict(task)},

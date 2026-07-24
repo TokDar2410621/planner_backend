@@ -201,63 +201,23 @@ class AIInsightsService:
     ) -> List[TimeGap]:
         """Find free time gaps in the user's schedule."""
         profile = user.profile
-        day_of_week = target_date.weekday()
+        from services.scheduling.placement import open_intervals
 
-        # Get all blocks for this day
-        recurring_blocks = RecurringBlock.objects.filter(
-            user=user,
-            day_of_week=day_of_week,
-            active=True
-        ).values_list('start_time', 'end_time')
-
-        scheduled_blocks = ScheduledBlock.objects.filter(
-            user=user,
-            date=target_date
-        ).values_list('start_time', 'end_time')
-
-        # Merge all blocked times
-        blocked_times = list(recurring_blocks) + list(scheduled_blocks)
-        blocked_times = sorted(blocked_times, key=lambda x: x[0])
-
-        # Merge overlapping blocks
-        merged = []
-        for start, end in blocked_times:
-            if merged and start <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
-            else:
-                merged.append((start, end))
-
-        # Find gaps
         gaps = []
-        current_time = time(8, 0)  # Start of day
-        end_of_day = time(22, 0)  # End of day
-
-        for block_start, block_end in merged:
-            if current_time < block_start:
-                duration = self._time_diff_minutes(current_time, block_start)
-                if duration >= 30:
-                    energy = self._get_energy_level(current_time, profile.peak_productivity_time)
-                    gaps.append(TimeGap(
-                        date=target_date,
-                        start_time=current_time,
-                        end_time=block_start,
-                        duration_minutes=duration,
-                        energy_level=energy
-                    ))
-            current_time = max(current_time, block_end)
-
-        # Check for time after last block
-        if current_time < end_of_day:
-            duration = self._time_diff_minutes(current_time, end_of_day)
-            if duration >= 30:
-                energy = self._get_energy_level(current_time, profile.peak_productivity_time)
-                gaps.append(TimeGap(
-                    date=target_date,
-                    start_time=current_time,
-                    end_time=end_of_day,
-                    duration_minutes=duration,
-                    energy_level=energy
-                ))
+        for start_min, end_min in open_intervals(user, target_date, 8 * 60, 22 * 60):
+            duration = end_min - start_min
+            if duration < 30:
+                continue
+            start = time(start_min // 60, start_min % 60)
+            end = time(end_min // 60, end_min % 60)
+            energy = self._get_energy_level(start, profile.peak_productivity_time)
+            gaps.append(TimeGap(
+                date=target_date,
+                start_time=start,
+                end_time=end,
+                duration_minutes=duration,
+                energy_level=energy,
+            ))
 
         return gaps
 
@@ -972,7 +932,17 @@ Jours: 0=Lundi, 1=Mardi, 2=Mercredi, 3=Jeudi, 4=Vendredi, 5=Samedi, 6=Dimanche
             # Create task and schedule it
             task_title = parsed_request.get('task_title') or 'Nouvelle tache'
             task_type = parsed_request.get('task_type', 'shallow')
-            duration = parsed_request.get('duration_minutes') or 60
+            raw_duration = parsed_request.get('duration_minutes')
+            assumptions = []
+            if raw_duration:
+                duration = raw_duration
+            else:
+                duration = 60
+                assumptions.append({
+                    'field': 'duration_minutes',
+                    'value': 60,
+                    'reason': "durée absente dans la demande",
+                })
             days = parsed_request.get('days') or [timezone.now().weekday()]
 
             # Create the task
@@ -986,6 +956,7 @@ Jours: 0=Lundi, 1=Mardi, 2=Mercredi, 3=Jeudi, 4=Vendredi, 5=Samedi, 6=Dimanche
 
             # Schedule for each specified day
             scheduled_blocks = []
+            unplaced = []
             today = timezone.now().date()
 
             for day in days:
@@ -1031,13 +1002,39 @@ Jours: 0=Lundi, 1=Mardi, 2=Mercredi, 3=Jeudi, 4=Vendredi, 5=Samedi, 6=Dimanche
                         'start': suitable_gap.start_time.isoformat(),
                         'end': end_time.isoformat()
                     })
+                else:
+                    reason = (
+                        f"aucun créneau {preferred_time} disponible d'au moins "
+                        f"{duration} min"
+                        if preferred_time
+                        else f"aucun créneau disponible d'au moins {duration} min"
+                    )
+                    unplaced.append({
+                        'date': target_date.isoformat(),
+                        'needed_minutes': duration,
+                        'preferred_time': preferred_time,
+                        'reason': reason,
+                    })
 
+            status = (
+                'success'
+                if scheduled_blocks and not unplaced
+                else 'partial'
+                if scheduled_blocks
+                else 'unplaced'
+            )
             return {
-                'status': 'success',
+                'status': status,
                 'task_id': task.id,
                 'task_title': task_title,
                 'scheduled_blocks': scheduled_blocks,
-                'message': f"'{task_title}' planifie pour {len(scheduled_blocks)} creneau(x)"
+                'unplaced': unplaced,
+                'assumptions': assumptions,
+                'message': (
+                    f"'{task_title}' planifie pour {len(scheduled_blocks)} creneau(x)"
+                    if scheduled_blocks
+                    else f"'{task_title}' non planifie: {unplaced[0]['reason']}"
+                ),
             }
 
         elif action == 'create_recurring':

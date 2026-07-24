@@ -74,3 +74,18 @@ def block_commute_minutes(block, profile) -> tuple:
         return prep + travel + margin, travel
     flat = getattr(profile, 'transport_time_minutes', 0) or 0
     return flat, flat
+
+
+def task_commute_minutes(task, profile) -> tuple:
+    """(before_minutes, after_minutes) around a scheduled task's place.
+
+    Scheduled tasks only reserve commute/prep time when they are tied to a
+    concrete UserPlace. Without a place, there is no safe way to infer a trip.
+    """
+    place = getattr(task, 'place', None)
+    travel = getattr(place, 'travel_minutes', 0) or 0
+    if travel <= 0:
+        return 0, 0
+    prep = getattr(profile, 'prep_time_minutes', 0) or 0
+    margin = getattr(profile, 'safety_margin_minutes', 0) or 0
+    return prep + travel + margin, travel

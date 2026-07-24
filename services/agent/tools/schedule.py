@@ -9,7 +9,12 @@ from django.utils import timezone
 from core.models import RecurringBlock, ScheduledBlock, Task
 from services.scheduling.exceptions import skipped_block_ids
 from services.scheduling.overlap import parse_time
-from services.scheduling.placement import open_intervals, occupied_intervals, place_day
+from services.scheduling.placement import (
+    fixed_busy_intervals,
+    occupied_intervals,
+    open_intervals,
+    place_day,
+)
 from .base import BaseTool, ToolResult, validate_choice
 
 DAY_NAMES = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
@@ -315,9 +320,10 @@ class ScheduleTaskAtTool(BaseTool):
         if err:
             return ToolResult(success=False, data={}, message=err)
 
-        # Chevauchement avec l'occupation RÉELLE du jour (récurrents overnight +
-        # débordement de la veille + blocs déjà planifiés), fenêtre pleine 0-24h.
-        for bs, be in occupied_intervals(user, target_date, 0, 24 * 60):
+        # Chevauchement avec les murs RÉELS du jour (fixes + blocs datés déjà
+        # planifiés), fenêtre pleine 0-24h. Les récurrents souples ne sont pas
+        # des murs: l'événement ponctuel verrouillé les fera se replacer.
+        for bs, be in fixed_busy_intervals(user, target_date):
             if s < be and bs < e:
                 return ToolResult(
                     success=False,
@@ -328,6 +334,40 @@ class ScheduleTaskAtTool(BaseTool):
                         f"Choisis un autre horaire libre."
                     ),
                 )
+
+        # Sleep is a protected flexible block: a one-off urgent event may move
+        # ordinary flexible habits, but it must not silently eat sleep.
+        for placement in place_day(user, target_date):
+            if placement["skipped"] or placement["block_type"] != "sleep":
+                continue
+            ps = placement["start_min"]
+            pe = placement["end_min"]
+            if ps is None or pe is None:
+                continue
+            sleep_pieces = [(ps, pe)] if pe > ps else [(ps, 24 * 60), (0, pe)]
+            for bs, be in sleep_pieces:
+                if s < be and bs < e:
+                    conflict_start, conflict_end = bs, be
+                    for os, oe in occupied_intervals(user, target_date, 0, 24 * 60):
+                        if s < oe and os < e:
+                            conflict_start, conflict_end = os, oe
+                            break
+                    return ToolResult(
+                        success=False,
+                        data={
+                            "conflict": {
+                                "start_time": _minutes_to_str(conflict_start),
+                                "end_time": _minutes_to_str(conflict_end),
+                            }
+                        },
+                        message=(
+                            f"Ce créneau ({_minutes_to_str(s)}-{_minutes_to_str(e)}) "
+                            f"chevauche le sommeil protégé "
+                            f"({_minutes_to_str(conflict_start)}-"
+                            f"{_minutes_to_str(conflict_end)}). "
+                            f"Choisis un autre horaire libre."
+                        ),
+                    )
 
         # Réutilise une tâche active du même titre (idempotence), sinon la crée.
         task = Task.objects.filter(user=user, completed=False, title__iexact=title).first()
