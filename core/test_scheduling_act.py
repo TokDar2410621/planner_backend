@@ -9,6 +9,8 @@ from datetime import date, time, timedelta
 
 from django.contrib.auth.models import User
 from django.test import TestCase
+from django.urls import reverse
+from rest_framework.test import APIClient
 
 from core.models import RecurringBlock, ScheduledBlock, Task
 from services.agent.tools.schedule import (
@@ -151,3 +153,36 @@ class ScheduleTaskAtTests(TestCase):
 
     def test_tool_takes_no_block_id(self):
         self.assertNotIn("block_id", ScheduleTaskAtTool().parameters["properties"])
+
+
+class SchedulePayloadPlacementTests(TestCase):
+    """The week payload (/api/schedule/) exposes daily placement of flexible blocks."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="payload", password="x")
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+        self.saturday = _weekday_on_or_after(5)
+        self.sunday = self.saturday + timedelta(days=1)
+        RecurringBlock.objects.create(
+            user=self.user, title="Travail", block_type="work",
+            day_of_week=self.saturday.weekday(), start_time=time(19, 0),
+            end_time=time(7, 0), is_night_shift=True,
+        )
+        RecurringBlock.objects.create(
+            user=self.user, title="Sommeil", block_type="sleep",
+            day_of_week=self.sunday.weekday(), start_time=time(0, 0),
+            end_time=time(7, 0),
+        )
+
+    def test_week_payload_places_flexible_sleep_in_daytime(self):
+        r = self.client.get(reverse("schedule"), {"start_date": self.saturday.isoformat()})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("recurring_placements", r.data)
+        sunday_sleep = [
+            p for p in r.data["recurring_placements"]
+            if p["date"] == self.sunday.isoformat() and not p["skipped"]
+        ]
+        self.assertTrue(sunday_sleep, "sleep placement missing for Sunday")
+        self.assertEqual(sunday_sleep[0]["start_time"], "07:00")
+        self.assertEqual(sunday_sleep[0]["end_time"], "14:00")
