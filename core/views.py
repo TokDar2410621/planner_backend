@@ -989,6 +989,9 @@ class ScheduleView(APIView):
                     'start_time': placement['start_time'],
                     'end_time': placement['end_time'],
                     'skipped': placement['skipped'],
+                    'preferred': placement['preferred'],
+                    'shrunk': placement['shrunk'],
+                    'overnight_kept': placement['overnight_kept'],
                 })
             day_cursor += timedelta(days=1)
 
@@ -1172,6 +1175,59 @@ class ScheduledBlockView(APIView):
         serializer = ScheduledBlockSerializer(block, data=data, partial=True)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        if any(k in serializer.validated_data for k in ('date', 'start_time', 'end_time')):
+            from datetime import datetime as _dt, timedelta as _td
+            from services.commute import task_commute_minutes
+            from services.scheduling.overlap import MINUTES_PER_DAY, time_to_min
+            from services.scheduling.placement import fixed_busy_intervals
+
+            vd = serializer.validated_data
+            candidate_date = vd.get('date', block.date)
+            candidate_start = vd.get('start_time', block.start_time)
+            # Le drag/drop du front n'envoie que {date, start_time}; la fin est
+            # recalculée (durée préservée) DANS ScheduledBlockSerializer.update(),
+            # APRÈS ce contrôle. On reproduit ici EXACTEMENT cette dérivation,
+            # sinon le check porterait sur l'ancienne fin (faux accept ET faux reject).
+            if vd.get('end_time'):
+                candidate_end = vd['end_time']
+            elif vd.get('start_time'):
+                duration = (
+                    _dt.combine(_dt.today(), block.end_time)
+                    - _dt.combine(_dt.today(), block.start_time)
+                )
+                if duration.total_seconds() <= 0:
+                    duration = _td(minutes=(block.task.estimated_duration_minutes or 60))
+                candidate_end = (_dt.combine(_dt.today(), candidate_start) + duration).time()
+            else:
+                candidate_end = block.end_time
+
+            profile = getattr(request.user, 'profile', None)
+            before, after = task_commute_minutes(block.task, profile) if profile else (0, 0)
+            s = time_to_min(candidate_start)
+            e = time_to_min(candidate_end)
+            # Bloc traversant minuit -> occupe [début, fin de journée] ce jour-là.
+            if e <= s:
+                candidate_interval = (max(0, s - before), MINUTES_PER_DAY)
+            else:
+                candidate_interval = (max(0, s - before), min(MINUTES_PER_DAY, e + after))
+
+            # Murs FIXES uniquement (récurrents fixes + autres blocs planifiés,
+            # soi-même exclu): un bloc SOUPLE cède, il ne bloque pas un déplacement.
+            for busy_start, busy_end in fixed_busy_intervals(
+                request.user, candidate_date, exclude_scheduled_id=block.id
+            ):
+                if candidate_interval[0] < busy_end and busy_start < candidate_interval[1]:
+                    return Response(
+                        {
+                            'error': "Déplacement refusé: ce créneau chevauche une occupation existante.",
+                            'conflict': {
+                                'start_time': f"{busy_start // 60:02d}:{busy_start % 60:02d}",
+                                'end_time': f"{busy_end // 60:02d}:{busy_end % 60:02d}",
+                            },
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
         serializer.save()
 
         if completing:

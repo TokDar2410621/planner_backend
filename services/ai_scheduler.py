@@ -249,14 +249,18 @@ class AIScheduler:
             # Get blocked times for this day (récurrents + overnight + déjà planifiés)
             blocked_times = self._get_blocked_times(user, current_date)
 
-            # Add sleep/recovery block after night shift
-            # Check if there was a night shift the day before
+            skipped_prev = skipped_block_ids(user, current_date - timedelta(days=1))
+
+            # Add sleep/recovery block after a real work night shift. Overnight
+            # sleep uses the same storage flag to cross midnight, but it must
+            # not create an extra post-shift recovery window.
             yesterday_blocks = RecurringBlock.objects.filter(
                 user=user,
                 day_of_week=(day_of_week - 1) % 7,
                 is_night_shift=True,
-                active=True
-            )
+                block_type='work',
+                active=True,
+            ).exclude(id__in=skipped_prev)
             if yesterday_blocks.exists():
                 # Find the latest end time of night shifts
                 latest_end = time(7, 0)  # Default assumption
@@ -323,6 +327,8 @@ class AIScheduler:
         day_of_week = current_date.weekday()
         prev_day = (day_of_week - 1) % 7
         profile = user.profile
+        skipped_today = skipped_block_ids(user, current_date)
+        skipped_prev = skipped_block_ids(user, current_date - timedelta(days=1))
 
         blocked = []  # (start_min, end_min) bornés à [0, 1440]
 
@@ -340,10 +346,6 @@ class AIScheduler:
         # trajet + marge de sécurité -> "début_indisponibilité"), et le retour
         # bloque `trajet` minutes APRÈS. Sans lieu: buffer transport plat (legacy).
         from services.commute import block_commute_minutes
-
-        # Occurrences ignorées (skip) à ne pas considérer comme occupées.
-        skipped_today = skipped_block_ids(user, current_date)
-        skipped_prev = skipped_block_ids(user, current_date - timedelta(days=1))
 
         for b in RecurringBlock.objects.filter(
             user=user, day_of_week=day_of_week, active=True
@@ -366,12 +368,17 @@ class AIScheduler:
                 add(0, e + after)
 
         # Blocs DÉJÀ planifiés à cette date -> ne jamais empiler dessus
-        for sb in ScheduledBlock.objects.filter(user=user, date=current_date):
+        from services.commute import task_commute_minutes
+
+        for sb in ScheduledBlock.objects.filter(
+            user=user, date=current_date
+        ).select_related('task', 'task__place'):
+            before, after = task_commute_minutes(sb.task, profile)
             s, e = to_min(sb.start_time), to_min(sb.end_time)
             if e <= s:
-                add(s, MINUTES_PER_DAY)
+                add(s - before, MINUTES_PER_DAY)
             else:
-                add(s, e)
+                add(s - before, e + after)
 
         return [(self._min_to_time(s), self._min_to_time(e)) for s, e in blocked]
 
@@ -534,11 +541,7 @@ class AIScheduler:
         # Filter slots that can fit the task
         fitting_slots = [s for s in slots if s.duration_minutes >= duration]
         if not fitting_slots:
-            # Try to find partial slot
-            fitting_slots = [s for s in slots if s.duration_minutes >= 30]
-            if not fitting_slots:
-                return None
-            duration = min(duration, max(s.duration_minutes for s in fitting_slots))
+            return None
 
         is_deep_work = task.task_type == 'deep_work'
 

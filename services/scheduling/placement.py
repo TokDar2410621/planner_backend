@@ -82,7 +82,12 @@ def _result(
     }
 
 
-def fixed_busy_intervals(user, date) -> list[tuple[int, int]]:
+def fixed_busy_intervals(
+    user,
+    date,
+    *,
+    exclude_scheduled_id=None,
+) -> list[tuple[int, int]]:
     """Return fixed hard-wall intervals for ``user`` on ``date``.
 
     Intervals are clipped to ``[0, 1440]``, merged, and sorted. Fixed recurring
@@ -91,12 +96,14 @@ def fixed_busy_intervals(user, date) -> list[tuple[int, int]]:
     as walls. Flexible recurring blocks are intentionally excluded.
     """
     from core.models import RecurringBlock, ScheduledBlock
+    from services.commute import block_commute_minutes, task_commute_minutes
 
     dow = date.weekday()
     prev_dow = (dow - 1) % 7
     prev_date = date - timedelta(days=1)
     skipped_today = skipped_block_ids(user, date)
     skipped_prev = skipped_block_ids(user, prev_date)
+    profile = getattr(user, "profile", None)
 
     raw: list[tuple[int, int]] = []
 
@@ -104,32 +111,47 @@ def fixed_busy_intervals(user, date) -> list[tuple[int, int]]:
         user=user,
         active=True,
         day_of_week=dow,
-    ).exclude(id__in=skipped_today)
+    ).exclude(id__in=skipped_today).select_related("place")
     for block in today_blocks:
         if block.is_flexible:
             continue
         start = time_to_min(block.start_time)
         end = time_to_min(block.end_time)
+        before, after = (
+            block_commute_minutes(block, profile) if profile is not None else (0, 0)
+        )
         if is_overnight(block.start_time, block.end_time, block.is_night_shift):
-            raw.append((start, MINUTES_PER_DAY))
+            raw.append((start - before, MINUTES_PER_DAY))
         else:
-            raw.append((start, end))
+            raw.append((start - before, end + after))
 
     previous_blocks = RecurringBlock.objects.filter(
         user=user,
         active=True,
         day_of_week=prev_dow,
-    ).exclude(id__in=skipped_prev)
+    ).exclude(id__in=skipped_prev).select_related("place")
     for block in previous_blocks:
         if block.is_flexible:
             continue
         if is_overnight(block.start_time, block.end_time, block.is_night_shift):
-            raw.append((0, time_to_min(block.end_time)))
+            _, after = (
+                block_commute_minutes(block, profile) if profile is not None else (0, 0)
+            )
+            raw.append((0, time_to_min(block.end_time) + after))
 
-    for block in ScheduledBlock.objects.filter(user=user, date=date):
+    scheduled_qs = ScheduledBlock.objects.filter(user=user, date=date)
+    if exclude_scheduled_id is not None:
+        scheduled_qs = scheduled_qs.exclude(id=exclude_scheduled_id)
+    for block in scheduled_qs.select_related("task", "task__place"):
         start = time_to_min(block.start_time)
         end = time_to_min(block.end_time)
-        raw.append((start, MINUTES_PER_DAY) if end <= start else (start, end))
+        before, after = (
+            task_commute_minutes(block.task, profile) if profile is not None else (0, 0)
+        )
+        if end <= start:
+            raw.append((start - before, MINUTES_PER_DAY))
+        else:
+            raw.append((start - before, end + after))
 
     clipped = [
         clipped_interval
@@ -167,9 +189,11 @@ def occupied_intervals(
     date,
     day_start: int = 0,
     day_end: int = MINUTES_PER_DAY,
+    *,
+    exclude_scheduled_id=None,
 ) -> list[tuple[int, int]]:
     """Return fixed walls plus placed flexible blocks within ``[day_start, day_end]``."""
-    raw = list(fixed_busy_intervals(user, date))
+    raw = list(fixed_busy_intervals(user, date, exclude_scheduled_id=exclude_scheduled_id))
 
     for placement in place_day(user, date, day_start, day_end):
         if placement["skipped"]:
@@ -200,10 +224,18 @@ def open_intervals(
     date,
     day_start: int,
     day_end: int,
+    *,
+    exclude_scheduled_id=None,
 ) -> list[tuple[int, int]]:
     """Return the complement of placed occupancy within ``[day_start, day_end]``."""
     return free_gaps(
-        occupied_intervals(user, date, day_start, day_end),
+        occupied_intervals(
+            user,
+            date,
+            day_start,
+            day_end,
+            exclude_scheduled_id=exclude_scheduled_id,
+        ),
         day_start,
         day_end,
     )
@@ -351,7 +383,7 @@ def place_day(user, date, day_start=0, day_end=MINUTES_PER_DAY) -> list[dict]:
             taken.append((start, end))
             continue
 
-        if gaps:
+        if gaps and block.block_type != "sleep":
             start, end = max(gaps, key=lambda gap: (gap[1] - gap[0], -gap[0]))
             placed_results.append(
                 _result(

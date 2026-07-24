@@ -170,7 +170,11 @@ def replan_after_delay(user, resume_time=None, delay_minutes=None, apply=None):
     # Flexible, not-yet-done blocks today that the delay invalidated — deduped
     # to one entry PER TASK. Locked blocks are sanctuaries: never displaced.
     displaced_qs = ScheduledBlock.objects.filter(
-        user=user, date=today, actually_completed=False, start_time__lt=resume_time,
+        user=user,
+        date=today,
+        actually_completed=False,
+        task__completed=False,
+        start_time__lt=resume_time,
     ).exclude(locked=True).select_related('task')
 
     seen = set()
