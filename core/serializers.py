@@ -193,6 +193,7 @@ class RecurringBlockSerializer(serializers.ModelSerializer):
             'day_of_week_display',
             'start_time',
             'end_time',
+            'flexibility',
             'location',
             'place',
             'is_night_shift',

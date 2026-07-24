@@ -129,10 +129,19 @@ class AIScheduler:
         reference_date = start_date
 
         if tasks is None:
-            tasks = list(Task.objects.filter(
-                user=user,
-                completed=False
-            ).order_by('deadline', '-priority'))
+            task_qs = Task.objects.filter(user=user, completed=False)
+            if not force:
+                scheduled_task_ids = ScheduledBlock.objects.filter(
+                    user=user,
+                    date__gte=start_date,
+                    date__lt=start_date + timedelta(days=num_days),
+                ).values_list("task_id", flat=True)
+                task_qs = task_qs.exclude(id__in=scheduled_task_ids)
+            tasks = list(task_qs.order_by('deadline', '-priority'))
+        else:
+            tasks = list(tasks)
+
+        self.last_unplaced = []
 
         if not tasks:
             return []
@@ -166,8 +175,6 @@ class AIScheduler:
         # Honest-conflict report (spec §10): a task that cannot fit is never
         # silently dropped; it lands here with the real remaining capacity so
         # the API/UI can surface options instead of inventing an impossible plan.
-        self.last_unplaced = []
-
         # Schedule tasks
         created_blocks = []
         for task, score in scored_tasks:

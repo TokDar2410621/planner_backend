@@ -320,10 +320,26 @@ class ScheduleTaskAtTool(BaseTool):
         if err:
             return ToolResult(success=False, data={}, message=err)
 
+        # Upsert support: a same-title locked one-off on the same date is this
+        # tool's own prior write. Exclude it from conflict checks and update it
+        # below instead of reporting a self-conflict.
+        task = Task.objects.filter(user=user, completed=False, title__iexact=title).first()
+        existing_block = None
+        if task is not None:
+            existing_block = ScheduledBlock.objects.filter(
+                user=user,
+                task=task,
+                date=target_date,
+                locked=True,
+            ).order_by("start_time", "id").first()
+        exclude_scheduled_id = existing_block.id if existing_block is not None else None
+
         # Chevauchement avec les murs RÉELS du jour (fixes + blocs datés déjà
         # planifiés), fenêtre pleine 0-24h. Les récurrents souples ne sont pas
         # des murs: l'événement ponctuel verrouillé les fera se replacer.
-        for bs, be in fixed_busy_intervals(user, target_date):
+        for bs, be in fixed_busy_intervals(
+            user, target_date, exclude_scheduled_id=exclude_scheduled_id
+        ):
             if s < be and bs < e:
                 return ToolResult(
                     success=False,
@@ -370,7 +386,6 @@ class ScheduleTaskAtTool(BaseTool):
                     )
 
         # Réutilise une tâche active du même titre (idempotence), sinon la crée.
-        task = Task.objects.filter(user=user, completed=False, title__iexact=title).first()
         if task is None:
             task = Task.objects.create(
                 user=user,
@@ -380,10 +395,25 @@ class ScheduleTaskAtTool(BaseTool):
                 description=kwargs.get("description", ""),
             )
 
-        sb = ScheduledBlock.objects.create(
-            user=user, task=task, date=target_date,
-            start_time=start_t, end_time=end_t, locked=True,
-        )
+        if existing_block is not None:
+            sb = existing_block
+            changed_fields = []
+            if sb.start_time != start_t:
+                sb.start_time = start_t
+                changed_fields.append("start_time")
+            if sb.end_time != end_t:
+                sb.end_time = end_t
+                changed_fields.append("end_time")
+            if not sb.locked:
+                sb.locked = True
+                changed_fields.append("locked")
+            if changed_fields:
+                sb.save(update_fields=changed_fields)
+        else:
+            sb = ScheduledBlock.objects.create(
+                user=user, task=task, date=target_date,
+                start_time=start_t, end_time=end_t, locked=True,
+            )
         return ToolResult(
             success=True,
             data={"scheduled_block": {

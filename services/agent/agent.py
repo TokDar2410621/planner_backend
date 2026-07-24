@@ -6,6 +6,8 @@ see results, and decide what to do next.
 """
 import json
 import logging
+import re
+import unicodedata
 from typing import Optional
 
 from django.conf import settings
@@ -33,6 +35,48 @@ from .system_prompt import build_system_prompt
 from .tools import get_tools_for_claude, execute_tool
 
 logger = logging.getLogger(__name__)
+
+MUTATION_TOOLS = {
+    "create_block",
+    "update_block",
+    "delete_block",
+    "clear_all_blocks",
+    "skip_block_occurrence",
+    "restore_block_occurrence",
+    "create_task",
+    "update_task",
+    "delete_task",
+    "complete_task",
+    "schedule_task_at",
+    "update_preferences",
+    "create_goal",
+    "update_goal",
+}
+
+COMPLETED_MUTATION_RE = re.compile(
+    r"\b(?:j'ai|je t'ai|c'est note)\b[^.!?\n]{0,80}"
+    r"\b(?:cree|creee|creees|ajoute|ajoutee|bloque|bloquee|planifie|"
+    r"planifiee|programme|programmee|ajuste|ajustee|modifie|modifiee|"
+    r"mis\s+a\s+jour|mise\s+a\s+jour|deplace|deplacee|decale|decalee)\b",
+    re.IGNORECASE,
+)
+
+
+def _successful_mutation(tool_calls: list) -> bool:
+    for call in tool_calls:
+        if call.get("tool") not in MUTATION_TOOLS:
+            continue
+        result = call.get("result") or {}
+        if result.get("success"):
+            return True
+    return False
+
+
+def _claims_completed_mutation(text: str) -> bool:
+    if not text:
+        return False
+    normalized = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    return bool(COMPLETED_MUTATION_RE.search(normalized.lower()))
 
 
 class PlannerAgent:
@@ -260,6 +304,17 @@ class PlannerAgent:
                 final_text = "J'ai effectué plusieurs actions. Voici un résumé de ce que j'ai fait."
                 for tc in tool_calls_made:
                     final_text += f"\n- {tc['result'].get('message', tc['tool'])}"
+
+        if (
+            not had_error
+            and _claims_completed_mutation(final_text)
+            and not _successful_mutation(tool_calls_made)
+        ):
+            final_text = (
+                "Je n'ai pas modifie ton planning: aucune action d'ecriture "
+                "n'a ete confirmee. "
+                f"{final_text}"
+            )
 
         # 7. Save assistant response — but never persist an LLM-failure message
         #    as a real assistant turn (B3): it would pollute future context.
