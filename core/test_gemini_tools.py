@@ -33,3 +33,30 @@ class GeminiToolConversionTest(SimpleTestCase):
         from services.llm.gemini import GeminiProvider
         self.assertIsNone(GeminiProvider()._to_gemini_tools(None))
         self.assertIsNone(GeminiProvider()._to_gemini_tools([]))
+
+
+class GeminiParseResponseRobustnessTest(SimpleTestCase):
+    """Regression: a candidate that exposes no parts (SAFETY / RECITATION /
+    MAX_TOKENS with empty content, or content=None) yields response.parts=None.
+    Iterating it raised "'NoneType' object is not iterable"; with the Claude
+    failover capped, that crash surfaced to users as "Erreur ... avec l'IA"."""
+
+    def _make_response(self, content):
+        from types import SimpleNamespace
+        candidate = SimpleNamespace(content=content, finish_reason=SimpleNamespace(name="SAFETY"))
+        return SimpleNamespace(candidates=[candidate], usage_metadata=None)
+
+    def test_candidate_without_content_does_not_crash(self):
+        from services.llm.gemini import GeminiProvider
+        parsed = GeminiProvider()._parse_response(self._make_response(content=None))
+        self.assertEqual(parsed.text, "")
+        self.assertEqual(parsed.function_calls, [])
+        self.assertEqual(parsed.stop_reason, "SAFETY")
+
+    def test_candidate_with_none_parts_does_not_crash(self):
+        from types import SimpleNamespace
+        from services.llm.gemini import GeminiProvider
+        resp = self._make_response(content=SimpleNamespace(parts=None))
+        parsed = GeminiProvider()._parse_response(resp)
+        self.assertEqual(parsed.text, "")
+        self.assertEqual(parsed.function_calls, [])

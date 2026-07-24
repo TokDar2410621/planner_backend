@@ -176,8 +176,16 @@ class GeminiProvider(LLMProvider):
         # raw_content lets the assistant's function-call turn round-trip back to
         # Gemini on the next request (B19). Without it, Gemini never sees that it
         # already called the tool and re-calls it (the duplicate-write bug).
+        #
+        # Robustesse: un candidat peut n'exposer AUCUNE part (SAFETY, RECITATION,
+        # MAX_TOKENS sans contenu, ou content=None). Dans ce cas `response.parts`
+        # vaut None; itérer dessus tel quel plantait avec
+        # "'NoneType' object is not iterable" et, le failover Claude étant capé,
+        # ce crash remontait en "Erreur lors de la communication avec l'IA".
         raw_content = []
-        for part in response.parts:
+        content = getattr(candidate, 'content', None)
+        parts = getattr(content, 'parts', None) if content is not None else None
+        for part in (parts or []):
             # Check for function calls
             fc = getattr(part, 'function_call', None)
             if fc:
