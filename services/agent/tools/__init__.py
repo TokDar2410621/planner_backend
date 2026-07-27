@@ -25,6 +25,7 @@ from .schedule import (
     GetWeekScheduleTool,
     FindFreeSlotsTool,
     ScheduleTaskAtTool,
+    CheckFeasibilityTool,
 )
 from .preferences import GetPreferencesTool, UpdatePreferencesTool
 from .goals import ListGoalsTool, CreateGoalTool, UpdateGoalTool
@@ -55,6 +56,7 @@ ALL_TOOLS: list[BaseTool] = [
     GetWeekScheduleTool(),
     FindFreeSlotsTool(),
     ScheduleTaskAtTool(),
+    CheckFeasibilityTool(),
     # Preferences
     GetPreferencesTool(),
     UpdatePreferencesTool(),

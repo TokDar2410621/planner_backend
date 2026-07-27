@@ -32,6 +32,9 @@ requests>=2.31,<3.0
 cloudinary>=1.36,<2.0
 django-cloudinary-storage>=0.3,<1.0
 
+# Optimisation planning (solveur CP-SAT de faisabilité — services/scheduling/solve_day.py)
+ortools>=9.14,<10.0
+
 # Testing
 pytest>=7.4,<8.0
 pytest-django>=4.5,<5.0
