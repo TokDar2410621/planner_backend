@@ -307,9 +307,16 @@ def place_day(user, date, day_start=0, day_end=MINUTES_PER_DAY) -> list[dict]:
                     overnight_kept=True,
                 )
             )
-            todays_piece = _clip_interval(start, MINUTES_PER_DAY, day_start, day_end)
-            if todays_piece is not None:
-                taken.append(todays_piece)
+            # Un souple overnight (sommeil 23:00-07:00) occupe CE jour aux DEUX
+            # bouts: le soir (start->minuit) ET le matin (minuit->end). Sans le
+            # morceau du matin, le glouton plaçait un autre souple en pleine nuit
+            # (ex sport à 06:30, dans le sommeil).
+            evening_piece = _clip_interval(start, MINUTES_PER_DAY, day_start, day_end)
+            if evening_piece is not None:
+                taken.append(evening_piece)
+            morning_piece = _clip_interval(0, end, day_start, day_end)
+            if morning_piece is not None:
+                taken.append(morning_piece)
             continue
 
         if duration <= 0 or duration > MINUTES_PER_DAY or start + duration > MINUTES_PER_DAY:

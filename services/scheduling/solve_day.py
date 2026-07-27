@@ -173,3 +173,107 @@ def solve_day(user, date, extra=None, day_start=0, day_end=MINUTES_PER_DAY, time
         "solve_ms": round(solver.WallTime() * 1000),
         "status": solver.StatusName(status),
     }
+
+
+def _placement_dict(block, start_min, end_min, *, preferred, shrunk, skipped,
+                    overnight_kept, start_time=None, end_time=None):
+    """Même forme que placement._result (contrat consommé par tout le rendu)."""
+    def fmt(x):
+        return f"{x // 60:02d}:{x % 60:02d}" if x is not None else None
+    return {
+        "block_id": block.id,
+        "title": block.title,
+        "block_type": block.block_type,
+        "start_min": start_min,
+        "end_min": end_min,
+        "start_time": start_time if start_time is not None else fmt(start_min),
+        "end_time": end_time if end_time is not None else fmt(end_min),
+        "preferred": preferred,
+        "shrunk": shrunk,
+        "skipped": skipped,
+        "overnight_kept": overnight_kept,
+    }
+
+
+def solve_placement(user, date, day_start=0, day_end=MINUTES_PER_DAY, time_limit=2.0):
+    """Placement OPTIMAL des blocs souples d'un jour (candidat au remplacement du
+    glouton place_day). Retour = MÊME forme que place_day (_result dicts).
+
+    Le solveur place TOUS les blocs souples plaçables à pleine durée autour des
+    murs fixes, au plus proche de leur heure préférée. Il ne RÉTRÉCIT jamais (un
+    bloc rentre en entier ou est sauté — pas de troncature silencieuse); il évite
+    les sauts que le glouton fait par optimum local. Overnight = gardé en place.
+    """
+    from ortools.sat.python import cp_model
+    from core.models import RecurringBlock
+    from services.scheduling.exceptions import skipped_block_ids
+
+    fixed = _merge(_clip(list(fixed_busy_intervals(user, date)), day_start, day_end))
+    skipped = skipped_block_ids(user, date)
+
+    results, extra_walls, candidates = [], [], []
+    for b in RecurringBlock.objects.filter(
+        user=user, active=True, day_of_week=date.weekday()
+    ).exclude(id__in=skipped):
+        if not b.is_flexible:
+            continue
+        start = time_to_min(b.start_time)
+        duration = b.effective_duration_minutes()
+        if is_overnight(b.start_time, b.end_time, b.is_night_shift):
+            results.append(_placement_dict(
+                b, start, time_to_min(b.end_time), preferred=True, shrunk=False,
+                skipped=False, overnight_kept=True,
+                start_time=b.start_time.strftime("%H:%M"), end_time=b.end_time.strftime("%H:%M")))
+            extra_walls.append((start, MINUTES_PER_DAY))
+            extra_walls.append((0, time_to_min(b.end_time)))
+            continue
+        if duration <= 0 or start + duration > MINUTES_PER_DAY:
+            results.append(_placement_dict(
+                b, None, None, preferred=False, shrunk=False, skipped=True, overnight_kept=False))
+            continue
+        candidates.append((b, duration, start))
+
+    walls = _merge(fixed + _clip(extra_walls, day_start, day_end))
+    span = day_end - day_start
+
+    model = cp_model.CpModel()
+    intervals = [model.NewIntervalVar(ws, we - ws, we, f"w{j}") for j, (ws, we) in enumerate(walls)]
+    present, start_var, obj = {}, {}, []
+    W_PLACE = 10 ** 9  # placer prime toujours sur la déviation
+    for b, dur, pref in candidates:
+        if dur > span:
+            present[b.id] = None
+            continue
+        st = model.NewIntVar(day_start, day_end - dur, f"s{b.id}")
+        pr = model.NewBoolVar(f"p{b.id}")
+        intervals.append(model.NewOptionalIntervalVar(st, dur, st + dur, pr, f"iv{b.id}"))
+        present[b.id], start_var[b.id] = pr, st
+        obj.append(pr * W_PLACE)
+        p = max(day_start, min(pref, day_end))
+        dev = model.NewIntVar(0, span, f"d{b.id}")
+        model.AddAbsEquality(dev, st - p)
+        obj.append(-dev)
+
+    model.AddNoOverlap(intervals)
+    model.Maximize(sum(obj))
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = time_limit
+    status = solver.Solve(model)
+    ok = status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+
+    for b, dur, pref in candidates:
+        prv = present.get(b.id)
+        if ok and prv is not None and solver.Value(prv):
+            s = solver.Value(start_var[b.id])
+            results.append(_placement_dict(
+                b, s, s + dur, preferred=(s == pref), shrunk=False, skipped=False, overnight_kept=False))
+        else:
+            results.append(_placement_dict(
+                b, None, None, preferred=False, shrunk=False, skipped=True, overnight_kept=False))
+
+    results.sort(key=lambda r: (
+        1 if r["skipped"] else 0,
+        r["start_min"] if r["start_min"] is not None else MINUTES_PER_DAY + 1,
+        r["block_id"],
+    ))
+    return results

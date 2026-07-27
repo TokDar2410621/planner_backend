@@ -65,6 +65,19 @@ class PlacementEngineTest(TestCase):
         self.assertFalse(sleep["skipped"])
         self.assertFalse(sleep["overnight_kept"])
 
+    def test_flexible_block_not_placed_inside_overnight_sleep_morning(self):
+        # Régression: un souple overnight (sommeil 23-07) mure AUSSI le matin
+        # 00-07 du même jour; un autre souple ne doit pas être placé en pleine
+        # nuit (avant le fix, le sport préférant 06:00 finissait à 06:00, dans
+        # le sommeil).
+        self._recurring("Sleep", "sleep", MONDAY.weekday(), time(23, 0), time(7, 0))
+        self._recurring("Sport", "sport", MONDAY.weekday(), time(6, 0), time(7, 0))
+
+        sport = self._by_title(place_day(self.user, MONDAY), "Sport")
+
+        if not sport["skipped"]:
+            self.assertGreaterEqual(sport["start_min"], 7 * 60)
+
     def test_night_worker_saturday_shift_spills_into_sunday_morning(self):
         self._recurring(
             "Night Work",

@@ -9,9 +9,54 @@ from django.contrib.auth.models import User
 from django.test import TestCase
 
 from core.models import RecurringBlock
-from services.scheduling.solve_day import solve_day
+from services.scheduling.solve_day import solve_day, solve_placement
 
 MONDAY = date(2026, 7, 27)
+
+
+class SolvePlacementTests(TestCase):
+    """solve_placement (candidat au remplacement du glouton, pour une action
+    'optimise' opt-in): place les souples à l'optimum, contrat identique à place_day."""
+
+    def test_returns_place_day_contract_keys(self):
+        u = User.objects.create_user("sp_contract", password="pw")
+        RecurringBlock.objects.create(
+            user=u, title="Sport", block_type="sport", day_of_week=0,
+            start_time=time(18, 0), end_time=time(19, 0))
+        res = solve_placement(u, MONDAY)
+        self.assertEqual(len(res), 1)
+        for k in ("block_id", "title", "block_type", "start_min", "end_min",
+                  "start_time", "end_time", "preferred", "shrunk", "skipped",
+                  "overnight_kept"):
+            self.assertIn(k, res[0])
+        self.assertFalse(res[0]["skipped"])
+        self.assertEqual(res[0]["shrunk"], False)  # le solveur ne rétrécit jamais
+
+    def test_packs_both_where_greedy_would_split(self):
+        # Trou unique 07-10 (3h) après murs; Révision 2h (préf 07:30) + Sport 1h
+        # (préf 07:00). Le solveur cale les DEUX à pleine durée.
+        u = User.objects.create_user("sp_pack", password="pw")
+        for d in range(7):
+            RecurringBlock.objects.create(
+                user=u, title="Sommeil", block_type="sleep", day_of_week=d,
+                start_time=time(23, 0), end_time=time(7, 0))
+        RecurringBlock.objects.create(
+            user=u, title="Cours", block_type="course", day_of_week=0,
+            start_time=time(10, 0), end_time=time(23, 0))
+        RecurringBlock.objects.create(
+            user=u, title="Révision", block_type="revision", day_of_week=0,
+            start_time=time(7, 30), end_time=time(9, 30))
+        RecurringBlock.objects.create(
+            user=u, title="Sport", block_type="sport", day_of_week=0,
+            start_time=time(7, 0), end_time=time(8, 0))
+
+        res = solve_placement(u, MONDAY)
+        placed = {r["title"]: r for r in res if not r["skipped"] and not r["overnight_kept"]}
+        self.assertIn("Révision", placed)
+        self.assertIn("Sport", placed)
+        # aucun placé avant 07:00 (sommeil du matin muré)
+        for r in placed.values():
+            self.assertGreaterEqual(r["start_min"], 7 * 60)
 
 
 class SolveDayFeasibilityTests(TestCase):
