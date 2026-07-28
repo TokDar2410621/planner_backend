@@ -298,6 +298,13 @@ class PlannerAgent:
         # as clearly-delimited DATA (never as instructions) (B8 / S9).
         if attachment:
             history[-1]["content"] = f"{history[-1]['content']}\n\n{self._build_attachment_context(attachment)}"
+        else:
+            # No attachment on THIS turn: if the user just imported a schedule,
+            # surface it so a vague follow-up ("gère ça", "c'est bon ?") never
+            # gets a false "je ne peux pas traiter de document" refusal.
+            recent_import = self._recent_import_context(user)
+            if recent_import:
+                history[-1]["content"] = f"{history[-1]['content']}\n\n{recent_import}"
 
         # 6. Agentic loop
         final_text = ""
@@ -464,6 +471,70 @@ class PlannerAgent:
             result["interactive_inputs"] = interactive_inputs
 
         return result
+
+    _DAYS_FR = ['lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi', 'dimanche']
+
+    def _recent_import_context(self, user: User) -> Optional[str]:
+        """Surface a just-finished schedule import when the follow-up message has
+        no attachment.
+
+        Root cause of the "je ne peux pas traiter de document" / "j'ai besoin de
+        plus de détails" refusals: on a follow-up turn the agent had NO signal
+        that the document it received seconds ago was processed and its blocks
+        created, so it invented a limitation and told the user the opposite of
+        the truth. Here we read the real state (most recent document processed in
+        the last ~20 min) and hand the agent the concrete list of blocks that
+        already exist, plus an explicit ban on denying the import.
+        """
+        from datetime import timedelta
+        from django.utils import timezone
+        from core.models import RecurringBlock
+
+        cutoff = timezone.now() - timedelta(minutes=20)
+        doc = (UploadedDocument.objects
+               .filter(user=user, uploaded_at__gte=cutoff)
+               .order_by('-uploaded_at')
+               .first())
+        if doc is None or not doc.processed:
+            return None
+
+        blocks = list(RecurringBlock.objects
+                      .filter(source_document=doc)
+                      .order_by('day_of_week', 'start_time'))
+        pending = (RecurringBlock.all_objects
+                   .filter(source_document=doc, status=RecurringBlock.STATUS_PENDING)
+                   .count())
+        if not blocks and not pending:
+            # Processed but nothing usable came out — be honest, not falsely capable.
+            if doc.processing_error or (doc.extracted_data or {}).get('parse_error'):
+                return (
+                    f"[IMPORT RÉCENT — le document « {doc.file_name} » a été reçu mais "
+                    "aucune donnée d'horaire exploitable n'a pu en être extraite. Dis-le "
+                    "honnêtement et propose de réessayer avec une image plus nette; ne "
+                    "prétends pas l'inverse.]"
+                )
+            return None
+
+        lines = []
+        for b in blocks:
+            day = self._DAYS_FR[b.day_of_week] if 0 <= b.day_of_week < 7 else '?'
+            start = b.start_time.strftime('%H:%M') if b.start_time else '?'
+            end = b.end_time.strftime('%H:%M') if b.end_time else '?'
+            lines.append(f"- {b.title} ({day} {start}-{end})")
+        listing = "\n".join(lines)
+        extra = ""
+        if pending:
+            extra = (f"\n({pending} autre(s) bloc(s) extraits avec une confiance faible "
+                     "attendent la confirmation de l'utilisateur.)")
+        return (
+            f"[IMPORT RÉCENT — le document « {doc.file_name} » a DÉJÀ été analysé et "
+            f"{len(blocks)} bloc(s) ont été ajoutés au planning de l'utilisateur:\n"
+            f"{listing}{extra}\n"
+            "Ces blocs existent en base MAINTENANT. Ne dis JAMAIS que tu ne peux pas "
+            "lire/traiter/importer le document, ni que tu as besoin qu'il ressaisisse "
+            "ces cours. Confirme ce qui a été ajouté (ou agis sur sa demande) en "
+            "t'appuyant sur cette liste.]"
+        )
 
     def _build_attachment_context(self, attachment: UploadedDocument) -> str:
         """
