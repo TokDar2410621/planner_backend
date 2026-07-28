@@ -173,6 +173,27 @@ class CreateBlockTool(BaseTool):
                         skipped.append({"day": day, "reason": "Jour invalide"})
                         continue
 
+                    # Anti-doublon EXACT, quelle que soit la flexibilité: un bloc
+                    # souple (sommeil, repas...) échappe à find_recurring_conflicts
+                    # (new_is_flexible -> []), donc rien n'empêchait de recréer un
+                    # "Déjeuner"/"Sommeil"/cours identique. Cause des doublons vus
+                    # quand le LLM "déplace"/"annule" en recréant sans supprimer.
+                    if RecurringBlock.objects.filter(
+                        user=user,
+                        active=True,
+                        day_of_week=day,
+                        block_type=block_type,
+                        title=title,
+                        start_time=start_t,
+                        end_time=end_t,
+                    ).exists():
+                        skipped.append({
+                            "day": day,
+                            "day_name": DAY_NAMES[day],
+                            "reason": f"'{title}' existe déjà le {DAY_NAMES[day]} à {start_time} (aucun doublon créé)",
+                        })
+                        continue
+
                     # Contrôle de chevauchement (gère l'overnight, AUCUN contournement).
                     conflicts = find_recurring_conflicts(
                         user,
@@ -227,7 +248,7 @@ class CreateBlockTool(BaseTool):
 
 class UpdateBlockTool(BaseTool):
     name = "update_block"
-    description = "Modifie un bloc récurrent existant (titre, horaires, lieu, flexibilité). Résous le bloc par son nom/jour/heure via list_blocks; ne demande JAMAIS un identifiant à l'utilisateur. flexibility='fixed' verrouille/protège le bloc ('ne déplace jamais mon sport') = il devient un mur infranchissable; flexibility='flexible' le rend déplaçable. Pour annuler/ignorer UN SEUL jour, n'utilise PAS update_block -> skip_block_occurrence."
+    description = "Modifie un bloc récurrent existant (titre, horaires, JOUR, lieu, flexibilité). Résous le bloc par son nom/jour/heure via list_blocks; ne demande JAMAIS un identifiant à l'utilisateur. Pour DÉPLACER un bloc vers un autre jour (ex: 'déplace mon cours du lundi au mardi'), passe day_of_week (0=Lundi..6=Dimanche): c'est un déplacement PROPRE en place. N'utilise JAMAIS delete_block+create_block pour déplacer (ça crée des doublons). flexibility='fixed' verrouille/protège le bloc; flexibility='flexible' le rend déplaçable. Pour annuler/ignorer UN SEUL jour, n'utilise PAS update_block -> skip_block_occurrence."
     parameters = {
         "type": "object",
         "properties": {
@@ -247,6 +268,12 @@ class UpdateBlockTool(BaseTool):
                 "type": "string",
                 "enum": ["fixed", "flexible"],
                 "description": "fixed pour verrouiller le bloc recurrent, flexible pour le rendre deplacable.",
+            },
+            "day_of_week": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 6,
+                "description": "Nouveau jour (0=Lundi..6=Dimanche) pour DÉPLACER le bloc vers ce jour, proprement, sans le recréer.",
             },
         },
         "required": ["block_id"],
@@ -276,6 +303,13 @@ class UpdateBlockTool(BaseTool):
         except ValueError as e:
             return ToolResult(success=False, data={}, message=str(e))
 
+        # Déplacement inter-jours propre (pas de delete+create qui duplique).
+        new_day = kwargs.get("day_of_week")
+        if new_day is None:
+            new_day = block.day_of_week
+        elif not (0 <= new_day <= 6):
+            return ToolResult(success=False, data={}, message="day_of_week invalide (0=Lundi..6=Dimanche).")
+
         night = is_overnight(new_start, new_end, block.is_night_shift)
         new_block_type = kwargs.get("block_type") or block.block_type
         if kwargs.get("flexibility") is not None:
@@ -286,10 +320,10 @@ class UpdateBlockTool(BaseTool):
             new_flexibility = block.flexibility or RecurringBlock.default_flexibility_for(new_block_type)
         new_is_flexible = new_flexibility == RecurringBlock.FLEXIBILITY_FLEXIBLE
 
-        # Contrôle de chevauchement (en s'excluant soi-même).
+        # Contrôle de chevauchement sur le jour CIBLE (en s'excluant soi-même).
         conflicts = find_recurring_conflicts(
             user,
-            block.day_of_week,
+            new_day,
             new_start,
             new_end,
             night,
@@ -317,6 +351,7 @@ class UpdateBlockTool(BaseTool):
         block.start_time = new_start
         block.end_time = new_end
         block.is_night_shift = night
+        block.day_of_week = new_day
 
         block.save()
         return ToolResult(

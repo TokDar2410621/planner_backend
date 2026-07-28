@@ -53,15 +53,26 @@ MUTATION_TOOLS = {
     "update_goal",
 }
 
+_MUT_VERBS = (
+    r"cree|creee|creees|crees|ajoute|ajoutee|ajoutes|ajoutees|bloque|bloquee|bloques|"
+    r"planifie|planifiee|planifies|programme|programmee|programmes|reprogramme|reprogrammee|"
+    r"ajuste|ajustee|modifie|modifiee|mis\s+a\s+jour|mise\s+a\s+jour|deplace|deplacee|deplaces|"
+    r"decale|decalee|prolonge|prolongee|rallonge|rallongee|allonge|allongee|etendu|etendue|"
+    r"raccourci|raccourcie|reduit|reduite|supprime|supprimee|supprimes|enleve|enlevee|"
+    r"retire|retiree|avance|avancee|reporte|reportee|reserve|reservee|verrouille|verrouillee|"
+    r"fixe|fixee|remis|remise|cale|calee|cales|calees|regle|reglee"
+)
+# Signale un texte qui AFFIRME une écriture accomplie. Gère les tournures
+# première-personne ("j'ai créé") ET impersonnelles/état, car les modèles
+# formulent le succès autrement ("C'est fait : ... est créé", "c'est bloqué",
+# "tout est calé") et échappaient au filet. Sûr car la garde ne s'arme que si
+# une écriture a été TENTÉE et a ÉCHOUÉ ce tour (voir _attempted_mutation).
 COMPLETED_MUTATION_RE = re.compile(
-    r"\b(?:j'ai|je t'ai|c'est note)\b[^.!?\n]{0,80}"
-    r"\b(?:cree|creee|creees|ajoute|ajoutee|bloque|bloquee|planifie|"
-    r"planifiee|programme|programmee|reprogramme|reprogrammee|ajuste|ajustee|"
-    r"modifie|modifiee|mis\s+a\s+jour|mise\s+a\s+jour|deplace|deplacee|"
-    r"decale|decalee|prolonge|prolongee|rallonge|rallongee|allonge|allongee|"
-    r"etendu|etendue|raccourci|raccourcie|reduit|reduite|supprime|supprimee|"
-    r"enleve|enlevee|retire|retiree|avance|avancee|reporte|reportee|"
-    r"reserve|reservee|verrouille|verrouillee|fixe|fixee)\b",
+    r"(?:\b(?:j'ai|je t'ai|c'est note)\b[^.!?\n]{0,80}\b(?:" + _MUT_VERBS + r")\b)"
+    r"|(?:\bc'est\s+(?:fait|bon|en\s+place|parti|regle|reglee|note|" + _MUT_VERBS + r")\b)"
+    r"|(?:\b(?:est|sont)\s+(?:" + _MUT_VERBS + r")\b)"
+    r"|(?:\btout\s+est\s+(?:fait|bon|pret|prete|cale|calee|regle|reglee|en\s+place)\b)"
+    r"|(?:\bvoila\b[^.!?\n]{0,40}\b(?:" + _MUT_VERBS + r")\b)",
     re.IGNORECASE,
 )
 
