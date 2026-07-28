@@ -2,9 +2,27 @@
 Goal tools for the Planner AI agent.
 """
 from django.contrib.auth.models import User
+from django.utils.dateparse import parse_date
 
 from core.models import Goal
 from .base import BaseTool, ToolResult, validate_choice, validate_max_length
+
+
+def _parse_deadline(value):
+    """Parse a 'YYYY-MM-DD' deadline to a date.
+
+    Returns (date_or_None, error_or_None). A DateField assigned a raw string
+    stays a string in memory until reloaded, so `_goal_to_dict` used to call
+    `.isoformat()` on a str and crash. Parse before write.
+    """
+    if value in (None, ""):
+        return None, None
+    if not isinstance(value, str):
+        return value, None
+    d = parse_date(value.strip())
+    if d is None:
+        return None, "Format de deadline invalide (attendu YYYY-MM-DD)."
+    return d, None
 
 # Enforced at the tool layer (not just in the JSON schema) before any write.
 VALID_GOAL_TYPES = {c[0] for c in Goal.GOAL_TYPE_CHOICES}
@@ -18,7 +36,10 @@ def _goal_to_dict(goal: Goal) -> dict:
         "title": goal.title,
         "description": goal.description or None,
         "goal_type": goal.goal_type,
-        "deadline": goal.deadline.isoformat() if goal.deadline else None,
+        "deadline": (
+            goal.deadline.isoformat() if hasattr(goal.deadline, "isoformat")
+            else (goal.deadline or None)
+        ),
         "progress": goal.progress,
         "status": goal.status,
         "created_at": goal.created_at.isoformat(),
@@ -92,12 +113,16 @@ class CreateGoalTool(BaseTool):
         if err:
             return ToolResult(success=False, data={}, message=err)
 
+        deadline, derr = _parse_deadline(kwargs.get("deadline"))
+        if derr:
+            return ToolResult(success=False, data={}, message=derr)
+
         goal = Goal.objects.create(
             user=user,
             title=kwargs["title"],
             goal_type=kwargs["goal_type"],
             description=kwargs.get("description", ""),
-            deadline=kwargs.get("deadline"),
+            deadline=deadline,
         )
         type_label = "court terme" if goal.goal_type == "short_term" else "long terme"
         return ToolResult(
@@ -149,7 +174,13 @@ class UpdateGoalTool(BaseTool):
         if err:
             return ToolResult(success=False, data={}, message=err)
 
-        for field in ["title", "description", "progress", "status", "deadline"]:
+        if kwargs.get("deadline") is not None:
+            deadline, derr = _parse_deadline(kwargs["deadline"])
+            if derr:
+                return ToolResult(success=False, data={}, message=derr)
+            goal.deadline = deadline
+
+        for field in ["title", "description", "progress", "status"]:
             if field in kwargs and kwargs[field] is not None:
                 setattr(goal, field, kwargs[field])
 

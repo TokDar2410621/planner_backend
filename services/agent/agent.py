@@ -32,7 +32,8 @@ except ImportError:  # pragma: no cover - fallback if the factory is unavailable
 
 from .context_builder import build_context
 from .system_prompt import build_system_prompt
-from .tools import get_tools_for_claude, execute_tool
+from .tools import get_tools_for_claude, execute_tool, TOOL_MAP
+from .tools.base import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,25 @@ def _claims_completed_mutation(text: str) -> bool:
         return False
     normalized = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     return bool(COMPLETED_MUTATION_RE.search(normalized.lower()))
+
+
+# Intention destructive/confirmation EXPLICITE dans le message de l'utilisateur.
+# Sert de garde-fou pour les outils `requires_confirmation` (efface TOUT, hard
+# delete): le LLM ne doit pas les exécuter de sa seule initiative — il faut que
+# l'utilisateur ait vraiment demandé la suppression ou confirmé.
+_DESTRUCTIVE_CONFIRM_RE = re.compile(
+    r"\b(?:efface|effacer|supprime|supprimer|vide|vider|enleve|enlever|retire|retirer|"
+    r"remets?\s+a\s+zero|reset|recommence|reinitialise|"
+    r"oui|confirme|d'accord|ok|vas-y|vas y|fais-le|fais le|je confirme|c'est bon)\b",
+    re.IGNORECASE,
+)
+
+
+def _user_authorized_destructive(message: str) -> bool:
+    if not message:
+        return False
+    normalized = unicodedata.normalize("NFKD", message).encode("ascii", "ignore").decode("ascii")
+    return bool(_DESTRUCTIVE_CONFIRM_RE.search(normalized.lower()))
 
 
 _DAY_NAMES_FR = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
@@ -373,7 +393,30 @@ class PlannerAgent:
                     continue
 
                 logger.info(f"Executing tool: {fc.name}({fc.args})")
-                result = execute_tool(fc.name, user, fc.args)
+                # Garde-fou destructif (A5): un outil `requires_confirmation`
+                # (efface TOUT, hard delete) ne s'exécute PAS sur la seule
+                # décision du LLM — l'utilisateur doit avoir explicitement demandé
+                # ou confirmé. Sinon on renvoie une demande de confirmation SANS
+                # muter, et l'agent la relaie.
+                _tool_obj = TOOL_MAP.get(fc.name)
+                if (
+                    _tool_obj is not None
+                    and getattr(_tool_obj, "requires_confirmation", False)
+                    and not _user_authorized_destructive(message)
+                ):
+                    logger.warning(f"Blocked unconfirmed destructive tool: {fc.name}")
+                    result = ToolResult(
+                        success=False,
+                        data={"needs_confirmation": True},
+                        message=(
+                            "Action destructive NON exécutée: elle efface des données. "
+                            "Demande d'abord une confirmation explicite à l'utilisateur "
+                            "(ex: « tu confirmes que je supprime … ? ») et ne réessaie "
+                            "que s'il répond oui."
+                        ),
+                    )
+                else:
+                    result = execute_tool(fc.name, user, fc.args)
                 logger.info(f"Tool result: {result.message}")
                 result_string = result.to_string()
                 executed_calls[call_key] = result_string

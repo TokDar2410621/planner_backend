@@ -27,6 +27,7 @@ from .schedule import (
     ScheduleTaskAtTool,
     CheckFeasibilityTool,
     OrganizeDayTool,
+    CancelScheduledBlockTool,
 )
 from .preferences import GetPreferencesTool, UpdatePreferencesTool
 from .goals import ListGoalsTool, CreateGoalTool, UpdateGoalTool
@@ -59,6 +60,7 @@ ALL_TOOLS: list[BaseTool] = [
     ScheduleTaskAtTool(),
     CheckFeasibilityTool(),
     OrganizeDayTool(),
+    CancelScheduledBlockTool(),
     # Preferences
     GetPreferencesTool(),
     UpdatePreferencesTool(),
