@@ -64,7 +64,7 @@ def _flexible_candidates(user, date):
     cands, extra_walls = [], []
     for b in RecurringBlock.objects.filter(
         user=user, active=True, day_of_week=date.weekday()
-    ).exclude(id__in=skipped_block_ids(user, date)):
+    ).exclude(id__in=skipped_block_ids(user, date)).order_by('id'):
         if not b.is_flexible:
             continue
         start = time_to_min(b.start_time)
@@ -140,6 +140,8 @@ def solve_day(user, date, extra=None, day_start=0, day_end=MINUTES_PER_DAY, time
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
+    solver.parameters.num_search_workers = 1  # déterministe (pas de course multi-thread)
+    solver.parameters.random_seed = 0
     status = solver.Solve(model)
 
     # Garde: ne lire les variables que si le solveur a trouvé une solution.
@@ -214,7 +216,7 @@ def solve_placement(user, date, day_start=0, day_end=MINUTES_PER_DAY, time_limit
     results, extra_walls, candidates = [], [], []
     for b in RecurringBlock.objects.filter(
         user=user, active=True, day_of_week=date.weekday()
-    ).exclude(id__in=skipped):
+    ).exclude(id__in=skipped).order_by('id'):
         if not b.is_flexible:
             continue
         start = time_to_min(b.start_time)
@@ -258,6 +260,8 @@ def solve_placement(user, date, day_start=0, day_end=MINUTES_PER_DAY, time_limit
     model.Maximize(sum(obj))
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
+    solver.parameters.num_search_workers = 1  # déterministe (pas de course multi-thread)
+    solver.parameters.random_seed = 0
     status = solver.Solve(model)
     ok = status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
 

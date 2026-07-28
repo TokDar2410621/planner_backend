@@ -9,9 +9,58 @@ from django.contrib.auth.models import User
 from django.test import TestCase
 
 from core.models import RecurringBlock
+from services.agent.tools.schedule import OrganizeDayTool
 from services.scheduling.solve_day import solve_day, solve_placement
 
 MONDAY = date(2026, 7, 27)
+
+
+class OrganizeDayToolTests(TestCase):
+    """organize_day: le moteur de résolution que l'agent appelle au besoin —
+    propose (rien changé) ou applique (déplace les souples), déterministe."""
+
+    def _setup(self, u):
+        for d in range(7):
+            RecurringBlock.objects.create(
+                user=u, title="Sommeil", block_type="sleep", day_of_week=d,
+                start_time=time(23, 0), end_time=time(7, 0))
+        RecurringBlock.objects.create(
+            user=u, title="Cours", block_type="course", day_of_week=0,
+            start_time=time(10, 0), end_time=time(18, 0))
+        s = RecurringBlock.objects.create(
+            user=u, title="Sport", block_type="sport", day_of_week=0,
+            start_time=time(7, 30), end_time=time(9, 0))
+        r = RecurringBlock.objects.create(
+            user=u, title="Revision", block_type="revision", day_of_week=0,
+            start_time=time(7, 0), end_time=time(9, 0))
+        return s, r
+
+    def test_propose_changes_nothing(self):
+        u = User.objects.create_user("org_propose", password="pw")
+        s, r = self._setup(u)
+        res = OrganizeDayTool().execute(u, date=MONDAY.isoformat(), apply=False)
+        self.assertTrue(res.success)
+        self.assertFalse(res.data["applied"])
+        s.refresh_from_db(); r.refresh_from_db()
+        self.assertEqual(s.start_time, time(7, 30))
+        self.assertEqual(r.start_time, time(7, 0))
+
+    def test_apply_moves_flexibles_keeps_fixed(self):
+        u = User.objects.create_user("org_apply", password="pw")
+        self._setup(u)
+        res = OrganizeDayTool().execute(u, date=MONDAY.isoformat(), apply=True)
+        self.assertTrue(res.success)
+        self.assertTrue(res.data["applied"])
+        self.assertEqual(len(res.data["placed"]), 2)  # les 2 souples placés
+        cours = RecurringBlock.objects.get(user=u, title="Cours")
+        self.assertEqual(cours.start_time, time(10, 0))  # le fixe n'a pas bougé
+
+    def test_deterministic(self):
+        u = User.objects.create_user("org_det", password="pw")
+        self._setup(u)
+        r1 = OrganizeDayTool().execute(u, date=MONDAY.isoformat(), apply=False)
+        r2 = OrganizeDayTool().execute(u, date=MONDAY.isoformat(), apply=False)
+        self.assertEqual(r1.data["placed"], r2.data["placed"])
 
 
 class SolvePlacementTests(TestCase):

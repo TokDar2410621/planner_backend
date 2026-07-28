@@ -15,7 +15,7 @@ from services.scheduling.placement import (
     open_intervals,
     place_day,
 )
-from services.scheduling.solve_day import solve_day
+from services.scheduling.solve_day import solve_day, solve_placement
 from .base import BaseTool, ToolResult, validate_choice
 
 DAY_NAMES = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
@@ -556,6 +556,71 @@ class CheckFeasibilityTool(BaseTool):
                 "placed": placed,
                 "unplaced": unplaced,
                 "date": target_date.isoformat(),
+            },
+            message=msg,
+        )
+
+
+class OrganizeDayTool(BaseTool):
+    name = "organize_day"
+    description = (
+        "Résout et RÉORGANISE de façon OPTIMALE le placement des blocs SOUPLES "
+        "d'une journée (sport, révision, repas, sommeil...) autour des murs fixes "
+        "(cours, travail) et du sommeil protégé, via un solveur exact. À utiliser "
+        "quand l'utilisateur demande d'optimiser / réorganiser / mieux agencer sa "
+        "journée, ou quand le placement laisse des trous. apply=false PROPOSE "
+        "l'arrangement sans rien changer (défaut); apply=true l'APPLIQUE en ajustant "
+        "les heures des blocs souples. Ne touche jamais aux blocs fixes."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "date": {"type": "string", "description": "Jour à réorganiser (YYYY-MM-DD). Déduis-le de la DATE du jour."},
+            "apply": {"type": "boolean", "description": "true = appliquer (déplacer les blocs); false = proposer seulement (défaut)."},
+        },
+        "required": ["date"],
+    }
+
+    def execute(self, user: User, **kwargs) -> ToolResult:
+        try:
+            target_date = datetime.strptime(kwargs["date"], "%Y-%m-%d").date()
+        except (ValueError, KeyError, TypeError):
+            return ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.")
+        apply = bool(kwargs.get("apply", False))
+
+        arrangement = solve_placement(user, target_date)  # fenêtre pleine journée
+        placed = [r for r in arrangement if not r["skipped"] and not r["overnight_kept"]]
+        overnight = [r for r in arrangement if r["overnight_kept"]]
+        skipped = [r for r in arrangement if r["skipped"]]
+
+        moved = []
+        if apply:
+            for r in placed:
+                block = RecurringBlock.objects.filter(id=r["block_id"], user=user).first()
+                if block is None:
+                    continue
+                new_start = time(r["start_min"] // 60, r["start_min"] % 60)
+                new_end = time(r["end_min"] // 60, r["end_min"] % 60)
+                if block.start_time != new_start or block.end_time != new_end:
+                    block.start_time = new_start
+                    block.end_time = new_end
+                    block.save(update_fields=["start_time", "end_time"])
+                    moved.append({"title": block.title, "start_time": r["start_time"], "end_time": r["end_time"]})
+
+        listing = ", ".join(f"{r['title']} {r['start_time']}-{r['end_time']}" for r in placed) or "rien à replacer"
+        head = "J'ai réorganisé" if apply else "Proposition (rien changé)"
+        msg = f"{head} le {DAY_NAMES[target_date.weekday()]} {target_date.isoformat()}: {listing}."
+        if skipped:
+            msg += " Non placé (journée trop pleine): " + ", ".join(r["title"] for r in skipped) + "."
+        return ToolResult(
+            success=True,
+            data={
+                "applied": apply,
+                "date": target_date.isoformat(),
+                "placed": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in placed],
+                "overnight_kept": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in overnight],
+                "skipped": [{"title": r["title"]} for r in skipped],
+                "moved": moved,
             },
             message=msg,
         )
