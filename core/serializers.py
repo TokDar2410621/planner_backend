@@ -226,11 +226,18 @@ class RecurringBlockSerializer(serializers.ModelSerializer):
             day_of_week = self.instance.day_of_week
 
         if start_time and end_time:
-            # Allow overnight blocks for night shifts
-            if not is_night_shift and start_time >= end_time:
+            if start_time == end_time:
                 raise serializers.ValidationError({
-                    'end_time': "L'heure de fin doit être après l'heure de début."
+                    'end_time': "La durée doit être non nulle (fin différente du début)."
                 })
+            if not is_night_shift and start_time > end_time:
+                # Bloc overnight (ex sommeil 23:00-07:00, quart de nuit): on
+                # AUTO-DÉTECTE le night shift au lieu de rejeter, comme le fait
+                # l'outil create_block de l'agent. Sinon le front / l'API REST ne
+                # peut pas créer un sommeil ou un quart de nuit sans cocher
+                # explicitement la case is_night_shift.
+                attrs['is_night_shift'] = True
+                is_night_shift = True
 
         request = self.context.get('request')
         user = getattr(request, 'user', None) if request is not None else None

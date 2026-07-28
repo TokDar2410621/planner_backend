@@ -176,3 +176,30 @@ class RecurringOverlapUpdateTests(TestCase):
         self.assertEqual(r.status_code, 400, r.content)
         block = RecurringBlock.all_objects.get(id=inactive.data["id"])
         self.assertFalse(block.active)
+
+
+class OvernightBlockCreationTests(TestCase):
+    """Régression: créer un bloc overnight (23-07) via l'API REST doit AUTO-DÉTECTER
+    is_night_shift au lieu de rejeter. Sinon le front / un client REST ne peut pas
+    créer un sommeil ou un quart de nuit sans cocher explicitement la case."""
+
+    def setUp(self):
+        self.user = User.objects.create_user("overnight_api", password="pw")
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def test_overnight_block_auto_detected_not_rejected(self):
+        r = self.client.post(reverse("recurring-block-list"), {
+            "title": "Sommeil", "block_type": "sleep", "day_of_week": 0,
+            "start_time": "23:00", "end_time": "07:00",
+        }, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        block = RecurringBlock.objects.get(user=self.user, title="Sommeil")
+        self.assertTrue(block.is_night_shift)
+
+    def test_zero_duration_still_rejected(self):
+        r = self.client.post(reverse("recurring-block-list"), {
+            "title": "Nul", "block_type": "sport", "day_of_week": 0,
+            "start_time": "09:00", "end_time": "09:00",
+        }, format="json")
+        self.assertEqual(r.status_code, 400)
