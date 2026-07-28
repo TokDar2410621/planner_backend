@@ -26,6 +26,7 @@ class UserProfile(models.Model):
     LLM_CHOICES = [
         ('gemini', 'Gemini (Google)'),
         ('claude', 'Claude (Anthropic)'),
+        ('deepseek', 'DeepSeek (raisonnement)'),
     ]
 
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')

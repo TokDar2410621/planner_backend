@@ -205,6 +205,16 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
 # Claude API (Anthropic)
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
 
+# DeepSeek API (OpenAI-compatible; base_url https://api.deepseek.com).
+# deepseek-v4-pro supports thinking mode together with tool calling. Reasoning
+# effort is 'high' by default; set DEEPSEEK_THINKING=false to run the faster
+# non-thinking path. The key is a BACKEND secret (never the frontend / VITE_).
+DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY', '')
+DEEPSEEK_MODEL = os.getenv('DEEPSEEK_MODEL', 'deepseek-v4-pro')
+DEEPSEEK_REASONING_EFFORT = os.getenv('DEEPSEEK_REASONING_EFFORT', 'high')
+DEEPSEEK_THINKING = os.getenv('DEEPSEEK_THINKING', 'true').lower() == 'true'
+DEEPSEEK_MAX_TOKENS = int(os.getenv('DEEPSEEK_MAX_TOKENS', '8192'))
+
 # Hugging Face API (fallback for Gemini vision)
 HF_API_KEY = os.getenv('HF_API_KEY', '')
 HF_MODEL = os.getenv('HF_MODEL', 'Qwen/Qwen2.5-VL-72B-Instruct')

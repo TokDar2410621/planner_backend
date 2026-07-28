@@ -210,14 +210,21 @@ class PlannerAgent:
         return get_provider(self._resolve_provider_name(user))
 
     def _build_alternate_provider(self, user: Optional[User] = None):
-        """The OTHER provider, used as a one-shot failover when the primary
-        errors (B3): claude <-> gemini."""
-        name = self._resolve_provider_name(user)
-        alt = "gemini" if name == "claude" else "claude"
-        try:
-            return get_provider(alt)
-        except Exception:
-            return None
+        """A configured provider OTHER than the primary, for one-shot failover
+        when the primary errors (B3). Returns the first available among the known
+        providers, so adding DeepSeek does not require a binary claude<->gemini
+        assumption."""
+        primary = str(self._resolve_provider_name(user)).strip().lower()
+        for alt in ("gemini", "deepseek", "claude"):
+            if alt == primary:
+                continue
+            try:
+                provider = get_provider(alt)
+                if provider.is_available():
+                    return provider
+            except Exception:
+                continue
+        return None
 
     def _generate_with_failover(self, *, messages, tools, system_prompt):
         """Call the primary provider; on a transport/API error, try the other
