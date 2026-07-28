@@ -614,12 +614,20 @@ Analyse ce texte et retourne le JSON structuré:"""
         try:
             # Use context manager to handle both local and remote (Cloudinary) storage
             with self._get_local_file(document) as file_path:
-                file_ext = file_path.lower().split('.')[-1]
+                # The stored name carries a neutral extension (Cloudinary blocks
+                # delivery of a .pdf public_id), so decide the extraction path
+                # from the file's magic bytes, never the suffix.
+                from core.validators import sniff_kind
+                with open(file_path, 'rb') as _fh:
+                    file_kind = sniff_kind(_fh.read(16))
 
                 # Step 0: Compute file hash and check cache
                 content_hash = self._compute_file_hash(file_path)
                 document.content_hash = content_hash
-                document.file_name = document.file.name.split('/')[-1]
+                # Keep the human-facing original filename set at upload time;
+                # only fall back to the (opaque) stored name if none was saved.
+                if not document.file_name:
+                    document.file_name = document.file.name.split('/')[-1]
                 document.save(update_fields=['content_hash', 'file_name'])
 
                 cached_data = self._check_cache(document.user, content_hash)
@@ -643,16 +651,12 @@ Analyse ce texte et retourne le JSON structuré:"""
                 response_text = None
                 extraction_method = None
 
-                if file_ext == 'pdf':
-                    # NEW: Try text extraction first (pdfplumber)
+                if file_kind == 'pdf':
+                    # Try text extraction first (pdfplumber), vision fallback.
                     response_text, extraction_method = self._process_pdf_smart(file_path, document.document_type)
-
-                elif file_ext in ['png', 'jpg', 'jpeg', 'webp', 'gif']:
-                    # Images always use vision
-                    response_text, extraction_method = self._process_image(file_path, document.document_type)
-
                 else:
-                    raise ValueError(f"Type de fichier non supporté: {file_ext}")
+                    # Images always use vision.
+                    response_text, extraction_method = self._process_image(file_path, document.document_type)
 
                 if response_text is None:
                     raise RuntimeError("Aucun service AI disponible")

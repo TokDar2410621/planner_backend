@@ -474,6 +474,9 @@ class ChatView(APIView):
                 user=request.user,
                 file=attachment_file,
                 document_type=doc_type,
+                # Keep the original human-facing name; the stored name is an
+                # opaque extensionless id (Cloudinary blocks .pdf delivery).
+                file_name=getattr(attachment_file, 'name', '') or '',
             )
             attachment = doc
             logger.debug("Chat document created id=%s", doc.id)
@@ -527,7 +530,9 @@ class DocumentViewSet(viewsets.ModelViewSet):
         return UploadedDocument.objects.filter(user=self.request.user)
 
     def perform_create(self, serializer):
-        doc = serializer.save(user=self.request.user)
+        uploaded = serializer.validated_data.get('file')
+        original_name = getattr(uploaded, 'name', '') or ''
+        doc = serializer.save(user=self.request.user, file_name=original_name)
 
         # Process document ASYNCHRONOUSLY after upload
         try:

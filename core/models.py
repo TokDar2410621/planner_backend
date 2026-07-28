@@ -104,6 +104,42 @@ def save_user_profile(sender, instance, **kwargs):
         instance.profile.save()
 
 
+def document_upload_to(instance, filename):
+    """Storage path for an uploaded document, with a NEUTRAL extension.
+
+    Cloudinary blocks delivery of a public_id ending in .pdf (HTTP 401) whatever
+    the resource_type, so we must never let the stored name carry a .pdf (or any
+    disallowed) suffix. A random extensionless name delivers fine as raw and the
+    processor decides pdf-vs-image from the file's magic bytes. The human-facing
+    original filename is kept separately in `file_name`.
+    """
+    return f"documents/{uuid.uuid4().hex}"
+
+
+def document_file_storage():
+    """Storage backend for uploaded documents.
+
+    On Cloudinary, a PDF stored under the default (image) resource_type is
+    BLOCKED from delivery (HTTP 401) unless the account enables PDF delivery, so
+    the processor can never download it back to extract the schedule. The raw
+    resource_type has no such restriction and keeps the file extension intact
+    (verified empirically against the prod cloud: image-type PDF -> 401 even
+    signed, raw PDF -> 200). Images are unaffected either way; storing them as
+    raw still downloads fine (they are never rendered as <img> in the UI, only
+    processed server-side).
+
+    Callable (not an instance) so migrations record a stable reference instead
+    of freezing environment-specific credentials, and so dev without Cloudinary
+    falls back to the project default (local filesystem) storage.
+    """
+    from django.conf import settings
+    if getattr(settings, 'CLOUDINARY_CLOUD_NAME', '') and getattr(settings, 'CLOUDINARY_API_KEY', ''):
+        from cloudinary_storage.storage import RawMediaCloudinaryStorage
+        return RawMediaCloudinaryStorage()
+    from django.core.files.storage import default_storage
+    return default_storage
+
+
 class UploadedDocument(models.Model):
     """Document uploaded by user (PDF, image)."""
 
@@ -114,7 +150,7 @@ class UploadedDocument(models.Model):
     ]
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='documents')
-    file = models.FileField(upload_to='documents/')
+    file = models.FileField(upload_to=document_upload_to, storage=document_file_storage)
     file_name = models.CharField(max_length=255, blank=True)
     content_hash = models.CharField(max_length=64, blank=True, db_index=True)
     document_type = models.CharField(
