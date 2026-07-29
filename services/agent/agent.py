@@ -509,8 +509,11 @@ class PlannerAgent:
                 response_text = f"{final_text}\n\n{footer}"
 
         # 8. Build response
-        # Use AI-generated quick replies if available, otherwise auto-generate
-        quick_replies = self._generate_quick_replies(tool_calls_made, context)
+        # Contextual quick replies: the LLM proposes the likely next steps for
+        # THIS exchange; deterministic rules are the fallback if it fails.
+        quick_replies = self._generate_quick_replies(
+            message, final_text, tool_calls_made, context, had_error
+        )
 
         result = {
             "response": response_text,
@@ -675,7 +678,76 @@ class PlannerAgent:
 
         return cleaned
 
-    def _generate_quick_replies(self, tool_calls: list, context: dict) -> list[dict]:
+    # Prompt système minimal pour la génération de suggestions (pas d'outils).
+    _QR_SYSTEM = (
+        "Tu génères des suggestions de réponse rapide pour un assistant d'agenda. "
+        "Tu réponds UNIQUEMENT par du JSON, jamais d'autre texte."
+    )
+
+    def _generate_quick_replies(
+        self, user_message: str, final_text: str, tool_calls: list,
+        context: dict, had_error: bool = False,
+    ) -> list[dict]:
+        """Suggestions contextuelles: le LLM propose les étapes suivantes probables;
+        les règles déterministes servent de repli si l'appel échoue ou déraille."""
+        if had_error:
+            return []
+        try:
+            llm = self._llm_quick_replies(user_message, final_text)
+            if llm:
+                return llm
+        except Exception:  # noqa: BLE001 - never fail the chat for a suggestion
+            logger.debug("LLM quick replies failed; falling back to rules", exc_info=True)
+        return self._rule_based_quick_replies(tool_calls, context)
+
+    def _llm_quick_replies(self, user_message: str, final_text: str) -> list[dict]:
+        """Un appel LLM léger (sans outils) qui propose 2-3 suites logiques."""
+        if not final_text or not self.llm or not self.llm.is_available():
+            return []
+        prompt = (
+            "Voici le dernier échange dans un assistant d'agenda (français).\n"
+            f"UTILISATEUR: {user_message[:500]}\n"
+            f"ASSISTANT: {final_text[:800]}\n\n"
+            "Propose 2 ou 3 SUGGESTIONS de message que l'utilisateur pourrait vouloir "
+            "envoyer JUSTE APRÈS, comme prochaine étape logique de la conversation "
+            "(ex: après un cours ajouté → en ajouter un autre, bloquer du temps d'étude; "
+            "après un conflit → décaler l'un des deux; après une question → l'action "
+            "correspondante). Elles doivent être concrètes, utiles et variées.\n"
+            "Réponds UNIQUEMENT par un tableau JSON de 2-3 objets "
+            '{"label": "...", "value": "..."} :\n'
+            "- label = texte du bouton, court (max 28 caractères), commençant par 1 emoji.\n"
+            "- value = le message complet à envoyer, à la première personne, prêt à l'emploi.\n"
+            "Aucun texte hors du JSON."
+        )
+        resp = self.llm.generate(prompt, system_prompt=self._QR_SYSTEM)
+        if getattr(resp, "is_error", False):
+            return []
+        return self._parse_quick_replies(getattr(resp, "text", "") or "")
+
+    @staticmethod
+    def _parse_quick_replies(text: str) -> list[dict]:
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if not match:
+            return []
+        try:
+            data = json.loads(match.group(0))
+        except (json.JSONDecodeError, ValueError):
+            return []
+        out = []
+        seen = set()
+        for item in data if isinstance(data, list) else []:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label", "")).strip()[:40]
+            value = str(item.get("value", "")).strip()[:300]
+            if label and value and value.lower() not in seen:
+                seen.add(value.lower())
+                out.append({"label": label, "value": value})
+            if len(out) >= 3:
+                break
+        return out
+
+    def _rule_based_quick_replies(self, tool_calls: list, context: dict) -> list[dict]:
         """Generate contextual quick reply buttons based on what just happened."""
         replies = []
 
