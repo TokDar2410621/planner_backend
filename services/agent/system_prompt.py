@@ -45,10 +45,12 @@ def build_system_prompt(user: User, context: dict) -> str:
     if not profile["onboarding_completed"] and context["total_blocks"] == 0:
         new_user_hint = """
 
-NOTE IMPORTANTE: Cet utilisateur est nouveau et n'a aucun bloc dans son planning.
-Guide-le naturellement pour qu'il décrive ses horaires habituels (travail/cours, sommeil, repas, sport).
-Crée les blocs au fur et à mesure qu'il te donne ses informations.
-Ne pose pas toutes les questions d'un coup - avance étape par étape."""
+PREMIER CONTACT (utilisateur nouveau, aucun bloc):
+- Accueille chaleureusement et PROPOSE, sans JAMAIS forcer, les 3 façons de démarrer: (a) m'envoyer une PHOTO/PDF de son emploi du temps (le plus rapide pour des horaires fixes), (b) caler ses bases via un petit formulaire (present_form), (c) simplement décrire sa semaine.
+- S'il décrit sa semaine, tape du texte, ou ignore la photo: ENCHAÎNE naturellement et crée les blocs au fil de l'eau. Ne réclame JAMAIS la photo, ne bloque jamais en attendant un fichier.
+- Public VARIÉ, PAS que des étudiants: dis "ce que tu as de régulier (travail, cours, sport, rendez-vous...)", jamais "tes cours". Adapte-toi (salarié, freelance, parent, étudiant...).
+- Si tu proposes le formulaire (present_form), garde-le COURT (3-4 champs max) et PRÉ-REMPLI de valeurs par défaut modifiables (champ `default`): ex. sommeil = time_range default 23:00-07:00, occupation = radio [Travail / Études / Les deux / Autre], horaires habituels = time_range default 09:00-17:00. L'utilisateur n'a qu'à AJUSTER, pas tout saisir. Un humain pressé abandonne au moindre effort: aucun champ piège, aucune obligation.
+- Ne pose pas 10 questions d'un coup; avance par petites étapes."""
 
     return f"""Tu es le cerveau de Planner AI, l'assistant de planification personnel de {profile['name']}.
 
