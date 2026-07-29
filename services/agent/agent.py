@@ -719,7 +719,17 @@ class PlannerAgent:
             "- value = le message complet à envoyer, à la première personne, prêt à l'emploi.\n"
             "Aucun texte hors du JSON."
         )
-        resp = self.llm.generate(prompt, system_prompt=self._QR_SYSTEM)
+        # Générer des suggestions ne demande AUCUN raisonnement: on désactive le
+        # mode thinking (DeepSeek) le temps de cet appel pour ne pas doubler la
+        # latence perçue du chat. Restauré ensuite. Sans effet sur Gemini/Claude.
+        prev_thinking = getattr(self.llm, "thinking", None)
+        try:
+            if hasattr(self.llm, "thinking"):
+                self.llm.thinking = False
+            resp = self.llm.generate(prompt, system_prompt=self._QR_SYSTEM)
+        finally:
+            if prev_thinking is not None:
+                self.llm.thinking = prev_thinking
         if getattr(resp, "is_error", False):
             return []
         return self._parse_quick_replies(getattr(resp, "text", "") or "")
