@@ -3,6 +3,7 @@ rule-based generator as a deterministic fallback. Tests cover the JSON parsing,
 the fallback path, and the had_error short-circuit. No real LLM is called.
 """
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from django.test import TestCase
@@ -82,3 +83,31 @@ class GenerateQuickRepliesTests(TestCase):
         out = self.agent._generate_quick_replies("salut", "Bonjour !", [], ctx)
         # rule-based: 0 blocks -> "Configurer mon planning"
         self.assertTrue(any("configurer" in r["label"].lower() for r in out))
+
+
+class QuickRepliesForTests(TestCase):
+    """Deferred endpoint path: quick_replies_for(user, msg, response)."""
+
+    def setUp(self):
+        self.user = User.objects.create_user("qrf", password="pw-123456")
+        self.agent = PlannerAgent()
+
+    def test_returns_llm_replies(self):
+        with patch.object(
+            self.agent, "_build_provider",
+            return_value=_fake_llm(text='[{"label":"➕ Cours","value":"Ajoute un cours"}]'),
+        ):
+            out = self.agent.quick_replies_for(self.user, "hi", "J'ai ajouté ton cours.")
+        self.assertEqual(out, [{"label": "➕ Cours", "value": "Ajoute un cours"}])
+
+    def test_empty_inputs_return_empty(self):
+        # Court-circuit AVANT tout appel LLM (aucun provider construit).
+        self.assertEqual(self.agent.quick_replies_for(self.user, "", "reply"), [])
+        self.assertEqual(self.agent.quick_replies_for(self.user, "hi", ""), [])
+
+    def test_unavailable_provider_returns_empty(self):
+        with patch.object(
+            self.agent, "_build_provider", return_value=_fake_llm(available=False),
+        ):
+            out = self.agent.quick_replies_for(self.user, "hi", "reply")
+        self.assertEqual(out, [])

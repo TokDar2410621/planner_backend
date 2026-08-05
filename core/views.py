@@ -1,10 +1,12 @@
 """
 API Views for Planner AI backend.
 """
+import json
 import logging
 from datetime import date, timedelta
 
 from django.contrib.auth import authenticate
+from django.http import StreamingHttpResponse
 from django.contrib.auth.models import User
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db.models import Q
@@ -30,6 +32,7 @@ from .models import (
     ConversationMessage,
     TaskHistory,
     SharedSchedule,
+    McpOAuthCode,
 )
 from .serializers import (
     UserSerializer,
@@ -133,6 +136,104 @@ class RegisterView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
+class PasswordResetRequestView(APIView):
+    """Demande de réinitialisation de mot de passe.
+
+    Anti-énumération: répond TOUJOURS 200 avec le même message, que l'email
+    existe ou non. Pour chaque compte correspondant (doublons d'email
+    historiques inclus), envoie un lien de reset signé (uid + token Django,
+    invalidé automatiquement dès que le mot de passe change).
+    """
+
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'password_reset'
+
+    def post(self, request):
+        from django.conf import settings as dj_settings
+        from django.contrib.auth.tokens import default_token_generator
+        from django.core.mail import send_mail
+        from django.utils.encoding import force_bytes
+        from django.utils.http import urlsafe_base64_encode
+
+        email = (request.data.get('email') or '').strip().lower()
+        generic = {'message': ("Si un compte existe avec cet email, un lien de "
+                               "réinitialisation vient d'être envoyé.")}
+        if not email:
+            return Response({'error': 'Email requis.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        for user in User.objects.filter(email__iexact=email, is_active=True):
+            uid = urlsafe_base64_encode(force_bytes(user.pk))
+            token = default_token_generator.make_token(user)
+            reset_url = f"{dj_settings.FRONTEND_URL}/reset-password?uid={uid}&token={token}"
+            try:
+                send_mail(
+                    subject="Planner AI : réinitialise ton mot de passe",
+                    message=(
+                        f"Salut {user.username},\n\n"
+                        "Quelqu'un (toi, normalement) a demandé à réinitialiser le "
+                        "mot de passe de ton compte Planner AI.\n\n"
+                        f"Clique ici pour choisir un nouveau mot de passe :\n{reset_url}\n\n"
+                        "Le lien expire automatiquement. Si tu n'es pas à l'origine "
+                        "de cette demande, ignore simplement ce message."
+                    ),
+                    from_email=None,  # DEFAULT_FROM_EMAIL
+                    recipient_list=[user.email],
+                    fail_silently=False,
+                )
+            except Exception as e:  # noqa: BLE001 - ne jamais révéler l'échec au client
+                logger.error(f"Password reset email failed for user {user.id}: {e}")
+        return Response(generic)
+
+
+class PasswordResetConfirmView(APIView):
+    """Applique le nouveau mot de passe si (uid, token) est valide.
+
+    Le token Django est à usage unique par construction (dérivé du hash du mot
+    de passe + last_login): dès que le mot de passe change, il devient invalide.
+    """
+
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'password_reset'
+
+    def post(self, request):
+        from django.contrib.auth.password_validation import validate_password
+        from django.contrib.auth.tokens import default_token_generator
+        from django.utils.encoding import force_str
+        from django.utils.http import urlsafe_base64_decode
+
+        uid = request.data.get('uid') or ''
+        token = request.data.get('token') or ''
+        new_password = request.data.get('new_password') or ''
+        if not uid or not token or not new_password:
+            return Response({'error': 'uid, token et new_password requis.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user = User.objects.get(pk=force_str(urlsafe_base64_decode(uid)),
+                                    is_active=True)
+        except (User.DoesNotExist, ValueError, TypeError, OverflowError):
+            return Response({'error': 'Lien invalide ou expiré.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        if not default_token_generator.check_token(user, token):
+            return Response({'error': 'Lien invalide ou expiré.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            validate_password(new_password, user)
+        except ValidationError as exc:
+            return Response({'error': ' '.join(exc.messages)},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        user.set_password(new_password)
+        user.save(update_fields=['password'])
+        logger.info(f"Password reset completed for user {user.id}")
+        return Response({'message': 'Mot de passe mis à jour. Tu peux te connecter.'})
+
+
 class LoginView(APIView):
     """User login endpoint."""
 
@@ -152,6 +253,19 @@ class LoginView(APIView):
         # Use Django's authenticate() so the auth backend enforces is_active:
         # a deactivated account must never receive tokens (B24).
         user = authenticate(request, username=username, password=password)
+        if user is None and '@' in username:
+            # Le formulaire de connexion demande l'EMAIL, mais authenticate()
+            # n'authentifie que par USERNAME: tout compte inscrit avec un pseudo
+            # était enfermé dehors (« Identifiants invalides » avec le bon mot de
+            # passe — bug attrapé par le parcours Playwright réel). On résout
+            # l'email vers le(s) username(s) correspondant(s); en cas de doublon
+            # d'email historique, le mot de passe départage.
+            candidates = User.objects.filter(email__iexact=username.strip())
+            for candidate in candidates:
+                user = authenticate(
+                    request, username=candidate.username, password=password)
+                if user is not None:
+                    break
         if user is None:
             return Response(
                 {'error': 'Identifiants invalides.'},
@@ -218,6 +332,115 @@ class McpTokenView(APIView):
         Token.objects.filter(user=request.user).delete()
         token = Token.objects.create(user=request.user)
         return Response({"token": token.key, "username": request.user.username})
+
+
+class McpOAuthApproveView(APIView):
+    """L'utilisateur (connecté, JWT) autorise Claude: on frappe un code OAuth
+    éphémère lié à son compte + au PKCE du client. Appelé par la page
+    /mcp-authorize du front. Renvoie l'URL de redirection vers Claude."""
+
+    def post(self, request):
+        import secrets as _secrets
+        from datetime import timedelta as _td
+        from django.utils import timezone as _tz
+
+        d = request.data
+        client_id = (d.get('client_id') or '').strip()
+        redirect_uri = (d.get('redirect_uri') or '').strip()
+        code_challenge = (d.get('code_challenge') or '').strip()
+        state = d.get('state') or ''
+        if not client_id or not redirect_uri or not code_challenge:
+            return Response({'error': 'Paramètres OAuth incomplets.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        # Claude enregistre ses clients en DCR avec des redirect_uri de
+        # confiance (claude.ai / localhost pour Claude Code). On borne quand
+        # même aux schémas attendus pour ne jamais rediriger vers n'importe où.
+        if not (redirect_uri.startswith('https://') or
+                redirect_uri.startswith('http://localhost') or
+                redirect_uri.startswith('http://127.0.0.1')):
+            return Response({'error': 'redirect_uri refusée.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        code = _secrets.token_urlsafe(32)
+        McpOAuthCode.objects.create(
+            code=code,
+            user=request.user,
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            redirect_uri_explicit=bool(d.get('redirect_uri_provided_explicitly', True)),
+            code_challenge=code_challenge,
+            scopes=d.get('scopes') or ['planner'],
+            resource=d.get('resource') or None,
+            expires_at=_tz.now() + _td(minutes=5),
+        )
+        sep = '&' if '?' in redirect_uri else '?'
+        from urllib.parse import quote
+        redirect = f"{redirect_uri}{sep}code={quote(code)}"
+        if state:
+            redirect += f"&state={quote(str(state))}"
+        return Response({'redirect': redirect})
+
+
+class _McpSecretPermission:
+    """Vérif du secret partagé serveur MCP -> backend (jamais exposé au client)."""
+
+    @staticmethod
+    def check(request) -> bool:
+        from django.conf import settings as dj_settings
+        secret = getattr(dj_settings, 'MCP_OAUTH_SECRET', '')
+        provided = request.headers.get('X-MCP-Secret', '')
+        import hmac as _hmac
+        return bool(secret) and _hmac.compare_digest(secret, provided)
+
+
+class McpOAuthLookupView(APIView):
+    """Le serveur MCP relit un code (sans le consommer) pour valider PKCE."""
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        if not _McpSecretPermission.check(request):
+            return Response(status=status.HTTP_403_FORBIDDEN)
+        from django.utils import timezone as _tz
+        try:
+            c = McpOAuthCode.objects.select_related('user').get(
+                code=request.data.get('code') or '')
+        except McpOAuthCode.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        if c.used or c.expires_at < _tz.now():
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        return Response({
+            'client_id': c.client_id,
+            'redirect_uri': c.redirect_uri,
+            'redirect_uri_explicit': c.redirect_uri_explicit,
+            'code_challenge': c.code_challenge,
+            'scopes': c.scopes,
+            'resource': c.resource,
+            'expires_at': c.expires_at.timestamp(),
+        })
+
+
+class McpOAuthRedeemView(APIView):
+    """Échange final: le serveur MCP consomme le code et reçoit le token DRF
+    de l'utilisateur (celui-là même que la carte Claude & MCP affiche)."""
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        if not _McpSecretPermission.check(request):
+            return Response(status=status.HTTP_403_FORBIDDEN)
+        from django.utils import timezone as _tz
+        try:
+            c = McpOAuthCode.objects.select_related('user').get(
+                code=request.data.get('code') or '')
+        except McpOAuthCode.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        if c.used or c.expires_at < _tz.now():
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        c.used = True
+        c.save(update_fields=['used'])
+        token, _ = Token.objects.get_or_create(user=c.user)
+        return Response({'token': token.key, 'username': c.user.username})
 
 
 class GoogleAuthView(APIView):
@@ -425,6 +648,54 @@ class OnboardingStatusView(APIView):
 
 # ============== Chat View ==============
 
+def _create_chat_attachment(request, attachment_file):
+    """Validate + persist a chat upload and kick off async processing.
+
+    Shared by ChatView and ChatStreamView. Returns (attachment, error_response):
+    exactly one of the two is non-None when a file was provided.
+    """
+    if not attachment_file:
+        return None, None
+    logger.debug(
+        "Chat attachment name=%s size=%s",
+        attachment_file.name,
+        attachment_file.size,
+    )
+
+    # S4: validate the upload (size + extension allowlist + magic bytes)
+    # BEFORE persisting it, so a smuggled SVG/HTML/executable payload or
+    # an oversized file never reaches storage or the processor.
+    from core.validators import validate_upload_file
+    from rest_framework.exceptions import ValidationError as DRFValidationError
+    try:
+        validate_upload_file(attachment_file)
+    except DRFValidationError as exc:
+        return None, Response(
+            {'error': 'Fichier invalide.', 'detail': exc.detail},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    doc_type = request.data.get('document_type', 'other')
+    doc = UploadedDocument.objects.create(
+        user=request.user,
+        file=attachment_file,
+        document_type=doc_type,
+        # Keep the original human-facing name; the stored name is an
+        # opaque extensionless id (Cloudinary blocks .pdf delivery).
+        file_name=getattr(attachment_file, 'name', '') or '',
+    )
+    logger.debug("Chat document created id=%s", doc.id)
+
+    # Process document ASYNCHRONOUSLY to avoid timeout
+    try:
+        processor = DocumentProcessor()
+        processor.process_document_async(doc.id)
+        logger.debug("Chat async processing started for doc %s", doc.id)
+    except Exception as e:
+        logger.error(f"Document processing error: {e}")
+    return doc, None
+
+
 class ChatView(APIView):
     """Chat endpoint for conversational AI."""
 
@@ -447,52 +718,26 @@ class ChatView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Handle file upload
-        attachment = None
-        if attachment_file:
-            logger.debug(
-                "Chat attachment name=%s size=%s",
-                attachment_file.name,
-                attachment_file.size,
-            )
+        attachment, error_response = _create_chat_attachment(request, attachment_file)
+        if error_response is not None:
+            return error_response
 
-            # S4: validate the upload (size + extension allowlist + magic bytes)
-            # BEFORE persisting it, so a smuggled SVG/HTML/executable payload or
-            # an oversized file never reaches storage or the processor.
-            from core.validators import validate_upload_file
-            from rest_framework.exceptions import ValidationError as DRFValidationError
-            try:
-                validate_upload_file(attachment_file)
-            except DRFValidationError as exc:
-                return Response(
-                    {'error': 'Fichier invalide.', 'detail': exc.detail},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            doc_type = request.data.get('document_type', 'other')
-            doc = UploadedDocument.objects.create(
-                user=request.user,
-                file=attachment_file,
-                document_type=doc_type,
-                # Keep the original human-facing name; the stored name is an
-                # opaque extensionless id (Cloudinary blocks .pdf delivery).
-                file_name=getattr(attachment_file, 'name', '') or '',
-            )
-            attachment = doc
-            logger.debug("Chat document created id=%s", doc.id)
-
-            # Process document ASYNCHRONOUSLY to avoid timeout
-            try:
-                processor = DocumentProcessor()
-                processor.process_document_async(doc.id)
-                logger.debug("Chat async processing started for doc %s", doc.id)
-            except Exception as e:
-                logger.error(f"Document processing error: {e}")
+        # When the client fetches quick replies out-of-band (deferred endpoint),
+        # skip the second LLM round-trip here so the answer returns faster.
+        # Absent/false keeps the legacy inline behaviour (backward compatible).
+        defer_quick_replies = str(
+            request.data.get('defer_quick_replies', '')
+        ).lower() in ('true', '1', 'yes')
 
         # Generate chat response via PlannerAgent
         try:
             agent = PlannerAgent()
-            result = agent.process_message(request.user, message or "J'ai uploadé un document.", attachment)
+            result = agent.process_message(
+                request.user,
+                message or "J'ai uploadé un document.",
+                attachment,
+                generate_quick_replies=not defer_quick_replies,
+            )
             logger.info(f"Agent response generated: {result.get('response', '')[:100]}...")
         except Exception as e:
             # Log the detail server-side; never leak the raw exception string
@@ -516,6 +761,87 @@ class ChatView(APIView):
             response_data['tasks_created'] = result['tasks_created']
 
         return Response(response_data)
+
+
+class ChatQuickRepliesView(APIView):
+    """Deferred, out-of-band contextual quick replies for the last exchange.
+
+    The client sends the just-completed {message, response}; we return 2-3
+    contextual reply buttons. Kept off the /chat/ critical path so the answer
+    lands first and the chips appear a moment later.
+    """
+
+    def post(self, request):
+        message = request.data.get('message', '') or ''
+        response_text = request.data.get('response', '') or ''
+        try:
+            replies = PlannerAgent().quick_replies_for(
+                request.user, message, response_text
+            )
+        except Exception as e:  # noqa: BLE001 - suggestions never fail the client
+            logger.debug("quick-replies endpoint error: %s", e, exc_info=True)
+            replies = []
+        return Response({'quick_replies': replies or []})
+
+
+class DailyBriefView(APIView):
+    """Brief quotidien proactif (cerveau): calculé/caché une fois par jour.
+
+    Même source de vérité que le worker daily_brain — le premier lecteur du
+    jour (worker OU app) calcule, les suivants relisent le cache.
+    """
+
+    def get(self, request):
+        from services.daily_brain import build_daily_brief
+        return Response(build_daily_brief(request.user))
+
+
+class ChatStreamView(APIView):
+    """Streaming chat endpoint (SSE over POST).
+
+    Emits the agent's events as `data: {json}\\n\\n` frames: status (outil en
+    cours), delta (fragments de texte), turn_discard, puis un done TERMINAL dont
+    `response` fait autorité (le client remplace la bulle par done.response).
+    Quick replies: jamais inline ici, le client passe par /chat/quick-replies/.
+    Le front retombe sur /chat/ classique si ce flux échoue.
+    """
+
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        message = request.data.get('message', '')
+        attachment_file = request.FILES.get('attachment')
+        if not message and not attachment_file:
+            return Response(
+                {'error': 'Message ou fichier requis.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        attachment, error_response = _create_chat_attachment(request, attachment_file)
+        if error_response is not None:
+            return error_response
+
+        user = request.user
+        final_message = message or "J'ai uploadé un document."
+
+        def event_stream():
+            try:
+                agent = PlannerAgent()
+                for event in agent.process_message_stream(user, final_message, attachment):
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            except Exception as e:  # noqa: BLE001 - never leak internals into the stream
+                logger.error(f"PlannerAgent stream error: {e}", exc_info=True)
+                yield "data: " + json.dumps({
+                    'type': 'error',
+                    'error': 'Erreur interne lors du traitement du message.',
+                }) + "\n\n"
+
+        response = StreamingHttpResponse(
+            event_stream(), content_type='text/event-stream')
+        response['Cache-Control'] = 'no-cache'
+        # Anti-buffering (nginx/proxies): chaque frame doit partir immédiatement.
+        response['X-Accel-Buffering'] = 'no'
+        return response
 
 
 # ============== Document Views ==============
@@ -958,12 +1284,20 @@ class ScheduleView(APIView):
             date__lt=end_date
         )
 
-        # Get unscheduled tasks
-        scheduled_task_ids = scheduled_tasks.values_list('task_id', flat=True)
+        # Get unscheduled tasks. « Non planifié » = aucun placement A VENIR,
+        # pas « pas placé CETTE semaine » : l'ancienne requête faisait
+        # réapparaître en « à planifier » toute tâche placée une autre semaine
+        # (vécu: les matchs datés importés). Un placement passé non complété
+        # reste « à planifier » (le rollover s'en occupe par ailleurs).
+        from django.utils import timezone as _tz
+        future_scheduled_ids = ScheduledBlock.objects.filter(
+            user=request.user,
+            date__gte=_tz.localdate(),
+        ).values_list('task_id', flat=True)
         unscheduled_tasks = Task.objects.filter(
             user=request.user,
             completed=False
-        ).exclude(id__in=scheduled_task_ids)
+        ).exclude(id__in=future_scheduled_ids)
 
         # Get recurring block completions for the week
         recurring_completions = RecurringBlockCompletion.objects.filter(

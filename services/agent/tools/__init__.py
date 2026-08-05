@@ -26,6 +26,7 @@ from .schedule import (
     FindFreeSlotsTool,
     ScheduleTaskAtTool,
     CheckFeasibilityTool,
+    OptimizeWeekTool,
     OrganizeDayTool,
     CancelScheduledBlockTool,
 )
@@ -59,6 +60,7 @@ ALL_TOOLS: list[BaseTool] = [
     FindFreeSlotsTool(),
     ScheduleTaskAtTool(),
     CheckFeasibilityTool(),
+    OptimizeWeekTool(),
     OrganizeDayTool(),
     CancelScheduledBlockTool(),
     # Preferences

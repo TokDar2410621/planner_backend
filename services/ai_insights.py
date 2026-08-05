@@ -1168,8 +1168,13 @@ Jours: 0=Lundi, 1=Mardi, 2=Mercredi, 3=Jeudi, 4=Vendredi, 5=Samedi, 6=Dimanche
             end_min = end.hour * 60 + end.minute
 
             if is_overnight:
-                # Split into two ranges: start->midnight and midnight->end
-                return [(start_min, 24 * 60), (0, end_min)]
+                # Un bloc overnight qui COMMENCE aujourd'hui n'occupe que le soir
+                # [start, minuit] AUJOURD'HUI. Sa queue du matin [00:00, end]
+                # appartient au LENDEMAIN et est deja representee separement le jour
+                # suivant (previous_night_blocks). Sans ca, la queue etait comptee
+                # deux fois: par ex. deux quarts de nuit CONSECUTIFS (Ven 19-07 +
+                # Sam 19-07) se "chevauchaient" a tort de 420min le samedi matin.
+                return [(start_min, 24 * 60)]
             else:
                 return [(start_min, end_min)]
 

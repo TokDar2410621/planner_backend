@@ -194,9 +194,15 @@ class AttachmentContextTest(TestCase):
             extracted_data={},
             processed=False,
         )
-        sent = self._run(user, "Analyse ce doc", doc)
+        from django.test import override_settings
+        with override_settings(ATTACHMENT_WAIT_SECONDS=0):
+            sent = self._run(user, "Analyse ce doc", doc)
         last_user = [m for m in sent if m["role"] == "user"][-1]
-        self.assertIn("EN COURS DE TRAITEMENT", last_user["content"])
+        # Nouveau contrat: etat "encore en analyse" + tutoiement impose + zero
+        # promesse de resume automatique (personne ne la livrerait).
+        self.assertIn("ENCORE EN ANALYSE", last_user["content"])
+        self.assertIn("TUTOYANT", last_user["content"])
+        self.assertIn("Ne promets JAMAIS", last_user["content"])
 
     def test_attachment_helper_delimits_and_does_not_leak_instructions(self):
         user = User.objects.create_user('docuser3', password='pw-123456')

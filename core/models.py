@@ -941,3 +941,56 @@ class PushSubscription(models.Model):
 
     def __str__(self):
         return f"PushSub {self.user.username} {self.endpoint[:40]}"
+
+
+class DailyBrainReport(models.Model):
+    """Brief quotidien du « cerveau » proactif.
+
+    Calculé UNE fois par utilisateur et par jour (par le worker Railway ou à la
+    première lecture de /insights/daily-brief/), puis mis en cache ici. Contient
+    les 1-3 choses qui méritent l'attention du jour (blocs ratés reprogrammés,
+    conflits à venir, échéances proches) et sert de garde d'idempotence pour le
+    push quotidien.
+    """
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='daily_brain_reports'
+    )
+    date = models.DateField()
+    payload = models.JSONField(default=dict)
+    pushed = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [('user', 'date')]
+        ordering = ['-date']
+        indexes = [models.Index(fields=['user', 'date'])]
+
+    def __str__(self):
+        return f"DailyBrain {self.user.username} {self.date}"
+
+
+class McpOAuthCode(models.Model):
+    """Code d'autorisation OAuth éphémère pour la connexion MCP « comme Gridar »
+    (Claude ouvre planneria.app/mcp-authorize, l'utilisateur clique Autoriser,
+    l'app crée ce code; le serveur MCP l'échange contre le token DRF via le
+    secret partagé). Un code = un usage, 5 minutes de vie, PKCE obligatoire.
+    """
+    code = models.CharField(max_length=64, unique=True)
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='mcp_oauth_codes'
+    )
+    client_id = models.CharField(max_length=255)
+    redirect_uri = models.TextField()
+    redirect_uri_explicit = models.BooleanField(default=True)
+    code_challenge = models.CharField(max_length=128)
+    scopes = models.JSONField(default=list)
+    resource = models.TextField(null=True, blank=True)
+    expires_at = models.DateTimeField()
+    used = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['code'])]
+
+    def __str__(self):
+        return f"McpOAuthCode {self.user.username} ({'used' if self.used else 'live'})"

@@ -60,3 +60,17 @@ def test_night_worker_flexible_sleep_no_sleep_conflict(svc):
     # ni sommeil/travail, ni sommeil/sommeil, ni le faux message "travail de nuit"
     assert not any("Sommeil" in c.message or "Sieste" in c.message for c in conflicts), \
         [c.message for c in conflicts]
+
+
+@pytest.mark.django_db
+def test_two_consecutive_night_shifts_are_not_flagged(svc):
+    # Deux quarts de nuit CONSECUTIFS (Ven 19-07 + Sam 19-07) ne se chevauchent
+    # PAS: Ven 19h->Sam 7h puis Sam 19h->Dim 7h, avec un trou Sam 7h-19h. Avant le
+    # fix, le detecteur comptait la queue du matin du quart de samedi DEUX FOIS
+    # (via son propre wrap overnight + via le quart de vendredi remonte le samedi)
+    # -> faux "Chevauchement de 420min le samedi".
+    user = User.objects.create_user("cf_two_nights", password="pw-123456")
+    _rb(user, "Quart de nuit", "work", 4, "19:00", "07:00", "fixed", night=True)
+    _rb(user, "Quart de nuit", "work", 5, "19:00", "07:00", "fixed", night=True)
+    conflicts = svc.detect_conflicts(user, days_ahead=8)
+    assert not any(c.type == "overlap" for c in conflicts), [c.message for c in conflicts]

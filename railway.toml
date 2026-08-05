@@ -6,31 +6,25 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "python manage.py migrate --noinput && python manage.py collectstatic --noinput && gunicorn planner.wsgi:application -k gevent -w ${WEB_CONCURRENCY:-3} -b 0.0.0.0:${PORT:-8000} --timeout 120"
+# DISPATCH par service: ce fichier est lu par TOUS les services du projet qui
+# deploient ce code (le CLI ne sait pas poser un cronSchedule, et le config
+# file est partage). La branche par defaut (web `planner_backend`) reproduit
+# EXACTEMENT l'ancienne commande; la branche `send-reminders` est un WORKER
+# boucle (equivalent d'un cron */15): rappels push + alertes de depart toutes
+# les 15 min. POSIX sh only. `|| true` = une iteration ratee ne tue pas la
+# boucle.
+startCommand = "bash -c 'if [ \"$RAILWAY_SERVICE_NAME\" = \"send-reminders\" ]; then while true; do python manage.py send_reminders --lead 15 || true; python manage.py daily_brain || true; sleep 900; done; else python manage.py migrate --noinput && python manage.py collectstatic --noinput && exec gunicorn planner.wsgi:application -k gevent -w ${WEB_CONCURRENCY:-3} -b 0.0.0.0:${PORT:-8000} --timeout 120; fi'"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
 
 # ---------------------------------------------------------------------------
-# T3 / D3 -- Durable document-processing backstop (Railway cron)
+# T3 / D3 -- Durable document-processing backstop
 # ---------------------------------------------------------------------------
-# The inline upload path processes documents in a background daemon thread,
-# which does NOT survive a redeploy or worker crash. To guarantee every
-# UploadedDocument eventually gets processed, run the management command
-# `process_pending_documents` on a schedule.
-#
-# DO NOT add the cron here (this file configures the WEB service, and its
-# startCommand above must stay as-is). Instead create a SEPARATE Railway
-# service in the same project/environment, sharing the same repo, env vars,
-# and DATABASE_URL, configured as a cron:
-#
-#   Service settings (Railway dashboard or `railway.toml` of that service):
-#     [deploy]
-#     startCommand   = "python manage.py process_pending_documents --min-age 60"
-#     cronSchedule   = "*/10 * * * *"   # every 10 minutes
-#     restartPolicyType = "never"       # cron: run to completion, don't restart
-#
-# The command is idempotent and per-document isolated: it is safe to run
-# concurrently with the inline path, skips docs already processed, and one bad
-# document never aborts the batch. `--min-age 60` avoids racing the inline
-# path on freshly uploaded documents.
+# The inline upload path processes documents in a background greenlet, which
+# does NOT survive a redeploy or worker crash. To guarantee every
+# UploadedDocument eventually gets processed, `process_pending_documents`
+# should also run on a schedule. If needed, add a branch for a
+# `process-documents` worker in the dispatch above (same pattern as
+# send-reminders: `python manage.py process_pending_documents --min-age 60`
+# every 600s). The command is idempotent and per-document isolated.
 # ---------------------------------------------------------------------------

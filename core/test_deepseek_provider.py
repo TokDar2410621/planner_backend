@@ -118,10 +118,13 @@ class DeepSeekProviderTests(TestCase):
         self.assertEqual(kwargs["tools"][0]["function"]["name"], "t")
 
     @override_settings(DEEPSEEK_THINKING=False)
-    def test_thinking_disabled_omits_reasoning_params(self):
+    def test_thinking_disabled_sends_explicit_disabled(self):
+        # deepseek-v4-pro reasons by DEFAULT if the field is omitted, so thinking
+        # off must be sent EXPLICITLY as disabled (sinon l'appel quick-replies
+        # payait quand meme la latence de raisonnement). Pas de reasoning_effort.
         p = self._provider()
         p._client.chat.completions.create.return_value = _resp(content="ok")
         p.generate_with_history([{"role": "user", "content": "hi"}])
         kwargs = p._client.chat.completions.create.call_args.kwargs
-        self.assertNotIn("extra_body", kwargs)
+        self.assertEqual(kwargs["extra_body"], {"thinking": {"type": "disabled"}})
         self.assertNotIn("reasoning_effort", kwargs)

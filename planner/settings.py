@@ -103,7 +103,11 @@ AUTH_PASSWORD_VALIDATORS = [
 
 # Internationalization
 LANGUAGE_CODE = 'fr-fr'
-TIME_ZONE = 'Europe/Paris'
+# Fuseau PRODUIT: le public est quebecois et toutes les heures de blocs sont
+# des heures murales locales. Europe/Paris (heritage) faisait chercher les
+# rappels sur l'horloge de Paris: un bloc de 9h se rappelait a 3h du matin
+# Quebec, et le jour basculait a 18h (vecu: "je ne recois jamais de notifs").
+TIME_ZONE = 'America/Toronto'
 USE_I18N = True
 USE_TZ = True
 
@@ -140,8 +144,27 @@ REST_FRAMEWORK = {
         'anon': os.getenv('THROTTLE_RATE_ANON', '50/day'),
         'chat': os.getenv('THROTTLE_RATE_CHAT', '30/min'),
         'upload': os.getenv('THROTTLE_RATE_UPLOAD', '20/min'),
+        # Anti-abus du reset de mot de passe (spam d'emails / énumération).
+        'password_reset': os.getenv('THROTTLE_RATE_PASSWORD_RESET', '10/hour'),
     },
 }
+
+# ---------------------------------------------------------------------------
+# Email (reset de mot de passe). Sans SMTP configuré, backend CONSOLE: le mail
+# part dans les logs Railway (lien de reset lisible là — dépannage manuel).
+# Quand le domaine + fournisseur (Resend/SES/SMTP) seront en place, poser
+# EMAIL_BACKEND=django.core.mail.backends.smtp.EmailBackend + EMAIL_* +
+# DEFAULT_FROM_EMAIL sur Railway. FRONTEND_URL = base des liens de reset.
+# ---------------------------------------------------------------------------
+EMAIL_BACKEND = os.getenv(
+    'EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')
+EMAIL_HOST = os.getenv('EMAIL_HOST', '')
+EMAIL_PORT = int(os.getenv('EMAIL_PORT', '587'))
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
+EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'True') == 'True'
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', 'Planner AI <no-reply@planner.local>')
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'https://day-wise-bot.vercel.app')
 
 # JWT Settings
 SIMPLE_JWT = {
@@ -217,6 +240,8 @@ DEEPSEEK_MAX_TOKENS = int(os.getenv('DEEPSEEK_MAX_TOKENS', '8192'))
 
 # Hugging Face API (fallback for Gemini vision)
 HF_API_KEY = os.getenv('HF_API_KEY', '')
+# Secret partagé serveur MCP <-> backend pour l'échange de codes OAuth
+MCP_OAUTH_SECRET = os.getenv('MCP_OAUTH_SECRET', '')
 HF_MODEL = os.getenv('HF_MODEL', 'Qwen/Qwen2.5-VL-72B-Instruct')
 
 # Cloudinary (for media storage in production)

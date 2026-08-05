@@ -158,6 +158,12 @@ class DocumentProcessor:
     Extracts schedule information from course schedules and work schedules.
     """
 
+    # Version du pipeline d'extraction. Incrementer a chaque evolution de
+    # prompt ou de structure: le cache par hash de fichier ne doit JAMAIS
+    # resservir une extraction d'une version anterieure (vecu: une photo de
+    # matchs re-importee resservait l'extraction SANS dates d'avant le fix).
+    EXTRACTION_VERSION = 2
+
     # Unified extraction prompt that extracts all types of schedule data
     UNIFIED_EXTRACTION_PROMPT = """Tu es un expert en extraction de données d'emploi du temps. Analyse cette image avec une EXTRÊME PRÉCISION.
 
@@ -232,7 +238,16 @@ TOUJOURS format HH:MM (24h):
             "notes": ""
         }
     ],
-    "events": []
+    "events": [
+        {
+            "name": "Nom de l'evenement (ex: Match: Jonquiere vs Alma)",
+            "date": "YYYY-MM-DD (OBLIGATOIRE si une date calendaire est visible)",
+            "day": "lundi|mardi|... (seulement si AUCUNE date, evenement hebdomadaire)",
+            "start_time": "HH:MM",
+            "end_time": "HH:MM (si absent: null)",
+            "location": "Lieu si visible"
+        }
+    ]
 }
 
 === RÈGLES ABSOLUES ===
@@ -309,7 +324,16 @@ Je te donne le TEXTE BRUT extrait d'un PDF d'horaire. Analyse-le et structure le
             "role": "Poste si mentionné"
         }}
     ],
-    "events": []
+    "events": [
+        {{
+            "name": "Nom de l'evenement (ex: Match: Jonquiere vs Alma)",
+            "date": "YYYY-MM-DD (OBLIGATOIRE si une date calendaire est visible)",
+            "day": "lundi|mardi|... (seulement si AUCUNE date, evenement hebdomadaire)",
+            "start_time": "HH:MM",
+            "end_time": "HH:MM (si absent: null)",
+            "location": "Lieu si visible"
+        }}
+    ]
 }}
 
 === RÈGLES ABSOLUES ===
@@ -317,7 +341,10 @@ Je te donne le TEXTE BRUT extrait d'un PDF d'horaire. Analyse-le et structure le
 2. FUSIONNER les créneaux consécutifs du même cours le même jour (8h-9h + 9h-10h = 8h-10h)
 3. Extraire TOUS les cours/shifts visibles
 4. Si "Cours inclus à l'horaire" ou légende présente, utiliser les VRAIS NOMS des cours
-5. UNIQUEMENT le JSON, aucun texte avant/après
+5. DATES CALENDAIRES = EVENEMENTS DATES: un tableau avec des dates explicites
+   (matchs, rendez-vous, tournois) va dans "events" avec le champ "date" —
+   JAMAIS dans courses/shifts (ce ne sont PAS des habitudes hebdomadaires)
+6. UNIQUEMENT le JSON, aucun texte avant/après
 
 === TEXTE EXTRAIT DU PDF ===
 {text}
@@ -505,8 +532,15 @@ Analyse ce texte et retourne le JSON structuré:"""
         ).exclude(extracted_data={}).first()
 
         if cached_doc:
+            cached = cached_doc.extracted_data or {}
+            if cached.get('extraction_version') != self.EXTRACTION_VERSION:
+                logger.info(
+                    "Cache STALE: version %s != %s pour hash %s..., re-extraction",
+                    cached.get('extraction_version'), self.EXTRACTION_VERSION, content_hash[:16],
+                )
+                return None
             logger.info(f"Cache HIT: Found previously processed document with hash {content_hash[:16]}...")
-            return cached_doc.extracted_data
+            return cached
 
         logger.info(f"Cache MISS: No cached document found for hash {content_hash[:16]}...")
         return None
@@ -668,6 +702,7 @@ Analyse ce texte et retourne le JSON structuré:"""
 
                 # Add extraction method to data
                 extracted_data['extraction_method'] = extraction_method
+                extracted_data['extraction_version'] = self.EXTRACTION_VERSION
 
                 # Log extraction results
                 courses_count = len(extracted_data.get('courses', []))
@@ -775,10 +810,40 @@ Analyse ce texte et retourne le JSON structuré:"""
                 response = self._call_gemini(prompt)
                 return response.text
             except Exception as e:
-                logger.error(f"Gemini text structuring failed: {e}")
+                # Structurer du TEXTE n'exige pas la vision: DeepSeek (cle deja
+                # en prod) peut sauver le coup quand Gemini tombe. On ne laisse
+                # tomber qu'apres avoir essaye les deux.
+                logger.error(f"Gemini text structuring failed: {e}; trying DeepSeek")
+                fallback = self._structure_text_with_deepseek(prompt)
+                if fallback:
+                    return fallback
                 raise
 
+        fallback = self._structure_text_with_deepseek(prompt)
+        if fallback:
+            return fallback
         raise RuntimeError("No LLM available for text structuring")
+
+    def _structure_text_with_deepseek(self, prompt: str) -> Optional[str]:
+        """Fallback texte-seulement via DeepSeek. Retourne None si indisponible
+        ou en echec (l'appelant decide de lever)."""
+        try:
+            from services.llm import get_provider
+            provider = get_provider('deepseek')
+            if not provider.is_available():
+                return None
+            response = provider.generate_with_history(
+                messages=[{"role": "user", "content": prompt}],
+                tools=None,
+                system_prompt=None,
+            )
+            if response.is_error or not (response.text or "").strip():
+                return None
+            logger.info("DeepSeek text structuring fallback succeeded")
+            return response.text
+        except Exception as e:  # noqa: BLE001 - fallback must never crash the pipeline
+            logger.error(f"DeepSeek text structuring fallback failed: {e}")
+            return None
 
     def _process_pdf_vision(self, file_path: str, doc_type: str) -> Optional[str]:
         """
@@ -988,6 +1053,60 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
         )
         return conf, status
 
+    def _create_dated_entry(self, user, entry: dict, fallback_title: str, created_blocks: list) -> bool:
+        """Materialise une ligne portant une DATE calendaire en entree
+        PONCTUELLE (Task + ScheduledBlock verrouille). Retourne True si la
+        ligne etait datee (creee ou deja presente), False sinon.
+
+        Filet de securite transverse: meme si le LLM classe une ligne datee en
+        course/shift (vecu: matchs extraits comme 'courses' avec course_code),
+        la date PRIME sur la recurrence.
+        """
+        from datetime import date as dt_date
+        from core.models import Task, ScheduledBlock
+
+        date_str = str(entry.get('date') or '').strip()
+        if not date_str:
+            return False
+        try:
+            event_date = dt_date.fromisoformat(date_str[:10])
+        except ValueError:
+            return False
+
+        raw_title = (entry.get('title') or entry.get('name') or '').strip()
+        title = raw_title if raw_title and raw_title.lower() not in ('none', 'n/a', 'null', '-') else fallback_title
+        location = (entry.get('location') or '').strip()
+        if location.lower() in ('none', 'n/a', 'null', '-'):
+            location = ''
+
+        start_time = parse_time_string(entry.get('start_time', '')) or dt_time(9, 0)
+        end_time = parse_time_string(entry.get('end_time', ''))
+        if end_time is None:
+            end_time = dt_time((start_time.hour + 2) % 24, start_time.minute)
+
+        # idempotence inter-documents: re-importer le meme horaire ne duplique rien
+        if ScheduledBlock.objects.filter(
+            user=user, date=event_date, start_time=start_time, task__title=title,
+        ).exists():
+            return True
+
+        task = Task.objects.create(
+            user=user, title=title,
+            description=(f"📍 {location}" if location else ''),
+            task_type='errand', priority=6, deadline=event_date,
+        )
+        ScheduledBlock.objects.create(
+            user=user, task=task, date=event_date,
+            start_time=start_time, end_time=end_time,
+            locked=True,  # sanctuaire: la replanification ne bouge pas un evenement date
+        )
+        created_blocks.append({
+            'type': 'event', 'title': title, 'date': event_date.isoformat(),
+            'start': start_time.strftime('%H:%M'), 'end': end_time.strftime('%H:%M'),
+        })
+        logger.info("Created dated entry '%s' on %s", title, event_date)
+        return True
+
     def _create_recurring_blocks(self, document: UploadedDocument, data: dict) -> list:
         """
         Create RecurringBlock instances from ALL extracted data types.
@@ -1021,6 +1140,8 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
         if 'courses' in data and data['courses']:
             for idx, course in enumerate(data['courses']):
                 logger.info(f"Processing course {idx}: {course}")
+                if self._create_dated_entry(user, course, 'Cours', created_blocks):
+                    continue
                 day_str = course.get('day', '')
                 if day_str:
                     day = self.DAY_MAPPING.get(day_str.lower().strip())
@@ -1050,6 +1171,16 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                     if location.lower() in ('none', 'n/a', 'null', '-'):
                         location = ''
 
+                    # Anti-doublon EXACT inter-documents: find_recurring_conflicts
+                    # ne voit que les blocs 'fixed', or les blocs d'import naissent
+                    # 'flexible' -> un re-upload dupliquait tout (vecu: 19->43 blocs).
+                    course_title = course.get('name') or 'Cours'
+                    if RecurringBlock.all_objects.filter(
+                        user=user, title=course_title, day_of_week=day, start_time=start_time,
+                    ).exists():
+                        logger.info("Skip duplicate course '%s' day %s", course_title, day)
+                        continue
+
                     # Skip a course that overlaps an existing block (prevents
                     # duplicates on re-upload and internal overlaps).
                     if find_recurring_conflicts(
@@ -1067,7 +1198,7 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
 
                     block = RecurringBlock.objects.create(
                         user=user,
-                        title=course.get('name') or 'Cours',
+                        title=course_title,
                         block_type='course',
                         day_of_week=day,
                         start_time=start_time,
@@ -1085,6 +1216,8 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
         # Create blocks from work shifts
         if 'shifts' in data and data['shifts']:
             for shift in data['shifts']:
+                if self._create_dated_entry(user, shift, 'Travail', created_blocks):
+                    continue
                 day_str = shift.get('day', '')
                 if day_str:
                     day = self.DAY_MAPPING.get(day_str.lower().strip())
@@ -1112,6 +1245,12 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                     if role.lower() in ('none', 'n/a', 'null', '-'):
                         role = ''
                     title = f"Travail - {role}" if role else 'Travail'
+
+                    if RecurringBlock.all_objects.filter(
+                        user=user, title=title, day_of_week=day, start_time=start_time,
+                    ).exists():
+                        logger.info("Skip duplicate shift '%s' day %s", title, day)
+                        continue
 
                     # Auto-detect night shift based on times (more reliable than Gemini)
                     is_night = is_night_shift(start_time, end_time)
@@ -1146,9 +1285,21 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                 except Exception as e:
                     logger.error(f"Error creating work block: {e}")
 
-        # Create blocks from events (as 'other' type)
+        # Create blocks from events. DEUX cas radicalement differents:
+        #  - evenement DATE (match, rendez-vous): une entree PONCTUELLE a cette
+        #    date (Task + ScheduledBlock). L'ancien code en faisait un bloc
+        #    HEBDOMADAIRE A VIE ("Événement" anonyme repete chaque semaine —
+        #    faille vecue: l'horaire de matchs de l'ami de Darius).
+        #  - evenement sans date (hebdomadaire assume): bloc recurrent 'other'.
         if 'events' in data and data['events']:
             for event in data['events']:
+                if self._create_dated_entry(user, event, 'Événement', created_blocks):
+                    continue
+
+                raw_title = event.get('title') or event.get('name') or ''
+                title_generic = not raw_title.strip() or raw_title.lower() in ('none', 'n/a', 'null', '-')
+                title = 'Événement' if title_generic else raw_title.strip()
+
                 day_str = event.get('day', '')
                 if day_str:
                     day = self.DAY_MAPPING.get(day_str.lower().strip())
@@ -1172,9 +1323,13 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
 
                 try:
                     # Handle None values from JSON (including string "None" from Gemini)
-                    raw_title = event.get('title') or ''
-                    title_generic = not raw_title.strip() or raw_title.lower() in ('none', 'n/a', 'null', '-')
-                    title = 'Événement' if title_generic else raw_title
+                    # titre deja resolu plus haut (title/name)
+
+                    if RecurringBlock.all_objects.filter(
+                        user=user, title=title, day_of_week=day, start_time=start_time,
+                    ).exists():
+                        logger.info("Skip duplicate event '%s' day %s", title, day)
+                        continue
 
                     if find_recurring_conflicts(user, day, start_time, end_time, night_flag=(end_time <= start_time)):
                         logger.info("Skip overlapping event '%s' day %s", raw_title, day)

@@ -18,6 +18,7 @@ this provider:
 """
 import json
 import logging
+import time
 from typing import Optional
 
 from django.conf import settings
@@ -37,6 +38,14 @@ class DeepSeekProvider(LLMProvider):
     """DeepSeek provider (thinking + tool calling) via the OpenAI-compatible API."""
 
     BASE_URL = "https://api.deepseek.com"
+    # L'agent route vers stream_with_history quand le client veut du SSE.
+    supports_streaming = True
+    # Pendant le reasoning (et le streaming d'arguments d'outils), AUCUN texte ne
+    # part au client: sans battement, un flux SSE muet plusieurs minutes se fait
+    # couper par les idle-timeouts (edge Railway, proxys mobiles) et le client
+    # croit à une panne. On ré-émet un événement "thinking" au plus toutes les
+    # KEEPALIVE_SECONDS tant que des chunks silencieux arrivent.
+    KEEPALIVE_SECONDS = 8.0
 
     def __init__(self):
         self.api_key = getattr(settings, "DEEPSEEK_API_KEY", "") or ""
@@ -128,11 +137,18 @@ class DeepSeekProvider(LLMProvider):
 
     # ---- API call -------------------------------------------------------
 
-    def _create(self, openai_messages: list, openai_tools: Optional[list]) -> LLMResponse:
+    def _request_kwargs(
+        self,
+        openai_messages: list,
+        openai_tools: Optional[list],
+        stream: bool = False,
+    ) -> dict:
         kwargs = {
             "model": self.model,
             "messages": openai_messages,
             "max_tokens": self.max_tokens,
+            # Parsing d'horaires: temperature basse pour la fidelite jours/heures.
+            "temperature": 0.3,
         }
         if openai_tools:
             kwargs["tools"] = openai_tools
@@ -141,8 +157,36 @@ class DeepSeekProvider(LLMProvider):
             # set it explicitly so behaviour is stable across model aliases.
             kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
             kwargs["reasoning_effort"] = self.reasoning_effort
-        resp = self._client.chat.completions.create(**kwargs)
+        else:
+            # Disable reasoning EXPLICITLY. deepseek-v4-pro reasons by DEFAULT when
+            # the field is omitted, so callers that toggle thinking off (e.g. the
+            # quick-replies suggestion call, which needs no reasoning) were still
+            # paying full reasoning latency. Measured: omit -> 6.7s (reasoning on)
+            # vs explicit disabled -> 2.6s (reasoning off).
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        if stream:
+            kwargs["stream"] = True
+        return kwargs
+
+    def _create(self, openai_messages: list, openai_tools: Optional[list]) -> LLMResponse:
+        resp = self._client.chat.completions.create(
+            **self._request_kwargs(openai_messages, openai_tools)
+        )
         return self._parse_response(resp)
+
+    @staticmethod
+    def _build_raw_content(text: str, reasoning: Optional[str], tool_calls_raw: list) -> dict:
+        """Assistant turn to replay verbatim next request. It MUST carry
+        reasoning_content when tool_calls are present (thinking mode), else
+        DeepSeek rejects the follow-up with HTTP 400."""
+        raw_content = {"role": "assistant", "content": text or ""}
+        if reasoning:
+            raw_content["reasoning_content"] = reasoning
+        if tool_calls_raw:
+            raw_content["tool_calls"] = tool_calls_raw
+            if not (text or "").strip():
+                raw_content["content"] = None
+        return raw_content
 
     def _parse_response(self, resp) -> LLMResponse:
         choice = resp.choices[0]
@@ -164,16 +208,7 @@ class DeepSeekProvider(LLMProvider):
                 "function": {"name": tc.function.name, "arguments": raw_args},
             })
 
-        # raw_content = the assistant turn to replay verbatim next request. It MUST
-        # carry reasoning_content when tool_calls are present (thinking mode), else
-        # DeepSeek rejects the follow-up with HTTP 400.
-        raw_content = {"role": "assistant", "content": text or ""}
-        if reasoning:
-            raw_content["reasoning_content"] = reasoning
-        if tool_calls_raw:
-            raw_content["tool_calls"] = tool_calls_raw
-            if not text.strip():
-                raw_content["content"] = None
+        raw_content = self._build_raw_content(text, reasoning, tool_calls_raw)
 
         usage = None
         if getattr(resp, "usage", None):
@@ -216,6 +251,118 @@ class DeepSeekProvider(LLMProvider):
                 is_error=True,
                 error=str(e),
             )
+
+    def stream_with_history(
+        self,
+        messages: list[dict],
+        tools: Optional[list] = None,
+        system_prompt: Optional[str] = None,
+    ):
+        """Streaming variant of generate_with_history.
+
+        Yields {"type": "thinking"} once when reasoning starts, then
+        {"type": "text_delta", "text": ...} per content chunk, and ALWAYS a
+        terminal {"type": "final", "response": LLMResponse} whose shape matches
+        generate_with_history exactly (including the reasoning_content echo in
+        raw_content) so the agent's tool loop replays history identically.
+        Tool-call fragments are accumulated by index (OpenAI convention: name
+        and id arrive early, arguments arrive in pieces to concatenate).
+        """
+        if not self.is_available():
+            yield {"type": "final", "response": LLMResponse(
+                text="Service IA non disponible.",
+                is_error=True, error="provider_unavailable")}
+            return
+        try:
+            openai_messages = self._to_openai_messages(messages, system_prompt)
+            openai_tools = self._convert_tools(tools)
+            stream = self._client.chat.completions.create(
+                **self._request_kwargs(openai_messages, openai_tools, stream=True)
+            )
+
+            text_parts: list[str] = []
+            reasoning_parts: list[str] = []
+            acc: dict[int, dict] = {}
+            finish_reason = None
+            # 0.0 => le PREMIER chunk silencieux (reasoning/outil) émet un
+            # battement immédiat (feedback UI instantané), puis throttle.
+            last_yield = 0.0
+
+            for chunk in stream:
+                if not getattr(chunk, "choices", None):
+                    continue
+                choice = chunk.choices[0]
+                delta = getattr(choice, "delta", None)
+                if delta is None:
+                    continue
+
+                reasoning_piece = getattr(delta, "reasoning_content", None)
+                if reasoning_piece:
+                    reasoning_parts.append(reasoning_piece)
+                    # La chaîne de raisonnement elle-même n'est JAMAIS envoyée
+                    # au client (tokens + privacy) — seulement un battement
+                    # throttlé qui garde le socket vivant et l'UI informée.
+                    if time.monotonic() - last_yield >= self.KEEPALIVE_SECONDS:
+                        last_yield = time.monotonic()
+                        yield {"type": "thinking"}
+
+                content_piece = getattr(delta, "content", None)
+                if content_piece:
+                    text_parts.append(content_piece)
+                    last_yield = time.monotonic()
+                    yield {"type": "text_delta", "text": content_piece}
+
+                # Les fragments d'arguments d'outils sont eux aussi silencieux:
+                # même battement pour ne pas laisser mourir le flux.
+                if not content_piece and getattr(delta, "tool_calls", None):
+                    if time.monotonic() - last_yield >= self.KEEPALIVE_SECONDS:
+                        last_yield = time.monotonic()
+                        yield {"type": "thinking"}
+
+                for tc in (getattr(delta, "tool_calls", None) or []):
+                    idx = tc.index if getattr(tc, "index", None) is not None else 0
+                    slot = acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                    if getattr(tc, "id", None):
+                        slot["id"] = tc.id
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        if getattr(fn, "name", None):
+                            slot["name"] += fn.name
+                        if getattr(fn, "arguments", None):
+                            slot["arguments"] += fn.arguments
+
+                if getattr(choice, "finish_reason", None):
+                    finish_reason = choice.finish_reason
+
+            text = "".join(text_parts)
+            reasoning = "".join(reasoning_parts) or None
+            function_calls, tool_calls_raw = [], []
+            for idx in sorted(acc):
+                slot = acc[idx]
+                raw_args = slot["arguments"] or "{}"
+                try:
+                    args = json.loads(raw_args)
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+                function_calls.append(FunctionCall(
+                    name=slot["name"], args=args, call_id=slot["id"]))
+                tool_calls_raw.append({
+                    "id": slot["id"], "type": "function",
+                    "function": {"name": slot["name"], "arguments": raw_args},
+                })
+
+            yield {"type": "final", "response": LLMResponse(
+                text=text,
+                function_calls=function_calls,
+                raw_response=None,
+                raw_content=self._build_raw_content(text, reasoning, tool_calls_raw),
+                stop_reason=finish_reason,
+            )}
+        except Exception as e:  # noqa: BLE001 - surface as an error final, never crash the SSE
+            logger.error(f"DeepSeek streaming error: {e}", exc_info=True)
+            yield {"type": "final", "response": LLMResponse(
+                text="Erreur lors de la communication avec l'IA.",
+                is_error=True, error=str(e))}
 
     def generate(
         self,
