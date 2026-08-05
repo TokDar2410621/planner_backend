@@ -119,3 +119,17 @@ class DatedEventsImportTest(TestCase):
                             'extraction_version': DocumentProcessor.EXTRACTION_VERSION},
         )
         self.assertIsNotNone(DocumentProcessor._check_cache(self.proc, self.user, 'b' * 64))
+
+    def test_past_locked_event_not_in_unscheduled(self):
+        # Un evenement date importe et deja passe (Gatineau 25 juillet vs
+        # aujourd'hui) ne doit pas trainer dans « À planifier ».
+        from rest_framework.test import APIClient
+        from rest_framework.authtoken.models import Token
+        self._run([{'name': 'Gatineau', 'date': '2020-01-04',
+                    'start_time': '09:00', 'end_time': '11:00'}])
+        client = APIClient()
+        token, _ = Token.objects.get_or_create(user=self.user)
+        client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+        resp = client.get('/api/schedule/')
+        titles = [t['title'] for t in resp.json()['unscheduled_tasks']]
+        self.assertNotIn('Gatineau', titles)

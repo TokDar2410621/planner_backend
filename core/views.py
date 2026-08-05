@@ -1290,9 +1290,12 @@ class ScheduleView(APIView):
         # (vécu: les matchs datés importés). Un placement passé non complété
         # reste « à planifier » (le rollover s'en occupe par ailleurs).
         from django.utils import timezone as _tz
+        from django.db.models import Q
+        # locked=True inclus sans regard a la date: un evenement date importe
+        # (match, RDV) deja passe n'est pas « a planifier », il a eu lieu.
         future_scheduled_ids = ScheduledBlock.objects.filter(
+            Q(date__gte=_tz.localdate()) | Q(locked=True),
             user=request.user,
-            date__gte=_tz.localdate(),
         ).values_list('task_id', flat=True)
         unscheduled_tasks = Task.objects.filter(
             user=request.user,
