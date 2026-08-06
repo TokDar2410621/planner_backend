@@ -72,7 +72,7 @@ class RecentImportContextTests(TestCase):
         # Either None (nothing to say) or an honest "no data" note — never a
         # confident claim of success.
         if ctx is not None:
-            self.assertNotIn("ont été ajoutés", ctx)
+            self.assertNotIn("ont été ajoutées", ctx)
 
     def test_pending_blocks_are_flagged_for_confirmation(self):
         doc = _doc(self.user)
@@ -82,4 +82,4 @@ class RecentImportContextTests(TestCase):
         ctx = self.agent._recent_import_context(self.user)
         self.assertIn("confiance faible", ctx)
         # The pending one is not counted among the added blocks.
-        self.assertIn("1 bloc(s) ont été ajoutés", ctx)
+        self.assertIn("1 entrée(s) ont été ajoutées", ctx)

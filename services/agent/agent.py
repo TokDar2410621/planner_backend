@@ -509,6 +509,13 @@ class PlannerAgent:
                     if tick and tick % 16 == 0:
                         yield {"type": "status", "text": "J'analyse ton document… (presque fini)"}
             history[-1]["content"] = f"{history[-1]['content']}\n\n{self._build_attachment_context(attachment)}"
+            # Le contexte d'import (liste des blocs crees, bornes, mention
+            # « RECURRENT SANS DATE DE FIN ») s'ajoute AUSSI sur le tour
+            # d'upload: c'est lui qui declenche la question de fin de
+            # recurrence (pattern AskQuestion) juste apres l'import.
+            recent_import = self._recent_import_context(user)
+            if recent_import:
+                history[-1]["content"] = f"{history[-1]['content']}\n\n{recent_import}"
         else:
             # No attachment on THIS turn: if the user just imported a schedule,
             # surface it so a vague follow-up ("gère ça", "c'est bon ?") never
@@ -780,12 +787,41 @@ class PlannerAgent:
             if recap:
                 response_text = f"{response_text}\n\n{recap}"
 
+        # FIN DE RÉCURRENCE déterministe: si l'import de CE tour a créé des
+        # blocs récurrents sans end_date, la question « jusqu'à quand ? » est
+        # posée par le CODE avec ses boutons de réponse — la règle du prompt
+        # seule était une loterie (1 tirage sur 3 l'omettait, vécu e2e
+        # manuscrit). Même philosophie que les footers: le déterminisme prime.
+        forced_quick_replies = None
+        if not had_error and attachment_processed_this_turn and attachment is not None:
+            from core.models import RecurringBlock as _RB
+            open_ended = list(_RB.objects.filter(
+                source_document=attachment, end_date__isnull=True))
+            if open_ended:
+                titles = sorted({b.title for b in open_ended})
+                label = titles[0] if len(titles) == 1 else ' et '.join(titles[:2])
+                if 'jusqu' not in response_text.lower():
+                    response_text += (
+                        f"\n\n⏳ « {label} » n'a pas de date de fin pour l'instant : "
+                        "jusqu'à quand veux-tu le garder à l'horaire ?"
+                    )
+                # Les chips de réponse sont forcées MÊME si le LLM a posé la
+                # question lui-même: ses propres quick replies partent souvent
+                # sur autre chose (vécu: « Voir mon agenda ») et l'utilisateur
+                # se retrouve à taper ce qu'un tap aurait dû régler.
+                forced_quick_replies = [
+                    {"label": "🏁 Je te donne la date de fin",
+                     "value": f"Je vais te donner la date de fin pour {label}."},
+                    {"label": "♾️ Pas de fin prévue",
+                     "value": f"{label} n'a pas de date de fin, garde-le tel quel."},
+                ]
+
         # 8. Build response
         # Contextual quick replies: the LLM proposes the likely next steps for
         # THIS exchange; deterministic rules are the fallback if it fails.
         # This is a SECOND LLM round-trip on the critical path, so callers that
         # fetch quick replies out-of-band (deferred endpoint) skip it here.
-        quick_replies = (
+        quick_replies = forced_quick_replies or (
             self._generate_quick_replies(
                 message, final_text, tool_calls_made, context, had_error
             )
@@ -847,7 +883,16 @@ class PlannerAgent:
         pending = (RecurringBlock.all_objects
                    .filter(source_document=doc, status=RecurringBlock.STATUS_PENDING)
                    .count())
-        if not blocks and not pending:
+        # Evenements DATES crees par cet import (Task+ScheduledBlock locked).
+        # Sans eux dans le contexte, l'agent croyait devoir les creer lui-meme,
+        # heurtait l'anti-doublon et narrait des « chevauchements » au lieu du
+        # recap; et un horaire 100% matchs passait pour « rien d'exploitable ».
+        from core.models import ScheduledBlock as _SB
+        dated = list(_SB.objects
+                     .filter(user=user, locked=True, created_at__gte=doc.uploaded_at)
+                     .select_related('task')
+                     .order_by('date', 'start_time')[:40])
+        if not blocks and not pending and not dated:
             # Processed but nothing usable came out — be honest, not falsely capable.
             if doc.processing_error or (doc.extracted_data or {}).get('parse_error'):
                 return (
@@ -859,21 +904,44 @@ class PlannerAgent:
             return None
 
         lines = []
+        open_ended = 0
         for b in blocks:
             day = self._DAYS_FR[b.day_of_week] if 0 <= b.day_of_week < 7 else '?'
             start = b.start_time.strftime('%H:%M') if b.start_time else '?'
             end = b.end_time.strftime('%H:%M') if b.end_time else '?'
-            lines.append(f"- {b.title} ({day} {start}-{end})")
-        listing = "\n".join(lines)
-        extra = ""
+            extra = ''
+            if b.start_date:
+                extra += f", débute le {b.start_date.isoformat()}"
+            if b.end_date:
+                extra += f", finit le {b.end_date.isoformat()}"
+            else:
+                extra += ", RÉCURRENT SANS DATE DE FIN"
+                open_ended += 1
+            lines.append(f"- {b.title} (id {b.id}, {day} {start}-{end}{extra})")
+        listing = "\n".join(lines) if lines else "  (aucun bloc récurrent)"
+        footer_extra = ""
         if pending:
-            extra = (f"\n({pending} autre(s) bloc(s) extraits avec une confiance faible "
-                     "attendent la confirmation de l'utilisateur.)")
+            footer_extra = (f"\n({pending} autre(s) bloc(s) extraits avec une confiance faible "
+                            "attendent la confirmation de l'utilisateur.)")
+        if dated:
+            dated_lines = "\n".join(
+                f"- {sb.task.title} ({sb.date.isoformat()} "
+                f"{sb.start_time.strftime('%H:%M')}-{sb.end_time.strftime('%H:%M')})"
+                for sb in dated
+            )
+            footer_extra += (
+                f"\nÉvénements DATÉS déjà créés par ce même import ({len(dated)}):\n"
+                f"{dated_lines}\n"
+                "Ces événements datés existent DÉJÀ en base: ne les recrée JAMAIS "
+                "(pas de schedule_task_at pour eux), récapitule-les simplement."
+            )
         return (
             f"[IMPORT RÉCENT — le document « {doc.file_name} » a DÉJÀ été analysé et "
-            f"{len(blocks)} bloc(s) ont été ajoutés au planning de l'utilisateur:\n"
-            f"{listing}{extra}\n"
-            "Ces blocs existent en base MAINTENANT. Ne dis JAMAIS que tu ne peux pas "
+            f"{len(blocks) + len(dated)} entrée(s) ont été ajoutées au planning de l'utilisateur "
+            "(NE recrée RIEN de cette liste — ni create_block ni schedule_task_at; "
+            "récapitule, c'est tout):\n"
+            f"{listing}{footer_extra}\n"
+            "Ces entrées existent en base MAINTENANT. Ne dis JAMAIS que tu ne peux pas "
             "lire/traiter/importer le document, ni que tu as besoin qu'il ressaisisse "
             "ces cours. Confirme ce qui a été ajouté (ou agis sur sa demande) en "
             "t'appuyant sur cette liste.]"

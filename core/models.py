@@ -302,6 +302,16 @@ class RecurringBlock(models.Model):
         help_text="Lieu de l'activité ; son travel_minutes pilote l'heure limite de départ.",
     )
     is_night_shift = models.BooleanField(default=False)
+    # Bornes de validite de la recurrence (ex: entrainements « 24 aout debut »,
+    # session qui finit mi-octobre). null = pas de borne de ce cote.
+    start_date = models.DateField(
+        null=True, blank=True,
+        help_text="Premiere date ou le bloc s'applique (null = depuis toujours).",
+    )
+    end_date = models.DateField(
+        null=True, blank=True,
+        help_text="Derniere date ou le bloc s'applique (null = sans fin).",
+    )
     source_document = models.ForeignKey(
         UploadedDocument,
         on_delete=models.SET_NULL,
@@ -327,6 +337,24 @@ class RecurringBlock(models.Model):
     # Default manager hides pending blocks; all_objects sees everything.
     objects = VisibleRecurringBlockManager()
     all_objects = models.Manager()
+
+    @staticmethod
+    def bounds_filter(date):
+        """Q object: blocs dont la fenetre [start_date, end_date] couvre date."""
+        from django.db.models import Q
+        return (
+            (Q(start_date__isnull=True) | Q(start_date__lte=date))
+            & (Q(end_date__isnull=True) | Q(end_date__gte=date))
+        )
+
+    def active_on(self, date) -> bool:
+        """Le bloc s'applique-t-il a cette date (bornes start/end incluses) ?
+        Ne verifie PAS le jour de semaine, seulement la fenetre de validite."""
+        if self.start_date and date < self.start_date:
+            return False
+        if self.end_date and date > self.end_date:
+            return False
+        return True
 
     @classmethod
     def default_flexibility_for(cls, block_type):

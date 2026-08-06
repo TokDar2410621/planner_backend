@@ -258,6 +258,16 @@ TOUJOURS format HH:MM (24h):
 5. Arrays vides [] si aucune donnée de ce type
 6. UNIQUEMENT le JSON, aucun texte avant/après
 7. is_night_shift = true SEULEMENT si shift après 20h ou finit après minuit
+8. BORNES DE RÉCURRENCE: si le document précise un début ou une fin pour une
+   activité hebdomadaire ("(24 août début)", "à partir du...", "jusqu'au...",
+   "fin de session le..."), ajoute "start_date" et/ou "end_date" (YYYY-MM-DD)
+   sur cette entrée de courses/shifts/events
+9. ANNÉE: nous sommes le __TODAY__. Si l'année n'est PAS écrite sur une date,
+   déduis-la pour que la date soit l'occurrence la plus PROCHE d'aujourd'hui:
+   une date des dernières semaines = passé récent de l'année EN COURS (pas
+   l'an prochain), une date à venir = cette année ou la suivante. JAMAIS une
+   année lointaine: "29 août" sans année vu un 5 août = le 29 août qui vient;
+   "26 juillet" vu un 5 août = le 26 juillet d'il y a 10 jours
 
 === IMPORTANT ===
 - Lis TRÈS attentivement chaque case de la grille
@@ -344,7 +354,17 @@ Je te donne le TEXTE BRUT extrait d'un PDF d'horaire. Analyse-le et structure le
 5. DATES CALENDAIRES = EVENEMENTS DATES: un tableau avec des dates explicites
    (matchs, rendez-vous, tournois) va dans "events" avec le champ "date" —
    JAMAIS dans courses/shifts (ce ne sont PAS des habitudes hebdomadaires)
-6. UNIQUEMENT le JSON, aucun texte avant/après
+6. BORNES DE RÉCURRENCE: si le document précise un début ou une fin pour une
+   activité hebdomadaire ("(24 août début)", "à partir du...", "jusqu'au...",
+   "fin de session le..."), ajoute "start_date" et/ou "end_date" (YYYY-MM-DD)
+   sur cette entrée de courses/shifts/events
+7. ANNÉE: nous sommes le __TODAY__. Si l'année n'est PAS écrite sur une date,
+   déduis-la pour que la date soit l'occurrence la plus PROCHE d'aujourd'hui:
+   une date des dernières semaines = passé récent de l'année EN COURS (pas
+   l'an prochain), une date à venir = cette année ou la suivante. JAMAIS une
+   année lointaine: "29 août" sans année vu un 5 août = le 29 août qui vient;
+   "26 juillet" vu un 5 août = le 26 juillet d'il y a 10 jours
+8. UNIQUEMENT le JSON, aucun texte avant/après
 
 === TEXTE EXTRAIT DU PDF ===
 {text}
@@ -794,7 +814,9 @@ Analyse ce texte et retourne le JSON structuré:"""
             LLM response with structured JSON
         """
         # Build the prompt with extracted text
+        from django.utils import timezone as _tz
         prompt = self.TEXT_STRUCTURING_PROMPT.format(text=text[:15000])  # Limit to 15k chars
+        prompt = prompt.replace('__TODAY__', _tz.localdate().isoformat())
 
         # Add tables if available
         if tables:
@@ -1002,7 +1024,9 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
         Returns:
             str: The extraction prompt
         """
-        return self.EXTRACTION_PROMPTS.get(doc_type, self.EXTRACTION_PROMPTS['other'])
+        from django.utils import timezone as _tz
+        prompt = self.EXTRACTION_PROMPTS.get(doc_type, self.EXTRACTION_PROMPTS['other'])
+        return prompt.replace('__TODAY__', _tz.localdate().isoformat())
 
     def _parse_response(self, response_text: str) -> dict:
         """
@@ -1053,6 +1077,54 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
         )
         return conf, status
 
+    @staticmethod
+    def _normalize_future_date(d):
+        """Corrige une annee hallucinee par l'extraction (page manuscrite sans
+        annee -> Gemini a deja renvoye 2023). Un horaire importe concerne le
+        present: une date a plus de ~6 mois dans le PASSE est avancee d'annee
+        en annee jusqu'a retomber dans la fenetre plausible. Les dates
+        recemment passees (ex: 25 juillet vs 5 aout) restent intactes."""
+        from datetime import timedelta
+        from django.utils import timezone as _tz
+        if d is None:
+            return None
+        today = _tz.localdate()
+        floor = today - timedelta(days=180)
+        guard = 0
+        while d < floor and guard < 10:
+            try:
+                d = d.replace(year=d.year + 1)
+            except ValueError:  # 29 fevrier
+                d = d.replace(year=d.year + 1, day=28)
+            guard += 1
+        # Sur-correction inverse ("26 juillet" vu le 5 aout -> 2027): une date
+        # a plus de ~9 mois devant dont la version -1 an tombe dans les 45
+        # derniers jours est du passe recent, pas de l'an prochain. Fenetre
+        # volontairement etroite pour ne pas toucher une fin de session
+        # explicite (ex: juin de l'an prochain).
+        if d > today + timedelta(days=270):
+            try:
+                back = d.replace(year=d.year - 1)
+            except ValueError:
+                back = d.replace(year=d.year - 1, day=28)
+            if today - timedelta(days=45) <= back <= today:
+                d = back
+        return d
+
+    @staticmethod
+    def _entry_bounds(entry: dict):
+        """(start_date, end_date) d'une entree recurrente, None si absents/invalides."""
+        from datetime import date as dt_date
+        out = []
+        for key in ('start_date', 'end_date'):
+            raw = str(entry.get(key) or '').strip()
+            try:
+                out.append(dt_date.fromisoformat(raw[:10]) if raw else None)
+            except ValueError:
+                out.append(None)
+        return (DocumentProcessor._normalize_future_date(out[0]),
+                DocumentProcessor._normalize_future_date(out[1]))
+
     def _create_dated_entry(self, user, entry: dict, fallback_title: str, created_blocks: list) -> bool:
         """Materialise une ligne portant une DATE calendaire en entree
         PONCTUELLE (Task + ScheduledBlock verrouille). Retourne True si la
@@ -1072,6 +1144,7 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
             event_date = dt_date.fromisoformat(date_str[:10])
         except ValueError:
             return False
+        event_date = self._normalize_future_date(event_date)
 
         raw_title = (entry.get('title') or entry.get('name') or '').strip()
         title = raw_title if raw_title and raw_title.lower() not in ('none', 'n/a', 'null', '-') else fallback_title
@@ -1196,6 +1269,7 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                         llm_confidence=course.get('confidence'),
                     )
 
+                    course_start, course_end = self._entry_bounds(course)
                     block = RecurringBlock.objects.create(
                         user=user,
                         title=course_title,
@@ -1207,6 +1281,8 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                         source_document=document,
                         confidence=confidence,
                         status=block_status,
+                        start_date=course_start,
+                        end_date=course_end,
                     )
                     created_blocks.append(block)
                     logger.info(f"Created course block: {block.title} (conf={confidence}, {block_status}) on day {day}")
@@ -1279,6 +1355,8 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                         source_document=document,
                         confidence=confidence,
                         status=block_status,
+                        start_date=self._entry_bounds(shift)[0],
+                        end_date=self._entry_bounds(shift)[1],
                     )
                     created_blocks.append(block)
                     logger.info(f"Created work block: {title} (conf={confidence}, {block_status}) on day {day}")
@@ -1342,6 +1420,7 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                         llm_confidence=event.get('confidence'),
                     )
 
+                    ev_start, ev_end = self._entry_bounds(event)
                     block = RecurringBlock.objects.create(
                         user=user,
                         title=title,
@@ -1352,6 +1431,8 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                         source_document=document,
                         confidence=confidence,
                         status=block_status,
+                        start_date=ev_start,
+                        end_date=ev_end,
                     )
                     created_blocks.append(block)
                     logger.info(f"Created event block: {block.title} (conf={confidence}, {block_status}) on day {day}")

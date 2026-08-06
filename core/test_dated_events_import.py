@@ -133,3 +133,45 @@ class DatedEventsImportTest(TestCase):
         resp = client.get('/api/schedule/')
         titles = [t['title'] for t in resp.json()['unscheduled_tasks']]
         self.assertNotIn('Gatineau', titles)
+
+    def test_hallucinated_past_year_is_normalized(self):
+        # Vécu e2e manuscrit: page sans année -> Gemini a renvoyé 2023 et
+        # l'import a créé 14 placements fantômes en 2023. La garde avance
+        # l'année jusqu'à la fenêtre plausible (>= aujourd'hui - 180 j).
+        from django.utils import timezone
+        today = timezone.localdate()
+        self._run([{'name': 'Match fantôme', 'date': f'{today.year - 3}-08-29',
+                    'start_time': '18:00', 'end_time': '19:30'}])
+        sb = ScheduledBlock.objects.get(user=self.user)
+        self.assertGreaterEqual(sb.date, today.replace(month=1, day=1))
+
+    def test_recent_past_date_kept_intact(self):
+        # Le 25 juillet vs aujourd'hui 5 août: 11 jours dans le passé, date
+        # légitime -> intacte, pas d'avance d'année.
+        from datetime import timedelta
+        from django.utils import timezone
+        recent = timezone.localdate() - timedelta(days=11)
+        self._run([{'name': 'Gatineau', 'date': recent.isoformat(),
+                    'start_time': '09:00', 'end_time': '11:00'}])
+        sb = ScheduledBlock.objects.get(user=self.user)
+        self.assertEqual(sb.date, recent)
+
+    def test_next_year_overcorrection_pulled_back(self):
+        # "26 juillet" vu début août renvoyé an+1 par le LLM -> passé récent.
+        from datetime import timedelta
+        from django.utils import timezone
+        today = timezone.localdate()
+        recent = today - timedelta(days=10)
+        pushed = recent.replace(year=recent.year + 1)
+        self._run([{'name': 'Can', 'date': pushed.isoformat(),
+                    'start_time': '18:00', 'end_time': '20:00'}])
+        self.assertEqual(ScheduledBlock.objects.get(user=self.user).date, recent)
+
+    def test_legitimate_far_future_untouched(self):
+        # Fin de session explicite ~10 mois devant: on n'y touche pas.
+        from datetime import timedelta
+        from django.utils import timezone
+        far = timezone.localdate() + timedelta(days=300)
+        self._run([{'name': 'Gala', 'date': far.isoformat(),
+                    'start_time': '19:00', 'end_time': '21:00'}])
+        self.assertEqual(ScheduledBlock.objects.get(user=self.user).date, far)

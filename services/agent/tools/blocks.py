@@ -35,6 +35,8 @@ def _block_to_dict(block: RecurringBlock) -> dict:
         "flexibility": block.flexibility,
         "location": block.location or None,
         "is_night_shift": block.is_night_shift,
+        "start_date": block.start_date.isoformat() if block.start_date else None,
+        "end_date": block.end_date.isoformat() if block.end_date else None,
     }
 
 
@@ -121,6 +123,14 @@ class CreateBlockTool(BaseTool):
                 "type": "boolean",
                 "description": "Si le bloc traverse minuit (ex: travail 22h-06h)",
             },
+            "start_date": {
+                "type": "string",
+                "description": "Premiere date d'application YYYY-MM-DD (ex: entrainements qui commencent le 24 aout). Omettre si des maintenant.",
+            },
+            "end_date": {
+                "type": "string",
+                "description": "Derniere date d'application YYYY-MM-DD (fin de session/saison). Omettre si sans fin.",
+            },
         },
         "required": ["title", "block_type", "days", "start_time", "end_time"],
     }
@@ -134,6 +144,18 @@ class CreateBlockTool(BaseTool):
         location = kwargs.get("location", "")
         flexibility = kwargs.get("flexibility")
         is_night_shift = kwargs.get("is_night_shift", False)
+
+        from datetime import date as dt_date
+        bounds = {}
+        for key in ("start_date", "end_date"):
+            raw = str(kwargs.get(key) or "").strip()
+            if raw:
+                try:
+                    bounds[key] = dt_date.fromisoformat(raw[:10])
+                except ValueError:
+                    return ToolResult(success=False, data={}, message=f"{key} invalide: attendu YYYY-MM-DD.")
+        if bounds.get("start_date") and bounds.get("end_date") and bounds["end_date"] < bounds["start_date"]:
+            return ToolResult(success=False, data={}, message="end_date avant start_date.")
 
         # Validation choices/max_length AVANT toute écriture (le schéma JSON
         # n'est qu'indicatif pour le LLM; SQLite n'applique pas ces contraintes).
@@ -178,11 +200,13 @@ class CreateBlockTool(BaseTool):
                     # (new_is_flexible -> []), donc rien n'empêchait de recréer un
                     # "Déjeuner"/"Sommeil"/cours identique. Cause des doublons vus
                     # quand le LLM "déplace"/"annule" en recréant sans supprimer.
+                    # SANS block_type: un import classe « Entraînements » en
+                    # course/other, l'agent en sport — même titre, même jour,
+                    # mêmes heures = même bloc (vécu: paire dupliquée e2e).
                     if RecurringBlock.objects.filter(
                         user=user,
                         active=True,
                         day_of_week=day,
-                        block_type=block_type,
                         title=title,
                         start_time=start_t,
                         end_time=end_t,
@@ -222,6 +246,7 @@ class CreateBlockTool(BaseTool):
                         flexibility=flexibility,
                         location=location,
                         is_night_shift=is_night_shift,
+                        **bounds,
                     )
                     created.append(_block_to_dict(block))
         except Exception as e:
@@ -274,6 +299,14 @@ class UpdateBlockTool(BaseTool):
                 "minimum": 0,
                 "maximum": 6,
                 "description": "Nouveau jour (0=Lundi..6=Dimanche) pour DÉPLACER le bloc vers ce jour, proprement, sans le recréer.",
+            },
+            "start_date": {
+                "type": "string",
+                "description": "Premiere date d'application YYYY-MM-DD; chaine vide '' pour retirer la borne.",
+            },
+            "end_date": {
+                "type": "string",
+                "description": "Derniere date d'application YYYY-MM-DD (ex: la session finit le 15 octobre); chaine vide '' pour retirer la borne.",
             },
         },
         "required": ["block_id"],
@@ -347,6 +380,20 @@ class UpdateBlockTool(BaseTool):
             block.location = kwargs["location"]
         if kwargs.get("block_type") is not None:
             block.block_type = kwargs["block_type"]
+        from datetime import date as dt_date
+        for key in ("start_date", "end_date"):
+            if kwargs.get(key) is None:
+                continue
+            raw = str(kwargs[key]).strip()
+            if raw == "":
+                setattr(block, key, None)
+            else:
+                try:
+                    setattr(block, key, dt_date.fromisoformat(raw[:10]))
+                except ValueError:
+                    return ToolResult(success=False, data={}, message=f"{key} invalide: attendu YYYY-MM-DD.")
+        if block.start_date and block.end_date and block.end_date < block.start_date:
+            return ToolResult(success=False, data={}, message="end_date avant start_date.")
         block.flexibility = new_flexibility
         block.start_time = new_start
         block.end_time = new_end

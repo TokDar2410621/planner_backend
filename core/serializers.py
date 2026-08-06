@@ -197,6 +197,8 @@ class RecurringBlockSerializer(serializers.ModelSerializer):
             'location',
             'place',
             'is_night_shift',
+            'start_date',
+            'end_date',
             'source_document',
             'active',
             'status',

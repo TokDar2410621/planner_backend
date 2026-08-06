@@ -18,7 +18,8 @@ def effective_day_blocks(user, target_date) -> list[dict]:
     """
     day_of_week = target_date.weekday()
     recurring = RecurringBlock.objects.filter(
-        user=user, day_of_week=day_of_week, active=True
+        RecurringBlock.bounds_filter(target_date),
+        user=user, day_of_week=day_of_week, active=True,
     ).exclude(id__in=skipped_block_ids(user, target_date))
 
     placements = {p["block_id"]: p for p in place_day(user, target_date)}
