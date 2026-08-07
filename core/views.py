@@ -1252,6 +1252,27 @@ class TaskViewSet(viewsets.ModelViewSet):
 
 # ============== Schedule Views ==============
 
+class SchedulePlaceView(APIView):
+    """Placer un événement PONCTUEL daté (équivalent REST de l'outil agent
+    schedule_task_at, même logique: upsert par (titre, date), overnight,
+    contrôles de conflits). Exposé pour le MCP et les intégrations — il
+    n'existait AUCUN moyen hors chat de poser une tâche à une date."""
+
+    def post(self, request):
+        from services.agent.tools.schedule import ScheduleTaskAtTool
+        allowed = ('title', 'date', 'start_time', 'end_time',
+                   'task_type', 'priority', 'description')
+        payload = {k: request.data.get(k) for k in allowed
+                   if request.data.get(k) is not None}
+        result = ScheduleTaskAtTool().execute(request.user, **payload)
+        return Response(
+            {'success': result.success, 'message': result.message,
+             'data': result.data},
+            status=status.HTTP_200_OK if result.success
+            else status.HTTP_400_BAD_REQUEST,
+        )
+
+
 class ScheduleView(APIView):
     """View for schedule management."""
 

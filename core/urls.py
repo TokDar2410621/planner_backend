@@ -68,6 +68,7 @@ from .views import (
     ShareScheduleDetailView,
     PublicScheduleView,
     PublicPlanningByUsernameView,
+    SchedulePlaceView,
 )
 
 router = DefaultRouter()
@@ -80,6 +81,7 @@ router.register(r'tasks', TaskViewSet, basename='task')
 
 urlpatterns = [
     # Auth endpoints
+    path('schedule/place/', SchedulePlaceView.as_view(), name='schedule-place'),
     path('auth/register/', RegisterView.as_view(), name='register'),
     path('auth/login/', LoginView.as_view(), name='login'),
     path('auth/check-email/', CheckEmailView.as_view(), name='check-email'),
