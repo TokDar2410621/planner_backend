@@ -553,6 +553,7 @@ class AIInsightsService:
                     'is_overnight': is_overnight,
                     'is_night_shift': rb.is_night_shift,
                     'block_type': rb.block_type,
+                    'flexibility': rb.flexibility,
                 })
 
             # Add previous day's night shift blocks (they end today morning)
@@ -568,6 +569,7 @@ class AIInsightsService:
                     'is_overnight': False,  # We're only looking at the morning part
                     'is_night_shift': True,
                     'block_type': rb.block_type,
+                    'flexibility': rb.flexibility,
                     'real_start': rb.start_time,  # Original start from yesterday
                 })
 
@@ -583,6 +585,9 @@ class AIInsightsService:
                     'is_overnight': is_overnight,
                     'is_night_shift': False,
                     'block_type': 'task',
+                    # One-off scheduled events occupy a real slot: treat them as a
+                    # fixed anchor for conflict detection.
+                    'flexibility': 'fixed',
                 })
 
             # Sort by start time (but overnight blocks that START today go at their start time)
@@ -601,15 +606,33 @@ class AIInsightsService:
                     )
 
                     if overlaps and overlap_minutes > 0:
-                        # Special handling for sleep vs work conflicts
+                        # RÈGLE PRODUIT (alignée sur find_recurring_conflicts + le
+                        # prompt): un bloc SOUPLE (flexible: sommeil/repas/sport) qui
+                        # chevauche un autre n'est PAS un conflit — il se replace
+                        # automatiquement autour des murs fixes. Seuls DEUX blocs
+                        # FIXES en chevauchement sont un vrai conflit. Sans ça, ce
+                        # détecteur criait "conflit urgent" là où le moteur de
+                        # placement (et les 2 autres détecteurs) disent "OK", ex. un
+                        # sommeil de récupération par-dessus un cours, ou le sommeil
+                        # d'un travailleur de nuit.
+                        if (block_a.get('flexibility') == 'flexible'
+                                or block_b.get('flexibility') == 'flexible'):
+                            continue
+
+                        # Sleep-vs-work: le côté "nuit" doit être un vrai bloc de
+                        # TRAVAIL (block_type 'work'), pas un sommeil overnight (qui
+                        # porte aussi is_night_shift=True) — sinon un sommeil-vs-
+                        # sommeil héritait à tort du message "travail de nuit".
+                        a_night_work = block_a.get('is_night_shift') and block_a.get('block_type') == 'work'
+                        b_night_work = block_b.get('is_night_shift') and block_b.get('block_type') == 'work'
                         is_sleep_work_conflict = (
-                            (block_a.get('block_type') == 'sleep' and block_b.get('is_night_shift')) or
-                            (block_b.get('block_type') == 'sleep' and block_a.get('is_night_shift'))
+                            (block_a.get('block_type') == 'sleep' and b_night_work) or
+                            (block_b.get('block_type') == 'sleep' and a_night_work)
                         )
 
                         if is_sleep_work_conflict:
-                            work_block = block_a if block_a.get('is_night_shift') else block_b
-                            sleep_block = block_b if block_a.get('is_night_shift') else block_a
+                            work_block = block_a if a_night_work else block_b
+                            sleep_block = block_b if a_night_work else block_a
                             work_end = work_block['end']
 
                             # Calculate suggested sleep time (after work + transport)
@@ -1145,8 +1168,13 @@ Jours: 0=Lundi, 1=Mardi, 2=Mercredi, 3=Jeudi, 4=Vendredi, 5=Samedi, 6=Dimanche
             end_min = end.hour * 60 + end.minute
 
             if is_overnight:
-                # Split into two ranges: start->midnight and midnight->end
-                return [(start_min, 24 * 60), (0, end_min)]
+                # Un bloc overnight qui COMMENCE aujourd'hui n'occupe que le soir
+                # [start, minuit] AUJOURD'HUI. Sa queue du matin [00:00, end]
+                # appartient au LENDEMAIN et est deja representee separement le jour
+                # suivant (previous_night_blocks). Sans ca, la queue etait comptee
+                # deux fois: par ex. deux quarts de nuit CONSECUTIFS (Ven 19-07 +
+                # Sam 19-07) se "chevauchaient" a tort de 420min le samedi matin.
+                return [(start_min, 24 * 60)]
             else:
                 return [(start_min, end_min)]
 

@@ -21,6 +21,7 @@ import logging
 from .base import LLMProvider, LLMResponse, FunctionCall
 from .gemini import GeminiProvider
 from .claude import ClaudeProvider
+from .deepseek import DeepSeekProvider
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 _PROVIDERS = {
     'gemini': GeminiProvider,
     'claude': ClaudeProvider,
+    'deepseek': DeepSeekProvider,
 }
 
 DEFAULT_PROVIDER = 'gemini'
@@ -98,5 +100,6 @@ __all__ = [
     'FunctionCall',
     'GeminiProvider',
     'ClaudeProvider',
+    'DeepSeekProvider',
     'get_provider',
 ]

@@ -26,6 +26,7 @@ class UserProfile(models.Model):
     LLM_CHOICES = [
         ('gemini', 'Gemini (Google)'),
         ('claude', 'Claude (Anthropic)'),
+        ('deepseek', 'DeepSeek (raisonnement)'),
     ]
 
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
@@ -104,6 +105,42 @@ def save_user_profile(sender, instance, **kwargs):
         instance.profile.save()
 
 
+def document_upload_to(instance, filename):
+    """Storage path for an uploaded document, with a NEUTRAL extension.
+
+    Cloudinary blocks delivery of a public_id ending in .pdf (HTTP 401) whatever
+    the resource_type, so we must never let the stored name carry a .pdf (or any
+    disallowed) suffix. A random extensionless name delivers fine as raw and the
+    processor decides pdf-vs-image from the file's magic bytes. The human-facing
+    original filename is kept separately in `file_name`.
+    """
+    return f"documents/{uuid.uuid4().hex}"
+
+
+def document_file_storage():
+    """Storage backend for uploaded documents.
+
+    On Cloudinary, a PDF stored under the default (image) resource_type is
+    BLOCKED from delivery (HTTP 401) unless the account enables PDF delivery, so
+    the processor can never download it back to extract the schedule. The raw
+    resource_type has no such restriction and keeps the file extension intact
+    (verified empirically against the prod cloud: image-type PDF -> 401 even
+    signed, raw PDF -> 200). Images are unaffected either way; storing them as
+    raw still downloads fine (they are never rendered as <img> in the UI, only
+    processed server-side).
+
+    Callable (not an instance) so migrations record a stable reference instead
+    of freezing environment-specific credentials, and so dev without Cloudinary
+    falls back to the project default (local filesystem) storage.
+    """
+    from django.conf import settings
+    if getattr(settings, 'CLOUDINARY_CLOUD_NAME', '') and getattr(settings, 'CLOUDINARY_API_KEY', ''):
+        from cloudinary_storage.storage import RawMediaCloudinaryStorage
+        return RawMediaCloudinaryStorage()
+    from django.core.files.storage import default_storage
+    return default_storage
+
+
 class UploadedDocument(models.Model):
     """Document uploaded by user (PDF, image)."""
 
@@ -114,7 +151,7 @@ class UploadedDocument(models.Model):
     ]
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='documents')
-    file = models.FileField(upload_to='documents/')
+    file = models.FileField(upload_to=document_upload_to, storage=document_file_storage)
     file_name = models.CharField(max_length=255, blank=True)
     content_hash = models.CharField(max_length=64, blank=True, db_index=True)
     document_type = models.CharField(
@@ -265,6 +302,16 @@ class RecurringBlock(models.Model):
         help_text="Lieu de l'activité ; son travel_minutes pilote l'heure limite de départ.",
     )
     is_night_shift = models.BooleanField(default=False)
+    # Bornes de validite de la recurrence (ex: entrainements « 24 aout debut »,
+    # session qui finit mi-octobre). null = pas de borne de ce cote.
+    start_date = models.DateField(
+        null=True, blank=True,
+        help_text="Premiere date ou le bloc s'applique (null = depuis toujours).",
+    )
+    end_date = models.DateField(
+        null=True, blank=True,
+        help_text="Derniere date ou le bloc s'applique (null = sans fin).",
+    )
     source_document = models.ForeignKey(
         UploadedDocument,
         on_delete=models.SET_NULL,
@@ -290,6 +337,24 @@ class RecurringBlock(models.Model):
     # Default manager hides pending blocks; all_objects sees everything.
     objects = VisibleRecurringBlockManager()
     all_objects = models.Manager()
+
+    @staticmethod
+    def bounds_filter(date):
+        """Q object: blocs dont la fenetre [start_date, end_date] couvre date."""
+        from django.db.models import Q
+        return (
+            (Q(start_date__isnull=True) | Q(start_date__lte=date))
+            & (Q(end_date__isnull=True) | Q(end_date__gte=date))
+        )
+
+    def active_on(self, date) -> bool:
+        """Le bloc s'applique-t-il a cette date (bornes start/end incluses) ?
+        Ne verifie PAS le jour de semaine, seulement la fenetre de validite."""
+        if self.start_date and date < self.start_date:
+            return False
+        if self.end_date and date > self.end_date:
+            return False
+        return True
 
     @classmethod
     def default_flexibility_for(cls, block_type):
@@ -904,3 +969,56 @@ class PushSubscription(models.Model):
 
     def __str__(self):
         return f"PushSub {self.user.username} {self.endpoint[:40]}"
+
+
+class DailyBrainReport(models.Model):
+    """Brief quotidien du « cerveau » proactif.
+
+    Calculé UNE fois par utilisateur et par jour (par le worker Railway ou à la
+    première lecture de /insights/daily-brief/), puis mis en cache ici. Contient
+    les 1-3 choses qui méritent l'attention du jour (blocs ratés reprogrammés,
+    conflits à venir, échéances proches) et sert de garde d'idempotence pour le
+    push quotidien.
+    """
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='daily_brain_reports'
+    )
+    date = models.DateField()
+    payload = models.JSONField(default=dict)
+    pushed = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [('user', 'date')]
+        ordering = ['-date']
+        indexes = [models.Index(fields=['user', 'date'])]
+
+    def __str__(self):
+        return f"DailyBrain {self.user.username} {self.date}"
+
+
+class McpOAuthCode(models.Model):
+    """Code d'autorisation OAuth éphémère pour la connexion MCP « comme Gridar »
+    (Claude ouvre planneria.app/mcp-authorize, l'utilisateur clique Autoriser,
+    l'app crée ce code; le serveur MCP l'échange contre le token DRF via le
+    secret partagé). Un code = un usage, 5 minutes de vie, PKCE obligatoire.
+    """
+    code = models.CharField(max_length=64, unique=True)
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='mcp_oauth_codes'
+    )
+    client_id = models.CharField(max_length=255)
+    redirect_uri = models.TextField()
+    redirect_uri_explicit = models.BooleanField(default=True)
+    code_challenge = models.CharField(max_length=128)
+    scopes = models.JSONField(default=list)
+    resource = models.TextField(null=True, blank=True)
+    expires_at = models.DateTimeField()
+    used = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['code'])]
+
+    def __str__(self):
+        return f"McpOAuthCode {self.user.username} ({'used' if self.used else 'live'})"

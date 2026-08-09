@@ -25,12 +25,16 @@ from .schedule import (
     GetWeekScheduleTool,
     FindFreeSlotsTool,
     ScheduleTaskAtTool,
+    CheckFeasibilityTool,
+    OptimizeWeekTool,
+    OrganizeDayTool,
+    CancelScheduledBlockTool,
 )
 from .preferences import GetPreferencesTool, UpdatePreferencesTool
 from .goals import ListGoalsTool, CreateGoalTool, UpdateGoalTool
 from .planning import SuggestOptimizationTool, DetectConflictsTool
 from .analytics import GetProductivityStatsTool
-from .interactive import PresentFormTool, PresentQuickRepliesTool
+from .interactive import PresentFormTool
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +59,10 @@ ALL_TOOLS: list[BaseTool] = [
     GetWeekScheduleTool(),
     FindFreeSlotsTool(),
     ScheduleTaskAtTool(),
+    CheckFeasibilityTool(),
+    OptimizeWeekTool(),
+    OrganizeDayTool(),
+    CancelScheduledBlockTool(),
     # Preferences
     GetPreferencesTool(),
     UpdatePreferencesTool(),
@@ -69,7 +77,6 @@ ALL_TOOLS: list[BaseTool] = [
     GetProductivityStatsTool(),
     # Interactive UI
     PresentFormTool(),
-    PresentQuickRepliesTool(),
 ]
 
 # Index by name for fast lookup

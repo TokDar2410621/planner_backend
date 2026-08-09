@@ -56,6 +56,7 @@ class Command(BaseCommand):
 
         # --- Pass 1: "Bientôt" reminders (block starting within the window) ----
         blocks = RecurringBlock.objects.filter(
+            RecurringBlock.bounds_filter(now.date()),
             user_id__in=user_ids,
             active=True,
             day_of_week=now.weekday(),
@@ -81,6 +82,7 @@ class Command(BaseCommand):
         # --- Pass 2: departure alerts for blocks tied to a place --------------
         prep_alerts = leave_alerts = 0
         placed_blocks = RecurringBlock.objects.filter(
+            RecurringBlock.bounds_filter(now.date()),
             user_id__in=user_ids,
             active=True,
             day_of_week=now.weekday(),

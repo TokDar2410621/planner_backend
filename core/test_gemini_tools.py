@@ -33,3 +33,53 @@ class GeminiToolConversionTest(SimpleTestCase):
         from services.llm.gemini import GeminiProvider
         self.assertIsNone(GeminiProvider()._to_gemini_tools(None))
         self.assertIsNone(GeminiProvider()._to_gemini_tools([]))
+
+
+class GeminiThinkingConfigTest(SimpleTestCase):
+    """Regression: un thinking_budget EXPLICITE est requis. En mode dynamique
+    (défaut -1), gemini-2.5-flash + outils + gros system prompt renvoie par
+    intermittence un candidat VIDE (STOP, 0 part) et l'agent reste muet. Un
+    budget fixe supprime ce comportement (reproduit: dynamique = vide,
+    0/512/1024/2048 = OK)."""
+
+    def test_build_config_sets_explicit_non_dynamic_thinking_budget(self):
+        from services.llm.gemini import GeminiProvider
+        cfg = GeminiProvider()._build_config(gemini_tools=None)
+        self.assertIsNotNone(getattr(cfg, "thinking_config", None))
+        self.assertEqual(cfg.thinking_config.thinking_budget, GeminiProvider.THINKING_BUDGET)
+        self.assertGreaterEqual(GeminiProvider.THINKING_BUDGET, 0)  # jamais -1 (dynamique)
+
+    def test_build_config_keeps_tools_and_budget_together(self):
+        from services.llm.gemini import GeminiProvider
+        from services.agent.tools import get_tools_for_claude
+        p = GeminiProvider()
+        cfg = p._build_config(p._to_gemini_tools(get_tools_for_claude()))
+        self.assertIsNotNone(getattr(cfg, "thinking_config", None))
+        self.assertTrue(cfg.tools)
+
+
+class GeminiParseResponseRobustnessTest(SimpleTestCase):
+    """Regression: a candidate that exposes no parts (SAFETY / RECITATION /
+    MAX_TOKENS with empty content, or content=None) yields response.parts=None.
+    Iterating it raised "'NoneType' object is not iterable"; with the Claude
+    failover capped, that crash surfaced to users as "Erreur ... avec l'IA"."""
+
+    def _make_response(self, content):
+        from types import SimpleNamespace
+        candidate = SimpleNamespace(content=content, finish_reason=SimpleNamespace(name="SAFETY"))
+        return SimpleNamespace(candidates=[candidate], usage_metadata=None)
+
+    def test_candidate_without_content_does_not_crash(self):
+        from services.llm.gemini import GeminiProvider
+        parsed = GeminiProvider()._parse_response(self._make_response(content=None))
+        self.assertEqual(parsed.text, "")
+        self.assertEqual(parsed.function_calls, [])
+        self.assertEqual(parsed.stop_reason, "SAFETY")
+
+    def test_candidate_with_none_parts_does_not_crash(self):
+        from types import SimpleNamespace
+        from services.llm.gemini import GeminiProvider
+        resp = self._make_response(content=SimpleNamespace(parts=None))
+        parsed = GeminiProvider()._parse_response(resp)
+        self.assertEqual(parsed.text, "")
+        self.assertEqual(parsed.function_calls, [])

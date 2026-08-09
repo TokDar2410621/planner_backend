@@ -8,9 +8,11 @@ from .views import (
     # Auth
     RegisterView,
     LoginView,
+    PasswordResetRequestView,
+    PasswordResetConfirmView,
     CheckEmailView,
     MeView,
-    McpTokenView,
+    McpTokenView, McpOAuthApproveView, McpOAuthLookupView, McpOAuthRedeemView,
     AppleAuthView,
     PushPublicKeyView,
     PushSubscribeView,
@@ -31,6 +33,9 @@ from .views import (
     OnboardingStatusView,
     # Chat
     ChatView,
+    ChatQuickRepliesView,
+    ChatStreamView,
+    DailyBriefView,
     # ViewSets
     DocumentViewSet,
     UserPlaceViewSet,
@@ -63,6 +68,7 @@ from .views import (
     ShareScheduleDetailView,
     PublicScheduleView,
     PublicPlanningByUsernameView,
+    SchedulePlaceView,
 )
 
 router = DefaultRouter()
@@ -75,13 +81,19 @@ router.register(r'tasks', TaskViewSet, basename='task')
 
 urlpatterns = [
     # Auth endpoints
+    path('schedule/place/', SchedulePlaceView.as_view(), name='schedule-place'),
     path('auth/register/', RegisterView.as_view(), name='register'),
     path('auth/login/', LoginView.as_view(), name='login'),
     path('auth/check-email/', CheckEmailView.as_view(), name='check-email'),
+    path('auth/password-reset/', PasswordResetRequestView.as_view(), name='password-reset'),
+    path('auth/password-reset/confirm/', PasswordResetConfirmView.as_view(), name='password-reset-confirm'),
     path('auth/google/', GoogleAuthView.as_view(), name='google-auth'),
     path('auth/apple/', AppleAuthView.as_view(), name='apple-auth'),
     path('auth/me/', MeView.as_view(), name='me'),
     path('auth/mcp-token/', McpTokenView.as_view(), name='mcp-token'),
+    path('auth/mcp-oauth/approve/', McpOAuthApproveView.as_view(), name='mcp-oauth-approve'),
+    path('auth/mcp-oauth/lookup/', McpOAuthLookupView.as_view(), name='mcp-oauth-lookup'),
+    path('auth/mcp-oauth/redeem/', McpOAuthRedeemView.as_view(), name='mcp-oauth-redeem'),
 
     # Web Push (VAPID)
     path('push/vapid-key/', PushPublicKeyView.as_view(), name='push-vapid-key'),
@@ -110,6 +122,8 @@ urlpatterns = [
 
     # Chat endpoint
     path('chat/', ChatView.as_view(), name='chat'),
+    path('chat/quick-replies/', ChatQuickRepliesView.as_view(), name='chat-quick-replies'),
+    path('chat/stream/', ChatStreamView.as_view(), name='chat-stream'),
 
     # Schedule endpoints
     path('schedule/', ScheduleView.as_view(), name='schedule'),
@@ -125,6 +139,7 @@ urlpatterns = [
     path('conversations/', ConversationView.as_view(), name='conversations'),
 
     # AI Insights endpoints
+    path('insights/daily-brief/', DailyBriefView.as_view(), name='daily-brief'),
     path('insights/suggestions/', SuggestionsView.as_view(), name='suggestions'),
     path('insights/patterns/', PatternsView.as_view(), name='patterns'),
     path('insights/predict-duration/', PredictDurationView.as_view(), name='predict-duration'),

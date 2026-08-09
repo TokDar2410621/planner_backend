@@ -15,6 +15,7 @@ dj-database-url>=2.1,<3.0
 # AI & Document Processing
 anthropic>=0.49,<1.0
 google-genai>=1.75,<1.76  # pinned narrowly: tool-calling validated on this line (avoid schema-validation drift between 1.6x/1.7x)
+openai>=1.51,<2.0  # DeepSeek provider (OpenAI-compatible API, base_url https://api.deepseek.com)
 huggingface-hub>=0.20,<1.0
 PyMuPDF>=1.24,<2.0
 Pillow>=11.0,<12.0
@@ -31,6 +32,9 @@ requests>=2.31,<3.0
 # Cloud Storage
 cloudinary>=1.36,<2.0
 django-cloudinary-storage>=0.3,<1.0
+
+# Optimisation planning (solveur CP-SAT de faisabilité — services/scheduling/solve_day.py)
+ortools>=9.14,<10.0
 
 # Testing
 pytest>=7.4,<8.0

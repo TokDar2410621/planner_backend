@@ -110,7 +110,11 @@ def find_recurring_conflicts(
         (day_of_week + 1) % 7,
         (day_of_week - 1) % 7,
     }
+    from django.db.models import Q
+    from django.utils import timezone as _tz
     qs = RecurringBlock.objects.filter(
+        # un bloc dont la fenetre est terminee ne bloque plus les nouveaux
+        Q(end_date__isnull=True) | Q(end_date__gte=_tz.localdate()),
         user=user,
         active=True,
         day_of_week__in=candidate_days,

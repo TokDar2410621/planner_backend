@@ -6,6 +6,9 @@ see results, and decide what to do next.
 """
 import json
 import logging
+import re
+import time
+import unicodedata
 from typing import Optional
 
 from django.conf import settings
@@ -30,9 +33,232 @@ except ImportError:  # pragma: no cover - fallback if the factory is unavailable
 
 from .context_builder import build_context
 from .system_prompt import build_system_prompt
-from .tools import get_tools_for_claude, execute_tool
+from .tools import get_tools_for_claude, execute_tool, TOOL_MAP
+from .tools.base import ToolResult
 
 logger = logging.getLogger(__name__)
+
+MUTATION_TOOLS = {
+    "create_block",
+    "update_block",
+    "delete_block",
+    "clear_all_blocks",
+    "skip_block_occurrence",
+    "restore_block_occurrence",
+    "create_task",
+    "update_task",
+    "delete_task",
+    "complete_task",
+    "schedule_task_at",
+    "update_preferences",
+    "create_goal",
+    "update_goal",
+}
+
+_MUT_VERBS = (
+    r"cree|creee|creees|crees|ajoute|ajoutee|ajoutes|ajoutees|bloque|bloquee|bloques|"
+    r"planifie|planifiee|planifies|programme|programmee|programmes|reprogramme|reprogrammee|"
+    r"ajuste|ajustee|modifie|modifiee|mis\s+a\s+jour|mise\s+a\s+jour|deplace|deplacee|deplaces|"
+    r"decale|decalee|prolonge|prolongee|rallonge|rallongee|allonge|allongee|etendu|etendue|"
+    r"raccourci|raccourcie|reduit|reduite|supprime|supprimee|supprimes|enleve|enlevee|"
+    r"retire|retiree|avance|avancee|reporte|reportee|reserve|reservee|verrouille|verrouillee|"
+    r"fixe|fixee|remis|remise|cale|calee|cales|calees|regle|reglee"
+)
+# Signale un texte qui AFFIRME une écriture accomplie. Gère les tournures
+# première-personne ("j'ai créé") ET impersonnelles/état, car les modèles
+# formulent le succès autrement ("C'est fait : ... est créé", "c'est bloqué",
+# "tout est calé") et échappaient au filet. Sûr car la garde ne s'arme que si
+# une écriture a été TENTÉE et a ÉCHOUÉ ce tour (voir _attempted_mutation).
+COMPLETED_MUTATION_RE = re.compile(
+    r"(?:\b(?:j'ai|je t'ai|c'est note)\b[^.!?\n]{0,80}\b(?:" + _MUT_VERBS + r")\b)"
+    r"|(?:\bc'est\s+(?:fait|bon|en\s+place|parti|regle|reglee|note|" + _MUT_VERBS + r")\b)"
+    r"|(?:\b(?:est|sont)\s+(?:" + _MUT_VERBS + r")\b)"
+    r"|(?:\btout\s+est\s+(?:fait|bon|pret|prete|cale|calee|regle|reglee|en\s+place)\b)"
+    r"|(?:\bvoila\b[^.!?\n]{0,40}\b(?:" + _MUT_VERBS + r")\b)",
+    re.IGNORECASE,
+)
+
+
+def _successful_mutation(tool_calls: list) -> bool:
+    for call in tool_calls:
+        if call.get("tool") not in MUTATION_TOOLS:
+            continue
+        result = call.get("result") or {}
+        if result.get("success"):
+            return True
+    return False
+
+
+def _attempted_mutation(tool_calls: list) -> bool:
+    """Un outil d'écriture a-t-il été APPELÉ ce tour (succès ou échec)?
+
+    La garde anti faux-succès ne se déclenche que si une écriture a été TENTÉE
+    ce tour-ci sans succès: sinon on risquerait de démentir à tort un
+    récapitulatif VRAI d'une action passée ("oui, je t'ai déplacé ta lecture
+    hier"), qui n'appelle aucun outil ce tour et doit passer intact.
+    """
+    return any(call.get("tool") in MUTATION_TOOLS for call in tool_calls)
+
+
+def _claims_completed_mutation(text: str) -> bool:
+    if not text:
+        return False
+    normalized = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    return bool(COMPLETED_MUTATION_RE.search(normalized.lower()))
+
+
+# Signature de la panne Gemini « tool_code »: au lieu d'un VRAI function call,
+# le modèle écrit le pseudo-code de l'appel dans le TEXTE (vécu audit:
+# `tool_code\nprint(default_api.present_form(...))` affiché tel quel à
+# l'utilisateur, formulaire jamais rendu). `default_api.` n'apparaît dans
+# aucune prose légitime de cette app.
+_TOOL_CODE_LEAK_RE = re.compile(r"default_api\s*\.|^\s*tool_code\b", re.MULTILINE)
+
+
+def _leaks_tool_code(text: str) -> bool:
+    return bool(_TOOL_CODE_LEAK_RE.search(text or ""))
+
+
+# Intention destructive/confirmation EXPLICITE dans le message de l'utilisateur.
+# Sert de garde-fou pour les outils `requires_confirmation` (efface TOUT, hard
+# delete): le LLM ne doit pas les exécuter de sa seule initiative — il faut que
+# l'utilisateur ait vraiment demandé la suppression ou confirmé.
+_DESTRUCTIVE_CONFIRM_RE = re.compile(
+    r"\b(?:efface|effacer|supprime|supprimer|vide|vider|enleve|enlever|retire|retirer|"
+    r"remets?\s+a\s+zero|reset|recommence|reinitialise|"
+    r"oui|confirme|d'accord|ok|vas-y|vas y|fais-le|fais le|je confirme|c'est bon)\b",
+    re.IGNORECASE,
+)
+
+
+def _user_authorized_destructive(message: str) -> bool:
+    if not message:
+        return False
+    normalized = unicodedata.normalize("NFKD", message).encode("ascii", "ignore").decode("ascii")
+    return bool(_DESTRUCTIVE_CONFIRM_RE.search(normalized.lower()))
+
+
+_DAY_NAMES_FR = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
+
+
+def _schedule_reality_footer(user, tool_calls: list) -> str:
+    """Après une planification datée réussie, annexe l'état RÉEL du/des jour(s).
+
+    Sourcé de la base (placements effectifs, skip-aware) et PAS de la prose du
+    LLM: l'utilisateur n'est jamais induit en erreur par un créneau annoncé mais
+    non réellement bloqué (OR2). Couvre schedule_task_at (daté) ET create_block
+    (prochaine occurrence du jour). S'affiche si le jour touché a >= 2 blocs OU
+    si >= 2 schedule_task_at ont été tentés pour ce jour ce tour (plusieurs
+    créneaux annoncés — cas OR2 même sur une journée peu chargée).
+    """
+    from datetime import date as _date, timedelta
+    from django.utils import timezone
+    from services.scheduling.day_view import effective_day_blocks
+
+    today = timezone.localdate()
+
+    def _next_date_for_weekday(dow):
+        try:
+            dow = int(dow)
+        except (TypeError, ValueError):
+            return None
+        if not 0 <= dow <= 6:
+            return None
+        return today + timedelta(days=(dow - today.weekday()) % 7)
+
+    dates = []
+    attempts = {}  # date iso -> nb de schedule_task_at tentés ce tour
+
+    def _add(ds):
+        if ds and ds not in dates:
+            dates.append(ds)
+
+    for call in tool_calls:
+        tool = call.get("tool")
+        result = call.get("result") or {}
+        if tool == "schedule_task_at":
+            ds = (call.get("args") or {}).get("date")
+            if ds:
+                attempts[ds] = attempts.get(ds, 0) + 1
+                if result.get("success"):
+                    _add(ds)
+        elif tool == "create_block" and result.get("success"):
+            # Un seul jour ciblé = placement type OR2 ("ajoute X ce/chaque lundi").
+            # Un create multi-jours = description d'habitude (onboarding): pas de
+            # footer, sinon on annexe une ligne par jour (spam).
+            days = (call.get("args") or {}).get("days") or []
+            if len(days) == 1:
+                d = _next_date_for_weekday(days[0])
+                if d is not None:
+                    _add(d.isoformat())
+    # Une journée avec >= 2 planifications datées tentées est ambiguë (plusieurs
+    # créneaux annoncés) même si la base n'en retient qu'un: on force le footer.
+    for ds, n in attempts.items():
+        if n >= 2:
+            _add(ds)
+
+    lines = []
+    for ds in dates:
+        try:
+            d = _date.fromisoformat(ds)
+        except (TypeError, ValueError):
+            continue
+        entries = effective_day_blocks(user, d)
+        if len(entries) < 2 and attempts.get(ds, 0) < 2:
+            continue
+        human = f"{_DAY_NAMES_FR[d.weekday()]} {d.strftime('%d/%m')}"
+        if entries:
+            listing = " ; ".join(
+                f"{e['start_time']}-{e['end_time']} {e['title']}" for e in entries
+            )
+        else:
+            listing = "(aucun bloc placé)"
+        lines.append(f"\U0001F4C5 Planning réel du {human} : {listing}")
+    return "\n".join(lines)
+
+
+_DAY_ABBR_FR = ["lun", "mar", "mer", "jeu", "ven", "sam", "dim"]
+
+
+def _creation_recap_footer(tool_calls: list) -> str:
+    """Récap DÉTERMINISTE des blocs récurrents créés ce tour, sourcé des ARGS
+    réellement exécutés — jamais de la prose du LLM. Vécu audit humain: sur un
+    premier message multi-blocs, le modèle a parfois brouillé jours/heures tout
+    en affirmant « c'est noté ». Ce récap rend l'erreur immédiatement visible
+    et corrigeable en une phrase. Ne s'affiche que quand le risque existe
+    (>= 2 jours créés ce tour); le cas 1 jour est couvert par le footer
+    réalité."""
+    lines = []
+    total_days = 0
+    for call in tool_calls:
+        if call.get("tool") != "create_block":
+            continue
+        result = call.get("result") or {}
+        if not result.get("success"):
+            continue
+        args = call.get("args") or {}
+        days = args.get("days") or []
+        names = []
+        for d in days:
+            try:
+                d = int(d)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= d <= 6:
+                names.append(_DAY_ABBR_FR[d])
+        if not names:
+            continue
+        total_days += len(names)
+        lines.append(
+            f"• {args.get('title', 'Bloc')} : {', '.join(names)} "
+            f"{args.get('start_time', '')}-{args.get('end_time', '')}"
+        )
+    if not lines or total_days < 2:
+        return ""
+    return (
+        "✅ Enregistré tel quel :\n" + "\n".join(lines)
+        + "\nUn détail cloche ? Dis-le-moi, je corrige."
+    )
 
 
 class PlannerAgent:
@@ -72,25 +298,47 @@ class PlannerAgent:
         return get_provider(self._resolve_provider_name(user))
 
     def _build_alternate_provider(self, user: Optional[User] = None):
-        """The OTHER provider, used as a one-shot failover when the primary
-        errors (B3): claude <-> gemini."""
-        name = self._resolve_provider_name(user)
-        alt = "gemini" if name == "claude" else "claude"
-        try:
-            return get_provider(alt)
-        except Exception:
-            return None
+        """A configured provider OTHER than the primary, for one-shot failover
+        when the primary errors (B3). Returns the first available among the known
+        providers, so adding DeepSeek does not require a binary claude<->gemini
+        assumption."""
+        primary = str(self._resolve_provider_name(user)).strip().lower()
+        for alt in ("gemini", "deepseek", "claude"):
+            if alt == primary:
+                continue
+            try:
+                provider = get_provider(alt)
+                if provider.is_available():
+                    return provider
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _is_unusable(response) -> bool:
+        """Erreur OU tour vide (ni texte ni outil). Un tour vide non-erreur est
+        la flakiness connue de gemini-2.5-flash: le laisser passer finit sur le
+        filet « reformule » — inacceptable, surtout au premier message d'un
+        nouvel utilisateur."""
+        if response.is_error:
+            return True
+        if not response.has_function_calls and _leaks_tool_code(response.text):
+            # Panne « tool_code » Gemini: l'appel d'outil est ecrit en pseudo-
+            # code dans le texte. Inutilisable: l'outil n'a PAS tourne et le
+            # code fuirait a l'ecran.
+            return True
+        return not response.has_function_calls and not (response.text or "").strip()
 
     def _generate_with_failover(self, *, messages, tools, system_prompt):
-        """Call the primary provider; on a transport/API error, try the other
-        provider once (B3). Never return the primary's error when the fallback
-        succeeds."""
+        """Call the primary provider; on a transport/API error OR an empty
+        non-error turn, try the other provider once (B3). Never return the
+        primary's error when the fallback succeeds."""
         response = self.llm.generate_with_history(
             messages=messages, tools=tools, system_prompt=system_prompt,
         )
-        if not response.is_error:
+        if not self._is_unusable(response):
             return response
-        logger.warning("Primary LLM provider failed; attempting fallback provider")
+        logger.warning("Primary LLM provider failed or empty; attempting fallback provider")
         alt = self._build_alternate_provider(self.user)
         if alt is not None:
             try:
@@ -98,21 +346,55 @@ class PlannerAgent:
                     alt_response = alt.generate_with_history(
                         messages=messages, tools=tools, system_prompt=system_prompt,
                     )
-                    if not alt_response.is_error:
+                    if not self._is_unusable(alt_response):
                         logger.info("Fallback LLM provider succeeded")
                         return alt_response
             except Exception as e:  # noqa: BLE001 - degrade gracefully
                 logger.error(f"Fallback provider also failed: {e}")
         return response
 
+    # Libellés humains émis pendant l'exécution des outils (événements "status"
+    # du flux SSE): l'utilisateur voit CE QUE l'agent fait au lieu d'un silence.
+    _TOOL_STATUS_LABELS = {
+        "get_today_schedule": "Je consulte ton planning…",
+        "get_week_schedule": "Je consulte ta semaine…",
+        "list_blocks": "Je consulte tes blocs…",
+        "find_free_slots": "Je cherche des créneaux libres…",
+        "check_feasibility": "Je vérifie que ça rentre…",
+        "organize_day": "J'optimise ta journée…",
+        "create_block": "J'ajoute le bloc…",
+        "update_block": "Je modifie le bloc…",
+        "delete_block": "Je supprime le bloc…",
+        "schedule_task_at": "Je cale le créneau…",
+        "cancel_scheduled_block": "J'annule le créneau…",
+        "skip_block_occurrence": "Je note l'exception…",
+        "restore_block_occurrence": "Je rétablis l'occurrence…",
+        "create_task": "Je crée la tâche…",
+        "update_task": "Je mets à jour la tâche…",
+        "complete_task": "Je marque la tâche terminée…",
+        "delete_task": "Je supprime la tâche…",
+        "create_goal": "Je crée l'objectif…",
+        "list_goals": "Je consulte tes objectifs…",
+        "present_form": "Je prépare un mini-formulaire…",
+    }
+
+    @classmethod
+    def _status_label(cls, tool_name: str) -> str:
+        return cls._TOOL_STATUS_LABELS.get(tool_name, "Je travaille sur ton planning…")
+
     def process_message(
         self,
         user: User,
         message: str,
         attachment: Optional[UploadedDocument] = None,
+        generate_quick_replies: bool = True,
     ) -> dict:
         """
         Process a user message through the agentic loop.
+
+        Non-streaming wrapper: drains process_message_stream (the single source
+        of truth) with provider streaming disabled, and returns the terminal
+        "done" payload. Legacy /chat/ behaviour is byte-identical.
 
         Returns:
             {
@@ -122,16 +404,59 @@ class PlannerAgent:
                 "tasks_created": list,      # Tasks created
             }
         """
+        done: dict = {}
+        for event in self.process_message_stream(
+            user,
+            message,
+            attachment,
+            use_streaming=False,
+            generate_quick_replies=generate_quick_replies,
+        ):
+            if event.get("type") == "done":
+                done = {k: v for k, v in event.items() if k != "type"}
+        return done
+
+    def process_message_stream(
+        self,
+        user: User,
+        message: str,
+        attachment: Optional[UploadedDocument] = None,
+        *,
+        use_streaming: bool = True,
+        generate_quick_replies: bool = False,
+    ):
+        """Agentic loop as an event generator (SSE contract).
+
+        Events yielded, in order:
+          {"type": "status", "text": str}    — outil en cours / réflexion
+          {"type": "delta", "text": str}     — fragment de texte de la réponse
+          {"type": "turn_discard"}           — le texte streamé de ce tour est
+                                               caduc (le modèle a finalement
+                                               appelé des outils): le client
+                                               vide la bulle en cours
+          {"type": "done", ...}              — TERMINAL, payload identique à
+                                               process_message(); son "response"
+                                               fait AUTORITÉ (garde anti faux
+                                               succès + footer réalité inclus):
+                                               le client REMPLACE toujours le
+                                               contenu par done.response.
+
+        use_streaming=False force les appels providers non-streamés (chemin
+        legacy exact); les providers sans stream_with_history retombent
+        d'eux-mêmes sur le chemin non-streamé.
+        """
         # Select the provider based on THIS user's preference (the view builds
         # the agent without a user), falling back to settings.LLM_PROVIDER.
         self.user = user
         self.llm = self._build_provider(user)
 
         if not self.llm.is_available():
-            return {
+            yield {
+                "type": "done",
                 "response": "Service IA non disponible. Vérifie la configuration de la clé API.",
                 "quick_replies": [],
             }
+            return
 
         # 1. Save user message
         ConversationMessage.objects.create(
@@ -158,8 +483,46 @@ class PlannerAgent:
 
         # If a document is attached, include its extracted content in the context
         # as clearly-delimited DATA (never as instructions) (B8 / S9).
+        attachment_processed_this_turn = False
         if attachment:
+            # Le traitement (vision/pdfplumber) prend ~5-15s et tourne en
+            # arriere-plan. Avant: l'agent repondait AVANT la fin avec une
+            # promesse de resume que rien ne livrait jamais (vecu audit: blocs
+            # crees a t=10s, ecran muet 120s). On ATTEND la fin (borne 45s)
+            # avec des statuts vivants: une reponse vraie en un tour vaut
+            # mieux qu'une promesse cassee en 3 secondes.
+            if not attachment.processed:
+                wait_s = getattr(settings, "ATTACHMENT_WAIT_SECONDS", 45)
+                if wait_s:
+                    yield {"type": "status", "text": "J'analyse ton document…"}
+                for tick in range(int(wait_s * 2)):
+                    time.sleep(0.5)
+                    attachment.refresh_from_db()
+                    if attachment.processed:
+                        # Cadrage deterministe: le LLM voit les blocs deja en
+                        # base (crees par le pipeline pendant cette attente) et
+                        # les presente volontiers comme « deja enregistres »,
+                        # ce qui seme le doute juste apres un envoi. Ce prefixe
+                        # etablit la verite quoi que raconte le modele.
+                        attachment_processed_this_turn = True
+                        break
+                    if tick and tick % 16 == 0:
+                        yield {"type": "status", "text": "J'analyse ton document… (presque fini)"}
             history[-1]["content"] = f"{history[-1]['content']}\n\n{self._build_attachment_context(attachment)}"
+            # Le contexte d'import (liste des blocs crees, bornes, mention
+            # « RECURRENT SANS DATE DE FIN ») s'ajoute AUSSI sur le tour
+            # d'upload: c'est lui qui declenche la question de fin de
+            # recurrence (pattern AskQuestion) juste apres l'import.
+            recent_import = self._recent_import_context(user)
+            if recent_import:
+                history[-1]["content"] = f"{history[-1]['content']}\n\n{recent_import}"
+        else:
+            # No attachment on THIS turn: if the user just imported a schedule,
+            # surface it so a vague follow-up ("gère ça", "c'est bon ?") never
+            # gets a false "je ne peux pas traiter de document" refusal.
+            recent_import = self._recent_import_context(user)
+            if recent_import:
+                history[-1]["content"] = f"{history[-1]['content']}\n\n{recent_import}"
 
         # 6. Agentic loop
         final_text = ""
@@ -167,22 +530,102 @@ class PlannerAgent:
         tool_calls_made = []
         executed_calls = {}  # (name, args) -> result string; skips duplicate tool calls
         interactive_inputs = None  # Captured from present_form tool
-        ai_quick_replies = None    # Captured from present_quick_replies tool
 
         for turn in range(self.MAX_TOOL_TURNS):
             logger.info(f"Agent turn {turn + 1}/{self.MAX_TOOL_TURNS}")
 
-            response = self._generate_with_failover(
-                messages=history,
-                tools=tools,
-                system_prompt=system_prompt,
-            )
+            # Tour streamé quand le provider le supporte: les fragments de texte
+            # partent au client AU FIL DE L'EAU. Si le flux échoue (exception ou
+            # final en erreur), on jette le texte partiel (turn_discard) et on
+            # retombe sur le chemin non-streamé, qui porte le failover.
+            response = None
+            streamed_this_turn = False
+            if use_streaming and getattr(self.llm, "supports_streaming", False):
+                try:
+                    for stream_event in self.llm.stream_with_history(
+                        messages=history, tools=tools, system_prompt=system_prompt,
+                    ):
+                        etype = stream_event.get("type")
+                        if etype == "text_delta" and stream_event.get("text"):
+                            streamed_this_turn = True
+                            yield {"type": "delta", "text": stream_event["text"]}
+                        elif etype == "thinking":
+                            yield {"type": "status", "text": "Je réfléchis…"}
+                        elif etype == "stream_reset":
+                            # Le provider a émis des deltas puis est reparti de
+                            # zéro (fallback Gemini après exception mi-flux): le
+                            # client vide la bulle, sinon partiel + texte complet
+                            # se concatènent à l'écran.
+                            if streamed_this_turn:
+                                yield {"type": "turn_discard"}
+                                streamed_this_turn = False
+                        elif etype == "final":
+                            response = stream_event.get("response")
+                except Exception:  # noqa: BLE001 - streaming must never kill the turn
+                    logger.error("Streaming turn failed; falling back", exc_info=True)
+                    response = None
+                if response is not None and response.is_error:
+                    response = None
+                if (
+                    response is not None
+                    and not response.has_function_calls
+                    and not (response.text or "").strip()
+                ):
+                    # Tour VIDE non-erreur: flakiness « candidat vide » de
+                    # gemini-2.5-flash, quasi systématique en STREAMING sur les
+                    # tours à appel d'outil (vérifié prod: streamGenerateContent
+                    # 200 mais 0 part). Rejoue le tour en non-streamé (retries
+                    # x3 + failover) au lieu de finir sur le filet « reformule ».
+                    logger.warning("Streamed turn came back empty; retrying non-streamed")
+                    response = None
+                if (
+                    response is not None
+                    and not response.has_function_calls
+                    and _leaks_tool_code(response.text)
+                ):
+                    # Panne « tool_code »: l'appel d'outil est du pseudo-code
+                    # dans le texte (vécu: present_form jamais rendu + code
+                    # affiché a l'utilisateur). On jette et on rejoue.
+                    logger.warning("Streamed turn leaked tool_code; retrying non-streamed")
+                    response = None
+                if (
+                    response is not None
+                    and not response.has_function_calls
+                    and not tool_calls_made
+                    and _claims_completed_mutation(response.text or "")
+                ):
+                    # MENSONGE ZÉRO-OUTIL spécifique au streaming Gemini (vérifié
+                    # prod A/B: en stream le modèle « répond » parfois J'ai ajouté…
+                    # SANS appeler l'outil — 2/4; en non-streamé il l'appelle 3/3).
+                    # Un tour streamé qui PRÉTEND une mutation alors qu'AUCUN outil
+                    # n'a tourné cette requête est suspect: on jette le texte et on
+                    # rejoue le tour en non-streamé. Si le rerun rend le même récap
+                    # sans outil (vrai récap d'une action passée), il passe.
+                    logger.warning(
+                        "Streamed turn claims a mutation with zero tool calls; "
+                        "retrying non-streamed")
+                    response = None
+                if response is None and streamed_this_turn:
+                    yield {"type": "turn_discard"}
+                    streamed_this_turn = False
+            if response is None:
+                response = self._generate_with_failover(
+                    messages=history,
+                    tools=tools,
+                    system_prompt=system_prompt,
+                )
 
             if not response.has_function_calls:
                 # No tool calls - we have the final response
                 final_text = response.text
                 had_error = response.is_error
                 break
+
+            # Tour à OUTILS: si du texte a été streamé pendant ce tour (narration
+            # intermédiaire), il sera remplacé par la vraie réponse finale — le
+            # client vide la bulle en cours.
+            if streamed_this_turn:
+                yield {"type": "turn_discard"}
 
             # Process tool calls
             # Add assistant message with tool calls to history (raw content)
@@ -211,7 +654,31 @@ class PlannerAgent:
                     continue
 
                 logger.info(f"Executing tool: {fc.name}({fc.args})")
-                result = execute_tool(fc.name, user, fc.args)
+                yield {"type": "status", "text": self._status_label(fc.name)}
+                # Garde-fou destructif (A5): un outil `requires_confirmation`
+                # (efface TOUT, hard delete) ne s'exécute PAS sur la seule
+                # décision du LLM — l'utilisateur doit avoir explicitement demandé
+                # ou confirmé. Sinon on renvoie une demande de confirmation SANS
+                # muter, et l'agent la relaie.
+                _tool_obj = TOOL_MAP.get(fc.name)
+                if (
+                    _tool_obj is not None
+                    and getattr(_tool_obj, "requires_confirmation", False)
+                    and not _user_authorized_destructive(message)
+                ):
+                    logger.warning(f"Blocked unconfirmed destructive tool: {fc.name}")
+                    result = ToolResult(
+                        success=False,
+                        data={"needs_confirmation": True},
+                        message=(
+                            "Action destructive NON exécutée: elle efface des données. "
+                            "Demande d'abord une confirmation explicite à l'utilisateur "
+                            "(ex: « tu confirmes que je supprime … ? ») et ne réessaie "
+                            "que s'il répond oui."
+                        ),
+                    )
+                else:
+                    result = execute_tool(fc.name, user, fc.args)
                 logger.info(f"Tool result: {result.message}")
                 result_string = result.to_string()
                 executed_calls[call_key] = result_string
@@ -226,8 +693,6 @@ class PlannerAgent:
                 # Capture interactive UI data from tools
                 if fc.name == "present_form" and result.success:
                     interactive_inputs = result.data.get("interactive_inputs")
-                if fc.name == "present_quick_replies" and result.success:
-                    ai_quick_replies = result.data.get("quick_replies")
 
                 tool_results.append({
                     "type": "tool_result",
@@ -261,6 +726,43 @@ class PlannerAgent:
                 for tc in tool_calls_made:
                     final_text += f"\n- {tc['result'].get('message', tc['tool'])}"
 
+        # Filet: ne JAMAIS renvoyer une réponse vide (ex: un LLM qui renvoie un
+        # candidat sans texte ni outil). Le raté vient de NOUS, jamais de
+        # l'utilisateur: on l'assume au lieu de lui demander de « reformuler »
+        # un message qui était clair (la confiance meurt au premier blâme
+        # inversé).
+        if not had_error and not (final_text or "").strip():
+            final_text = (
+                "Oups, petit raté de mon côté (ton message était clair). "
+                "Renvoie-le et je m'en occupe."
+            )
+
+        # Dernier rempart anti-fuite: si malgré les retries le texte contient
+        # encore du pseudo-code d'appel d'outil, on ne l'affiche JAMAIS.
+        if not had_error and _leaks_tool_code(final_text) and not tool_calls_made:
+            logger.error("Final text still leaks tool_code after retries; replacing with filet")
+            final_text = (
+                "Oups, petit raté de mon côté (ton message était clair). "
+                "Renvoie-le et je m'en occupe."
+            )
+
+        if (
+            not had_error
+            and _attempted_mutation(tool_calls_made)
+            and _claims_completed_mutation(final_text)
+            and not _successful_mutation(tool_calls_made)
+        ):
+            # Le LLM a TENTÉ une écriture qui a échoué mais prétend l'avoir
+            # réussie. On REMPLACE le message (au lieu de le préfixer): préfixer
+            # produisait une réponse qui se contredit ("Je n'ai pas modifié...
+            # J'ai ajusté..."). On ne se déclenche que si une mutation a été
+            # tentée ce tour, pour ne jamais démentir à tort un récapitulatif
+            # VRAI d'une action passée (qui n'appelle aucun outil ce tour).
+            final_text = (
+                "Je n'ai pas pu appliquer la modification à ton planning "
+                "(l'action a échoué). Dis-moi si tu veux que je réessaie."
+            )
+
         # 7. Save assistant response — but never persist an LLM-failure message
         #    as a real assistant turn (B3): it would pollute future context.
         if not had_error:
@@ -268,12 +770,68 @@ class PlannerAgent:
                 user=user, role="assistant", content=final_text
             )
 
+        # Ancrage factuel (OR2): après une planification datée, annexe l'état
+        # RÉEL du/des jour(s) touché(s), calculé depuis la base, à la RÉPONSE
+        # rendue — mais PAS au message persisté ci-dessus. Sinon le LLM apprend
+        # le format "📅 Planning réel" et le ré-émet lui-même un tour SANS
+        # écriture (donc sans footer déterministe), réintroduisant des créneaux
+        # fantômes sous un format devenu "de confiance".
+        response_text = final_text
+        if not had_error and attachment_processed_this_turn:
+            response_text = f"✅ Document analysé.\n\n{response_text}"
+        if not had_error:
+            footer = _schedule_reality_footer(user, tool_calls_made)
+            if footer:
+                response_text = f"{response_text}\n\n{footer}"
+            recap = _creation_recap_footer(tool_calls_made)
+            if recap:
+                response_text = f"{response_text}\n\n{recap}"
+
+        # FIN DE RÉCURRENCE déterministe: si l'import de CE tour a créé des
+        # blocs récurrents sans end_date, la question « jusqu'à quand ? » est
+        # posée par le CODE avec ses boutons de réponse — la règle du prompt
+        # seule était une loterie (1 tirage sur 3 l'omettait, vécu e2e
+        # manuscrit). Même philosophie que les footers: le déterminisme prime.
+        forced_quick_replies = None
+        if not had_error and attachment_processed_this_turn and attachment is not None:
+            from core.models import RecurringBlock as _RB
+            open_ended = list(_RB.objects.filter(
+                source_document=attachment, end_date__isnull=True))
+            if open_ended:
+                titles = sorted({b.title for b in open_ended})
+                label = titles[0] if len(titles) == 1 else ' et '.join(titles[:2])
+                if 'jusqu' not in response_text.lower():
+                    response_text += (
+                        f"\n\n⏳ « {label} » n'a pas de date de fin pour l'instant : "
+                        "jusqu'à quand veux-tu le garder à l'horaire ?"
+                    )
+                # Les chips de réponse sont forcées MÊME si le LLM a posé la
+                # question lui-même: ses propres quick replies partent souvent
+                # sur autre chose (vécu: « Voir mon agenda ») et l'utilisateur
+                # se retrouve à taper ce qu'un tap aurait dû régler.
+                forced_quick_replies = [
+                    {"label": "🏁 Je te donne la date de fin",
+                     "value": f"Je vais te donner la date de fin pour {label}."},
+                    {"label": "♾️ Pas de fin prévue",
+                     "value": f"{label} n'a pas de date de fin, garde-le tel quel."},
+                ]
+
         # 8. Build response
-        # Use AI-generated quick replies if available, otherwise auto-generate
-        quick_replies = ai_quick_replies or self._generate_quick_replies(tool_calls_made, context)
+        # Contextual quick replies: the LLM proposes the likely next steps for
+        # THIS exchange; deterministic rules are the fallback if it fails.
+        # This is a SECOND LLM round-trip on the critical path, so callers that
+        # fetch quick replies out-of-band (deferred endpoint) skip it here.
+        quick_replies = forced_quick_replies or (
+            self._generate_quick_replies(
+                message, final_text, tool_calls_made, context, had_error
+            )
+            if generate_quick_replies
+            else []
+        )
 
         result = {
-            "response": final_text,
+            "type": "done",
+            "response": response_text,
             "quick_replies": quick_replies,
             "blocks_created": [
                 tc["result"]["data"].get("created", [])
@@ -291,7 +849,103 @@ class PlannerAgent:
         if interactive_inputs:
             result["interactive_inputs"] = interactive_inputs
 
-        return result
+        yield result
+
+    _DAYS_FR = ['lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi', 'dimanche']
+
+    def _recent_import_context(self, user: User) -> Optional[str]:
+        """Surface a just-finished schedule import when the follow-up message has
+        no attachment.
+
+        Root cause of the "je ne peux pas traiter de document" / "j'ai besoin de
+        plus de détails" refusals: on a follow-up turn the agent had NO signal
+        that the document it received seconds ago was processed and its blocks
+        created, so it invented a limitation and told the user the opposite of
+        the truth. Here we read the real state (most recent document processed in
+        the last ~20 min) and hand the agent the concrete list of blocks that
+        already exist, plus an explicit ban on denying the import.
+        """
+        from datetime import timedelta
+        from django.utils import timezone
+        from core.models import RecurringBlock
+
+        cutoff = timezone.now() - timedelta(minutes=20)
+        doc = (UploadedDocument.objects
+               .filter(user=user, uploaded_at__gte=cutoff)
+               .order_by('-uploaded_at')
+               .first())
+        if doc is None or not doc.processed:
+            return None
+
+        blocks = list(RecurringBlock.objects
+                      .filter(source_document=doc)
+                      .order_by('day_of_week', 'start_time'))
+        pending = (RecurringBlock.all_objects
+                   .filter(source_document=doc, status=RecurringBlock.STATUS_PENDING)
+                   .count())
+        # Evenements DATES crees par cet import (Task+ScheduledBlock locked).
+        # Sans eux dans le contexte, l'agent croyait devoir les creer lui-meme,
+        # heurtait l'anti-doublon et narrait des « chevauchements » au lieu du
+        # recap; et un horaire 100% matchs passait pour « rien d'exploitable ».
+        from core.models import ScheduledBlock as _SB
+        dated = list(_SB.objects
+                     .filter(user=user, locked=True, created_at__gte=doc.uploaded_at)
+                     .select_related('task')
+                     .order_by('date', 'start_time')[:40])
+        if not blocks and not pending and not dated:
+            # Processed but nothing usable came out — be honest, not falsely capable.
+            if doc.processing_error or (doc.extracted_data or {}).get('parse_error'):
+                return (
+                    f"[IMPORT RÉCENT — le document « {doc.file_name} » a été reçu mais "
+                    "aucune donnée d'horaire exploitable n'a pu en être extraite. Dis-le "
+                    "honnêtement et propose de réessayer avec une image plus nette; ne "
+                    "prétends pas l'inverse.]"
+                )
+            return None
+
+        lines = []
+        open_ended = 0
+        for b in blocks:
+            day = self._DAYS_FR[b.day_of_week] if 0 <= b.day_of_week < 7 else '?'
+            start = b.start_time.strftime('%H:%M') if b.start_time else '?'
+            end = b.end_time.strftime('%H:%M') if b.end_time else '?'
+            extra = ''
+            if b.start_date:
+                extra += f", débute le {b.start_date.isoformat()}"
+            if b.end_date:
+                extra += f", finit le {b.end_date.isoformat()}"
+            else:
+                extra += ", RÉCURRENT SANS DATE DE FIN"
+                open_ended += 1
+            lines.append(f"- {b.title} (id {b.id}, {day} {start}-{end}{extra})")
+        listing = "\n".join(lines) if lines else "  (aucun bloc récurrent)"
+        footer_extra = ""
+        if pending:
+            footer_extra = (f"\n({pending} autre(s) bloc(s) extraits avec une confiance faible "
+                            "attendent la confirmation de l'utilisateur.)")
+        if dated:
+            dated_lines = "\n".join(
+                f"- {sb.task.title} ({sb.date.isoformat()} "
+                f"{sb.start_time.strftime('%H:%M')}-{sb.end_time.strftime('%H:%M')})"
+                for sb in dated
+            )
+            footer_extra += (
+                f"\nÉvénements DATÉS déjà créés par ce même import ({len(dated)}):\n"
+                f"{dated_lines}\n"
+                "Ces événements datés existent DÉJÀ en base: ne les recrée JAMAIS "
+                "(pas de schedule_task_at pour eux), récapitule-les simplement."
+            )
+        return (
+            f"[IMPORT RÉCENT — le document « {doc.file_name} » a DÉJÀ été analysé et "
+            f"{len(blocks) + len(dated)} entrée(s) ont été ajoutées au planning de l'utilisateur "
+            "(NE recrée RIEN de cette liste — ni create_block ni schedule_task_at; "
+            "récapitule, c'est tout):\n"
+            f"{listing}{footer_extra}\n"
+            "Ces entrées existent en base MAINTENANT. Ne dis JAMAIS que tu ne peux pas "
+            "lire/traiter/importer le document, ni que tu as besoin qu'il ressaisisse "
+            "ces cours. Confirme ce qui a été ajouté (ou agis sur sa demande) en "
+            "t'appuyant sur cette liste.]"
+        )
 
     def _build_attachment_context(self, attachment: UploadedDocument) -> str:
         """
@@ -308,11 +962,17 @@ class PlannerAgent:
         header = f"Document uploadé: {attachment.file_name} (type: {doc_type})"
 
         if not attachment.processed:
+            # Cas rare depuis l'attente synchrone: seulement si l'analyse
+            # depasse la borne. Tutoiement explicite (le LLM vouvoyait sur ce
+            # chemin) et AUCUNE promesse de resume automatique: rien ne la
+            # livrerait.
             return (
                 f"[{header}]\n"
-                "[DOCUMENT EN COURS DE TRAITEMENT — le contenu extrait n'est pas "
-                "encore disponible. Indique à l'utilisateur que le document est en "
-                "cours d'analyse et sera exploitable dans un instant.]"
+                "[DOCUMENT ENCORE EN ANALYSE — le contenu n'est pas disponible. "
+                "Dis-le simplement, en TUTOYANT (comme partout dans l'app): "
+                "l'analyse prend plus de temps que prevu, il peut te redemander "
+                "dans un instant (« c'est bon ? »). Ne promets JAMAIS d'envoyer "
+                "un résumé de toi-même: tu n'en as pas le moyen.]"
             )
 
         extracted = attachment.extracted_data or {}
@@ -371,7 +1031,112 @@ class PlannerAgent:
 
         return cleaned
 
-    def _generate_quick_replies(self, tool_calls: list, context: dict) -> list[dict]:
+    # Prompt système minimal pour la génération de suggestions (pas d'outils).
+    _QR_SYSTEM = (
+        "Tu génères des suggestions de réponse rapide pour un assistant d'agenda. "
+        "Tu réponds UNIQUEMENT par du JSON, jamais d'autre texte."
+    )
+
+    def quick_replies_for(
+        self, user: User, user_message: str, assistant_response: str,
+    ) -> list[dict]:
+        """Standalone quick-reply generation for the deferred endpoint.
+
+        The main chat response returns first (no quick replies on the critical
+        path); the client then calls this to fetch contextual replies a beat
+        later. Uses the user's own provider; returns [] on any failure.
+        """
+        if not user_message or not assistant_response:
+            return []
+        self.user = user
+        self.llm = self._build_provider(user)
+        if not self.llm or not self.llm.is_available():
+            return []
+        try:
+            return self._llm_quick_replies(user_message, assistant_response) or []
+        except Exception:  # noqa: BLE001 - a suggestion must never surface an error
+            logger.debug("Deferred quick replies failed", exc_info=True)
+            return []
+
+    def _generate_quick_replies(
+        self, user_message: str, final_text: str, tool_calls: list,
+        context: dict, had_error: bool = False,
+    ) -> list[dict]:
+        """Suggestions contextuelles: le LLM propose les étapes suivantes probables;
+        les règles déterministes servent de repli si l'appel échoue ou déraille."""
+        if had_error:
+            return []
+        try:
+            llm = self._llm_quick_replies(user_message, final_text)
+            if llm:
+                return llm
+        except Exception:  # noqa: BLE001 - never fail the chat for a suggestion
+            logger.debug("LLM quick replies failed; falling back to rules", exc_info=True)
+        return self._rule_based_quick_replies(tool_calls, context)
+
+    def _llm_quick_replies(self, user_message: str, final_text: str) -> list[dict]:
+        """Un appel LLM léger (sans outils) qui propose 2-3 suites logiques."""
+        if not final_text or not self.llm or not self.llm.is_available():
+            return []
+        prompt = (
+            "Voici le dernier échange dans un assistant d'agenda (français).\n"
+            f"UTILISATEUR: {user_message[:500]}\n"
+            f"ASSISTANT: {final_text[:800]}\n\n"
+            "Propose 2 ou 3 SUGGESTIONS de message que l'utilisateur pourrait vouloir "
+            "envoyer JUSTE APRÈS, comme prochaine étape logique de la conversation "
+            "(ex: après un cours ajouté → en ajouter un autre, bloquer du temps d'étude; "
+            "après un conflit → décaler l'un des deux; après une question → l'action "
+            "correspondante). Elles doivent être concrètes, utiles et variées.\n"
+            "Réponds UNIQUEMENT par un tableau JSON de 2-3 objets "
+            '{"label": "...", "value": "..."} :\n'
+            "- label = texte du bouton, court (max 28 caractères), commençant par 1 emoji.\n"
+            "- value = le message complet à envoyer, à la première personne, prêt à l'emploi.\n"
+            "- NE propose JAMAIS une capacité que l'assistant n'a pas : pas de rappel "
+            "ni de notification push (« rappelle-moi », « préviens-moi », « notifie-moi »), "
+            "pas d'email, pas de synchronisation Google/Apple/calendrier externe. "
+            "L'assistant ne peut PAS envoyer de notifications ni de rappels proactifs; "
+            "un bouton qui le sous-entend contredirait sa réponse.\n"
+            "Aucun texte hors du JSON."
+        )
+        # Générer des suggestions ne demande AUCUN raisonnement: on désactive le
+        # mode thinking (DeepSeek) le temps de cet appel pour ne pas doubler la
+        # latence perçue du chat. Restauré ensuite. Sans effet sur Gemini/Claude.
+        prev_thinking = getattr(self.llm, "thinking", None)
+        try:
+            if hasattr(self.llm, "thinking"):
+                self.llm.thinking = False
+            resp = self.llm.generate(prompt, system_prompt=self._QR_SYSTEM)
+        finally:
+            if prev_thinking is not None:
+                self.llm.thinking = prev_thinking
+        if getattr(resp, "is_error", False):
+            return []
+        return self._parse_quick_replies(getattr(resp, "text", "") or "")
+
+    @staticmethod
+    def _parse_quick_replies(text: str) -> list[dict]:
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if not match:
+            return []
+        try:
+            data = json.loads(match.group(0))
+        except (json.JSONDecodeError, ValueError):
+            return []
+        out = []
+        seen = set()
+        for item in data if isinstance(data, list) else []:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label", "")).strip()[:40]
+            value = str(item.get("value", "")).strip()[:300]
+            if label and value and value.lower() not in seen:
+                seen.add(value.lower())
+                out.append({"label": label, "value": value})
+            if len(out) >= 3:
+                break
+        return out
+
+    def _rule_based_quick_replies(self, tool_calls: list, context: dict) -> list[dict]:
         """Generate contextual quick reply buttons based on what just happened."""
         replies = []
 

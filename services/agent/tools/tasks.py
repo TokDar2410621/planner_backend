@@ -285,7 +285,7 @@ class CreateTaskTool(BaseTool):
 
 class UpdateTaskTool(BaseTool):
     name = "update_task"
-    description = "Modifie une tâche existante."
+    description = "Modifie une tâche existante. Résous la tâche par son nom via list_tasks; ne demande jamais un identifiant à l'utilisateur."
     parameters = {
         "type": "object",
         "properties": {
@@ -400,7 +400,7 @@ class DeleteTaskTool(BaseTool):
 
 class CompleteTaskTool(BaseTool):
     name = "complete_task"
-    description = "Marque une tâche comme terminée."
+    description = "Marque une tâche comme terminée. Résous la tâche par son nom via list_tasks; ne demande jamais un identifiant à l'utilisateur."
     parameters = {
         "type": "object",
         "properties": {

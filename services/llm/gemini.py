@@ -29,6 +29,17 @@ class GeminiProvider(LLMProvider):
     """
 
     DEFAULT_MODEL = 'gemini-2.5-flash'
+    # L'agent route vers stream_with_history quand le client veut du SSE.
+    supports_streaming = True
+
+    # Un thinking_budget EXPLICITE est REQUIS. En mode dynamique (défaut -1),
+    # avec des outils + un gros system prompt, gemini-2.5-flash renvoie par
+    # moments un candidat VIDE (finish=STOP, aucune part, output_tokens=None) ->
+    # l'agent ne fait rien (réponse blanche, ou "Erreur IA" quand le failover
+    # était vivant). Un budget FIXE (même modéré) supprime ce comportement tout
+    # en gardant du raisonnement. Reproduit et vérifié: budget 0/512/1024/2048
+    # renvoient tous une part; seul le mode dynamique produisait le vide.
+    THINKING_BUDGET = 1024
 
     def __init__(self, model_name: Optional[str] = None):
         """
@@ -53,6 +64,28 @@ class GeminiProvider(LLMProvider):
     @property
     def name(self) -> str:
         return f"Gemini ({self.model_name})"
+
+    def _build_config(self, gemini_tools=None):
+        """Config Gemini avec un thinking_budget explicite (anti candidat vide).
+
+        Toujours renvoyer une config (même sans outils) pour garantir le budget
+        de pensée fixe. Garde de compat: si ThinkingConfig manque (skew de
+        version), on n'ajoute pas le champ plutôt que de planter.
+        """
+        # Temperature basse: l'agent PARSE des horaires (jours/heures). Au
+        # defaut (1.0), gemini-2.5-flash brouille par moments un message
+        # pourtant clair (vecu audit humain: mardi 13-16 devenu mardi 9-12 et
+        # resto vendredi devenu samedi). Le planning exige du deterministe.
+        kwargs = {"temperature": 0.3}
+        thinking_cls = getattr(types, "ThinkingConfig", None)
+        if thinking_cls is not None:
+            kwargs["thinking_config"] = thinking_cls(thinking_budget=self.THINKING_BUDGET)
+        if gemini_tools:
+            kwargs["tools"] = gemini_tools
+            kwargs["tool_config"] = types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode='AUTO')
+            )
+        return types.GenerateContentConfig(**kwargs)
 
     @retry_with_backoff(max_retries=3, base_delay=2.0, max_delay=30.0)
     def _call_api(self, contents, config=None):
@@ -108,16 +141,7 @@ class GeminiProvider(LLMProvider):
             full_prompt = f"{system_prompt}\n\n{prompt}"
 
         try:
-            # Build config if tools are provided
-            config = None
-            gemini_tools = self._to_gemini_tools(tools)
-            if gemini_tools:
-                config = types.GenerateContentConfig(
-                    tools=gemini_tools,
-                    tool_config=types.ToolConfig(
-                        function_calling_config=types.FunctionCallingConfig(mode='AUTO')
-                    )
-                )
+            config = self._build_config(self._to_gemini_tools(tools))
 
             # Call the API
             response = self._call_api(full_prompt, config)
@@ -176,8 +200,16 @@ class GeminiProvider(LLMProvider):
         # raw_content lets the assistant's function-call turn round-trip back to
         # Gemini on the next request (B19). Without it, Gemini never sees that it
         # already called the tool and re-calls it (the duplicate-write bug).
+        #
+        # Robustesse: un candidat peut n'exposer AUCUNE part (SAFETY, RECITATION,
+        # MAX_TOKENS sans contenu, ou content=None). Dans ce cas `response.parts`
+        # vaut None; itérer dessus tel quel plantait avec
+        # "'NoneType' object is not iterable" et, le failover Claude étant capé,
+        # ce crash remontait en "Erreur lors de la communication avec l'IA".
         raw_content = []
-        for part in response.parts:
+        content = getattr(candidate, 'content', None)
+        parts = getattr(content, 'parts', None) if content is not None else None
+        for part in (parts or []):
             # Check for function calls
             fc = getattr(part, 'function_call', None)
             if fc:
@@ -259,36 +291,25 @@ class GeminiProvider(LLMProvider):
             )
 
         try:
-            # Build conversation content
-            contents = []
-            if system_prompt:
-                contents.append(types.Content(
-                    role="user",
-                    parts=[types.Part(text=f"[SYSTEM]\n{system_prompt}")]
-                ))
-                contents.append(types.Content(
-                    role="model",
-                    parts=[types.Part(text="Compris, je suivrai ces instructions.")]
-                ))
-
-            for msg in messages:
-                contents.append(self._message_to_content(msg))
-
+            contents = self._build_contents(messages, system_prompt)
             logger.debug(f"Gemini request: {len(contents)} content parts, tools={'yes' if tools else 'no'}")
 
-            # Build config
-            config = None
-            gemini_tools = self._to_gemini_tools(tools)
-            if gemini_tools:
-                config = types.GenerateContentConfig(
-                    tools=gemini_tools,
-                    tool_config=types.ToolConfig(
-                        function_calling_config=types.FunctionCallingConfig(mode='AUTO')
-                    )
-                )
+            # Build config (thinking_budget explicite: anti candidat vide)
+            config = self._build_config(self._to_gemini_tools(tools))
 
-            response = self._call_api(contents, config)
-            parsed = self._parse_response(response)
+            # Retry sur candidat VIDE: même avec un budget fixe, Gemini peut
+            # renvoyer par intermittence un candidat sans texte ni outil (STOP,
+            # 0 part). Un blanc = l'agent ne fait rien; on redemande jusqu'à 3x.
+            parsed = None
+            for attempt in range(3):
+                response = self._call_api(contents, config)
+                parsed = self._parse_response(response)
+                if parsed.function_calls or parsed.text.strip() or parsed.is_truncated:
+                    break
+                logger.warning(
+                    "Gemini a renvoyé un candidat vide (essai %d/3, stop=%s); nouvel essai.",
+                    attempt + 1, parsed.stop_reason,
+                )
 
             logger.debug(f"Gemini response parsed: text_len={len(parsed.text)}, function_calls={len(parsed.function_calls)}")
             return parsed
@@ -300,6 +321,111 @@ class GeminiProvider(LLMProvider):
                 is_error=True,
                 error=str(e),
             )
+
+    def _build_contents(self, messages: list[dict], system_prompt: Optional[str]) -> list:
+        """Conversation -> liste de ``Content`` Gemini (system prompt simulé en
+        tête, comme le fait generate_with_history depuis toujours)."""
+        contents = []
+        if system_prompt:
+            contents.append(types.Content(
+                role="user",
+                parts=[types.Part(text=f"[SYSTEM]\n{system_prompt}")]
+            ))
+            contents.append(types.Content(
+                role="model",
+                parts=[types.Part(text="Compris, je suivrai ces instructions.")]
+            ))
+        for msg in messages:
+            contents.append(self._message_to_content(msg))
+        return contents
+
+    def stream_with_history(
+        self,
+        messages: list[dict],
+        tools: Optional[list] = None,
+        system_prompt: Optional[str] = None,
+    ):
+        """Streaming variant of generate_with_history.
+
+        Yields {"type": "text_delta", "text": ...} per chunk and ALWAYS a
+        terminal {"type": "final", "response": LLMResponse} in the same shape as
+        generate_with_history (raw_content dict blocks for the tool round-trip).
+
+        Robustesse candidat vide: si le flux ne produit NI texte NI appel
+        d'outil (la flakiness connue de gemini-2.5-flash), on retombe sur le
+        chemin NON-streamé — qui porte le retry x3 — et on émet son texte comme
+        un unique delta. Le client voit toujours quelque chose.
+        """
+        if not self.is_available():
+            yield {"type": "final", "response": LLMResponse(
+                text="Service IA non disponible.",
+                is_error=True, error="provider_unavailable")}
+            return
+
+        text_parts: list[str] = []
+        function_calls: list[FunctionCall] = []
+        tool_use_blocks: list[dict] = []
+        stop_reason = None
+        emitted_delta = False
+        try:
+            contents = self._build_contents(messages, system_prompt)
+            config = self._build_config(self._to_gemini_tools(tools))
+            stream = self.client.models.generate_content_stream(
+                model=self.model_name, contents=contents, config=config,
+            )
+            for chunk in stream:
+                candidates = getattr(chunk, "candidates", None) or []
+                if not candidates:
+                    continue
+                candidate = candidates[0]
+                fr = getattr(candidate, "finish_reason", None)
+                if fr is not None:
+                    stop_reason = getattr(fr, "name", None) or str(fr)
+                content = getattr(candidate, "content", None)
+                parts = getattr(content, "parts", None) if content is not None else None
+                for part in (parts or []):
+                    fc = getattr(part, "function_call", None)
+                    if fc:
+                        args = dict(fc.args) if fc.args else {}
+                        function_calls.append(FunctionCall(
+                            name=fc.name, args=args, call_id=fc.name))
+                        tool_use_blocks.append(
+                            {"type": "tool_use", "name": fc.name, "input": args})
+                    piece = getattr(part, "text", None)
+                    if piece:
+                        text_parts.append(piece)
+                        emitted_delta = True
+                        yield {"type": "text_delta", "text": piece}
+        except Exception as e:  # noqa: BLE001 - fall back to the retried non-stream path
+            logger.warning(f"Gemini streaming failed; falling back to non-streaming: {e}")
+            text_parts, function_calls, tool_use_blocks = [], [], []
+
+        if not text_parts and not function_calls:
+            # Des deltas sont peut-être DÉJÀ partis (exception en plein flux):
+            # sans reset, le client concaténerait « partiel + texte complet du
+            # fallback ». stream_reset dit au client de vider la bulle d'abord.
+            if emitted_delta:
+                yield {"type": "stream_reset"}
+            response = self.generate_with_history(
+                messages, tools=tools, system_prompt=system_prompt)
+            if response.text and not response.is_error and not response.has_function_calls:
+                yield {"type": "text_delta", "text": response.text}
+            yield {"type": "final", "response": response}
+            return
+
+        text = "".join(text_parts)
+        # raw_content: un seul bloc texte consolidé (pas N micro-blocs par delta)
+        # + les tool_use, même format dict que _parse_response pour l'écho B19.
+        raw_content = ([{"type": "text", "text": text}] if text else []) + tool_use_blocks
+        parsed = LLMResponse(
+            text=text,
+            function_calls=function_calls,
+            raw_response=None,
+            raw_content=raw_content,
+            stop_reason=stop_reason,
+        )
+        log_llm_usage(parsed, provider_name=self.name)
+        yield {"type": "final", "response": parsed}
 
     # ------------------------------------------------------------------
     # Multi-turn / tool round-trip helpers (B19)

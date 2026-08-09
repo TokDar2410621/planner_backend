@@ -344,4 +344,9 @@ def test_natural_language_execution_normalizes_llm_string_days_and_duration():
 
     assert result["status"] == "unplaced"
     assert result["unplaced"]
-    assert result["unplaced"][0]["date"] == MONDAY.isoformat()
+    # "lundi" (string) doit se normaliser en un vrai lundi présent/futur. On teste
+    # l'INVARIANT (weekday + non-passé), pas une date codée en dur qui périme dès
+    # que la date du jour dépasse le lundi hardcodé.
+    resolved = date.fromisoformat(result["unplaced"][0]["date"])
+    assert resolved.weekday() == 0
+    assert resolved >= timezone.localdate()

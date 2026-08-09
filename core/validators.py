@@ -69,6 +69,26 @@ def _matches_signature(header, signatures):
     return True
 
 
+def sniff_kind(header: bytes) -> str:
+    """Return 'pdf' or 'image' from a file's leading magic bytes.
+
+    Documents are stored on Cloudinary with a neutral extension (a real .pdf
+    public_id is blocked from delivery), so the processor can no longer trust
+    the file suffix and must decide the extraction path from CONTENT. GIF is
+    accepted here (vision-readable) even though it is not in the upload
+    allowlist. Anything unrecognised defaults to 'pdf', whose pipeline itself
+    falls back to vision.
+    """
+    if header[:5] == b'%PDF-':
+        return 'pdf'
+    if (header[:8] == b'\x89PNG\r\n\x1a\n'
+            or header[:3] == b'\xff\xd8\xff'
+            or (header[:4] == b'RIFF' and header[8:12] == b'WEBP')
+            or header[:6] in (b'GIF87a', b'GIF89a')):
+        return 'image'
+    return 'pdf'
+
+
 def validate_upload_file(file):
     """Validate an uploaded file by size, extension and magic bytes.
 

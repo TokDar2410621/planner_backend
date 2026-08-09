@@ -294,6 +294,18 @@ def place_day(user, date, day_start=0, day_end=MINUTES_PER_DAY) -> list[dict]:
         end = time_to_min(block.end_time)
         duration = block.effective_duration_minutes()
         if is_overnight(block.start_time, block.end_time, block.is_night_shift):
+            duration = block.effective_duration_minutes()
+            # Si l'heure de début stockée tombe DANS un mur fixe (ex: sommeil
+            # 23:00-07:00 alors qu'un travail de nuit fixe couvre 19:00-07:00),
+            # le bloc ne peut pas commencer là. On le relocalise dans la journée
+            # comme un bloc intra-jour, au lieu de l'afficher par-dessus le mur
+            # (c'était la limite v1: le sommeil restait collé à 23:00-07:00 sous
+            # le quart). Si le début est libre, on garde le créneau overnight tel
+            # quel (cas courant, y compris un léger rognage matinal déjà toléré).
+            start_walled = _overlaps((start, start + 1), fixed)
+            if start_walled and 0 < duration <= MINUTES_PER_DAY:
+                intraday_blocks.append((block, duration, start))
+                continue
             overnight_results.append(
                 _result(
                     block,
@@ -307,9 +319,16 @@ def place_day(user, date, day_start=0, day_end=MINUTES_PER_DAY) -> list[dict]:
                     overnight_kept=True,
                 )
             )
-            todays_piece = _clip_interval(start, MINUTES_PER_DAY, day_start, day_end)
-            if todays_piece is not None:
-                taken.append(todays_piece)
+            # Un souple overnight (sommeil 23:00-07:00) occupe CE jour aux DEUX
+            # bouts: le soir (start->minuit) ET le matin (minuit->end). Sans le
+            # morceau du matin, le glouton plaçait un autre souple en pleine nuit
+            # (ex sport à 06:30, dans le sommeil).
+            evening_piece = _clip_interval(start, MINUTES_PER_DAY, day_start, day_end)
+            if evening_piece is not None:
+                taken.append(evening_piece)
+            morning_piece = _clip_interval(0, end, day_start, day_end)
+            if morning_piece is not None:
+                taken.append(morning_piece)
             continue
 
         if duration <= 0 or duration > MINUTES_PER_DAY or start + duration > MINUTES_PER_DAY:

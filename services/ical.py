@@ -117,19 +117,29 @@ def build_calendar(user, include_tasks: bool = False, cal_name: str | None = Non
         "day_of_week", "start_time"
     )
     for b in blocks:
-        start_date = _next_weekday_on_or_after(today, b.day_of_week)
+        # Fenetre de validite: bloc termine -> pas d'evenement; bloc a venir
+        # -> premiere occurrence a partir de sa start_date; end_date -> UNTIL.
+        if b.end_date and b.end_date < today:
+            continue
+        anchor = max(today, b.start_date) if b.start_date else today
+        start_date = _next_weekday_on_or_after(anchor, b.day_of_week)
+        if b.end_date and start_date > b.end_date:
+            continue
         end_date = start_date
         # Overnight block (e.g. night shift 22:00 -> 06:00): DTEND rolls to +1 day.
         if b.end_time <= b.start_time:
             end_date = start_date + timedelta(days=1)
         label = _BLOCK_TYPE_LABELS.get(b.block_type, b.block_type)
+        rrule = f"RRULE:FREQ=WEEKLY;BYDAY={_BYDAY[b.day_of_week]}"
+        if b.end_date:
+            rrule += f";UNTIL={b.end_date.strftime('%Y%m%d')}T235959"
         lines += [
             "BEGIN:VEVENT",
             f"UID:recblock-{b.id}@planner-ai",
             f"DTSTAMP:{dtstamp}",
             f"DTSTART:{_dt_floating(start_date, b.start_time)}",
             f"DTEND:{_dt_floating(end_date, b.end_time)}",
-            f"RRULE:FREQ=WEEKLY;BYDAY={_BYDAY[b.day_of_week]}",
+            rrule,
         ]
         # Occurrences ignorées (skip) -> EXDATE, pour que le calendrier abonné
         # n'affiche pas ce jour-là (heure flottante alignée sur DTSTART).

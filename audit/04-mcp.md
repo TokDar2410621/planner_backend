@@ -6,7 +6,13 @@
 
 Le serveur MCP (`mcp-server/server.py`, basé sur le SDK `mcp`/FastMCP) traduit chaque appel d'outil de Claude en un appel à l'API REST de Planner, **au nom de l'utilisateur** (jamais un compte partagé). Transport **HTTP streamable** (hébergeable sur Railway) ou **stdio** (local).
 
-### Outils exposés (8)
+### Outils exposés (24 — v2 du 2026-08-04 : +16 outils directs, `chat` passe `defer_quick_replies`)
+
+Lectures : `get_daily_brief`, `get_conflicts`, `get_streak`, `get_weekly_summary`, `list_blocks`.
+Blocs : `create_block`, `update_block`, `delete_block`, `uncomplete_block`, `skip_block_occurrence`, `restore_block_occurrence`.
+Tâches : `update_task`, `delete_task`. Actions : `rollover_missed`, `reset_day`, `undo_last_schedule_change`.
+
+### Outils v1 (8)
 
 | Outil | Action | Endpoint appelé |
 |---|---|---|

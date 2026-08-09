@@ -15,6 +15,7 @@ from services.scheduling.placement import (
     open_intervals,
     place_day,
 )
+from services.scheduling.solve_day import solve_day, solve_placement
 from .base import BaseTool, ToolResult, validate_choice
 
 DAY_NAMES = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
@@ -51,7 +52,7 @@ def _free_slots_from_intervals(intervals, min_duration: int) -> list:
 
 class GetTodayScheduleTool(BaseTool):
     name = "get_today_schedule"
-    description = "Récupère le planning complet d'aujourd'hui : blocs récurrents, tâches planifiées, et créneaux libres."
+    description = "Récupère le planning EFFECTIF d'un jour (blocs récurrents aux heures PLACÉES, tâches planifiées, créneaux libres). Consulte-le avant d'affirmer où se trouve une activité ou si elle a bougé, et parle des heures effectives — jamais de mémoire ni d'après l'historique (un bloc souple peut être placé à une autre heure que son heure habituelle)."
     parameters = {
         "type": "object",
         "properties": {
@@ -217,7 +218,7 @@ class GetWeekScheduleTool(BaseTool):
 
 class FindFreeSlotsTool(BaseTool):
     name = "find_free_slots"
-    description = "Trouve les créneaux libres sur un jour donné, avec une durée minimum optionnelle."
+    description = "Trouve les créneaux libres d'un jour (overnight-aware: un quart de nuit occupe la soirée, le travail de la veille occupe le matin), avec une durée minimum optionnelle. Appelle-le AVANT de déclarer un jour 'libre' ou de choisir un créneau toi-même (ne demande pas l'heure à l'utilisateur si tu peux la trancher)."
     parameters = {
         "type": "object",
         "properties": {
@@ -262,6 +263,52 @@ class FindFreeSlotsTool(BaseTool):
         )
 
 
+def _window_conflict(user, target_date, s, e, exclude_scheduled_id=None):
+    """ToolResult d'erreur si la fenêtre [s,e] (minutes) du jour target_date
+    chevauche un mur fixe ou le sommeil protégé; sinon None. Réutilisable pour
+    chaque moitié d'un événement ponctuel qui traverse minuit."""
+    for bs, be in fixed_busy_intervals(user, target_date, exclude_scheduled_id=exclude_scheduled_id):
+        if s < be and bs < e:
+            return ToolResult(
+                success=False,
+                data={"conflict": {"start_time": _minutes_to_str(bs), "end_time": _minutes_to_str(be)}},
+                message=(
+                    f"Ce créneau ({_minutes_to_str(s)}-{_minutes_to_str(e)}) chevauche une "
+                    f"occupation existante ({_minutes_to_str(bs)}-{_minutes_to_str(be)}). "
+                    f"Choisis un autre horaire libre."
+                ),
+            )
+    for placement in place_day(user, target_date):
+        if placement["skipped"] or placement["block_type"] != "sleep":
+            continue
+        ps = placement["start_min"]
+        pe = placement["end_min"]
+        if ps is None or pe is None:
+            continue
+        sleep_pieces = [(ps, pe)] if pe > ps else [(ps, 24 * 60), (0, pe)]
+        for bs, be in sleep_pieces:
+            if s < be and bs < e:
+                conflict_start, conflict_end = bs, be
+                for os, oe in occupied_intervals(user, target_date, 0, 24 * 60):
+                    if s < oe and os < e:
+                        conflict_start, conflict_end = os, oe
+                        break
+                return ToolResult(
+                    success=False,
+                    data={"conflict": {
+                        "start_time": _minutes_to_str(conflict_start),
+                        "end_time": _minutes_to_str(conflict_end),
+                    }},
+                    message=(
+                        f"Ce créneau ({_minutes_to_str(s)}-{_minutes_to_str(e)}) "
+                        f"chevauche le sommeil protégé "
+                        f"({_minutes_to_str(conflict_start)}-{_minutes_to_str(conflict_end)}). "
+                        f"Choisis un autre horaire libre."
+                    ),
+                )
+    return None
+
+
 class ScheduleTaskAtTool(BaseTool):
     name = "schedule_task_at"
     description = (
@@ -271,7 +318,12 @@ class ScheduleTaskAtTool(BaseTool):
         "replanification ne le bouge pas). N'utilise PAS create_block (qui crée une "
         "habitude répétée CHAQUE semaine) pour un événement ponctuel. Si l'utilisateur "
         "ne donne pas d'heure, choisis toi-même un créneau libre (find_free_slots) au "
-        "lieu de lui demander."
+        "lieu de lui demander. Pour AJUSTER un événement déjà planifié (durée/heure: "
+        "'finalement 45 min'), ré-appelle schedule_task_at avec le même titre et la "
+        "même date: ça MET À JOUR l'événement (upsert), ce n'est pas un doublon. "
+        "Gère aussi un événement qui traverse minuit (ex: quart de nuit PONCTUEL "
+        "'ce lundi 22h-06h'). Pour un quart de nuit RÉCURRENT (chaque semaine), "
+        "utilise plutôt create_block."
     )
     parameters = {
         "type": "object",
@@ -279,7 +331,7 @@ class ScheduleTaskAtTool(BaseTool):
             "title": {"type": "string", "description": "Titre de l'événement (ex: 'Lecture')."},
             "date": {"type": "string", "description": "Date de l'événement (YYYY-MM-DD). Déduis-la de la DATE du jour."},
             "start_time": {"type": "string", "description": "Heure de début (HH:MM)."},
-            "end_time": {"type": "string", "description": "Heure de fin (HH:MM), après le début."},
+            "end_time": {"type": "string", "description": "Heure de fin (HH:MM). Peut passer minuit pour un événement ponctuel qui traverse la nuit (ex: 22:00 -> 06:00)."},
             "task_type": {
                 "type": "string",
                 "enum": ["deep_work", "shallow", "errand"],
@@ -309,81 +361,101 @@ class ScheduleTaskAtTool(BaseTool):
 
         s = _time_to_minutes(start_t)
         e = _time_to_minutes(end_t)
-        if e <= s:
-            return ToolResult(
-                success=False,
-                data={},
-                message="L'heure de fin doit être après l'heure de début (un événement ponctuel ne passe pas minuit ici).",
-            )
+        if s == e:
+            return ToolResult(success=False, data={}, message="La durée doit être non nulle (fin différente du début).")
 
-        err = validate_choice(kwargs.get("task_type"), VALID_TASK_TYPES, "task_type")
-        if err:
-            return ToolResult(success=False, data={}, message=err)
+        # task_type est OPTIONNEL: un type invalide (ex: le LLM envoie 'work' pour
+        # un quart de nuit) ne doit PAS faire échouer toute la planification.
+        task_type = kwargs.get("task_type") or "shallow"
+        if task_type not in VALID_TASK_TYPES:
+            task_type = "shallow"
 
-        # Chevauchement avec les murs RÉELS du jour (fixes + blocs datés déjà
-        # planifiés), fenêtre pleine 0-24h. Les récurrents souples ne sont pas
-        # des murs: l'événement ponctuel verrouillé les fera se replacer.
-        for bs, be in fixed_busy_intervals(user, target_date):
-            if s < be and bs < e:
-                return ToolResult(
-                    success=False,
-                    data={"conflict": {"start_time": _minutes_to_str(bs), "end_time": _minutes_to_str(be)}},
-                    message=(
-                        f"Ce créneau ({_minutes_to_str(s)}-{_minutes_to_str(e)}) chevauche une "
-                        f"occupation existante ({_minutes_to_str(bs)}-{_minutes_to_str(be)}). "
-                        f"Choisis un autre horaire libre."
-                    ),
-                )
+        next_date = target_date + timedelta(days=1)
+        # Un événement qui traverse minuit (ex: quart de nuit 22h-06h) est stocké
+        # en DEUX morceaux within-day, frontend-safe: [start, 23:59] sur la date +
+        # [00:00, end] le lendemain. Chaque morceau garde fin > début (jamais
+        # end<=start, que fixed_busy_intervals lirait comme un mur toute la
+        # journée). "Fin à minuit exact" (end=00:00) n'est PAS un passage de
+        # minuit: c'est un même-jour clampé à 23:59, sans morceau du lendemain.
+        crosses_midnight = e < s and e > 0
+        main_end_t = end_t if e > s else time(23, 59)
+        main_win_end = e if e > s else 24 * 60  # le conflit du soir couvre jusqu'à minuit
+        has_main = _time_to_minutes(main_end_t) > s
 
-        # Sleep is a protected flexible block: a one-off urgent event may move
-        # ordinary flexible habits, but it must not silently eat sleep.
-        for placement in place_day(user, target_date):
-            if placement["skipped"] or placement["block_type"] != "sleep":
-                continue
-            ps = placement["start_min"]
-            pe = placement["end_min"]
-            if ps is None or pe is None:
-                continue
-            sleep_pieces = [(ps, pe)] if pe > ps else [(ps, 24 * 60), (0, pe)]
-            for bs, be in sleep_pieces:
-                if s < be and bs < e:
-                    conflict_start, conflict_end = bs, be
-                    for os, oe in occupied_intervals(user, target_date, 0, 24 * 60):
-                        if s < oe and os < e:
-                            conflict_start, conflict_end = os, oe
-                            break
-                    return ToolResult(
-                        success=False,
-                        data={
-                            "conflict": {
-                                "start_time": _minutes_to_str(conflict_start),
-                                "end_time": _minutes_to_str(conflict_end),
-                            }
-                        },
-                        message=(
-                            f"Ce créneau ({_minutes_to_str(s)}-{_minutes_to_str(e)}) "
-                            f"chevauche le sommeil protégé "
-                            f"({_minutes_to_str(conflict_start)}-"
-                            f"{_minutes_to_str(conflict_end)}). "
-                            f"Choisis un autre horaire libre."
-                        ),
-                    )
+        # Morceaux verrouillés du MÊME événement, à exclure des conflits / à
+        # réconcilier. La queue overnight commence TOUJOURS à 00:00: on la cible
+        # précisément pour ne pas toucher un autre événement du lendemain.
+        task = Task.objects.filter(user=user, completed=False, title__iexact=title).first()
+        existing_main = existing_tail = None
+        if task is not None:
+            existing_main = ScheduledBlock.objects.filter(
+                user=user, task=task, date=target_date, locked=True,
+            ).order_by("start_time", "id").first()
+            existing_tail = ScheduledBlock.objects.filter(
+                user=user, task=task, date=next_date, locked=True, start_time=time(0, 0),
+            ).order_by("id").first()
+
+        if has_main:
+            c = _window_conflict(user, target_date, s, main_win_end,
+                                 existing_main.id if existing_main is not None else None)
+            if c is not None:
+                return c
+        if crosses_midnight:
+            c = _window_conflict(user, next_date, 0, e,
+                                 existing_tail.id if existing_tail is not None else None)
+            if c is not None:
+                return c
 
         # Réutilise une tâche active du même titre (idempotence), sinon la crée.
-        task = Task.objects.filter(user=user, completed=False, title__iexact=title).first()
         if task is None:
             task = Task.objects.create(
                 user=user,
                 title=title,
-                task_type=kwargs.get("task_type", "shallow"),
+                task_type=task_type,
                 priority=kwargs.get("priority", 5),
                 description=kwargs.get("description", ""),
             )
 
-        sb = ScheduledBlock.objects.create(
-            user=user, task=task, date=target_date,
-            start_time=start_t, end_time=end_t, locked=True,
-        )
+        # Morceau principal (jour de départ): met à jour l'existant (garde l'id,
+        # upsert N06) sinon crée.
+        sb = existing_main
+        if sb is not None:
+            changed_fields = []
+            if sb.start_time != start_t:
+                sb.start_time = start_t
+                changed_fields.append("start_time")
+            if sb.end_time != main_end_t:
+                sb.end_time = main_end_t
+                changed_fields.append("end_time")
+            if not sb.locked:
+                sb.locked = True
+                changed_fields.append("locked")
+            if changed_fields:
+                sb.save(update_fields=changed_fields)
+        else:
+            sb = ScheduledBlock.objects.create(
+                user=user, task=task, date=target_date,
+                start_time=start_t, end_time=main_end_t, locked=True,
+            )
+
+        # Morceau du lendemain UNIQUEMENT si l'événement traverse minuit. Sinon on
+        # SUPPRIME une éventuelle queue orpheline d'une version overnight
+        # précédente (sinon bloc fantôme verrouillé le matin suivant, immunisé au
+        # replan).
+        if crosses_midnight:
+            if existing_tail is not None:
+                if existing_tail.end_time != end_t:
+                    existing_tail.end_time = end_t
+                    existing_tail.save(update_fields=["end_time"])
+            else:
+                ScheduledBlock.objects.create(
+                    user=user, task=task, date=next_date,
+                    start_time=time(0, 0), end_time=end_t, locked=True,
+                )
+        elif existing_tail is not None:
+            existing_tail.delete()
+
+        span = f" (traverse minuit, jusqu'au {DAY_NAMES[next_date.weekday()]})" if crosses_midnight else ""
         return ToolResult(
             success=True,
             data={"scheduled_block": {
@@ -392,9 +464,331 @@ class ScheduleTaskAtTool(BaseTool):
                 "date": target_date.isoformat(),
                 "start_time": start_t.strftime("%H:%M"),
                 "end_time": end_t.strftime("%H:%M"),
+                "overnight": crosses_midnight,
             }},
             message=(
                 f"'{task.title}' planifié le {DAY_NAMES[target_date.weekday()]} "
-                f"{target_date.isoformat()} de {start_t.strftime('%H:%M')} à {end_t.strftime('%H:%M')}."
+                f"{target_date.isoformat()} de {start_t.strftime('%H:%M')} à "
+                f"{end_t.strftime('%H:%M')}{span}."
             ),
+        )
+
+
+class CheckFeasibilityTool(BaseTool):
+    name = "check_feasibility"
+    description = (
+        "Vérifie EXACTEMENT (solveur) si un ensemble d'activités tient dans une "
+        "journée donnée, autour de l'emploi du temps existant (murs fixes + "
+        "sommeil protégé). À utiliser AVANT d'affirmer qu'une charge 'tient', "
+        "surtout sur une journée chargée: ne juge JAMAIS la faisabilité de tête. "
+        "Renvoie ce qui rentre (avec un créneau suggéré) et ce qui ne rentre pas. "
+        "Ex: 3h libres fragmentées en 3x1h ne peuvent PAS accueillir un bloc de 2h."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "date": {"type": "string", "description": "Jour à tester (YYYY-MM-DD). Déduis-le de la DATE du jour."},
+            "activities": {
+                "type": "array",
+                "description": "Activités à faire tenir ce jour-là.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "Nom de l'activité."},
+                        "duration_minutes": {"type": "integer", "description": "Durée en minutes."},
+                    },
+                    "required": ["title", "duration_minutes"],
+                },
+            },
+        },
+        "required": ["date", "activities"],
+    }
+
+    def execute(self, user: User, **kwargs) -> ToolResult:
+        try:
+            target_date = datetime.strptime(kwargs["date"], "%Y-%m-%d").date()
+        except (ValueError, KeyError, TypeError):
+            return ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.")
+
+        extra = []
+        for a in kwargs.get("activities") or []:
+            if not isinstance(a, dict):
+                continue
+            try:
+                dur = int(a.get("duration_minutes") or 0)
+            except (TypeError, ValueError):
+                dur = 0
+            if dur <= 0:
+                continue
+            extra.append({"title": a.get("title") or "Activité", "duration_minutes": dur})
+        if not extra:
+            return ToolResult(success=False, data={}, message="Aucune activité valide à tester (titre + durée en minutes).")
+
+        # Fenêtre éveillée 07h-23h (comme find_free_slots) pour ne pas proposer un
+        # créneau en pleine nuit; le sommeil reste un mur si l'utilisateur en a un.
+        result = solve_day(user, target_date, extra=extra,
+                           day_start=DAY_START_MIN, day_end=DAY_END_MIN)
+        placed = [
+            {"title": p["title"], "start_time": _minutes_to_str(p["start_min"]), "end_time": _minutes_to_str(p["end_min"])}
+            for p in result["placements"] if p["kind"] == "extra"
+        ]
+        unplaced = [
+            {"title": x["title"], "duration_minutes": x["duration"]}
+            for x in result["unplaced"] if x["key"].startswith("extra:")
+        ]
+        day_name = DAY_NAMES[target_date.weekday()]
+        placed_str = ", ".join(f"{p['title']} {p['start_time']}-{p['end_time']}" for p in placed) or "rien"
+        # C'est une VÉRIFICATION: rien n'est créé. L'agent doit ensuite créer le
+        # faisable (schedule_task_at/create_block), pas dire "j'ai planifié".
+        head = "Vérification (rien n'est encore créé):"
+        if result["feasible"]:
+            msg = f"{head} tout tient le {day_name} {target_date.isoformat()}: {placed_str}. Crée-le avec schedule_task_at."
+        else:
+            unplaced_str = ", ".join(f"{x['title']} ({x['duration_minutes']}min)" for x in unplaced)
+            msg = (
+                f"{head} tout ne tient PAS le {day_name} {target_date.isoformat()}. "
+                f"Rentre: {placed_str}. Ne rentre pas: {unplaced_str}. Propose une option (créer ce qui rentre, autre jour, durée réduite)."
+            )
+        return ToolResult(
+            success=True,
+            data={
+                "feasible": result["feasible"],
+                "placed": placed,
+                "unplaced": unplaced,
+                "date": target_date.isoformat(),
+            },
+            message=msg,
+        )
+
+
+class OrganizeDayTool(BaseTool):
+    name = "organize_day"
+    description = (
+        "Résout et RÉORGANISE de façon OPTIMALE le placement des blocs SOUPLES "
+        "d'une journée (sport, révision, repas, sommeil...) autour des murs fixes "
+        "(cours, travail) et du sommeil protégé, via un solveur exact. À utiliser "
+        "quand l'utilisateur demande d'optimiser / réorganiser / mieux agencer sa "
+        "journée, ou quand le placement laisse des trous. apply=false PROPOSE "
+        "l'arrangement sans rien changer (défaut); apply=true l'APPLIQUE en ajustant "
+        "les heures des blocs souples. Ne touche jamais aux blocs fixes."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "date": {"type": "string", "description": "Jour à réorganiser (YYYY-MM-DD). Déduis-le de la DATE du jour."},
+            "apply": {"type": "boolean", "description": "true = appliquer (déplacer les blocs); false = proposer seulement (défaut)."},
+        },
+        "required": ["date"],
+    }
+
+    def execute(self, user: User, **kwargs) -> ToolResult:
+        try:
+            target_date = datetime.strptime(kwargs["date"], "%Y-%m-%d").date()
+        except (ValueError, KeyError, TypeError):
+            return ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.")
+        apply = bool(kwargs.get("apply", False))
+
+        arrangement = solve_placement(user, target_date)  # fenêtre pleine journée
+        placed = [r for r in arrangement if not r["skipped"] and not r["overnight_kept"]]
+        overnight = [r for r in arrangement if r["overnight_kept"]]
+        skipped = [r for r in arrangement if r["skipped"]]
+
+        moved = []
+        if apply:
+            for r in placed:
+                block = RecurringBlock.objects.filter(id=r["block_id"], user=user).first()
+                if block is None:
+                    continue
+                new_start = time(r["start_min"] // 60, r["start_min"] % 60)
+                new_end = time(r["end_min"] // 60, r["end_min"] % 60)
+                if block.start_time != new_start or block.end_time != new_end:
+                    block.start_time = new_start
+                    block.end_time = new_end
+                    block.save(update_fields=["start_time", "end_time"])
+                    moved.append({"title": block.title, "start_time": r["start_time"], "end_time": r["end_time"]})
+
+        listing = ", ".join(f"{r['title']} {r['start_time']}-{r['end_time']}" for r in placed) or "rien à replacer"
+        head = "J'ai réorganisé" if apply else "Proposition (rien changé)"
+        msg = f"{head} le {DAY_NAMES[target_date.weekday()]} {target_date.isoformat()}: {listing}."
+        if skipped:
+            msg += " Non placé (journée trop pleine): " + ", ".join(r["title"] for r in skipped) + "."
+        return ToolResult(
+            success=True,
+            data={
+                "applied": apply,
+                "date": target_date.isoformat(),
+                "placed": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in placed],
+                "overnight_kept": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in overnight],
+                "skipped": [{"title": r["title"]} for r in skipped],
+                "moved": moved,
+            },
+            message=msg,
+        )
+
+
+class OptimizeWeekTool(BaseTool):
+    name = "optimize_week"
+    description = (
+        "Résout et RÉORGANISE de façon OPTIMALE les blocs SOUPLES de TOUTE LA "
+        "SEMAINE (7 jours consécutifs), jour par jour, autour des murs fixes "
+        "(cours, travail) et du sommeil protégé, via le solveur exact. À utiliser "
+        "quand l'utilisateur demande d'optimiser / réorganiser / mieux agencer sa "
+        "SEMAINE (pour UN seul jour → organize_day). apply=false PROPOSE le plan "
+        "sans rien changer (défaut); apply=true l'APPLIQUE en ajustant les heures "
+        "des blocs souples. PORTÉE: chaque bloc récurrent vit sur SON jour de "
+        "semaine et la passe hebdo le traite une seule fois; ajuster son heure "
+        "vaut pour toutes les semaines suivantes. Ne touche jamais aux blocs fixes."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "start_date": {"type": "string", "description": "Premier jour de la passe (YYYY-MM-DD). Défaut: aujourd'hui."},
+            "apply": {"type": "boolean", "description": "true = appliquer (déplacer les blocs); false = proposer seulement (défaut)."},
+        },
+        "required": [],
+    }
+
+    def execute(self, user: User, **kwargs) -> ToolResult:
+        raw = kwargs.get("start_date")
+        if raw:
+            try:
+                start = datetime.strptime(raw, "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                return ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.")
+        else:
+            start = timezone.localdate()
+        apply = bool(kwargs.get("apply", False))
+
+        days_data = []
+        lines = []
+        moved_total = 0
+        skipped_total = 0
+        for offset in range(7):
+            day = start + timedelta(days=offset)
+            arrangement = solve_placement(user, day)
+            placed = [r for r in arrangement if not r["skipped"] and not r["overnight_kept"]]
+            overnight = [r for r in arrangement if r["overnight_kept"]]
+            skipped = [r for r in arrangement if r["skipped"]]
+
+            moved = []
+            if apply:
+                for r in placed:
+                    block = RecurringBlock.objects.filter(id=r["block_id"], user=user).first()
+                    if block is None:
+                        continue
+                    new_start = time(r["start_min"] // 60, r["start_min"] % 60)
+                    new_end = time(r["end_min"] // 60, r["end_min"] % 60)
+                    if block.start_time != new_start or block.end_time != new_end:
+                        block.start_time = new_start
+                        block.end_time = new_end
+                        block.save(update_fields=["start_time", "end_time"])
+                        moved.append({"title": block.title, "start_time": r["start_time"], "end_time": r["end_time"]})
+
+            moved_total += len(moved)
+            skipped_total += len(skipped)
+            days_data.append({
+                "date": day.isoformat(),
+                "placed": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in placed],
+                "overnight_kept": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in overnight],
+                "skipped": [{"title": r["title"]} for r in skipped],
+                "moved": moved,
+            })
+            if placed or skipped:
+                seg = ", ".join(f"{r['title']} {r['start_time']}-{r['end_time']}" for r in placed) or "—"
+                line = f"{DAY_NAMES[day.weekday()]} {seg}"
+                if skipped:
+                    line += " (non placé: " + ", ".join(r["title"] for r in skipped) + ")"
+                lines.append(line)
+
+        head = "Semaine réorganisée" if apply else "Proposition pour la semaine (rien n'est encore changé)"
+        msg = f"{head}: " + ("; ".join(lines) if lines else "rien à replacer, tout est déjà bien agencé") + "."
+        if skipped_total:
+            msg += f" {skipped_total} activité(s) ne rentrent pas entièrement (journées trop pleines)."
+        return ToolResult(
+            success=True,
+            data={"applied": apply, "start_date": start.isoformat(),
+                  "days": days_data, "moved_count": moved_total, "skipped_count": skipped_total},
+            message=msg,
+        )
+
+
+class CancelScheduledBlockTool(BaseTool):
+    name = "cancel_scheduled_block"
+    description = (
+        "Annule/supprime un événement PONCTUEL déjà planifié à une date précise "
+        "(ex: 'annule mon rdv dentiste', 'enlève mon étude de demain', 'supprime "
+        "le prochain événement'). C'est l'outil pour un one-off créé par "
+        "schedule_task_at. NE l'utilise PAS pour un bloc RÉCURRENT: pour sauter UN "
+        "jour d'une série -> skip_block_occurrence; pour supprimer toute la série -> "
+        "delete_block. Résous par date (+ titre si plusieurs événements ce jour-là); "
+        "ne demande jamais d'identifiant. Si plusieurs événements distincts existent "
+        "ce jour-là sans titre fourni, l'outil renvoie la liste et te demande lequel."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "date": {"type": "string", "description": "Date de l'événement (YYYY-MM-DD)."},
+            "title": {"type": "string", "description": "Titre pour lever l'ambiguïté si plusieurs événements ce jour-là (optionnel)."},
+        },
+        "required": ["date"],
+    }
+
+    def execute(self, user: User, **kwargs) -> ToolResult:
+        try:
+            target_date = datetime.strptime(kwargs["date"], "%Y-%m-%d").date()
+        except (ValueError, KeyError, TypeError):
+            return ToolResult(success=False, data={}, message="Format de date invalide (attendu YYYY-MM-DD).")
+
+        title = (kwargs.get("title") or "").strip()
+        qs = ScheduledBlock.objects.filter(user=user, date=target_date).select_related("task")
+        if title:
+            qs = qs.filter(task__title__icontains=title)
+        blocks = list(qs)
+        if not blocks:
+            suffix = f" pour « {title} »" if title else ""
+            return ToolResult(
+                success=False, data={},
+                message=f"Aucun événement ponctuel trouvé le {target_date.isoformat()}{suffix}.",
+            )
+
+        distinct = sorted({(b.task.title if b.task else "") for b in blocks})
+        if len(distinct) > 1 and not title:
+            listing = ", ".join(t for t in distinct if t)
+            return ToolResult(
+                success=False, data={"candidates": distinct},
+                message=f"Plusieurs événements le {target_date.isoformat()}: {listing}. Lequel veux-tu annuler ?",
+            )
+
+        # Inclut la queue d'un événement ponctuel qui traverse minuit (morceau
+        # 00:00 du lendemain de la même tâche), pour ne pas laisser de résidu.
+        task_ids = {b.task_id for b in blocks if b.task_id}
+        tail = ScheduledBlock.objects.filter(
+            user=user, date=target_date + timedelta(days=1),
+            task_id__in=task_ids, start_time=time(0, 0),
+        )
+        blocks += list(tail)
+
+        cancelled = []
+        for b in blocks:
+            cancelled.append({
+                "title": (b.task.title if b.task else ""),
+                "date": b.date.isoformat(),
+                "start_time": b.start_time.strftime("%H:%M"),
+                "end_time": b.end_time.strftime("%H:%M"),
+            })
+            b.delete()
+
+        # Supprime la tâche devenue orpheline (one-off pur: plus aucun créneau,
+        # non complétée). Une tâche encore planifiée ailleurs ou complétée reste.
+        for tid in task_ids:
+            t = Task.objects.filter(id=tid, user=user).first()
+            if t and not t.completed and not ScheduledBlock.objects.filter(task=t).exists():
+                t.delete()
+
+        label = cancelled[0]["title"] or "événement"
+        extra = f" ({len(cancelled)} créneaux)" if len(cancelled) > 1 else ""
+        return ToolResult(
+            success=True,
+            data={"cancelled": cancelled},
+            message=f"Annulé: {label} le {target_date.isoformat()}{extra}.",
         )

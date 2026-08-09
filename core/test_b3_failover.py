@@ -66,6 +66,54 @@ class AgentFailoverTest(TestCase):
             ).exists()
         )
 
+    def test_empty_non_error_turn_fails_over(self):
+        # Flakiness gemini-2.5-flash: candidat 200 mais NI texte NI outil. Avant,
+        # ce tour passait le failover (is_error=False) et finissait sur le filet
+        # « reformule » — au premier message d'un nouvel utilisateur, c'est un
+        # tueur de confiance. Un tour vide doit declencher le failover.
+        empty = LLMResponse(text="", is_error=False)
+        ok = LLMResponse(text="Réponse de secours", is_error=False)
+
+        result = self._run_with(empty, ok)
+
+        self.assertEqual(result['response'], "Réponse de secours")
+
+    def test_both_empty_falls_back_to_honest_filet(self):
+        # Si meme le failover rend un tour vide, le filet assume le rate
+        # (« de mon cote ») au lieu de blamer l'utilisateur (« reformule »).
+        empty = LLMResponse(text="", is_error=False)
+
+        result = self._run_with(empty, empty)
+
+        self.assertIn("de mon côté", result['response'])
+        self.assertNotIn("reformuler", result['response'])
+
+    def test_tool_code_leak_fails_over(self):
+        # Panne Gemini « tool_code »: l'appel d'outil ecrit en pseudo-code dans
+        # le TEXTE (vecu: present_form jamais rendu, code affiche a l'ecran).
+        # Ce tour est inutilisable -> failover.
+        leak = LLMResponse(
+            text="tool_code\nprint(default_api.present_form(inputs=[...]))",
+            is_error=False,
+        )
+        ok = LLMResponse(text="Réponse de secours", is_error=False)
+
+        result = self._run_with(leak, ok)
+
+        self.assertEqual(result['response'], "Réponse de secours")
+
+    def test_tool_code_never_reaches_user_even_if_both_leak(self):
+        leak = LLMResponse(
+            text="voici:\ntool_code\nprint(default_api.create_block(...))",
+            is_error=False,
+        )
+
+        result = self._run_with(leak, leak)
+
+        self.assertNotIn("default_api", result['response'])
+        self.assertNotIn("tool_code", result['response'])
+        self.assertIn("de mon côté", result['response'])
+
     def test_both_providers_fail_does_not_persist_error_turn(self):
         err1 = LLMResponse(text="Erreur lors de la communication avec l'IA.", is_error=True)
         err2 = LLMResponse(text="Erreur Gemini.", is_error=True)

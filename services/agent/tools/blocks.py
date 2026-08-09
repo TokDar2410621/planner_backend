@@ -18,6 +18,7 @@ DAY_NAMES = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Diman
 
 # Enforced at the tool layer (not just in the JSON schema) before any write.
 VALID_BLOCK_TYPES = {c[0] for c in RecurringBlock.BLOCK_TYPE_CHOICES}
+VALID_FLEXIBILITIES = {c[0] for c in RecurringBlock.FLEXIBILITY_CHOICES}
 TITLE_MAX_LENGTH = RecurringBlock._meta.get_field("title").max_length
 LOCATION_MAX_LENGTH = RecurringBlock._meta.get_field("location").max_length
 
@@ -31,8 +32,11 @@ def _block_to_dict(block: RecurringBlock) -> dict:
         "day_name": DAY_NAMES[block.day_of_week],
         "start_time": block.start_time.strftime("%H:%M"),
         "end_time": block.end_time.strftime("%H:%M"),
+        "flexibility": block.flexibility,
         "location": block.location or None,
         "is_night_shift": block.is_night_shift,
+        "start_date": block.start_date.isoformat() if block.start_date else None,
+        "end_date": block.end_date.isoformat() if block.end_date else None,
     }
 
 
@@ -80,7 +84,7 @@ class ListBlocksTool(BaseTool):
 
 class CreateBlockTool(BaseTool):
     name = "create_block"
-    description = "Crée un ou plusieurs blocs récurrents dans le planning. Spécifie les jours comme une liste (ex: [0,1,2,3,4] pour lundi à vendredi). Un bloc séparé sera créé pour chaque jour."
+    description = "Crée un ou plusieurs blocs récurrents HEBDOMADAIRES (une habitude qui revient chaque semaine: cours, travail, sport, sommeil...). Jours = liste (ex: [0,1,2,3,4] = lundi à vendredi); un bloc séparé par jour. Appelle-le DÈS que l'utilisateur décrit un horaire habituel. N'utilise JAMAIS create_block pour un événement unique daté ('ce samedi', une date précise) -> schedule_task_at. Gère un quart de nuit récurrent qui traverse minuit (ex: travail 22:00-06:00 chaque lundi): mets start_time/end_time tels quels, le passage de minuit est détecté automatiquement. Les conflits sont détectés et renvoyés automatiquement."
     parameters = {
         "type": "object",
         "properties": {
@@ -110,9 +114,22 @@ class CreateBlockTool(BaseTool):
                 "type": "string",
                 "description": "Lieu (optionnel)",
             },
+            "flexibility": {
+                "type": "string",
+                "enum": ["fixed", "flexible"],
+                "description": "fixed si le bloc ne doit pas bouger; flexible sinon.",
+            },
             "is_night_shift": {
                 "type": "boolean",
                 "description": "Si le bloc traverse minuit (ex: travail 22h-06h)",
+            },
+            "start_date": {
+                "type": "string",
+                "description": "Premiere date d'application YYYY-MM-DD (ex: entrainements qui commencent le 24 aout). Omettre si des maintenant.",
+            },
+            "end_date": {
+                "type": "string",
+                "description": "Derniere date d'application YYYY-MM-DD (fin de session/saison). Omettre si sans fin.",
             },
         },
         "required": ["title", "block_type", "days", "start_time", "end_time"],
@@ -125,12 +142,26 @@ class CreateBlockTool(BaseTool):
         start_time = kwargs["start_time"]
         end_time = kwargs["end_time"]
         location = kwargs.get("location", "")
+        flexibility = kwargs.get("flexibility")
         is_night_shift = kwargs.get("is_night_shift", False)
+
+        from datetime import date as dt_date
+        bounds = {}
+        for key in ("start_date", "end_date"):
+            raw = str(kwargs.get(key) or "").strip()
+            if raw:
+                try:
+                    bounds[key] = dt_date.fromisoformat(raw[:10])
+                except ValueError:
+                    return ToolResult(success=False, data={}, message=f"{key} invalide: attendu YYYY-MM-DD.")
+        if bounds.get("start_date") and bounds.get("end_date") and bounds["end_date"] < bounds["start_date"]:
+            return ToolResult(success=False, data={}, message="end_date avant start_date.")
 
         # Validation choices/max_length AVANT toute écriture (le schéma JSON
         # n'est qu'indicatif pour le LLM; SQLite n'applique pas ces contraintes).
         err = (
             validate_choice(block_type, VALID_BLOCK_TYPES, "block_type")
+            or validate_choice(flexibility, VALID_FLEXIBILITIES, "flexibility")
             or validate_max_length(title, TITLE_MAX_LENGTH, "title")
             or validate_max_length(location, LOCATION_MAX_LENGTH, "location")
         )
@@ -146,7 +177,11 @@ class CreateBlockTool(BaseTool):
 
         # Détection night shift basée sur les minutes (pas une comparaison de chaînes).
         is_night_shift = is_overnight(start_t, end_t, is_night_shift)
-        nf = RecurringBlock.default_flexibility_for(block_type) == RecurringBlock.FLEXIBILITY_FLEXIBLE
+        nf = (
+            flexibility == RecurringBlock.FLEXIBILITY_FLEXIBLE
+            if flexibility
+            else RecurringBlock.default_flexibility_for(block_type) == RecurringBlock.FLEXIBILITY_FLEXIBLE
+        )
 
         created = []
         skipped = []
@@ -158,6 +193,29 @@ class CreateBlockTool(BaseTool):
                 for day in days:
                     if day < 0 or day > 6:
                         skipped.append({"day": day, "reason": "Jour invalide"})
+                        continue
+
+                    # Anti-doublon EXACT, quelle que soit la flexibilité: un bloc
+                    # souple (sommeil, repas...) échappe à find_recurring_conflicts
+                    # (new_is_flexible -> []), donc rien n'empêchait de recréer un
+                    # "Déjeuner"/"Sommeil"/cours identique. Cause des doublons vus
+                    # quand le LLM "déplace"/"annule" en recréant sans supprimer.
+                    # SANS block_type: un import classe « Entraînements » en
+                    # course/other, l'agent en sport — même titre, même jour,
+                    # mêmes heures = même bloc (vécu: paire dupliquée e2e).
+                    if RecurringBlock.objects.filter(
+                        user=user,
+                        active=True,
+                        day_of_week=day,
+                        title=title,
+                        start_time=start_t,
+                        end_time=end_t,
+                    ).exists():
+                        skipped.append({
+                            "day": day,
+                            "day_name": DAY_NAMES[day],
+                            "reason": f"'{title}' existe déjà le {DAY_NAMES[day]} à {start_time} (aucun doublon créé)",
+                        })
                         continue
 
                     # Contrôle de chevauchement (gère l'overnight, AUCUN contournement).
@@ -185,8 +243,10 @@ class CreateBlockTool(BaseTool):
                         day_of_week=day,
                         start_time=start_t,
                         end_time=end_t,
+                        flexibility=flexibility,
                         location=location,
                         is_night_shift=is_night_shift,
+                        **bounds,
                     )
                     created.append(_block_to_dict(block))
         except Exception as e:
@@ -213,7 +273,7 @@ class CreateBlockTool(BaseTool):
 
 class UpdateBlockTool(BaseTool):
     name = "update_block"
-    description = "Modifie un bloc récurrent existant (titre, horaires, lieu, etc.)."
+    description = "Modifie un bloc récurrent existant (titre, horaires, JOUR, lieu, flexibilité). Résous le bloc par son nom/jour/heure via list_blocks; ne demande JAMAIS un identifiant à l'utilisateur. Pour DÉPLACER un bloc vers un autre jour (ex: 'déplace mon cours du lundi au mardi'), passe day_of_week (0=Lundi..6=Dimanche): c'est un déplacement PROPRE en place. N'utilise JAMAIS delete_block+create_block pour déplacer (ça crée des doublons). flexibility='fixed' verrouille/protège le bloc; flexibility='flexible' le rend déplaçable. Pour annuler/ignorer UN SEUL jour, n'utilise PAS update_block -> skip_block_occurrence."
     parameters = {
         "type": "object",
         "properties": {
@@ -229,6 +289,25 @@ class UpdateBlockTool(BaseTool):
                 "type": "string",
                 "enum": ["course", "work", "sleep", "meal", "sport", "project", "revision", "other"],
             },
+            "flexibility": {
+                "type": "string",
+                "enum": ["fixed", "flexible"],
+                "description": "fixed pour verrouiller le bloc recurrent, flexible pour le rendre deplacable.",
+            },
+            "day_of_week": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 6,
+                "description": "Nouveau jour (0=Lundi..6=Dimanche) pour DÉPLACER le bloc vers ce jour, proprement, sans le recréer.",
+            },
+            "start_date": {
+                "type": "string",
+                "description": "Premiere date d'application YYYY-MM-DD; chaine vide '' pour retirer la borne.",
+            },
+            "end_date": {
+                "type": "string",
+                "description": "Derniere date d'application YYYY-MM-DD (ex: la session finit le 15 octobre); chaine vide '' pour retirer la borne.",
+            },
         },
         "required": ["block_id"],
     }
@@ -243,6 +322,7 @@ class UpdateBlockTool(BaseTool):
         # Validation choices/max_length AVANT save() (idem CreateBlockTool).
         err = (
             validate_choice(kwargs.get("block_type"), VALID_BLOCK_TYPES, "block_type")
+            or validate_choice(kwargs.get("flexibility"), VALID_FLEXIBILITIES, "flexibility")
             or validate_max_length(kwargs.get("title"), TITLE_MAX_LENGTH, "title")
             or validate_max_length(kwargs.get("location"), LOCATION_MAX_LENGTH, "location")
         )
@@ -256,17 +336,32 @@ class UpdateBlockTool(BaseTool):
         except ValueError as e:
             return ToolResult(success=False, data={}, message=str(e))
 
-        night = is_overnight(new_start, new_end, block.is_night_shift)
+        # Déplacement inter-jours propre (pas de delete+create qui duplique).
+        new_day = kwargs.get("day_of_week")
+        if new_day is None:
+            new_day = block.day_of_week
+        elif not (0 <= new_day <= 6):
+            return ToolResult(success=False, data={}, message="day_of_week invalide (0=Lundi..6=Dimanche).")
 
-        # Contrôle de chevauchement (en s'excluant soi-même).
+        night = is_overnight(new_start, new_end, block.is_night_shift)
+        new_block_type = kwargs.get("block_type") or block.block_type
+        if kwargs.get("flexibility") is not None:
+            new_flexibility = kwargs["flexibility"]
+        elif kwargs.get("block_type") is not None:
+            new_flexibility = RecurringBlock.default_flexibility_for(new_block_type)
+        else:
+            new_flexibility = block.flexibility or RecurringBlock.default_flexibility_for(new_block_type)
+        new_is_flexible = new_flexibility == RecurringBlock.FLEXIBILITY_FLEXIBLE
+
+        # Contrôle de chevauchement sur le jour CIBLE (en s'excluant soi-même).
         conflicts = find_recurring_conflicts(
             user,
-            block.day_of_week,
+            new_day,
             new_start,
             new_end,
             night,
             exclude_id=block.id,
-            new_is_flexible=block.is_flexible,
+            new_is_flexible=new_is_flexible,
         )
         if conflicts:
             o = conflicts[0]
@@ -285,9 +380,25 @@ class UpdateBlockTool(BaseTool):
             block.location = kwargs["location"]
         if kwargs.get("block_type") is not None:
             block.block_type = kwargs["block_type"]
+        from datetime import date as dt_date
+        for key in ("start_date", "end_date"):
+            if kwargs.get(key) is None:
+                continue
+            raw = str(kwargs[key]).strip()
+            if raw == "":
+                setattr(block, key, None)
+            else:
+                try:
+                    setattr(block, key, dt_date.fromisoformat(raw[:10]))
+                except ValueError:
+                    return ToolResult(success=False, data={}, message=f"{key} invalide: attendu YYYY-MM-DD.")
+        if block.start_date and block.end_date and block.end_date < block.start_date:
+            return ToolResult(success=False, data={}, message="end_date avant start_date.")
+        block.flexibility = new_flexibility
         block.start_time = new_start
         block.end_time = new_end
         block.is_night_shift = night
+        block.day_of_week = new_day
 
         block.save()
         return ToolResult(
@@ -299,7 +410,7 @@ class UpdateBlockTool(BaseTool):
 
 class DeleteBlockTool(BaseTool):
     name = "delete_block"
-    description = "Supprime un bloc récurrent du planning."
+    description = "Supprime TOUTE la série d'un bloc récurrent. Résous le bloc par nom/jour/heure; ne demande jamais d'identifiant à l'utilisateur. Pour annuler un seul jour, utilise skip_block_occurrence, PAS delete_block."
     parameters = {
         "type": "object",
         "properties": {
