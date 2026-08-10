@@ -997,6 +997,37 @@ class DailyBrainReport(models.Model):
         return f"DailyBrain {self.user.username} {self.date}"
 
 
+class PushSendLog(models.Model):
+    """Journal anti-doublon des pushs planifies (rappels et departs).
+
+    Le worker de rappels tourne desormais en fenetres qui se CHEVAUCHENT
+    (retro-regard de 12 min contre les fissures entre ticks: un bloc de
+    10:00 pile pouvait tomber entre deux fenetres et n'etre JAMAIS notifie,
+    vecu 2026-08-09). Ce journal garantit UN push par occurrence.
+    """
+
+    KIND_CHOICES = [
+        ('block_soon', 'Bloc bientot'),
+        ('block_prep', 'Bloc preparation'),
+        ('block_leave', 'Bloc depart'),
+        ('task_prep', 'Tache preparation'),
+        ('task_leave', 'Tache depart'),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='push_send_logs')
+    kind = models.CharField(max_length=24, choices=KIND_CHOICES)
+    ref = models.CharField(max_length=40)
+    date = models.DateField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('user', 'kind', 'ref', 'date')
+        indexes = [models.Index(fields=['user', 'date'])]
+
+    def __str__(self):
+        return f'{self.user_id}:{self.kind}:{self.ref}@{self.date}'
+
+
 class McpOAuthCode(models.Model):
     """Code d'autorisation OAuth éphémère pour la connexion MCP « comme Gridar »
     (Claude ouvre planneria.app/mcp-authorize, l'utilisateur clique Autoriser,

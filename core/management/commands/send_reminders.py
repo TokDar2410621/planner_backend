@@ -1,29 +1,65 @@
 """
-Send Web Push reminders + departure alerts for recurring blocks.
+Send Web Push reminders + departure alerts for recurring blocks and tasks.
 
-Run on a Railway cron at the same cadence as --lead (e.g. every 15 min with
---lead 15). Two passes:
-  1. "Bientôt : <bloc>" when a block starts within --lead minutes.
-  2. Departure alerts for blocks tied to a place (spec §9): "commence à te
-     préparer" at début_indisponibilité, "pars maintenant" at l'heure limite de
-     départ, computed from the commute engine (trajet + marge + préparation).
+Boucle worker (railway.toml): toutes les ~10 min avec --lead 15. La fenêtre
+regarde EN ARRIÈRE (12 min) et EN AVANT (--lead): les fenêtres consécutives se
+chevauchent volontairement, et le journal PushSendLog garantit UN push par
+occurrence. Sans ça, un bloc démarrant à l'heure pile pouvait tomber dans la
+fissure entre deux ticks et n'être JAMAIS notifié (vécu 2026-08-09: une seule
+notification sur toute une journée de blocs).
+
+Trois passes:
+  1. "Bientôt : <bloc>" quand un bloc récurrent démarre dans la fenêtre.
+  2. Alertes de départ des blocs liés à un lieu (préparation + départ).
+  3. Alertes de départ des tâches planifiées liées à un lieu.
 
 Degrades silently if push is not configured.
 """
-from datetime import timedelta
+from datetime import datetime, time as dt_time, timedelta
 
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
-from core.models import PushSubscription, RecurringBlock, ScheduledBlock
+from core.models import PushSendLog, PushSubscription, RecurringBlock, ScheduledBlock
 from services.commute import commute_window
 from services.push import push_configured, send_to_user
+
+# Rétro-regard: assez large pour couvrir la dérive des ticks (durée d'exécution
+# qui s'ajoute au sleep), plus courte que l'intervalle de deux ticks + lead.
+LOOKBACK_MINUTES = 12
 
 
 def _fmt(minutes: int) -> str:
     """Minutes-since-midnight -> 'HH:MM' (clamped to the day)."""
     minutes = max(0, min(minutes, 23 * 60 + 59))
     return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def _window_segments(now, lead: int):
+    """Découpe [now - LOOKBACK, now + lead] en segments par jour calendaire.
+
+    Chaque segment: (date_occurrence, heure_debut, heure_fin). Deux segments
+    quand la fenêtre traverse minuit (l'ancien code SAUTAIT ces ticks: les
+    blocs de début de nuit n'étaient jamais rappelés).
+    """
+    start_dt = now - timedelta(minutes=LOOKBACK_MINUTES)
+    end_dt = now + timedelta(minutes=lead)
+    segments = []
+    day = start_dt.date()
+    while day <= end_dt.date():
+        seg_start = start_dt.timetz() if day == start_dt.date() else dt_time.min
+        seg_end = end_dt.timetz() if day == end_dt.date() else dt_time.max
+        segments.append((day, seg_start, seg_end))
+        day += timedelta(days=1)
+    return segments
+
+
+def _once(user, kind: str, ref, occ_date) -> bool:
+    """True si ce push n'a pas encore été envoyé pour cette occurrence."""
+    _, created = PushSendLog.objects.get_or_create(
+        user=user, kind=kind, ref=str(ref), date=occ_date
+    )
+    return created
 
 
 class Command(BaseCommand):
@@ -40,44 +76,44 @@ class Command(BaseCommand):
         lead = opts["lead"]
         now = timezone.localtime()
         now_min = now.hour * 60 + now.minute
-        end_min = now_min + lead
-        if end_min >= 24 * 60:
-            # Window crosses midnight; skip this edge for the simple v1 cron.
-            self.stdout.write("Reminder window crosses midnight; skipped.")
-            return
+        win_start_min = max(0, now_min - LOOKBACK_MINUTES)
+        end_min = min(24 * 60 - 1, now_min + lead)
 
         from services.webhooks import dispatch
 
         user_ids = list(
             PushSubscription.objects.values_list("user_id", flat=True).distinct()
         )
-        start = now.time()
-        end = (now + timedelta(minutes=lead)).time()
 
         # --- Pass 1: "Bientôt" reminders (block starting within the window) ----
-        blocks = RecurringBlock.objects.filter(
-            RecurringBlock.bounds_filter(now.date()),
-            user_id__in=user_ids,
-            active=True,
-            day_of_week=now.weekday(),
-            start_time__gte=start,
-            start_time__lte=end,
-        ).select_related("user")
-
+        matched = 0
         sent = 0
-        for block in blocks:
-            body = f"{block.title} à {block.start_time.strftime('%H:%M')}"
-            if block.location:
-                body += f" ({block.location})"
-            sent += send_to_user(block.user, f"Bientôt : {block.title}", body, url="/schedule")
-            dispatch(block.user, "reminder.sent", {
-                "block": {
-                    "id": block.id,
-                    "title": block.title,
-                    "start_time": block.start_time.strftime("%H:%M"),
-                    "location": block.location,
-                },
-            })
+        for occ_date, seg_start, seg_end in _window_segments(now, lead):
+            blocks = RecurringBlock.objects.filter(
+                RecurringBlock.bounds_filter(occ_date),
+                user_id__in=user_ids,
+                active=True,
+                day_of_week=occ_date.weekday(),
+                start_time__gte=seg_start,
+                start_time__lte=seg_end,
+            ).select_related("user")
+
+            for block in blocks:
+                matched += 1
+                if not _once(block.user, "block_soon", block.id, occ_date):
+                    continue
+                body = f"{block.title} à {block.start_time.strftime('%H:%M')}"
+                if block.location:
+                    body += f" ({block.location})"
+                sent += send_to_user(block.user, f"Bientôt : {block.title}", body, url="/schedule")
+                dispatch(block.user, "reminder.sent", {
+                    "block": {
+                        "id": block.id,
+                        "title": block.title,
+                        "start_time": block.start_time.strftime("%H:%M"),
+                        "location": block.location,
+                    },
+                })
 
         # --- Pass 2: departure alerts for blocks tied to a place --------------
         prep_alerts = leave_alerts = 0
@@ -103,7 +139,9 @@ class Command(BaseCommand):
             )
 
             # "Commence à te préparer" when prep-start falls in this window.
-            if now_min <= w.unavailability_start <= end_min:
+            if win_start_min <= w.unavailability_start <= end_min and _once(
+                block.user, "block_prep", block.id, now.date()
+            ):
                 prep_alerts += send_to_user(
                     block.user,
                     "Prépare-toi",
@@ -113,7 +151,9 @@ class Command(BaseCommand):
                 )
 
             # "Pars maintenant" when the latest-departure time falls in the window.
-            if now_min <= w.departure <= end_min:
+            if win_start_min <= w.departure <= end_min and _once(
+                block.user, "block_leave", block.id, now.date()
+            ):
                 leave_alerts += send_to_user(
                     block.user,
                     "Pars maintenant",
@@ -147,7 +187,9 @@ class Command(BaseCommand):
             label = sb.task.title
             place_name = sb.task.place.name
 
-            if now_min <= w.unavailability_start <= end_min:
+            if win_start_min <= w.unavailability_start <= end_min and _once(
+                sb.user, "task_prep", sb.id, now.date()
+            ):
                 task_prep += send_to_user(
                     sb.user,
                     "Prépare-toi",
@@ -156,7 +198,9 @@ class Command(BaseCommand):
                     url="/schedule",
                 )
 
-            if now_min <= w.departure <= end_min:
+            if win_start_min <= w.departure <= end_min and _once(
+                sb.user, "task_leave", sb.id, now.date()
+            ):
                 task_leave += send_to_user(
                     sb.user,
                     "Pars maintenant",
@@ -166,7 +210,7 @@ class Command(BaseCommand):
                 )
 
         self.stdout.write(
-            f"Reminders: {blocks.count()} bloc(s), {sent} push. "
+            f"Reminders: {matched} bloc(s), {sent} push. "
             f"Départs blocs: {prep_alerts} prépa, {leave_alerts} départ. "
             f"Départs tâches: {task_prep} prépa, {task_leave} départ."
         )

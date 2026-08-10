@@ -13,7 +13,7 @@ builder = "nixpacks"
 # boucle (equivalent d'un cron */15): rappels push + alertes de depart toutes
 # les 15 min. POSIX sh only. `|| true` = une iteration ratee ne tue pas la
 # boucle.
-startCommand = "bash -c 'if [ \"$RAILWAY_SERVICE_NAME\" = \"send-reminders\" ]; then while true; do python manage.py send_reminders --lead 15 || true; python manage.py daily_brain || true; sleep 900; done; else python manage.py migrate --noinput && python manage.py collectstatic --noinput && exec gunicorn planner.wsgi:application -k gevent -w ${WEB_CONCURRENCY:-3} -b 0.0.0.0:${PORT:-8000} --timeout 120; fi'"
+startCommand = "bash -c 'if [ \"$RAILWAY_SERVICE_NAME\" = \"send-reminders\" ]; then while true; do python manage.py send_reminders --lead 15 || true; python manage.py daily_brain || true; sleep 600; done; else python manage.py migrate --noinput && python manage.py collectstatic --noinput && exec gunicorn planner.wsgi:application -k gevent -w ${WEB_CONCURRENCY:-3} -b 0.0.0.0:${PORT:-8000} --timeout 120; fi'"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
 
