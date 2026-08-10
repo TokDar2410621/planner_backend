@@ -50,3 +50,20 @@ class SchedulePlaceTest(TestCase):
         }, format='json')
         self.assertEqual(resp.status_code, 400)
         self.assertFalse(ScheduledBlock.objects.filter(user=self.user).exists())
+
+    def test_conflict_names_the_actual_item(self):
+        # Vécu 2026-08-09: le refus annonçait l'union fusionnée de la journée
+        # (« 08:00-21:30 ») pour un trou de 15 min. Le message doit nommer
+        # l'occupation réelle et sa vraie plage.
+        self.client.post('/api/schedule/place/', {
+            'title': 'Reunion equipe', 'date': '2026-09-03',
+            'start_time': '11:00', 'end_time': '13:00',
+        }, format='json')
+        resp = self.client.post('/api/schedule/place/', {
+            'title': 'Pause cafe', 'date': '2026-09-03',
+            'start_time': '12:15', 'end_time': '12:30',
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+        msg = resp.json()['message']
+        self.assertIn('Reunion equipe', msg)
+        self.assertIn('11:00-13:00', msg)

@@ -263,19 +263,55 @@ class FindFreeSlotsTool(BaseTool):
         )
 
 
+def _first_conflicting_item(user, target_date, s, e, exclude_scheduled_id=None):
+    """(titre, start_min, end_min) du premier élément REEL qui chevauche
+    [s,e], ou None. fixed_busy_intervals renvoie l'union FUSIONNÉE de la
+    journée (vécu: refus « chevauche 08:00-21:30 » pour un trou de 15 min,
+    illisible et faux): on nomme l'occupation précise à la place."""
+    from core.models import RecurringBlock, ScheduledBlock
+    items = []
+    qs = ScheduledBlock.objects.filter(user=user, date=target_date).select_related('task')
+    if exclude_scheduled_id is not None:
+        qs = qs.exclude(id=exclude_scheduled_id)
+    for sb in qs:
+        bs = sb.start_time.hour * 60 + sb.start_time.minute
+        be = sb.end_time.hour * 60 + sb.end_time.minute
+        if be <= bs:
+            be = 24 * 60
+        items.append((sb.task.title, bs, be))
+    for b in RecurringBlock.objects.filter(
+        RecurringBlock.bounds_filter(target_date),
+        user=user, active=True, flexibility='fixed',
+        day_of_week=target_date.weekday(),
+    ):
+        bs = b.start_time.hour * 60 + b.start_time.minute
+        be = b.end_time.hour * 60 + b.end_time.minute
+        if be <= bs:
+            be = 24 * 60
+        items.append((b.title, bs, be))
+    hits = [it for it in items if s < it[2] and it[1] < e]
+    return min(hits, key=lambda it: it[1]) if hits else None
+
+
 def _window_conflict(user, target_date, s, e, exclude_scheduled_id=None):
     """ToolResult d'erreur si la fenêtre [s,e] (minutes) du jour target_date
     chevauche un mur fixe ou le sommeil protégé; sinon None. Réutilisable pour
     chaque moitié d'un événement ponctuel qui traverse minuit."""
     for bs, be in fixed_busy_intervals(user, target_date, exclude_scheduled_id=exclude_scheduled_id):
         if s < be and bs < e:
+            item = _first_conflicting_item(user, target_date, s, e, exclude_scheduled_id)
+            if item:
+                title, ibs, ibe = item
+                label = f"« {title} » ({_minutes_to_str(ibs)}-{_minutes_to_str(ibe)})"
+                bs, be = ibs, ibe
+            else:
+                label = f"une occupation existante ({_minutes_to_str(bs)}-{_minutes_to_str(be)})"
             return ToolResult(
                 success=False,
                 data={"conflict": {"start_time": _minutes_to_str(bs), "end_time": _minutes_to_str(be)}},
                 message=(
-                    f"Ce créneau ({_minutes_to_str(s)}-{_minutes_to_str(e)}) chevauche une "
-                    f"occupation existante ({_minutes_to_str(bs)}-{_minutes_to_str(be)}). "
-                    f"Choisis un autre horaire libre."
+                    f"Ce créneau ({_minutes_to_str(s)}-{_minutes_to_str(e)}) chevauche "
+                    f"{label}. Choisis un autre horaire libre."
                 ),
             )
     for placement in place_day(user, target_date):
