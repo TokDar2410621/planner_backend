@@ -155,3 +155,65 @@ class GoalApiTests(TestCase):
         self.assertEqual(len(self.client_.get('/api/goals/?status=paused').json()['results']), 1)
         self.assertEqual(len(self.client_.get('/api/goals/?type=long_term').json()['results']), 1)
         self.assertEqual(len(self.client_.get('/api/goals/').json()['results']), 2)
+
+    # --- PUT complet ----------------------------------------------------------
+
+    def test_un_put_sans_type_ne_remet_pas_court_terme(self):
+        """Un `default` sur le serializer rendrait « champ absent » = short_term.
+
+        Le PUT laisse tranquilles les autres champs omis; il n'y a aucune raison
+        qu'il rétrograde le type d'un objectif long terme en silence.
+        """
+        goal = Goal.objects.create(user=self.user, title='A', goal_type='long_term')
+        r = self.client_.put(f'/api/goals/{goal.id}/', {'title': 'A'}, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        goal.refresh_from_db()
+        self.assertEqual(goal.goal_type, 'long_term')
+
+    # --- Effacement de champs -------------------------------------------------
+
+    def test_on_peut_effacer_une_echeance(self):
+        """`deadline: null` doit vider le champ, pas être refusé."""
+        goal = Goal.objects.create(
+            user=self.user, title='A', goal_type='short_term', deadline='2026-08-25'
+        )
+        r = self.client_.patch(f'/api/goals/{goal.id}/', {'deadline': None}, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        goal.refresh_from_db()
+        self.assertIsNone(goal.deadline)
+
+    def test_on_peut_effacer_une_description(self):
+        goal = Goal.objects.create(
+            user=self.user, title='A', goal_type='short_term', description='du texte'
+        )
+        r = self.client_.patch(f'/api/goals/{goal.id}/', {'description': ''}, format='json')
+        self.assertEqual(r.status_code, 200, r.content)
+        goal.refresh_from_db()
+        self.assertEqual(goal.description, '')
+
+    # --- Ce que la reprise du localStorage envoie ------------------------------
+
+    def test_un_titre_de_plus_de_200_caracteres_est_refuse_proprement(self):
+        """Le store local n'imposait aucune longueur: le front rabote avant d'envoyer.
+
+        Ce test fixe le comportement serveur pour que le rabotage côté client
+        reste justifié, et documente que le refus est un 400 et non un 500.
+        """
+        r = self.client_.post(
+            '/api/goals/', {'title': 'x' * 201, 'type': 'short_term'}, format='json'
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_une_echeance_chaine_vide_est_refusee(self):
+        """Cas réel du vieux formulaire. Le front envoie null; '' rend bien 400."""
+        r = self.client_.post(
+            '/api/goals/', {'title': 'A', 'type': 'short_term', 'deadline': ''}, format='json'
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_une_echeance_nulle_est_acceptee(self):
+        r = self.client_.post(
+            '/api/goals/', {'title': 'A', 'type': 'short_term', 'deadline': None}, format='json'
+        )
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertIsNone(r.json()['deadline'])

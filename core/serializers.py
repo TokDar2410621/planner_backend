@@ -451,10 +451,16 @@ class GoalSerializer(serializers.ModelSerializer):
     TypeScript côté front. `source` fait le pont vers le champ du modèle.
     """
 
+    # `required=False` sans `default`: un `default` rend le champ absent
+    # ÉQUIVALENT à « short_term », donc un PUT qui omet `type` remettrait
+    # silencieusement un objectif long terme en court terme, alors qu'il laisse
+    # les autres champs omis tranquilles. Sans default, un champ absent
+    # n'atteint pas validated_data: à la création le modèle applique le sien, à
+    # la mise à jour la valeur existante est conservée.
     type = serializers.ChoiceField(
         source='goal_type',
         choices=Goal.GOAL_TYPE_CHOICES,
-        default='short_term',
+        required=False,
     )
 
     class Meta:
