@@ -43,6 +43,7 @@ from .views import (
     RecurringBlockCompletionViewSet,
     RecurringBlockExceptionViewSet,
     TaskViewSet,
+    GoalViewSet,
     # Schedule
     ScheduleView,
     ScheduleGenerateView,
@@ -78,6 +79,7 @@ router.register(r'recurring-blocks', RecurringBlockViewSet, basename='recurring-
 router.register(r'recurring-completions', RecurringBlockCompletionViewSet, basename='recurring-completion')
 router.register(r'recurring-exceptions', RecurringBlockExceptionViewSet, basename='recurring-exception')
 router.register(r'tasks', TaskViewSet, basename='task')
+router.register(r'goals', GoalViewSet, basename='goal')
 
 urlpatterns = [
     # Auth endpoints

@@ -17,6 +17,7 @@ from .models import (
     ScheduledBlock,
     ConversationMessage,
     SharedSchedule,
+    Goal,
 )
 
 
@@ -434,6 +435,59 @@ class TaskCompleteSerializer(serializers.Serializer):
     """Serializer for completing a task."""
 
     actual_duration_minutes = serializers.IntegerField(required=False, min_value=1)
+
+
+class GoalSerializer(serializers.ModelSerializer):
+    """Serializer for Goal model.
+
+    Les objectifs existaient en base et alimentaient l'agent (contexte du jour,
+    cerveau quotidien) mais n'avaient AUCUNE route REST: la page Objectifs
+    tenait tout dans un store local. Un objectif créé par l'agent ou par le MCP
+    restait donc invisible dans l'interface, et un objectif créé dans
+    l'interface était invisible pour l'agent. Cette classe branche les deux
+    bouts sur la même table.
+
+    `type` plutôt que `goal_type`: c'est le nom qu'utilise déjà le contrat
+    TypeScript côté front. `source` fait le pont vers le champ du modèle.
+    """
+
+    type = serializers.ChoiceField(
+        source='goal_type',
+        choices=Goal.GOAL_TYPE_CHOICES,
+        default='short_term',
+    )
+
+    class Meta:
+        model = Goal
+        fields = [
+            'id',
+            'title',
+            'description',
+            'type',
+            'deadline',
+            'progress',
+            'status',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate_progress(self, value):
+        # Le modèle clamp déjà dans save(), mais une CheckConstraint en base
+        # rendrait un 500 là où l'API doit répondre 400.
+        if value < 0 or value > 100:
+            raise serializers.ValidationError("La progression doit être entre 0 et 100.")
+        return value
+
+    def validate(self, attrs):
+        # 100% et « actif » sont contradictoires. L'agent applique déjà cette
+        # règle dans update_goal; l'API la tient aussi pour que les deux
+        # chemins d'écriture produisent le même état.
+        progress = attrs.get('progress', getattr(self.instance, 'progress', 0))
+        status_value = attrs.get('status', getattr(self.instance, 'status', 'active'))
+        if progress >= 100 and status_value == 'active':
+            attrs['status'] = 'completed'
+        return attrs
 
 
 class ScheduledBlockSerializer(serializers.ModelSerializer):

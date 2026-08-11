@@ -33,6 +33,7 @@ from .models import (
     TaskHistory,
     SharedSchedule,
     McpOAuthCode,
+    Goal,
 )
 from .serializers import (
     UserSerializer,
@@ -54,6 +55,7 @@ from .serializers import (
     OnboardingStatusSerializer,
     SharedScheduleSerializer,
     CreateShareSerializer,
+    GoalSerializer,
 )
 from services import DocumentProcessor, AIScheduler
 from services.ai_insights import AIInsightsService
@@ -1121,6 +1123,33 @@ class RecurringBlockExceptionViewSet(viewsets.ModelViewSet):
 
 
 # ============== Task Views ==============
+
+class GoalViewSet(viewsets.ModelViewSet):
+    """CRUD des objectifs.
+
+    Le queryset est filtré sur `request.user`: `get_object()` traverse ce même
+    queryset, donc un id qui appartient à quelqu'un d'autre rend 404, pas 403
+    (pas d'énumération d'ids).
+    """
+
+    serializer_class = GoalSerializer
+
+    def get_queryset(self):
+        queryset = Goal.objects.filter(user=self.request.user)
+
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+
+        goal_type = self.request.query_params.get('type')
+        if goal_type:
+            queryset = queryset.filter(goal_type=goal_type)
+
+        return queryset
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
+
 
 class TaskViewSet(viewsets.ModelViewSet):
     """ViewSet for task management."""
