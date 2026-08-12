@@ -318,6 +318,48 @@ class MeView(APIView):
         return Response(UserSerializer(request.user).data)
 
 
+class DeleteAccountView(APIView):
+    """Suppression definitive du compte, depuis l'app.
+
+    Exigence App Store 5.1.1(v): une app qui permet de creer un compte doit
+    permettre de le SUPPRIMER, dans l'app — pas par courriel, pas par
+    formulaire externe. Le reviewer le teste systematiquement.
+
+    Garde-fou: le client doit envoyer confirmation="SUPPRIMER". Pas de mot de
+    passe exige, car les comptes Google/Apple n'en ont pas d'utilisable — le
+    type-to-confirm est le denominateur commun des trois modes de connexion.
+
+    Toutes les FK vers User sont en CASCADE (verifie ligne a ligne dans
+    models.py): profil, blocs, taches, placements, objectifs, conversations,
+    documents, partages, connexions sociales, webhooks, abonnements push,
+    jetons MCP. Un seul user.delete() emporte tout. Les fichiers uploades
+    (stockage externe) sont retires AVANT, en best-effort: un orphelin de
+    stockage vaut mieux qu'une suppression de compte qui echoue.
+    """
+
+    def post(self, request):
+        if request.data.get('confirmation') != 'SUPPRIMER':
+            return Response(
+                {'error': 'Confirmation invalide. Envoyer confirmation="SUPPRIMER".'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = request.user
+        username = user.username
+
+        # Fichiers du stockage externe: best-effort, jamais bloquant.
+        for doc in user.documents.all():
+            try:
+                if doc.file:
+                    doc.file.delete(save=False)
+            except Exception as e:
+                logger.warning(f"Fichier non supprime pour {username}: {e}")
+
+        user.delete()
+        logger.info(f"Compte supprime a la demande de l'utilisateur: {username}")
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 class McpTokenView(APIView):
     """Long-lived per-user API token for the MCP server.
 
