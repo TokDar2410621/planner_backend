@@ -213,6 +213,16 @@ if not DEBUG:
 
 # Google OAuth
 GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID', '')
+# Audiences Google ACCEPTEES pour l'ID token. Le web envoie aud=client web;
+# l'app iOS native (GoogleSignIn SDK via serverClientID) envoie aussi le client
+# web en principe, mais accepter une liste protege un cycle TestFlight si un
+# token arrive avec l'audience du client iOS. Extensible par la variable
+# d'environnement GOOGLE_EXTRA_CLIENT_IDS (liste separee par des virgules).
+GOOGLE_ALLOWED_CLIENT_IDS = [
+    cid.strip()
+    for cid in ([GOOGLE_CLIENT_ID] + os.getenv('GOOGLE_EXTRA_CLIENT_IDS', '').split(','))
+    if cid.strip()
+]
 # Sign in with Apple audience(s): web Services ID and/or native bundle ID,
 # comma-separated (e.g. "com.planner.web,com.planner.app").
 APPLE_CLIENT_ID = os.getenv('APPLE_CLIENT_ID', '')

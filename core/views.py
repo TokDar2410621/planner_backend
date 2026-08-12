@@ -519,8 +519,10 @@ class GoogleAuthView(APIView):
 
             google_data = google_response.json()
 
-            # Verify the token is for our app
-            if google_data.get('aud') != settings.GOOGLE_CLIENT_ID:
+            # Verify the token is for our app. Liste et non valeur unique: le
+            # web envoie l'audience du client web, l'app iOS native peut
+            # envoyer celle du client iOS.
+            if google_data.get('aud') not in settings.GOOGLE_ALLOWED_CLIENT_IDS:
                 return Response(
                     {'error': 'Token non autorise pour cette application.'},
                     status=status.HTTP_401_UNAUTHORIZED
