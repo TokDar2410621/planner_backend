@@ -180,6 +180,12 @@ CORS_ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:5173,http://localhost:8081,https://day-wise-bot.vercel.app').split(',')
 ]
+# La coque native Capacitor sert le bundle depuis sa propre origine, pas depuis
+# planneria.app: `capacitor://localhost` sur iOS (WKWebView), `https://localhost`
+# sur Android. Sans elles, TOUTES les requetes de l'app installee meurent en
+# preflight, y compris /auth/login/. Ajoutees en dur et pas via la variable
+# d'environnement: elles font partie du produit, pas de la config d'un deploiement.
+CORS_ALLOWED_ORIGINS += ['capacitor://localhost', 'https://localhost']
 CORS_ALLOW_CREDENTIALS = True
 
 # ============== Security hardening (S5) ==============
