@@ -226,6 +226,12 @@ GOOGLE_ALLOWED_CLIENT_IDS = [
 # Sign in with Apple audience(s): web Services ID and/or native bundle ID,
 # comma-separated (e.g. "com.planner.web,com.planner.app").
 APPLE_CLIENT_ID = os.getenv('APPLE_CLIENT_ID', '')
+# Revocation Sign in with Apple (exigence Apple liee a la suppression de
+# compte): cle « Sign in with Apple » du portail developpeur. Le .p8 complet
+# vit dans la variable d'environnement, jamais dans le depot.
+APPLE_SIGNIN_KEY_ID = os.getenv('APPLE_SIGNIN_KEY_ID', '')
+APPLE_SIGNIN_PRIVATE_KEY = os.getenv('APPLE_SIGNIN_PRIVATE_KEY', '')
+APPLE_TEAM_ID = os.getenv('APPLE_TEAM_ID', '')
 
 # ============== Web Push (VAPID) ==============
 # Push notifications for the PWA and downstream apps. Generate a keypair once

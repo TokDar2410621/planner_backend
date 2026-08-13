@@ -80,6 +80,13 @@ class UserProfile(models.Model):
         default=False,
         help_text="Autorise le partage public du planning via /planning/<username>/"
     )
+    # Sign in with Apple: refresh token obtenu a la connexion (echange du code
+    # d'autorisation) et REVOQUE a la suppression du compte — exigence Apple
+    # depuis 2022 pour toute app offrant SIWA + suppression. `apple_client_id`
+    # memorise l'audience du flux (Services ID web ou bundle id natif): la
+    # revocation doit utiliser le meme client que l'echange.
+    apple_refresh_token = models.TextField(blank=True, default='')
+    apple_client_id = models.CharField(max_length=255, blank=True, default='')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

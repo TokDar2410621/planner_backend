@@ -347,6 +347,18 @@ class DeleteAccountView(APIView):
         user = request.user
         username = user.username
 
+        # Exigence Apple: revoquer les jetons Sign in with Apple AVANT
+        # d'effacer le compte. Best-effort — un endpoint Apple en panne ne
+        # doit pas rendre la suppression impossible.
+        try:
+            profile = user.profile
+            if profile.apple_refresh_token and profile.apple_client_id:
+                from services.apple_revocation import revoke_refresh_token
+                revoked = revoke_refresh_token(profile.apple_refresh_token, profile.apple_client_id)
+                logger.info('Revocation Apple pour %s: %s', username, 'ok' if revoked else 'echec (non bloquant)')
+        except Exception as e:  # noqa: BLE001
+            logger.warning('Revocation Apple sautee pour %s: %s', username, e)
+
         # Fichiers du stockage externe: best-effort, jamais bloquant.
         for doc in user.documents.all():
             try:
@@ -635,6 +647,22 @@ class AppleAuthView(APIView):
         last_name = (name.get('lastName') or name.get('family_name') or '') if isinstance(name, dict) else ''
 
         user, created = resolve_social_user(email, first_name=first_name, last_name=last_name)
+
+        # Exigence Apple (suppression de compte): garder de quoi REVOQUER.
+        # Le client envoie le code d'autorisation; on l'echange contre un
+        # refresh token, stocke sur le profil avec l'audience du flux (web ou
+        # natif) — la revocation devra utiliser le meme client_id. Best-effort:
+        # un echange rate ne bloque jamais la connexion.
+        auth_code = request.data.get('authorization_code') or ''
+        if auth_code:
+            from services.apple_revocation import exchange_authorization_code, revocation_configured
+            if revocation_configured():
+                token = exchange_authorization_code(auth_code, claims.get('aud', ''))
+                if token:
+                    profile = user.profile
+                    profile.apple_refresh_token = token
+                    profile.apple_client_id = claims.get('aud', '')
+                    profile.save(update_fields=['apple_refresh_token', 'apple_client_id'])
 
         refresh = RefreshToken.for_user(user)
         return Response({
