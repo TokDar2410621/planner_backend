@@ -2138,6 +2138,50 @@ class PushTestView(APIView):
         return Response({"sent": sent})
 
 
+class PushSendView(APIView):
+    """Send an arbitrary push notification to the current user's devices.
+
+    Porte d'entrée unique pour l'agent IA et les clients MCP: un POST
+    {title?, body} part vers TOUS les abonnements Web Push de l'utilisateur.
+    """
+
+    # Bornes partagées avec l'outil agent send_notification: un seul contrat
+    # quel que soit le canal d'entrée (agent, REST direct, MCP).
+    MAX_TITLE = 100
+    MAX_BODY = 500
+
+    def post(self, request):
+        from services.push import push_configured, send_to_user
+
+        # Titre par défaut: la notification reste identifiable même si
+        # l'appelant n'en fournit pas.
+        title = (request.data.get("title") or "").strip() or "Planner AI"
+        body = (request.data.get("body") or "").strip()
+        if not body:
+            return Response(
+                {"error": "body requis."}, status=status.HTTP_400_BAD_REQUEST
+            )
+        # Bornes courtes: au-delà, la bannière système tronque et les services
+        # de push plafonnent le payload de toute façon.
+        if len(title) > self.MAX_TITLE:
+            return Response(
+                {"error": f"title trop long (max {self.MAX_TITLE} caractères)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if len(body) > self.MAX_BODY:
+            return Response(
+                {"error": f"body trop long (max {self.MAX_BODY} caractères)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not push_configured():
+            return Response(
+                {"error": "Web push non configuré (VAPID)."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        sent = send_to_user(request.user, title, body, url="/")
+        return Response({"sent": sent})
+
+
 # ============== iCal calendar feed ==============
 class CalendarFeedView(APIView):
     """Manage the current user's stable iCal subscription URL.

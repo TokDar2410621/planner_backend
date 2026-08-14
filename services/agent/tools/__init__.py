@@ -35,6 +35,7 @@ from .goals import ListGoalsTool, CreateGoalTool, UpdateGoalTool
 from .planning import SuggestOptimizationTool, DetectConflictsTool
 from .analytics import GetProductivityStatsTool
 from .interactive import PresentFormTool
+from .notify import SendNotificationTool
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,8 @@ ALL_TOOLS: list[BaseTool] = [
     DetectConflictsTool(),
     # Analytics
     GetProductivityStatsTool(),
+    # Notifications
+    SendNotificationTool(),
     # Interactive UI
     PresentFormTool(),
 ]

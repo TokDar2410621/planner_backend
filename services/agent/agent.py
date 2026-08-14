@@ -375,6 +375,7 @@ class PlannerAgent:
         "delete_task": "Je supprime la tâche…",
         "create_goal": "Je crée l'objectif…",
         "list_goals": "Je consulte tes objectifs…",
+        "send_notification": "J'envoie la notification…",
         "present_form": "Je prépare un mini-formulaire…",
     }
 
