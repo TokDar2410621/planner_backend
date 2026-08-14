@@ -139,7 +139,18 @@ def fixed_busy_intervals(
             )
             raw.append((0, time_to_min(block.end_time) + after))
 
-    scheduled_qs = ScheduledBlock.objects.filter(user=user, date=date)
+    from django.db.models import Q
+
+    # Une tache TERMINEE ne bloque plus son creneau: cocher doit liberer la
+    # place. Vecu (2026-08-13): « une tache d'une minute dans 6 minutes »
+    # refusee parce qu'elle chevauchait une tache App Store cochee la veille,
+    # dont le placement 18:40-20:40 comptait toujours comme un mur. On exclut
+    # le placement coche (actually_completed) ET tout placement d'une tache
+    # completee par un autre chemin (les deux drapeaux sont synchronises par
+    # mark_completed, mais la ceinture ne coute qu'un OR).
+    scheduled_qs = ScheduledBlock.objects.filter(user=user, date=date).exclude(
+        Q(actually_completed=True) | Q(task__completed=True)
+    )
     if exclude_scheduled_id is not None:
         scheduled_qs = scheduled_qs.exclude(id=exclude_scheduled_id)
     for block in scheduled_qs.select_related("task", "task__place"):

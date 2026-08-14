@@ -247,9 +247,18 @@ class FindFreeSlotsTool(BaseTool):
         # Créneaux libres 7h-23h via la logique unique overnight-aware: un quart
         # de nuit (ex: 19h-07h) occupe bien la soirée, le débordement de la veille
         # occupe le matin, et les blocs déjà planifiés comptent aussi.
-        free = _free_slots_from_intervals(
-            open_intervals(user, target_date, DAY_START_MIN, DAY_END_MIN), min_duration
-        )
+        intervals = open_intervals(user, target_date, DAY_START_MIN, DAY_END_MIN)
+
+        # AUJOURD'HUI, le passé n'est pas libre. Vécu (2026-08-13, 19:48):
+        # l'agent proposait « 07:00 à 08:00 » pour une tâche « dans 6
+        # minutes ». On rogne à l'heure murale courante, arrondie aux 5 min
+        # supérieures; le filtre de durée minimum s'applique après rognage.
+        now_local = timezone.localtime()
+        if target_date == now_local.date():
+            now_min = ((now_local.hour * 60 + now_local.minute + 4) // 5) * 5
+            intervals = [(max(s, now_min), e) for s, e in intervals if e > now_min]
+
+        free = _free_slots_from_intervals(intervals, min_duration)
 
         return ToolResult(
             success=True,
@@ -268,9 +277,14 @@ def _first_conflicting_item(user, target_date, s, e, exclude_scheduled_id=None):
     [s,e], ou None. fixed_busy_intervals renvoie l'union FUSIONNÉE de la
     journée (vécu: refus « chevauche 08:00-21:30 » pour un trou de 15 min,
     illisible et faux): on nomme l'occupation précise à la place."""
+    from django.db.models import Q
     from core.models import RecurringBlock, ScheduledBlock
     items = []
-    qs = ScheduledBlock.objects.filter(user=user, date=target_date).select_related('task')
+    # Meme regle que fixed_busy_intervals: une tache terminee n'occupe plus
+    # son creneau, donc elle ne peut pas non plus etre NOMMEE comme conflit.
+    qs = ScheduledBlock.objects.filter(user=user, date=target_date).exclude(
+        Q(actually_completed=True) | Q(task__completed=True)
+    ).select_related('task')
     if exclude_scheduled_id is not None:
         qs = qs.exclude(id=exclude_scheduled_id)
     for sb in qs:
