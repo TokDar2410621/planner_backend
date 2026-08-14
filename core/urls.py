@@ -32,6 +32,7 @@ from .views import (
     GoogleAuthView,
     # Profile
     ProfileView,
+    AIConsentView,
     OnboardingStatusView,
     # Chat
     ChatView,
@@ -124,6 +125,7 @@ urlpatterns = [
 
     # Profile endpoints
     path('profile/', ProfileView.as_view(), name='profile'),
+    path('ai/consent/', AIConsentView.as_view(), name='ai-consent'),
     path('profile/onboarding-status/', OnboardingStatusView.as_view(), name='onboarding-status'),
 
     # Chat endpoint

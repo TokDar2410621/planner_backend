@@ -109,6 +109,18 @@ class Command(BaseCommand):
                 logger.info("Document %s already processed, skipping.", doc_id)
                 continue
 
+            # Apple 5.1.2(i): jamais d'envoi à une IA tierce sans consentement.
+            # Les uploads sont gatés côté vues, mais un document déposé AVANT le
+            # gate (ou après une révocation) resterait pending: on le saute.
+            from core.ai_consent import has_ai_consent
+            if not has_ai_consent(document.user):
+                skipped += 1
+                logger.info(
+                    "Document %s: utilisateur %s sans consentement IA, sauté.",
+                    doc_id, document.user_id,
+                )
+                continue
+
             try:
                 processor.process_document(document)
                 succeeded += 1

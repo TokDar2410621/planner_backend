@@ -87,6 +87,10 @@ class UserProfile(models.Model):
     # revocation doit utiliser le meme client que l'echange.
     apple_refresh_token = models.TextField(blank=True, default='')
     apple_client_id = models.CharField(max_length=255, blank=True, default='')
+    # Apple 5.1.2(i): consentement explicite AVANT tout envoi de contenu
+    # utilisateur à une IA tierce (Gemini, Claude, DeepSeek, Hugging Face).
+    # Null = jamais consenti ou révoqué; la date fait foi pour l'audit.
+    ai_consent_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

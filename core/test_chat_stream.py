@@ -160,6 +160,11 @@ class AgentStreamTests(TestCase):
 class ChatStreamViewTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user("sse", password="pw-123456")
+        # Gate Apple 5.1.2(i): sans consentement IA, la vue répond 403 avant
+        # de streamer (couvert par core.test_ai_consent).
+        from django.utils import timezone
+        self.user.profile.ai_consent_at = timezone.now()
+        self.user.profile.save(update_fields=['ai_consent_at'])
         self.client_api = APIClient()
         self.client_api.force_authenticate(self.user)
 

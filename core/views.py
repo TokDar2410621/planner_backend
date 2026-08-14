@@ -60,6 +60,7 @@ from .serializers import (
 from services import DocumentProcessor, AIScheduler
 from services.ai_insights import AIInsightsService
 from services.agent import PlannerAgent
+from core.ai_consent import ai_consent_denied
 
 logger = logging.getLogger(__name__)
 
@@ -694,6 +695,37 @@ class ProfileView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
+class AIConsentView(APIView):
+    """Consentement IA (Apple 5.1.2(i)): état et bascule.
+
+    GET -> {granted, granted_at}. POST {granted: bool} -> même forme.
+    granted=false révoque (remet granted_at à null); les endpoints IA
+    répondront 403 ai_consent_required jusqu'au prochain consentement.
+    """
+
+    def get(self, request):
+        profile = request.user.profile
+        return Response({
+            "granted": bool(profile.ai_consent_at),
+            "granted_at": profile.ai_consent_at,
+        })
+
+    def post(self, request):
+        granted = request.data.get('granted')
+        if not isinstance(granted, bool):
+            return Response(
+                {"error": "granted (booléen) requis."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        profile = request.user.profile
+        profile.ai_consent_at = timezone.now() if granted else None
+        profile.save(update_fields=['ai_consent_at', 'updated_at'])
+        return Response({
+            "granted": bool(profile.ai_consent_at),
+            "granted_at": profile.ai_consent_at,
+        })
+
+
 class OnboardingStatusView(APIView):
     """Get onboarding status."""
 
@@ -777,6 +809,9 @@ class ChatView(APIView):
 
     def post(self, request):
         """Send a message and get AI response."""
+        denied = ai_consent_denied(request.user)
+        if denied is not None:
+            return denied
         logger.debug("Chat POST received from user %s", request.user.id)
         message = request.data.get('message', '')
         attachment_file = request.FILES.get('attachment')
@@ -846,6 +881,9 @@ class ChatQuickRepliesView(APIView):
     """
 
     def post(self, request):
+        denied = ai_consent_denied(request.user)
+        if denied is not None:
+            return denied
         message = request.data.get('message', '') or ''
         response_text = request.data.get('response', '') or ''
         try:
@@ -883,6 +921,9 @@ class ChatStreamView(APIView):
     parser_classes = [MultiPartParser, FormParser]
 
     def post(self, request):
+        denied = ai_consent_denied(request.user)
+        if denied is not None:
+            return denied
         message = request.data.get('message', '')
         attachment_file = request.FILES.get('attachment')
         if not message and not attachment_file:
@@ -928,6 +969,14 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         return UploadedDocument.objects.filter(user=self.request.user)
+
+    def create(self, request, *args, **kwargs):
+        # L'upload part en extraction LLM (Gemini/DeepSeek/HF): même gate de
+        # consentement que le chat.
+        denied = ai_consent_denied(request.user)
+        if denied is not None:
+            return denied
+        return super().create(request, *args, **kwargs)
 
     def perform_create(self, serializer):
         uploaded = serializer.validated_data.get('file')
@@ -1897,6 +1946,9 @@ class NaturalLanguageScheduleView(APIView):
 
     def post(self, request):
         """Parse a natural language request and optionally execute it."""
+        denied = ai_consent_denied(request.user)
+        if denied is not None:
+            return denied
         message = request.data.get('message', '')
         execute = request.data.get('execute', False)
 
