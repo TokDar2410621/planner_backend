@@ -56,6 +56,7 @@ class Suggestion:
     type: str  # 'free_time', 'reschedule', 'pattern', 'conflict', 'reminder'
     message: str
     task_id: Optional[int] = None
+    task_title: Optional[str] = None
     action: Optional[str] = None  # 'schedule', 'move', 'split', 'remind'
     metadata: Optional[dict] = None
 
@@ -153,8 +154,9 @@ class AIInsightsService:
                 if matching_task:
                     suggestions.append(Suggestion(
                         type='free_time',
-                        message=f"Tu as {gap.duration_minutes} minutes de libre de {gap.start_time.strftime('%H:%M')} a {gap.end_time.strftime('%H:%M')}. Veux-tu avancer sur '{matching_task.title}'?",
+                        message=f"Tu as {gap.duration_minutes} minutes de libre de {gap.start_time.strftime('%H:%M')} à {gap.end_time.strftime('%H:%M')}. Veux-tu avancer sur « {matching_task.title} » ?",
                         task_id=matching_task.id,
+                        task_title=matching_task.title,
                         action='schedule',
                         metadata={
                             'gap_start': gap.start_time.isoformat(),
@@ -174,16 +176,18 @@ class AIInsightsService:
             if days_left <= 0:
                 suggestions.append(Suggestion(
                     type='reminder',
-                    message=f"'{task.title}' est en retard! Deadline: {task.deadline.strftime('%d/%m %H:%M')}",
+                    message=f"« {task.title} » est en retard ! Échéance : {task.deadline.strftime('%d/%m %H:%M')}",
                     task_id=task.id,
+                    task_title=task.title,
                     action='schedule',
                     metadata={'urgency': 'critical'}
                 ))
             elif days_left <= 1:
                 suggestions.append(Suggestion(
                     type='reminder',
-                    message=f"'{task.title}' est due demain. Planifie-la maintenant!",
+                    message=f"« {task.title} » est due demain. Planifie-la maintenant !",
                     task_id=task.id,
+                    task_title=task.title,
                     action='schedule',
                     metadata={'urgency': 'high'}
                 ))
@@ -394,7 +398,7 @@ class AIInsightsService:
         if accuracy.get('tendency') == 'underestimate' and accuracy.get('average_error_minutes', 0) > 15:
             suggestions.append(Suggestion(
                 type='pattern',
-                message=f"Tu sous-estimes souvent tes taches de ~{accuracy['average_error_minutes']} min. Ajoute un buffer de temps!",
+                message=f"Tu sous-estimes souvent tes tâches de ~{accuracy['average_error_minutes']} min. Ajoute une marge de temps !",
                 action=None,
                 metadata={'pattern_type': 'estimation'}
             ))
@@ -404,7 +408,7 @@ class AIInsightsService:
         if best_time.get('hour'):
             suggestions.append(Suggestion(
                 type='pattern',
-                message=f"Tu es plus efficace pour le travail en profondeur vers {best_time['time_range']}. Planifie tes taches importantes a ce moment!",
+                message=f"Tu es plus efficace pour le travail en profondeur vers {best_time['time_range']}. Planifie tes tâches importantes à ce moment-là !",
                 action=None,
                 metadata={'pattern_type': 'timing', 'best_hour': best_time['hour']}
             ))

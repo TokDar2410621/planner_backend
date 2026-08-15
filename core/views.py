@@ -1816,6 +1816,7 @@ class SuggestionsView(APIView):
                     'type': s.type,
                     'message': s.message,
                     'task_id': s.task_id,
+                    'task_title': s.task_title,
                     'action': s.action,
                     'metadata': s.metadata,
                 }
