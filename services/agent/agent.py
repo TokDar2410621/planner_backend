@@ -141,6 +141,213 @@ def _user_authorized_destructive(message: str) -> bool:
 _DAY_NAMES_FR = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
 
 
+_SCHED_INTENT_RE = re.compile(
+    r"\b(planifie|cale|mets|ajoute|programme|reserve|bloque)\b", re.IGNORECASE)
+_TIME_RE = re.compile(r"\b(\d{1,2})[:h](\d{2})?\b")
+
+
+def _chips_from_message(user, message: str):
+    """Jambe déterministe finale de la garantie « planification ambiguë »:
+    le message demande EXPLICITEMENT un créneau (verbe + deux heures + jour
+    résolvable) et la fenêtre est OCCUPÉE -> chips de créneaux libres, même
+    si l'agent n'a appelé aucun outil ce tour. Retourne None sinon."""
+    if not message:
+        return None
+    import unicodedata as _ud
+    norm = _ud.normalize("NFKD", message).encode("ascii", "ignore").decode("ascii").lower()
+    if not _SCHED_INTENT_RE.search(norm):
+        return None
+    from django.utils import timezone as _tz
+    from datetime import timedelta as _td
+    if "aujourd'hui" in norm or "aujourdhui" in norm:
+        target = _tz.localdate()
+    elif "demain" in norm:
+        target = _tz.localdate() + _td(days=1)
+    else:
+        m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", norm)
+        if not m:
+            return None
+        from datetime import date as _date
+        try:
+            target = _date.fromisoformat(m.group(1))
+        except ValueError:
+            return None
+    times = _TIME_RE.findall(message)
+    if len(times) < 2:
+        return None
+    s_min = int(times[0][0]) * 60 + int(times[0][1] or 0)
+    e_min = int(times[1][0]) * 60 + int(times[1][1] or 0)
+    if e_min <= s_min:
+        return None
+    title_m = re.search(r"[«\"]\s*([^»\"]{2,60})\s*[»\"]", message)
+    title = title_m.group(1).strip() if title_m else None
+    fake_call = {
+        "tool": "schedule_task_at",
+        "args": {
+            "title": title or "cet événement",
+            "date": target.isoformat(),
+            "start_time": f"{s_min // 60:02d}:{s_min % 60:02d}",
+            "end_time": f"{e_min // 60:02d}:{e_min % 60:02d}",
+        },
+        "result": {"success": False, "data": {"conflict": {"synthetic": True}}},
+    }
+    # la fenêtre demandée est-elle réellement occupée ?
+    from services.agent.tools.schedule import (
+        DAY_START_MIN, DAY_END_MIN, _free_slots_from_intervals,
+    )
+    from services.scheduling.placement import open_intervals
+    try:
+        free = open_intervals(user, target, DAY_START_MIN, DAY_END_MIN)
+    except Exception:
+        return None
+    for fs, fe in free:
+        if fs <= s_min and e_min <= fe:
+            return None  # fenêtre libre: rien à forcer
+    return _ambiguous_scheduling_chips(user, [fake_call])
+
+
+def _ambiguous_scheduling_chips(user, tool_calls: list, user_message: str = ""):
+    """(phrase, chips) quand une planification a été BLOQUÉE par un conflit ce
+    tour (schedule_task_at success=False avec data.conflict) et que l'agent
+    n'a pas déjà posé ses propres chips: le serveur calcule 2-3 créneaux
+    LIBRES du jour visé (lendemain en secours) et les impose en boutons.
+    Demande Darius: « toute planification ambiguë propose 2-3 créneaux en
+    chips », garanti par le code comme la question de fin de récurrence.
+    Retourne None si rien à forcer."""
+    from datetime import datetime as _dt, timedelta as _td
+    from services.agent.tools.schedule import (
+        DAY_START_MIN, DAY_END_MIN, _free_slots_from_intervals,
+    )
+    from services.scheduling.placement import open_intervals
+
+    # NB: même si l'agent a posé ses propres chips, un conflit non résolu
+    # force les nôtres — les siennes sont vagues (« cherche un créneau »),
+    # les nôtres portent des heures concrètes, c'est la garantie demandée.
+    blocked = None
+    for call in tool_calls:
+        if call.get("tool") != "schedule_task_at":
+            continue
+        result = call.get("result") or {}
+        if result.get("success"):
+            return None  # une planification a fini par passer: rien à forcer
+        if (result.get("data") or {}).get("conflict"):
+            blocked = call
+
+    # Second déclencheur (vécu: l'agent CONSULTE d'abord et ne tente jamais
+    # l'écriture): des créneaux cherchés (find_free_slots) sans AUCUNE
+    # écriture réussie ce tour = même garantie, chips construites depuis le
+    # résultat de l'outil.
+    if blocked is None:
+        consulted = None
+        for call in tool_calls:
+            if call.get("tool") in MUTATION_TOOLS and (call.get("result") or {}).get("success"):
+                return None
+            if call.get("tool") == "find_free_slots" and (call.get("result") or {}).get("success"):
+                consulted = call
+        if consulted is None:
+            # Troisième jambe (vécu: l'agent répond depuis l'HISTORIQUE sans
+            # appeler aucun outil): parser le message — intention de
+            # planification avec heures et jour EXPLICITES — et vérifier la
+            # fenêtre côté serveur. Occupée = chips imposées.
+            return _chips_from_message(user, user_message)
+        c_args = consulted.get("args") or {}
+        c_data = (consulted.get("result") or {}).get("data") or {}
+        c_date = str(c_data.get("date") or c_args.get("date") or "").strip()
+        slots = (c_data.get("free_slots") or [])[:3]
+        if not c_date or not slots:
+            return None
+        duration = int(c_args.get("min_duration_minutes") or 30)
+        chips = []
+        for slot in slots:
+            start = str(slot.get("start_time") or "")[:5]
+            if not start:
+                continue
+            h, m = start.split(":")
+            end_total = int(h) * 60 + int(m) + duration
+            end = f"{(end_total // 60) % 24:02d}:{end_total % 60:02d}"
+            chips.append({
+                "label": f"🕐 {start}–{end}",
+                "value": f"Va pour {start}–{end} le {c_date}.",
+            })
+        if not chips:
+            return None
+        return "🕐 Des créneaux libres, choisis :", chips
+
+    args = blocked.get("args") or {}
+    title = (args.get("title") or "").strip()
+    date_str = (args.get("date") or "").strip()
+    if not title or not date_str:
+        return None
+    try:
+        target = _dt.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+    def _mins(hhmm):
+        try:
+            h, m = str(hhmm).split(":")[:2]
+            return int(h) * 60 + int(m)
+        except (ValueError, AttributeError):
+            return None
+
+    start_min = _mins(args.get("start_time"))
+    end_min = _mins(args.get("end_time"))
+    duration = 30
+    if start_min is not None and end_min is not None and end_min != start_min:
+        duration = (end_min - start_min) % (24 * 60)
+
+    from django.utils import timezone as _tz
+    now_local = _tz.localtime()
+    now_min = now_local.hour * 60 + now_local.minute
+    chips = []
+    for offset, day_label in ((0, ""), (1, "demain ")):
+        day = target + _td(days=offset)
+        try:
+            slots = _free_slots_from_intervals(
+                open_intervals(user, day, DAY_START_MIN, DAY_END_MIN), duration
+            )
+        except Exception:
+            return None
+        if day == now_local.date():
+            # jamais de créneau déjà passé: départ >= maintenant + 5 min
+            # (un trou englobant « maintenant » est rogné à l'instant présent)
+            floor = now_min + 5
+            trimmed = []
+            for sl in slots:
+                s_min = _mins(sl["start_time"])
+                e_min = _mins(sl["end_time"])
+                if s_min is None or e_min is None:
+                    continue
+                if s_min < floor:
+                    s_min = floor + (5 - floor % 5) % 5
+                if e_min - s_min >= duration:
+                    trimmed.append(dict(
+                        sl, start_time=f"{s_min // 60:02d}:{s_min % 60:02d}"
+                    ))
+            slots = trimmed
+        for slot in slots:
+            if len(chips) >= 3:
+                break
+            slot_start = slot["start_time"]
+            s_min = _mins(slot_start)
+            slot_end_min = s_min + duration
+            slot_end = f"{slot_end_min // 60:02d}:{slot_end_min % 60:02d}"
+            chips.append({
+                "label": f"🕐 {day_label}{slot_start}–{slot_end}".strip(),
+                "value": (
+                    f"Planifie « {title} » le {day.isoformat()} "
+                    f"de {slot_start} à {slot_end}."
+                ),
+            })
+        if chips:
+            break
+    if not chips:
+        return None
+
+    phrase = "⏱️ Ce créneau est pris — en voici de libres, choisis :"
+    return phrase, chips
+
+
 def _schedule_reality_footer(user, tool_calls: list) -> str:
     """Après une planification datée réussie, annexe l'état RÉEL du/des jour(s).
 
@@ -816,6 +1023,16 @@ class PlannerAgent:
                     {"label": "♾️ Pas de fin prévue",
                      "value": f"{label} n'a pas de date de fin, garde-le tel quel."},
                 ]
+
+        # PLANIFICATION AMBIGUË déterministe: un schedule_task_at bloqué par
+        # conflit ce tour (sans placement réussi ni chips posées par l'agent)
+        # -> 2-3 créneaux LIBRES imposés en boutons par le serveur.
+        if forced_quick_replies is None and not had_error:
+            ambiguous = _ambiguous_scheduling_chips(user, tool_calls_made, message)
+            if ambiguous:
+                phrase, slot_chips = ambiguous
+                response_text = f"{response_text}\n\n{phrase}"
+                forced_quick_replies = slot_chips
 
         # 8. Build response
         # Contextual quick replies: the LLM proposes the likely next steps for
