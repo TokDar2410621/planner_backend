@@ -107,6 +107,40 @@ def _claims_completed_mutation(text: str) -> bool:
     return bool(COMPLETED_MUTATION_RE.search(normalized.lower()))
 
 
+# Infinitifs des écritures: le filet COMPLETED ne couvre que les participes
+# (« j'ai supprimé »), or le mensonge observé en prod (2026-08-18, 21:59) est
+# au FUTUR et au PROGRESSIF: « je vais supprimer les blocs puis ajouter tes
+# cours », « je suis en train de mettre à jour », « je te tiendrai informé »,
+# « je n'ai pas encore terminé » — trois tours de suite, ZÉRO appel d'outil.
+# Il n'existe aucun travail en arrière-plan: promettre au futur et finir le
+# tour sans outil est le même mensonge que « j'ai créé » sans outil.
+_MUT_VERBS_INF = (
+    r"creer|ajouter|planifier|programmer|reprogrammer|ajuster|modifier|"
+    r"mettre\s+a\s+jour|deplacer|decaler|prolonger|raccourcir|reduire|"
+    r"supprimer|enlever|retirer|avancer|reporter|reserver|verrouiller|"
+    r"fixer|caler|regler|remplacer|reorganiser|optimiser|importer"
+)
+
+PENDING_WORK_RE = re.compile(
+    r"(?:\bje\s+(?:vais|dois)\b[^.!?\n]{0,60}?\b(?:" + _MUT_VERBS_INF + r")\b)"
+    r"|(?:\b(?:suis|est)\s+en\s+train\s+de\b)"
+    r"|(?:\bje\s+m'?en\s+occupe\b)"
+    r"|(?:\bje\s+te\s+tiendrai\b)"
+    r"|(?:\b(?:cela|ca)\s+(?:peut|va)\s+prendre\b)"
+    r"|(?:\bpas\s+encore\s+termine\b)"
+    r"|(?:\bencore\s+en\s+cours\b)",
+    re.IGNORECASE,
+)
+
+
+def _claims_pending_work(text: str) -> bool:
+    """Le texte promet-il un travail « en cours » ou « à venir »?"""
+    if not text:
+        return False
+    normalized = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    return bool(PENDING_WORK_RE.search(normalized.lower()))
+
+
 # Signature de la panne Gemini « tool_code »: au lieu d'un VRAI function call,
 # le modèle écrit le pseudo-code de l'appel dans le TEXTE (vécu audit:
 # `tool_code\nprint(default_api.present_form(...))` affiché tel quel à
@@ -812,6 +846,23 @@ class PlannerAgent:
                     logger.warning(
                         "Streamed turn claims a mutation with zero tool calls; "
                         "retrying non-streamed")
+                    response = None
+                if (
+                    response is not None
+                    and not response.has_function_calls
+                    and not tool_calls_made
+                    and _claims_pending_work(response.text or "")
+                ):
+                    # MENSONGE DU « TRAVAIL EN COURS » (vécu prod 2026-08-18,
+                    # 21:59-22:02): « je vais supprimer... puis ajouter », puis
+                    # « je suis en train », puis « pas encore terminé », trois
+                    # tours streamés d'affilée avec ZÉRO outil. Il n'existe
+                    # aucune tâche de fond: un tour qui PROMET une écriture
+                    # sans avoir rien appelé est rejoué en non-streamé, où le
+                    # modèle appelle ses outils au lieu de raconter.
+                    logger.warning(
+                        "Streamed turn promises pending work with zero tool "
+                        "calls; retrying non-streamed")
                     response = None
                 if response is None and streamed_this_turn:
                     yield {"type": "turn_discard"}
