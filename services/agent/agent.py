@@ -738,6 +738,10 @@ class PlannerAgent:
                 if wait_s:
                     yield {"type": "status", "text": "J'analyse ton document…"}
                 for tick in range(int(wait_s * 2)):
+                    # NE BLOQUE PAS LE WORKER: gunicorn -k gevent fait
+                    # monkey.patch_all() au boot (ggevent.patch), ce sleep est
+                    # cooperatif et ne suspend que cette conversation. Verifie
+                    # le 2026-08-19 apres une alerte d'audit externe erronee.
                     time.sleep(0.5)
                     attachment.refresh_from_db()
                     if attachment.processed:
