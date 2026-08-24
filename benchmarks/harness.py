@@ -112,6 +112,32 @@ class Pilote:
     def __init__(self, nom: str, fabrique: Callable[[], object]):
         self.nom = nom
         self._fabrique = fabrique
+        # Journal de TOUS les tours du banc: sert a calculer la latence p95,
+        # separement pour les tours AVEC outils et SANS outils. La spec agent
+        # v2 fixe sa cible de latence par rapport a cette mesure (incrment 0),
+        # donc le banc doit la produire, pas l'estimer.
+        self.journal: list[Tour] = []
+
+    def _noter(self, tour: Tour) -> Tour:
+        self.journal.append(tour)
+        return tour
+
+    def latences(self) -> dict:
+        """p50 et p95 en secondes, ventiles par presence d'appels d'outils."""
+        def pct(valeurs: list[float], q: float) -> float:
+            if not valeurs:
+                return 0.0
+            ordonnees = sorted(valeurs)
+            i = min(len(ordonnees) - 1, int(round(q * (len(ordonnees) - 1))))
+            return round(ordonnees[i], 1)
+
+        avec = [t.secondes for t in self.journal if t.outils and not t.erreur]
+        sans = [t.secondes for t in self.journal if not t.outils and not t.erreur]
+        return {
+            "tours": len(self.journal),
+            "avec_outils": {"n": len(avec), "p50": pct(avec, 0.50), "p95": pct(avec, 0.95)},
+            "sans_outils": {"n": len(sans), "p50": pct(sans, 0.50), "p95": pct(sans, 0.95)},
+        }
 
     def envoyer(self, user: User, message: str,
                 attachment: Optional[UploadedDocument] = None) -> Tour:
@@ -131,15 +157,17 @@ class Pilote:
                 )
             finally:
                 piege.stop()
-            return Tour(
+            return self._noter(Tour(
                 message=message,
                 reponse=(res or {}).get("response", "") or "",
                 outils=outils,
                 secondes=round(time.monotonic() - debut, 1),
-            )
+            ))
         except Exception as e:  # noqa: BLE001 - une épreuve ratée n'arrête pas le banc
-            return Tour(message=message, reponse="", secondes=round(time.monotonic() - debut, 1),
-                        erreur=f"{type(e).__name__}: {e}"[:300])
+            return self._noter(Tour(
+                message=message, reponse="",
+                secondes=round(time.monotonic() - debut, 1),
+                erreur=f"{type(e).__name__}: {e}"[:300]))
 
 
 def pilote_v1() -> Pilote:

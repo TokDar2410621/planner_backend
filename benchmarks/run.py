@@ -72,8 +72,16 @@ def score_sur_100(notes: list[Note]) -> float:
     return round(total, 1)
 
 
-def rapport(nom: str, notes: list[Note]) -> str:
+def rapport(nom: str, notes: list[Note], lat: dict | None = None) -> str:
     lignes = [f"## Agent {nom}: {score_sur_100(notes)} / 100", ""]
+    if lat:
+        a, sa = lat["avec_outils"], lat["sans_outils"]
+        lignes += [
+            "### Latence (secondes par tour)",
+            f"- avec outils (n={a['n']}): p50 {a['p50']}, **p95 {a['p95']}**",
+            f"- sans outils (n={sa['n']}): p50 {sa['p50']}, **p95 {sa['p95']}**",
+            "",
+        ]
     for n in notes:
         poids = PONDERATION.get(n.epreuve, 0)
         obtenu = round(poids * n.pourcent / 100.0, 1)
@@ -96,7 +104,7 @@ def main() -> None:
         p = pilote_v1() if cible == "v1" else pilote_v2()
         print(f"\n=== Examen de l'agent {cible} ===", flush=True)
         notes = passer_examen(p, image)
-        blocs.append(rapport(cible, notes))
+        blocs.append(rapport(cible, notes, p.latences()))
         print(f"  -> {score_sur_100(notes)} / 100")
 
     horodatage = datetime.now().strftime("%Y-%m-%d-%H%M")
