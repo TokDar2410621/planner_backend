@@ -59,5 +59,11 @@ def _juger(question: str, reponse: str) -> dict:
         brut = getattr(res, "text", "") or ""
         trouve = re.search(r"\{[^{}]+\}", brut)
         return json.loads(trouve.group(0)) if trouve else {}
-    except Exception:  # noqa: BLE001 - un juge muet ne casse pas le banc
-        return {}
+    except Exception as e:  # noqa: BLE001
+        # Un echec de PARSING n'est pas une reponse mauvaise: sans ce dict
+        # complet, possibles restait a zero et l'epreuve rendait 0/10 sans
+        # qu'aucune ligne du rapport ne l'explique. Vecu: la note de ton a
+        # derive de 9,3 a 8,0 sur trois passages sans cause visible.
+        print(f"    juge indisponible: {type(e).__name__} {str(e)[:80]}")
+        return {c: 0 for c in ("tutoiement", "concision", "non_culpabilisant",
+                               "concret", "pas_de_promesse")}

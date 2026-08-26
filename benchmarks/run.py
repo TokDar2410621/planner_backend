@@ -22,7 +22,9 @@ from benchmarks import epreuves, juge  # noqa: E402
 from benchmarks.harness import Note, Pilote, pilote_v1, pilote_v2  # noqa: E402
 from benchmarks.horaire_image import generer, verite_pour_notation  # noqa: E402
 
-# (nom, poids sur 100)
+# La somme des poids EST le maximum de score_sur_100. Une epreuve absente de ce
+# dict pese zero: c'est ainsi que "Conversation" mesure sans noter, et que les
+# references v1 (78,3 / 85,7 / 90,0) restent comparables.
 PONDERATION = {
     "Compréhension temporelle": 20,
     "Extraction d'horaire (image)": 20,
@@ -42,6 +44,7 @@ def passer_examen(p: Pilote, image: str) -> list[Note]:
         ("verite", lambda: epreuves.epreuve_verite(p)),
         ("lecture", lambda: epreuves.epreuve_lecture(p)),
         ("ton", lambda: juge.epreuve_ton(p)),
+        ("conversation", lambda: epreuves.epreuve_conversation(p)),
     ):
         print(f"  [{p.nom}] épreuve {libelle}…", flush=True)
         try:
@@ -98,6 +101,15 @@ def main() -> None:
     cibles = [a for a in sys.argv[1:] if a in ("v1", "v2")] or ["v1"]
     image = generer(os.path.join(os.path.dirname(__file__), "horaire_test.png"))
     print(f"Image d'épreuve: {image}")
+
+    # --fournisseur=deepseek force les DEUX agents sur le meme modele, ce qui
+    # isole l'apport de la boucle. Sans lui, on mesure le produit tel quel.
+    force = next((a.split("=", 1)[1] for a in sys.argv[1:]
+                  if a.startswith("--fournisseur=")), None)
+    if force:
+        from benchmarks import harness
+        harness.FOURNISSEUR = force
+        print(f"Fournisseur force: {force}")
 
     blocs = []
     for cible in cibles:

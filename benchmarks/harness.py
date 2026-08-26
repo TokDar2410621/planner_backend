@@ -59,13 +59,27 @@ class Monde:
         return list(Task.objects.filter(user=self.user).order_by("id"))
 
 
-def monde_neuf(prefixe: str) -> Monde:
-    """Utilisateur jetable, consentement IA accordé, semaine de référence."""
+# Fournisseur force pour TOUS les mondes de ce passage, pose par run.py.
+FOURNISSEUR: str | None = None
+
+
+def monde_neuf(prefixe: str, fournisseur: str | None = None) -> Monde:
+    """Utilisateur jetable, consentement IA accorde, semaine de reference.
+
+    `fournisseur` force profile.preferred_llm. Sans lui, l'agent v1 tombe sur
+    le defaut (gemini) alors que v2 tourne sur DeepSeek: la comparaison
+    melangerait un changement de boucle et un changement de modele.
+    """
+    fournisseur = fournisseur or FOURNISSEUR
     u = User.objects.create_user(
         username=f"bench-{prefixe}-{uuid.uuid4().hex[:8]}", password="x"
     )
     u.profile.ai_consent_at = timezone.now()
-    u.profile.save(update_fields=["ai_consent_at"])
+    champs = ["ai_consent_at"]
+    if fournisseur:
+        u.profile.preferred_llm = fournisseur
+        champs.append("preferred_llm")
+    u.profile.save(update_fields=champs)
     today = timezone.localtime().date()
     lundi = today - timedelta(days=today.weekday())
     return Monde(user=u, lundi=lundi)
@@ -90,7 +104,11 @@ class _CaptureOutils(logging.Handler):
     def __init__(self, cible: list):
         super().__init__(level=logging.INFO)
         self.cible = cible
-        self._logger = logging.getLogger("services.agent.agent")
+        # Logger PARENT: par propagation il recoit v1 (services.agent.agent)
+        # ET v2 (services.agent_v2.agent). Cabler le nom exact de v1 rendait
+        # Tour.outils toujours vide pour v2, ce qui faussait l'epreuve de
+        # verite et rangeait tous les tours de v2 en "sans outils".
+        self._logger = logging.getLogger("services")
 
     def emit(self, record: logging.LogRecord) -> None:
         msg = record.getMessage()
