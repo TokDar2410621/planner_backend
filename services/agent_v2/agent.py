@@ -13,6 +13,7 @@ cle manquante rend un 500 a l'utilisateur.
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Optional
 
@@ -34,6 +35,16 @@ logger = logging.getLogger(__name__)
 
 BUDGET_ETAPES = 10
 HISTORIQUE_MAX = 20
+# Une lecture de semaine chargee depasse largement ce volume; on tronque plutot
+# que de laisser un seul outil manger le contexte de la redaction.
+EXTRAIT_MAX = 4000
+
+
+def _extrait(donnees: dict) -> str:
+    brut = json.dumps(donnees, ensure_ascii=False, default=str)
+    if len(brut) <= EXTRAIT_MAX:
+        return brut
+    return f"{brut[:EXTRAIT_MAX]}... (tronque)"
 
 
 class PlannerAgentV2:
@@ -92,6 +103,15 @@ class PlannerAgentV2:
             for a in registre.actions:
                 etiquette = "OK" if a.succes else "ECHEC"
                 lignes.append(f"  {a.id} [{etiquette}] {a.outil}: {a.message}")
+                # Le CONTENU des lectures, sans quoi DIRE ne peut repondre a
+                # « c'est quoi mon planning ? »: il saurait qu'un outil a
+                # tourne sans savoir ce qu'il a renvoye (defaut observe le
+                # 2026-08-25 sur un tour reel). Les MUTATIONS en sont exclues:
+                # leur recit reste tenu par le bloc factuel et la validation
+                # des references, et deverser leurs donnees brutes rouvrirait
+                # le canal que la garantie structurelle ferme.
+                if a.succes and not a.est_mutation and a.donnees:
+                    lignes.append(f"       donnees: {_extrait(a.donnees)}")
         else:
             lignes.append("REGISTRE DU TOUR: VIDE. Tu n'as rien accompli.")
         for e in registre.ecarts:

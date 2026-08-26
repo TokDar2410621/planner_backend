@@ -174,6 +174,51 @@ class ReglagesTests(TestCase):
         self.assertEqual(vus.get('model_settings'), REGLAGES_DIRE)
 
 
+class MatierePremiereTests(TestCase):
+    """DIRE doit RECEVOIR le contenu des lectures.
+
+    Defaut observe le 2026-08-25 sur un tour reel: a « tu peux me rappeler ce
+    que j'ai mardi ? », l'agent appelait bien list_blocks puis repondait « J'ai
+    trouve votre bloc de mardi. Veux-tu que je t'en donne le detail ? ». Il
+    avait la donnee et ne la livrait pas.
+
+    Cause: bloc_factuel ne rend que les MUTATIONS, et le brief ne passait que
+    le message de chaque action. Sur un tour de pure lecture, DIRE savait
+    qu'un outil avait tourne sans savoir ce qu'il avait renvoye.
+    """
+
+    def setUp(self):
+        from services.agent_v2 import PlannerAgentV2
+        self.Agent = PlannerAgentV2
+
+    def _brief_avec(self, outil, donnees, message=""):
+        from services.agent_v2.registre import Registre
+        registre = Registre()
+        registre.ajouter(outil, {}, ToolResult(
+            success=True, data=donnees, message=message))
+        return self.Agent._brief_dire("et mardi ?", registre, {}, ''), registre
+
+    def test_le_contenu_d_une_lecture_arrive_dans_le_brief(self):
+        brief, _ = self._brief_avec(
+            'list_blocks',
+            {'blocks': [{'title': 'Cours de chimie', 'day_name': 'Mardi',
+                         'start_time': '09:00', 'end_time': '11:00'}]},
+            message="1 bloc trouve")
+        self.assertIn('Cours de chimie', brief)
+        self.assertIn('09:00', brief)
+
+    def test_une_mutation_ne_deverse_PAS_ses_donnees_dans_le_brief(self):
+        """Contre-epreuve: le recit des mutations reste tenu par le bloc
+        factuel et la validation des references. Deverser leurs donnees
+        brutes rouvrirait le canal que la garantie structurelle ferme."""
+        brief, _ = self._brief_avec(
+            'create_block',
+            {'created': [{'title': 'Bloc secret', 'id': 42}]},
+            message="1 bloc cree")
+        self.assertNotIn('Bloc secret', brief)
+        self.assertIn('1 bloc cree', brief)
+
+
 class ResilienceTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user(username='resilience', password='x')
