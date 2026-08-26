@@ -65,6 +65,20 @@ from core.ai_consent import ai_consent_denied
 logger = logging.getLogger(__name__)
 
 
+def _agent_pour(user):
+    """Aiguillage v1 / v2. Un seul endroit, pour que la bascule soit un UPDATE.
+
+    L'import de v2 est LOCAL: tant qu'aucun compte n'est bascule, le paquet
+    agent_v2 n'est jamais charge en production, donc il ne peut pas casser un
+    demarrage. Un profil absent retombe sur v1: la bascule est un confort, pas
+    une dependance.
+    """
+    if getattr(getattr(user, 'profile', None), 'agent_v2', False):
+        from services.agent_v2 import PlannerAgentV2
+        return PlannerAgentV2()
+    return PlannerAgent()
+
+
 def _as_bool(value):
     """Coerce a request value (bool, int, or string) to a boolean.
 
@@ -840,7 +854,7 @@ class ChatView(APIView):
 
         # Generate chat response via PlannerAgent
         try:
-            agent = PlannerAgent()
+            agent = _agent_pour(request.user)
             result = agent.process_message(
                 request.user,
                 message or "J'ai uploadé un document.",
@@ -887,7 +901,7 @@ class ChatQuickRepliesView(APIView):
         message = request.data.get('message', '') or ''
         response_text = request.data.get('response', '') or ''
         try:
-            replies = PlannerAgent().quick_replies_for(
+            replies = _agent_pour(request.user).quick_replies_for(
                 request.user, message, response_text
             )
         except Exception as e:  # noqa: BLE001 - suggestions never fail the client
@@ -941,7 +955,7 @@ class ChatStreamView(APIView):
 
         def event_stream():
             try:
-                agent = PlannerAgent()
+                agent = _agent_pour(user)
                 for event in agent.process_message_stream(user, final_message, attachment):
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as e:  # noqa: BLE001 - never leak internals into the stream
