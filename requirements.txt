@@ -16,6 +16,12 @@ dj-database-url>=2.1,<3.0
 anthropic>=0.49,<1.0
 google-genai>=1.75,<1.76  # pinned narrowly: tool-calling validated on this line (avoid schema-validation drift between 1.6x/1.7x)
 openai>=1.51,<2.0  # DeepSeek provider (OpenAI-compatible API, base_url https://api.deepseek.com)
+# Agent v2 (services/agent_v2). Les TROIS epinglages tiennent ensemble, mesure
+# du 2026-08-24: sans opentelemetry-api<1.38, `import pydantic_ai` casse sur
+# ModuleNotFoundError: opentelemetry._events; sans openai<2, pip monte
+# pydantic-ai en 2.x qui exige openai 3.x et casse le provider DeepSeek.
+pydantic-ai-slim[openai]>=1.30,<2.0
+opentelemetry-api<1.38
 huggingface-hub>=0.20,<1.0
 PyMuPDF>=1.24,<2.0
 Pillow>=11.0,<12.0
