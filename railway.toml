@@ -1,6 +1,23 @@
 # Railway deployment config for Planner AI backend (B6).
-# Boots gunicorn with gevent workers so the psycogreen patch in wsgi.py is
-# actually exercised and background document-processing greenlets can run.
+#
+# ASGI (uvicorn) depuis le 2026-08-27, et pas par gout: l'agent v2 tourne sur
+# PydanticAI, donc sur asyncio, et asyncio ne cohabite pas avec gevent. Sous
+# gevent tous les greenlets partagent UN thread systeme, or asyncio suit sa
+# boucle par thread. Mesure sur 8 conversations concurrentes: 1 passe, 7
+# echouent en « asyncio.run() cannot be called from a running event loop », et
+# l'ORM levait SynchronousOnlyOperation avant meme cela. Conflit connu:
+# gunicorn #3000 et #3053. Meme mesure sous ASGI: 0 erreur.
+#
+# Le commentaire precedent parlait de « background document-processing
+# greenlets ». Il etait PERIME: utils.helpers.run_in_background utilise
+# threading.Thread, pas gevent.spawn (son propre commentaire le dit). Ces
+# taches tournent ici en vrais threads systeme, a l'identique.
+#
+# PAS de --preload avec un worker uvicorn: forker apres le demarrage de la
+# boucle corrompt l'etat asyncio.
+#
+# Retour arriere: remettre `planner.wsgi:application -k gevent`. wsgi.py et ses
+# dependances (gevent, psycogreen) sont conserves exactement pour ca.
 
 [build]
 builder = "nixpacks"
@@ -13,7 +30,7 @@ builder = "nixpacks"
 # boucle (equivalent d'un cron */15): rappels push + alertes de depart toutes
 # les 15 min. POSIX sh only. `|| true` = une iteration ratee ne tue pas la
 # boucle.
-startCommand = "bash -c 'if [ \"$RAILWAY_SERVICE_NAME\" = \"send-reminders\" ]; then while true; do python manage.py send_reminders --lead 15 || true; python manage.py daily_brain || true; sleep 600; done; else python manage.py migrate --noinput && python manage.py collectstatic --noinput && exec gunicorn planner.wsgi:application -k gevent -w ${WEB_CONCURRENCY:-3} -b 0.0.0.0:${PORT:-8000} --timeout 120; fi'"
+startCommand = "bash -c 'if [ \"$RAILWAY_SERVICE_NAME\" = \"send-reminders\" ]; then while true; do python manage.py send_reminders --lead 15 || true; python manage.py daily_brain || true; sleep 600; done; else python manage.py migrate --noinput && python manage.py collectstatic --noinput && exec gunicorn planner.asgi:application -k uvicorn.workers.UvicornWorker -w ${WEB_CONCURRENCY:-3} -b 0.0.0.0:${PORT:-8000} --timeout 120; fi'"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
 

@@ -4,6 +4,11 @@ djangorestframework>=3.15,<4.0
 djangorestframework-simplejwt>=5.3,<6.0
 django-cors-headers>=4.4,<5.0
 gunicorn>=22.0,<24.0
+# ASGI. L'agent v2 tourne sur asyncio (PydanticAI) et asyncio ne cohabite pas
+# avec gevent: tous les greenlets partagent un thread systeme, et asyncio suit
+# sa boucle par thread. Mesure du 2026-08-27 sur 8 conversations concurrentes
+# sous gevent: 1 passe, 7 echouent. Voir planner/asgi.py.
+uvicorn[standard]>=0.30,<1.0
 gevent>=24.0,<26.0
 whitenoise>=6.6,<7.0
 
