@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Optional
 
+from django.conf import settings
 from django.contrib.auth.models import User
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UsageLimitExceeded
@@ -146,11 +148,24 @@ class PlannerAgentV2:
         self._exclu = courant.pk
 
         registre = Registre()
+
+        # Le document et l'import recent DOIVENT entrer dans le message vu par
+        # AGIR. Sans cela, un horaire envoye est perdu en silence et l'agent
+        # decrit le planning deja en base en laissant croire qu'il a lu le
+        # document (defaut observe le 2026-08-26 sur un tour reel). L'envoi
+        # d'horaire est le premier chemin d'entree du produit.
+        message_enrichi = message
+        for evenement, complement in self._contexte_document(user, attachment):
+            if evenement:
+                yield evenement
+            if complement:
+                message_enrichi = f"{message_enrichi}\n\n{complement}"
+
         yield {"type": "status", "text": "Je regarde ton planning..."}
 
         raisonnement = ""
         try:
-            raisonnement = self._agir(user, message, registre) or ""
+            raisonnement = self._agir(user, message_enrichi, registre) or ""
         except Exception as e:  # noqa: BLE001
             # Une panne d'AGIR ne doit pas effacer ce que les outils ont deja
             # ecrit: le registre survit et le tour continue vers DIRE.
@@ -227,6 +242,45 @@ class PlannerAgentV2:
             return []
 
     # ------------------------------------------------------------------ util
+
+    @staticmethod
+    def _contexte_document(user: User, attachment):
+        """Rend des couples (evenement a emettre, complement de message).
+
+        Les deux formateurs viennent de v1 et sont repris tels quels: ils
+        portent des consignes produit affinees par l'audit (ne jamais nier un
+        import, ne jamais promettre un resume qu'on ne livrera pas, presenter
+        les blocs comme le RESULTAT de l'import). Les reecrire les ferait
+        deriver.
+        """
+        from services.agent.agent import PlannerAgent
+        v1 = PlannerAgent()
+
+        if attachment is not None:
+            if not attachment.processed:
+                # Meme attente cooperative que v1: gunicorn tourne en workers
+                # gevent avec monkey.patch_all(), ce sommeil ne suspend que
+                # cette conversation. Une reponse vraie en un tour vaut mieux
+                # qu'une promesse cassee en trois secondes.
+                attente = getattr(settings, "ATTACHMENT_WAIT_SECONDS", 45)
+                if attente:
+                    yield {"type": "status", "text": "J'analyse ton document..."}, None
+                    for tic in range(int(attente * 2)):
+                        time.sleep(0.5)
+                        attachment.refresh_from_db()
+                        if attachment.processed:
+                            break
+                        if tic and tic % 16 == 0:
+                            yield ({"type": "status",
+                                    "text": "J'analyse ton document... (presque fini)"}, None)
+            yield None, v1._build_attachment_context(attachment)
+
+        # Vaut AVEC ou SANS piece jointe: un « c'est bon ? » au tour suivant
+        # doit voir l'import, sinon l'agent invente une limitation et dit a
+        # l'utilisateur l'inverse de la verite.
+        recent = v1._recent_import_context(user)
+        if recent:
+            yield None, recent
 
     def _historique(self, user: User) -> list:
         lignes = (ConversationMessage.objects
