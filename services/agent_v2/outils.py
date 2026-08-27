@@ -16,11 +16,12 @@ Trois pieges, tous verifies plutot que supposes:
    par execute_tool. Un adaptateur qui appelle les outils en direct contourne
    la garde, et clear_all_blocks efface un planning sans confirmation.
 
-3. PydanticAI executerait une fonction SYNCHRONE dans un thread de travail
-   anyio, hors du cycle de requete qui ferme les connexions Django. La sonde
-   n'a pas reproduit de fuite a faible charge, mais sync_to_async
-   (thread_sensitive=True) est le motif que Django documente et il ne coute
-   rien.
+3. L'ORM doit passer par sync_to_async, mais avec thread_sensitive=FALSE.
+   Sous ASGI, Django execute la vue synchrone dans un thread de son pool, et
+   on y demarre une boucle asyncio pour PydanticAI. Avec thread_sensitive=True
+   asgiref veut rejouer l'ORM dans ce meme thread, deja bloque a attendre la
+   boucle: interblocage, observe en production le 2026-08-27. Les connexions
+   sont fermees des deux cotes, ce thread vivant hors du cycle de requete.
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ import re
 import unicodedata
 
 from asgiref.sync import sync_to_async
+from django.db import close_old_connections
 from django.contrib.auth.models import User
 from pydantic_ai.tools import Tool
 
@@ -58,7 +60,24 @@ def autorise_destructif(message) -> bool:
 
 def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str):
     """Rend la coroutine que PydanticAI appellera avec les arguments du modele."""
-    executer_sync = sync_to_async(outil.execute, thread_sensitive=True)
+
+    def _appel_ferme(*args, **kwargs):
+        """L'ORM tourne dans un thread du pool d'asgiref, hors du cycle de
+        requete qui ferme les connexions. On les ferme donc nous-memes des
+        deux cotes, comme le fait database_sync_to_async de channels."""
+        close_old_connections()
+        try:
+            return outil.execute(*args, **kwargs)
+        finally:
+            close_old_connections()
+
+    # thread_sensitive=FALSE, et c'est mesure, pas theorique. Sous ASGI, Django
+    # execute la vue synchrone dans un thread de son pool; on y demarre une
+    # boucle asyncio pour PydanticAI. Avec thread_sensitive=True, asgiref veut
+    # rejouer l'ORM dans CE thread, lequel est bloque a attendre la boucle:
+    # interblocage, observe en production le 2026-08-27 (l'outil create_block
+    # est appele, puis plus rien, et le client reessaie trois fois).
+    executer_sync = sync_to_async(_appel_ferme, thread_sensitive=False)
 
     async def executer(**kwargs) -> str:
         if getattr(outil, "requires_confirmation", False) and not autorise_destructif(message_du_tour):
