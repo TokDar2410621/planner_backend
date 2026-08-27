@@ -19,7 +19,11 @@ def _google_response(email, aud, verified='true', **extra):
     return resp
 
 
-@override_settings(GOOGLE_CLIENT_ID='test-client-id')
+# La vue lit GOOGLE_ALLOWED_CLIENT_IDS (web + iOS), calculee dans settings
+# a l'import depuis GOOGLE_CLIENT_ID: surcharger le singulier ne recalcule
+# PAS la liste, et tout token etait refuse en 401.
+@override_settings(GOOGLE_CLIENT_ID='test-client-id',
+                   GOOGLE_ALLOWED_CLIENT_IDS=['test-client-id'])
 class GoogleAuthDuplicateTest(APITestCase):
     def test_duplicate_email_signs_into_data_account_not_409(self):
         # Reproduit la prod: 2 comptes sur le même email, l'un a les données.

@@ -125,12 +125,17 @@ class PublicEndpointTest(APITestCase):
 
 
 # ---------------------------------------------------------------------------
-# AI chat endpoint wiring (LLM mocked — no network / API key needed)
+# AI chat endpoint wiring (LLM mocked, no network / API key needed)
 # ---------------------------------------------------------------------------
 class ChatEndpointTest(APITestCase):
 
     def setUp(self):
         self.user = User.objects.create_user('chatuser', password='pw-chat-123')
+        # Apple 5.1.2(i): le chat exige un consentement IA explicite depuis la
+        # migration 0028. Sans lui, toutes ces vues rendent 403 et ces tests
+        # mesureraient le portail de consentement au lieu de leur sujet.
+        self.user.profile.ai_consent_at = timezone.now()
+        self.user.profile.save()
 
     def test_chat_requires_authentication(self):
         resp = self.client.post(reverse('chat'), {'message': 'hi'})

@@ -13,6 +13,7 @@ from django.contrib.auth.models import User
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from core.models import UploadedDocument, document_upload_to
@@ -111,6 +112,11 @@ class ChatUploadPreservesNameTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user("chatdoc", password="pw-123456")
         self.client.force_authenticate(self.user)
+        # Apple 5.1.2(i): l'upload et le chat exigent un consentement IA
+        # explicite depuis la migration 0028. Sans lui, la vue rend 403 et ce
+        # test mesurerait le portail de consentement au lieu de son sujet.
+        self.user.profile.ai_consent_at = timezone.now()
+        self.user.profile.save()
 
     @patch("core.views.DocumentProcessor")
     def test_chat_upload_keeps_original_filename(self, mock_proc):

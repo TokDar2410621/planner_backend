@@ -13,6 +13,7 @@ from django.contrib.auth.models import User
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -62,6 +63,11 @@ class DocumentTypeAliasAPITest(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user("docalias", password="pw-doc-123456")
         self.client.force_authenticate(self.user)
+        # Apple 5.1.2(i): l'upload et le chat exigent un consentement IA
+        # explicite depuis la migration 0028. Sans lui, la vue rend 403 et ce
+        # test mesurerait le portail de consentement au lieu de son sujet.
+        self.user.profile.ai_consent_at = timezone.now()
+        self.user.profile.save()
 
     @override_settings(MEDIA_ROOT=tempfile.mkdtemp())
     @patch("core.views.DocumentProcessor")

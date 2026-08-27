@@ -16,7 +16,7 @@ modele le 2026-08-26, aucun des deux visible en test unitaire:
    toutes annoncees comme calees. La reconciliation comparait la date demandee
    a la date obtenue, jamais la date obtenue a MAINTENANT.
 """
-from datetime import timedelta
+
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
@@ -100,24 +100,41 @@ class AncrageTemporelTests(TestCase):
             message=f"Revision calee le {date}"))
         return registre
 
+    def _ecarts_a(self, maintenant_txt, date, heure_fin):
+        """Fige l'heure courante.
+
+        Une premiere version de ces tests lisait l'horloge reelle et a casse au
+        passage de minuit: a 00h00, aucun creneau « du jour deja termine » ne
+        peut exister. Un test d'ancrage temporel qui depend de l'heure a
+        laquelle on le lance ne prouve rien.
+        """
+        from datetime import datetime
+
+        from services.agent_v2 import reconciliation
+
+        faux = timezone.make_aware(
+            datetime.strptime(maintenant_txt, "%Y-%m-%d %H:%M"),
+            timezone.get_current_timezone())
+        registre = self._registre_avec_date(date, heure_fin)
+        with patch.object(reconciliation.timezone, 'localtime', return_value=faux):
+            reconciliation.detecter_ecarts(registre)
+        return registre.ecarts
+
     def test_une_seance_placee_hier_produit_un_ecart(self):
-        from services.agent_v2.reconciliation import detecter_ecarts
-        registre = self._registre_avec_date(timezone.localdate() - timedelta(days=1))
-        detecter_ecarts(registre)
-        self.assertEqual(len(registre.ecarts), 1)
-        self.assertIn('passe', registre.ecarts[0].description.lower())
-        self.assertIn('PAS ete annule', registre.ecarts[0].description)
+        ecarts = self._ecarts_a("2026-08-26 23:30", "2026-08-25", "12:00")
+        self.assertEqual(len(ecarts), 1)
+        self.assertIn('passe', ecarts[0].description.lower())
+        self.assertIn('PAS ete annule', ecarts[0].description)
 
     def test_une_seance_a_venir_ne_produit_aucun_ecart(self):
-        from services.agent_v2.reconciliation import detecter_ecarts
-        registre = self._registre_avec_date(timezone.localdate() + timedelta(days=2))
-        detecter_ecarts(registre)
-        self.assertEqual(registre.ecarts, [])
+        self.assertEqual(self._ecarts_a("2026-08-26 23:30", "2026-08-28", "11:00"), [])
 
     def test_une_seance_du_jour_deja_terminee_produit_un_ecart(self):
         """Le cas reel: il etait 23h30 et le modele a cale 09:00-12:00 le jour
         meme. La date seule ne suffit donc pas, il faut l'heure de fin."""
-        from services.agent_v2.reconciliation import detecter_ecarts
-        registre = self._registre_avec_date(timezone.localdate(), heure_fin="00:01")
-        detecter_ecarts(registre)
-        self.assertEqual(len(registre.ecarts), 1)
+        self.assertEqual(len(self._ecarts_a("2026-08-26 23:30", "2026-08-26", "12:00")), 1)
+
+    def test_une_seance_du_jour_ENCORE_a_venir_ne_produit_aucun_ecart(self):
+        """Contre-epreuve du meme jour: sans elle, un detecteur qui signale
+        tout ce qui porte la date du jour passerait les trois autres tests."""
+        self.assertEqual(self._ecarts_a("2026-08-26 08:00", "2026-08-26", "12:00"), [])
