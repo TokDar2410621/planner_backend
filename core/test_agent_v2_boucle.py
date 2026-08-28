@@ -10,7 +10,7 @@ supprime tout passerait le premier test.
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
-from django.test import TestCase, override_settings
+from django.test import TestCase, TransactionTestCase, override_settings
 
 from core.models import ConversationMessage
 from services.agent.tools.base import ToolResult
@@ -82,9 +82,16 @@ class BoucleTests(TestCase):
         self.assertEqual(res, [])
 
 
-class PersistanceTests(TestCase):
+class PersistanceTests(TransactionTestCase):
     """L'historique doit rester lisible par v1: meme modele, memes roles. Un
-    compte bascule sur v2 puis ramene sur v1 ne doit rien perdre."""
+    compte bascule sur v2 puis ramene sur v1 ne doit rien perdre.
+
+    TransactionTestCase depuis le 2026-08-28: AGIR tourne desormais dans un
+    thread du pool pour que le raisonnement puisse etre streame pendant qu'il
+    travaille. Ce thread ne voit pas la transaction non validee d'un TestCase,
+    donc l'historique y arrivait vide. La production n'a pas ce probleme,
+    ATOMIC_REQUESTS valant False: chaque ecriture est validee immediatement et
+    visible de tout thread."""
 
     def setUp(self):
         self.user = User.objects.create_user(username='persist', password='x')

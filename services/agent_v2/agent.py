@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from django.conf import settings
 from django.contrib.auth.models import User
+from django.db import close_old_connections
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
@@ -38,6 +41,28 @@ logger = logging.getLogger(__name__)
 
 BUDGET_ETAPES = 10
 HISTORIQUE_MAX = 20
+
+# POOL DE THREADS REUTILISES, et le mot « reutilises » porte tout le poids.
+#
+# AGIR doit tourner a cote du generateur pour qu'on puisse emettre pendant
+# qu'il travaille. La premiere version creait un thread NEUF par tour: mesure
+# du 2026-08-28, le DEUXIEME tour d'un meme processus se bloque
+# indefiniment, alors que trois tours dans le thread principal passent sans
+# rien. Quatre tours sur un thread reutilise passent aussi, et douze tours
+# concurrents sur un pool de quatre egalement.
+#
+# Consequence pratique: ne JAMAIS remplacer ce pool par un threading.Thread
+# cree a la volee. Le symptome est un blocage silencieux au second message,
+# donc invisible sur un essai unique.
+_POOL_AGIR = ThreadPoolExecutor(
+    max_workers=getattr(settings, "AGENT_V2_THREADS", 8),
+    thread_name_prefix="agir",
+)
+
+# Le drainage attend par tranches plutot qu'indefiniment: si le thread meurt
+# sans poser sa sentinelle, un get() sans delai gelerait la connexion SSE
+# jusqu'au timeout du serveur.
+ATTENTE_PENSEE = 0.5
 # Une lecture de semaine chargee depasse largement ce volume; on tronque plutot
 # que de laisser un seul outil manger le contexte de la redaction.
 EXTRAIT_MAX = 4000
@@ -60,6 +85,17 @@ class PlannerAgentV2:
         # initialisee leverait un AttributeError loin de sa cause.
         self._tache: str = ""
         self._exclu: Optional[int] = None
+        self._file_pensees: Optional[queue.Queue] = None
+
+    def pousser_pensee(self, texte: str) -> None:
+        """Emet un fragment de raisonnement vers le flux, s'il y a un flux.
+
+        Sans file (appel direct depuis le banc ou un test), l'appel est sans
+        effet: la primitive ne doit jamais imposer au reste du code de savoir
+        s'il tourne dans un contexte streame.
+        """
+        if self._file_pensees is not None and texte:
+            self._file_pensees.put(("thinking", texte))
 
     # ------------------------------------------------------------------ AGIR
 
@@ -75,11 +111,26 @@ class PlannerAgentV2:
             system_prompt=prompt_agir(user),
             tools=outils_pour(user, registre, message, tache=self._tache),
         )
+        async def sur_evenements(_contexte, evenements):
+            """Capte les fragments de raisonnement AU FIL de leur production.
+
+            run_sync execute le graphe en entier, donc tous les outils
+            tournent; run_stream_sync s'arreterait a la premiere sortie
+            « finale » et sauterait les appels suivants, ce qui serait faux
+            ici. Le handler est le seul moyen d'avoir les deux.
+            """
+            async for evenement in evenements:
+                delta = getattr(evenement, "delta", None)
+                fragment = getattr(delta, "content_delta", None)
+                if fragment:
+                    self.pousser_pensee(fragment)
+
         try:
             resultat = agent.run_sync(
                 message,
                 message_history=self._historique(user),
                 usage_limits=UsageLimits(request_limit=BUDGET_ETAPES),
+                event_stream_handler=sur_evenements,
             )
         except UsageLimitExceeded:
             # Le tour est tronque, pas rate: les outils deja executes ont
@@ -101,7 +152,23 @@ class PlannerAgentV2:
             system_prompt=PROMPT_DIRE,
             model_settings=REGLAGES_DIRE,
         )
-        return agent.run_sync(self._brief_dire(message, registre, etat, faits)).output
+        brief = self._brief_dire(message, registre, etat, faits)
+
+        # DIRE passe par le MEME pool qu'AGIR, et ce n'est pas un detail de
+        # style. Mesure du 2026-08-28: appeler run_sync depuis le thread
+        # principal apres qu'un thread du pool en a fait un bloque
+        # indefiniment. Le tour se figeait juste apres le compte rendu
+        # factuel, donc apres avoir tout affiche, ce qui rendait le defaut
+        # particulierement trompeur. La seule configuration verifiee est
+        # « tous les appels au modele sur le pool ».
+        def _rediger():
+            close_old_connections()
+            try:
+                return agent.run_sync(brief).output
+            finally:
+                close_old_connections()
+
+        return _POOL_AGIR.submit(_rediger).result()
 
     @staticmethod
     def _brief_dire(message: str, registre: Registre, etat: dict, faits: str) -> str:
@@ -173,15 +240,57 @@ class PlannerAgentV2:
 
         yield {"type": "status", "text": "R\u00e9flexion..."}
 
-        raisonnement = ""
-        try:
-            raisonnement = self._agir(user, message_enrichi, registre) or ""
-        except Exception as e:  # noqa: BLE001
+        # AGIR tourne dans un THREAD pour qu'on puisse emettre pendant qu'il
+        # travaille. Mesure du 2026-08-28: sur une demande multi-etapes il
+        # occupe 15 s des 25 s du tour, et l'utilisateur n'avait rien a lire
+        # pendant ce temps. Le raisonnement etait bien capte, mais emis apres
+        # coup: il decrivait une reflexion deja terminee.
+        raisonnement, panne = "", None
+        self._file_pensees = queue.Queue()
+
+        def travailler():
+            nonlocal raisonnement, panne
+            # Ce thread vit hors du cycle de requete Django, qui ferme les
+            # connexions: on s'en charge des deux cotes.
+            close_old_connections()
+            try:
+                raisonnement = self._agir(user, message_enrichi, registre) or ""
+            except Exception as e:  # noqa: BLE001
+                panne = e
+            finally:
+                close_old_connections()
+                self._file_pensees.put(None)  # sentinelle de fin
+
+        futur = _POOL_AGIR.submit(travailler)
+        fragments = 0
+        while True:
+            try:
+                element = self._file_pensees.get(timeout=ATTENTE_PENSEE)
+            except queue.Empty:
+                # Filet: si le thread s'est termine sans poser sa sentinelle
+                # (arret brutal du worker), on sort au lieu d'attendre pour
+                # toujours et de geler la connexion SSE.
+                if futur.done():
+                    break
+                continue
+            if element is None:
+                break
+            fragments += 1
+            yield {"type": element[0], "text": element[1]}
+        futur.result()  # remonte une panne du pool lui-meme, pas d'AGIR
+        self._file_pensees = None
+
+        # Repli pour les fournisseurs qui ne streament pas leurs deltas: sans
+        # lui, leur raisonnement n'atteindrait le client que dans la charge
+        # utile finale, et le volet resterait vide tout le tour. On perd le
+        # gain de latence, jamais l'information.
+        if raisonnement and not fragments:
+            yield {"type": "thinking", "text": raisonnement}
+
+        if panne is not None:
             # Une panne d'AGIR ne doit pas effacer ce que les outils ont deja
             # ecrit: le registre survit et le tour continue vers DIRE.
-            logger.error("AGIR a echoue: %s", e, exc_info=True)
-        if raisonnement:
-            yield {"type": "thinking", "text": raisonnement}
+            logger.error("AGIR a echoue: %s", panne, exc_info=panne)
 
         etat: dict = {}
         if registre.mutations():
