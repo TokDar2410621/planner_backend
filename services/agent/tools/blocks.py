@@ -16,6 +16,53 @@ from .base import BaseTool, ToolResult, validate_choice, validate_max_length
 
 DAY_NAMES = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
 
+# Le modele peut nommer les jours au lieu de les numeroter.
+#
+# POURQUOI. L'audit de production du 2026-08-19 decrivait un decalage de +1
+# jour a l'import: des matchs annonces samedi stockes dimanche, l'utilisateur
+# finissant par vider ses 28 blocs. Le defaut a ete REPRODUIT le 2026-08-28.
+# L'outil n'y est pour rien (days=[5] stocke bien samedi) et le schema n'est
+# pas ambigu (il dit 0=Lundi..6=Dimanche): c'est le modele qui retombe sur la
+# convention americaine dimanche=0, et seulement sur les jours de fin de
+# semaine. Une convention bien documentee ne suffit donc pas; on retire
+# l'occasion de se tromper.
+_JOURS_PAR_NOM = {
+    'lundi': 0, 'mardi': 1, 'mercredi': 2, 'jeudi': 3,
+    'vendredi': 4, 'samedi': 5, 'dimanche': 6,
+}
+
+
+def normaliser_jours(jours):
+    """Rend une liste d'entiers 0..6, a partir de noms, de numeros ou des deux.
+
+    Une valeur incomprise est IGNOREE, jamais devinee: deviner rouvrirait par
+    un autre chemin le defaut qu'on vient de fermer.
+    """
+    import unicodedata
+
+    if jours is None:
+        return []
+    if isinstance(jours, (str, int)):
+        jours = [jours]
+
+    sortie = []
+    for brut in jours:
+        valeur = None
+        if isinstance(brut, bool):
+            continue
+        if isinstance(brut, int):
+            valeur = brut
+        elif isinstance(brut, str):
+            plat = unicodedata.normalize('NFKD', brut.strip().lower())
+            plat = plat.encode('ascii', 'ignore').decode('ascii')
+            if plat.isdigit():
+                valeur = int(plat)
+            else:
+                valeur = _JOURS_PAR_NOM.get(plat)
+        if valeur is not None and 0 <= valeur <= 6 and valeur not in sortie:
+            sortie.append(valeur)
+    return sortie
+
 # Enforced at the tool layer (not just in the JSON schema) before any write.
 VALID_BLOCK_TYPES = {c[0] for c in RecurringBlock.BLOCK_TYPE_CHOICES}
 VALID_FLEXIBILITIES = {c[0] for c in RecurringBlock.FLEXIBILITY_CHOICES}
@@ -99,8 +146,8 @@ class CreateBlockTool(BaseTool):
             },
             "days": {
                 "type": "array",
-                "items": {"type": "integer", "minimum": 0, "maximum": 6},
-                "description": "Jours de la semaine (0=Lundi, 1=Mardi, ..., 6=Dimanche)",
+                "items": {"type": "string"},
+                "description": "Jours de la semaine. Utilise de preference les NOMS: [\"samedi\", \"dimanche\"]. Les numeros restent acceptes (0=Lundi, 1=Mardi, ..., 6=Dimanche) mais les noms evitent toute confusion de convention.",
             },
             "start_time": {
                 "type": "string",
@@ -138,7 +185,8 @@ class CreateBlockTool(BaseTool):
     def execute(self, user: User, **kwargs) -> ToolResult:
         title = kwargs["title"]
         block_type = kwargs["block_type"]
-        days = kwargs["days"]
+        # Noms ou numeros: le modele se trompait sur samedi et dimanche.
+        days = normaliser_jours(kwargs["days"])
         start_time = kwargs["start_time"]
         end_time = kwargs["end_time"]
         location = kwargs.get("location", "")

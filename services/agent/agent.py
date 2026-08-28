@@ -32,6 +32,7 @@ except ImportError:  # pragma: no cover - fallback if the factory is unavailable
         return GeminiProvider()
 
 from .context_builder import build_context
+from .tools.blocks import normaliser_jours
 from .system_prompt import build_system_prompt
 from .tools import get_tools_for_claude, execute_tool, TOOL_MAP
 from .tools.base import ToolResult
@@ -427,7 +428,10 @@ def _schedule_reality_footer(user, tool_calls: list) -> str:
             # Un seul jour ciblé = placement type OR2 ("ajoute X ce/chaque lundi").
             # Un create multi-jours = description d'habitude (onboarding): pas de
             # footer, sinon on annexe une ligne par jour (spam).
-            days = (call.get("args") or {}).get("days") or []
+            # normaliser_jours: create_block accepte desormais les NOMS de
+            # jours (correctif du decalage +1 de l'audit). Sans ca,
+            # « samedi » arriverait tel quel dans un calcul de date.
+            days = normaliser_jours((call.get("args") or {}).get("days"))
             if len(days) == 1:
                 d = _next_date_for_weekday(days[0])
                 if d is not None:
@@ -478,7 +482,10 @@ def _creation_recap_footer(tool_calls: list) -> str:
         if not result.get("success"):
             continue
         args = call.get("args") or {}
-        days = args.get("days") or []
+        # Idem: sans normalisation, un jour nomme serait ecarte par le
+        # int(d) plus bas et le recapitulatif deterministe disparaitrait
+        # en silence, ce qui est pire qu'un plantage.
+        days = normaliser_jours(args.get("days"))
         names = []
         for d in days:
             try:
