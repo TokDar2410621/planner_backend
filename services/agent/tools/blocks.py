@@ -94,10 +94,8 @@ class ListBlocksTool(BaseTool):
         "type": "object",
         "properties": {
             "day_of_week": {
-                "type": "integer",
-                "description": "Filtrer par jour (0=Lundi, 1=Mardi, ..., 6=Dimanche)",
-                "minimum": 0,
-                "maximum": 6,
+                "type": "string",
+                "description": "Filtrer par jour. Nom de preference (\"samedi\"); les numeros restent acceptes (0=Lundi..6=Dimanche).",
             },
             "block_type": {
                 "type": "string",
@@ -111,9 +109,12 @@ class ListBlocksTool(BaseTool):
     def execute(self, user: User, **kwargs) -> ToolResult:
         blocks = RecurringBlock.objects.filter(user=user, active=True)
 
-        day = kwargs.get("day_of_week")
-        if day is not None:
-            blocks = blocks.filter(day_of_week=day)
+        # Noms acceptes ici aussi: un filtre silencieusement faux rend une
+        # reponse fausse sans le signaler, et melanger les conventions entre
+        # outils reintroduirait la confusion qu'on supprime.
+        jours = normaliser_jours(kwargs.get("day_of_week"))
+        if jours:
+            blocks = blocks.filter(day_of_week=jours[0])
 
         block_type = kwargs.get("block_type")
         if block_type:
@@ -343,10 +344,8 @@ class UpdateBlockTool(BaseTool):
                 "description": "fixed pour verrouiller le bloc recurrent, flexible pour le rendre deplacable.",
             },
             "day_of_week": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 6,
-                "description": "Nouveau jour (0=Lundi..6=Dimanche) pour DÉPLACER le bloc vers ce jour, proprement, sans le recréer.",
+                "type": "string",
+                "description": "Nouveau jour pour DÉPLACER le bloc, proprement, sans le recréer. Utilise de préférence le NOM: \"samedi\". Les numéros restent acceptés (0=Lundi..6=Dimanche).",
             },
             "start_date": {
                 "type": "string",
@@ -388,8 +387,16 @@ class UpdateBlockTool(BaseTool):
         new_day = kwargs.get("day_of_week")
         if new_day is None:
             new_day = block.day_of_week
-        elif not (0 <= new_day <= 6):
-            return ToolResult(success=False, data={}, message="day_of_week invalide (0=Lundi..6=Dimanche).")
+        else:
+            # Meme correctif que create_block: le modele confond samedi et
+            # dimanche avec la convention americaine. On accepte les noms, et
+            # on REFUSE ce qu'on ne comprend pas plutot que de deviner: un
+            # bloc deplace au hasard est pire qu'un refus, l'utilisateur ne le
+            # verrait pas passer.
+            compris = normaliser_jours(new_day)
+            if not compris:
+                return ToolResult(success=False, data={}, message="day_of_week invalide (nom de jour ou 0=Lundi..6=Dimanche).")
+            new_day = compris[0]
 
         night = is_overnight(new_start, new_end, block.is_night_shift)
         new_block_type = kwargs.get("block_type") or block.block_type

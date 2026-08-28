@@ -140,21 +140,23 @@ class DetectConflictsTool(BaseTool):
         "type": "object",
         "properties": {
             "day_of_week": {
-                "type": "integer",
-                "description": "Vérifier un jour spécifique (0=Lundi, 6=Dimanche). Si absent, vérifie tous les jours.",
-                "minimum": 0,
-                "maximum": 6,
+                "type": "string",
+                "description": "Vérifier un jour spécifique. Nom de préférence (\"samedi\"); les numéros restent acceptés (0=Lundi..6=Dimanche). Si absent, vérifie tous les jours.",
             },
         },
         "required": [],
     }
 
     def execute(self, user: User, **kwargs) -> ToolResult:
-        day = kwargs.get("day_of_week")
+        # Nom ou numero, comme partout ailleurs depuis le correctif du
+        # decalage +1: une convention par outil serait une invitation a se
+        # tromper.
+        from .blocks import normaliser_jours
+        jours = normaliser_jours(kwargs.get("day_of_week"))
         blocks = RecurringBlock.objects.filter(user=user, active=True)
 
-        if day is not None:
-            days_to_check = [day]
+        if jours:
+            days_to_check = [jours[0]]
         else:
             days_to_check = range(7)
 

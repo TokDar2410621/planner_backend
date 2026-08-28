@@ -137,3 +137,101 @@ class RecapitulatifsDeV1Tests(TestCase):
         from services.agent.agent import _creation_recap_footer
         self.assertEqual(_creation_recap_footer(self._appel([5, 6])),
                          _creation_recap_footer(self._appel(["samedi", "dimanche"])))
+
+
+class DeplacementParNomTests(TestCase):
+    """update_block gardait la faiblesse que create_block vient de perdre.
+
+    Deplacer un bloc vers le samedi passe par day_of_week, un entier: le
+    modele pouvait donc encore y envoyer la convention americaine. Le defaut
+    etait le meme, sur un chemin different."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='deplace', password='x')
+        self.bloc = RecurringBlock.objects.create(
+            user=self.user, title='Cours de chimie', block_type='course',
+            day_of_week=0, start_time='09:00', end_time='12:00')
+
+    def _deplacer(self, jour):
+        return execute_tool('update_block', self.user,
+                            {'block_id': self.bloc.id, 'day_of_week': jour})
+
+    def test_deplacer_vers_samedi_nomme(self):
+        r = self._deplacer('samedi')
+        self.bloc.refresh_from_db()
+        self.assertTrue(r.success, r.message)
+        self.assertEqual(self.bloc.day_of_week, 5, f"stocke {JOURS[self.bloc.day_of_week]}")
+
+    def test_deplacer_vers_dimanche_nomme(self):
+        self._deplacer('dimanche')
+        self.bloc.refresh_from_db()
+        self.assertEqual(self.bloc.day_of_week, 6, f"stocke {JOURS[self.bloc.day_of_week]}")
+
+    def test_le_numero_deplace_toujours(self):
+        """Non-regression du chemin existant."""
+        self._deplacer(3)
+        self.bloc.refresh_from_db()
+        self.assertEqual(self.bloc.day_of_week, 3)
+
+    def test_un_jour_incomprehensible_est_refuse_et_ne_deplace_rien(self):
+        """Refuser plutot que deviner: un bloc deplace au hasard est pire
+        qu'un refus, l'utilisateur ne le verrait pas."""
+        r = self._deplacer('samdi')
+        self.bloc.refresh_from_db()
+        self.assertFalse(r.success)
+        self.assertEqual(self.bloc.day_of_week, 0)
+
+    def test_le_schema_accepte_un_nom(self):
+        from services.agent.tools import TOOL_MAP
+        champ = TOOL_MAP['update_block'].parameters['properties']['day_of_week']
+        self.assertEqual(champ.get('type'), 'string')
+        self.assertIn('samedi', champ['description'].lower())
+
+
+class FiltresDeLectureTests(TestCase):
+    """Les filtres de lecture acceptent les noms, eux aussi.
+
+    Ils ne corrompent rien, mais dire au modele d'utiliser des noms sur les
+    outils d'ecriture et des numeros sur ceux de lecture reintroduirait
+    exactement la confusion qu'on supprime. Un filtre silencieusement faux
+    rend en plus une reponse fausse sans le signaler."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='filtre', password='x')
+        RecurringBlock.objects.create(
+            user=self.user, title='Match', block_type='sport',
+            day_of_week=5, start_time='13:00', end_time='14:30')
+
+    def test_list_blocks_filtre_par_nom(self):
+        r = execute_tool('list_blocks', self.user, {'day_of_week': 'samedi'})
+        self.assertEqual(r.data['count'], 1, r.message)
+
+    def test_list_blocks_filtre_toujours_par_numero(self):
+        r = execute_tool('list_blocks', self.user, {'day_of_week': 5})
+        self.assertEqual(r.data['count'], 1)
+
+    def test_un_autre_jour_ne_ramene_rien(self):
+        """Contre-epreuve: sans elle, un filtre casse qui ignore l'argument
+        et rend TOUT passerait les deux tests precedents."""
+        r = execute_tool('list_blocks', self.user, {'day_of_week': 'dimanche'})
+        self.assertEqual(r.data['count'], 0)
+
+    def test_detect_conflicts_filtre_par_nom(self):
+        RecurringBlock.objects.create(
+            user=self.user, title='Autre', block_type='course',
+            day_of_week=5, start_time='13:30', end_time='15:00')
+        r = execute_tool('detect_conflicts', self.user, {'day_of_week': 'samedi'})
+        self.assertTrue(r.success, r.message)
+        self.assertGreaterEqual(r.data.get('count', 0), 1)
+
+    def test_tous_les_outils_a_jour_annoncent_le_meme_type(self):
+        """Une convention par outil serait une invitation a se tromper: c'est
+        exactement le defaut qu'on ferme."""
+        from services.agent.tools import TOOL_MAP
+        for nom, champ in (('create_block', 'days'), ('update_block', 'day_of_week'),
+                           ('list_blocks', 'day_of_week'),
+                           ('detect_conflicts', 'day_of_week')):
+            with self.subTest(outil=nom):
+                p = TOOL_MAP[nom].parameters['properties'][champ]
+                type_reel = p['items']['type'] if p.get('type') == 'array' else p['type']
+                self.assertEqual(type_reel, 'string', f"{nom}.{champ}")
