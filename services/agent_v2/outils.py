@@ -36,7 +36,8 @@ from pydantic_ai.tools import Tool
 
 from services.agent.tools import ALL_TOOLS
 from services.agent.tools.base import ToolResult
-from services.agent_v2.registre import Registre
+from services.agent_v2.registre import (OUTILS_DE_MUTATION, Registre,
+                                        _empreinte, boucle_detectee)
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,8 @@ def autorise_destructif(message) -> bool:
     return bool(_CONFIRME.search(plat))
 
 
-def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str):
+def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
+               tache: str, cache: dict):
     """Rend la coroutine que PydanticAI appellera avec les arguments du modele."""
 
     def _appel_ferme(*args, **kwargs):
@@ -95,6 +97,30 @@ def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str):
         # Meme marqueur que v1: le banc capte les appels d'outils par le
         # logger parent « services », et cette ligne est ce qu'il cherche.
         logger.info(f"Executing tool: {outil.name}({kwargs})")
+
+        # IDEMPOTENCE, sur les ECRITURES seulement. Observe en production le
+        # 2026-08-27: un tour bloque a fait reessayer le client trois fois, et
+        # create_block est parti trois fois avec les memes arguments. Ce
+        # jour-la l'outil echouait; le meme scenario avec un outil qui reussit
+        # lentement creerait trois blocs.
+        #
+        # La cle vient de l'identite METIER de l'action (tache, outil,
+        # arguments normalises) et JAMAIS d'un identifiant tire a chaque
+        # tentative: un jeton neuf par essai ferait voir une action neuve a
+        # chaque fois et le motif s'effondrerait en silence.
+        #
+        # Les LECTURES en sont exclues: elles doivent refleter l'etat courant,
+        # sinon l'agent devient aveugle a ses propres ecritures du meme tour.
+        cle = None
+        if outil.name in OUTILS_DE_MUTATION:
+            cle = f"{tache}:{_empreinte(outil.name, kwargs)}"
+            if cle in cache:
+                deja = cache[cle]
+                logger.info("Idempotence: %s deja execute ce tour, resultat rejoue",
+                            outil.name)
+                registre.ajouter(outil.name, kwargs, deja)
+                return deja.to_string()
+
         try:
             resultat = await executer_sync(user, **kwargs)
         except Exception as e:  # noqa: BLE001
@@ -106,18 +132,45 @@ def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str):
             resultat = ToolResult(
                 success=False, data={}, message=f"Erreur de l'outil: {e}"
             )
+        # On ne met en cache que les SUCCES: un echec peut etre transitoire
+        # (429, timeout), et rejouer un echec empecherait toute reprise.
+        if cle is not None and resultat.success:
+            cache[cle] = resultat
         registre.ajouter(outil.name, kwargs, resultat)
+
+        # Garde de terminaison, ici parce que c'est le seul point par lequel
+        # TOUS les appels passent. Le budget d'etapes seul ne suffit pas: il
+        # finit par arreter le tour, mais apres avoir brule dix allers-retours
+        # a rejouer la meme action. On rend au modele une consigne explicite
+        # plutot que de lever: il peut encore rediger une reponse utile avec
+        # ce qu'il a, et le bloc factuel dira que le tour a ete coupe.
+        if boucle_detectee(registre):
+            registre.boucle_interrompue = True
+            logger.warning(
+                "Boucle detectee: %s rejoue a l'identique, tour interrompu", outil.name)
+            return (
+                "ARRET: tu viens de rejouer trois fois la meme action avec les "
+                "memes arguments sans progresser. N'appelle plus d'outil. "
+                "Reponds a l'utilisateur avec ce que tu as deja."
+            )
         return resultat.to_string()
 
     executer.__name__ = outil.name
     return executer
 
 
-def outils_pour(user: User, registre: Registre, message_du_tour: str = "") -> list[Tool]:
-    """Les 30 outils de v1, prets pour PydanticAI, branches sur ce registre."""
+def outils_pour(user: User, registre: Registre, message_du_tour: str = "",
+                tache: str = "") -> list[Tool]:
+    """Les 30 outils de v1, prets pour PydanticAI, branches sur ce registre.
+
+    `tache` identifie le tour: il entre dans la cle d'idempotence pour que
+    deux tours distincts puissent legitimement refaire la meme action, alors
+    qu'un meme tour rejoue ne l'execute qu'une fois.
+    """
+    cache: dict = {}
     return [
         Tool.from_schema(
-            _fabriquer(outil, user, registre, message_du_tour),
+            _fabriquer(outil, user, registre, message_du_tour, tache, cache),
             outil.name,
             outil.description,
             outil.parameters,

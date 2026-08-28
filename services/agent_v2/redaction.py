@@ -32,7 +32,8 @@ def bloc_factuel(registre: Registre) -> str:
     """Le compte rendu deterministe de ce qui s'est passe."""
     reussites = [a for a in registre.actions if a.succes and a.est_mutation]
     echecs = [a for a in registre.actions if not a.succes]
-    if not reussites and not echecs and not registre.ecarts and not registre.budget_epuise:
+    interrompu = registre.budget_epuise or getattr(registre, "boucle_interrompue", False)
+    if not reussites and not echecs and not registre.ecarts and not interrompu:
         return ""
 
     lignes: list[str] = []
@@ -50,6 +51,12 @@ def bloc_factuel(registre: Registre) -> str:
     lignes += [f"- Ecart: {e.description}" for e in registre.ecarts]
     if registre.budget_epuise:
         lignes.append("- Traitement interrompu: la limite d'etapes du tour a ete atteinte.")
+    if getattr(registre, "boucle_interrompue", False):
+        # Dit a l'utilisateur, pas seulement journalise: un tour tronque sans
+        # explication ressemble a une panne, et il a le droit de savoir que
+        # l'agent tournait en rond plutot que de travailler.
+        lignes.append(
+            "- Traitement interrompu: je repetais la meme action sans progresser.")
     return "\n".join(lignes)
 
 

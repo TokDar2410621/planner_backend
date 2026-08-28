@@ -46,11 +46,43 @@ class Ecart:
     description: str
 
 
+# Deux appels identiques peuvent etre legitimes: relire apres avoir ecrit est
+# un bon reflexe. Trois d'affilee ne le sont plus. Seuil choisi bas parce que
+# la litterature de 2026 (taxonomie MAST, 1600+ traces) montre que les boucles
+# d'actions identiques absorbent plus d'un quart des echecs sur certains bancs.
+REPETITIONS_TOLEREES = 3
+
+
+def _empreinte(outil: str, parametres: dict) -> str:
+    """Identifie une action par son intention, pas par sa forme.
+
+    Les cles sont triees: un dict n'a pas d'ordre stable d'un appel a l'autre,
+    et sans normalisation le detecteur raterait la repetition la plus banale.
+    """
+    import json
+
+    return f"{outil}:{json.dumps(parametres or {}, sort_keys=True, default=str)}"
+
+
+def boucle_detectee(registre: "Registre") -> bool:
+    """Le meme appel, a l'identique, REPETITIONS_TOLEREES fois de suite ?
+
+    On regarde la fin du registre et non tout l'historique: trois creations de
+    blocs differents ne sont pas une boucle, c'est un import d'horaire.
+    """
+    if len(registre.actions) < REPETITIONS_TOLEREES:
+        return False
+    derniers = registre.actions[-REPETITIONS_TOLEREES:]
+    empreintes = {_empreinte(a.outil, a.parametres) for a in derniers}
+    return len(empreintes) == 1
+
+
 class Registre:
     def __init__(self) -> None:
         self.actions: list[Action] = []
         self.ecarts: list[Ecart] = []
         self.budget_epuise: bool = False
+        self.boucle_interrompue: bool = False
         self._index: dict = {}
 
     def ajouter(self, outil: str, parametres: dict, resultat: ToolResult) -> Action:

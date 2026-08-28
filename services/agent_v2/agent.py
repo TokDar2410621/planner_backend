@@ -55,6 +55,11 @@ class PlannerAgentV2:
 
     def __init__(self, user: Optional[User] = None):
         self.user = user
+        # Poses ici et pas seulement dans le flux: _agir et _historique sont
+        # appelables directement (banc, tests), et une instance a demi
+        # initialisee leverait un AttributeError loin de sa cause.
+        self._tache: str = ""
+        self._exclu: Optional[int] = None
 
     # ------------------------------------------------------------------ AGIR
 
@@ -68,7 +73,7 @@ class PlannerAgentV2:
         agent = Agent(
             modele_agir(),
             system_prompt=prompt_agir(user),
-            tools=outils_pour(user, registre, message),
+            tools=outils_pour(user, registre, message, tache=self._tache),
         )
         try:
             resultat = agent.run_sync(
@@ -147,6 +152,10 @@ class PlannerAgentV2:
         courant = ConversationMessage.objects.create(
             user=user, role="user", content=message)
         self._exclu = courant.pk
+        # Identifie CE tour pour les cles d'idempotence: deux tours
+        # distincts peuvent legitimement refaire la meme action, un meme
+        # tour rejoue ne doit l'executer qu'une fois.
+        self._tache = f"{user.pk}:{courant.pk}"
 
         registre = Registre()
 
