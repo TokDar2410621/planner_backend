@@ -26,6 +26,7 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserProm
 from pydantic_ai.usage import UsageLimits
 
 from core.models import ConversationMessage, UploadedDocument
+from services.agent_v2.mesure import fuites_reponse
 from services.agent_v2.modeles import REGLAGES_DIRE, modele_agir, modele_dire
 from services.agent_v2.outils import outils_pour
 from services.agent_v2.prompts import PROMPT_DIRE, prompt_agir
@@ -135,7 +136,7 @@ class PlannerAgentV2:
         use_streaming: bool = True,
         generate_quick_replies: bool = False,
     ):
-        """Contrat SSE identique a v1: status, delta, done. Le done fait
+        """Contrat SSE additif: status, thinking, delta, done. Le done fait
         AUTORITE et le client remplace toujours la bulle par son response."""
         self.user = user
 
@@ -161,7 +162,7 @@ class PlannerAgentV2:
             if complement:
                 message_enrichi = f"{message_enrichi}\n\n{complement}"
 
-        yield {"type": "status", "text": "Je regarde ton planning..."}
+        yield {"type": "status", "text": "R\u00e9flexion..."}
 
         raisonnement = ""
         try:
@@ -170,6 +171,8 @@ class PlannerAgentV2:
             # Une panne d'AGIR ne doit pas effacer ce que les outils ont deja
             # ecrit: le registre survit et le tour continue vers DIRE.
             logger.error("AGIR a echoue: %s", e, exc_info=True)
+        if raisonnement:
+            yield {"type": "thinking", "text": raisonnement}
 
         etat: dict = {}
         if registre.mutations():
@@ -184,16 +187,31 @@ class PlannerAgentV2:
             yield {"type": "delta", "text": faits}
 
         texte = ""
+        rejetees = 0
+        fuites: list[str] = []
         try:
             brut = self._dire(user, message, registre, etat, faits)
+            fuites = fuites_reponse(brut)
             texte, rejetees = assembler(brut, registre)
-            if rejetees:
-                # La mesure du canal que la garantie structurelle protege.
-                logger.warning(
-                    "DIRE a cite %d action(s) inexistante(s), supprimee(s)", rejetees)
         except Exception as e:  # noqa: BLE001
             logger.error("DIRE a echoue: %s", e, exc_info=True)
             texte = self._repli(faits)
+
+        # Une seule ligne par tour, mais pas toujours au meme niveau: une
+        # reference rejetee est un mensonge que la garantie structurelle vient
+        # d'attraper, et une fuite est une affirmation d'action dans le canal
+        # qu'elle ne protege pas. Ce sont LES deux signaux du projet; en INFO
+        # ils se noieraient dans le bruit et personne ne les verrait passer.
+        anormal = bool(rejetees or fuites)
+        logger.log(
+            logging.WARNING if anormal else logging.INFO,
+            "agent_v2 tour actions=%d rejetees=%d fuites=%d ecarts=%d%s",
+            len(registre.actions),
+            rejetees,
+            len(fuites),
+            len(registre.ecarts),
+            f" types={','.join(fuites)}" if fuites else "",
+        )
 
         ConversationMessage.objects.create(
             user=user, role="assistant", content=texte)
