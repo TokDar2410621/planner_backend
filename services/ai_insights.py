@@ -139,7 +139,10 @@ class AIInsightsService:
             List of Suggestion objects
         """
         if target_date is None:
-            target_date = timezone.now().date()
+            # HEURE MURALE, pas UTC. `timezone.now().date()` bascule sur demain
+            # des 20 h a Montreal (mesure 2026-08-29): tout le jeu de
+            # suggestions du soir portait alors sur le lendemain, sans le dire.
+            target_date = timezone.localdate()
 
         suggestions = []
 
@@ -152,15 +155,27 @@ class AIInsightsService:
                 # Find matching task for this gap
                 matching_task = self._find_best_task_for_gap(gap, pending_tasks, user.profile)
                 if matching_task:
+                    # Le creneau PROPOSE fait la taille de la tache, pas celle
+                    # du trou. Sur une journee vide le trou fait 14 h: on
+                    # annoncait « 840 minutes de libre », et surtout le clic
+                    # envoyait « Planifie X de 08:00 a 22:00 », soit un bloc de
+                    # quatorze heures demande a l'agent.
+                    duree = min(
+                        matching_task.estimated_duration_minutes or 60,
+                        gap.duration_minutes,
+                    )
+                    debut = gap.start_time
+                    fin = (datetime.combine(gap.date, debut)
+                           + timedelta(minutes=duree)).time()
                     suggestions.append(Suggestion(
                         type='free_time',
-                        message=f"Tu as {gap.duration_minutes} minutes de libre de {gap.start_time.strftime('%H:%M')} à {gap.end_time.strftime('%H:%M')}. Veux-tu avancer sur « {matching_task.title} » ?",
+                        message=f"Tu peux avancer sur « {matching_task.title} » de {debut.strftime('%H:%M')} à {fin.strftime('%H:%M')}.",
                         task_id=matching_task.id,
                         task_title=matching_task.title,
                         action='schedule',
                         metadata={
-                            'gap_start': gap.start_time.isoformat(),
-                            'gap_end': gap.end_time.isoformat(),
+                            'gap_start': debut.isoformat(),
+                            'gap_end': fin.isoformat(),
                             'gap_date': gap.date.isoformat(),
                             'energy_level': gap.energy_level,
                         }
@@ -171,18 +186,35 @@ class AIInsightsService:
             deadline__isnull=False,
             deadline__lte=timezone.now() + timedelta(days=3)
         )
+        maintenant = timezone.now()
         for task in deadline_tasks[:2]:
-            days_left = (task.deadline.date() - target_date).days
-            if days_left <= 0:
+            # HEURE MURALE des deux cotes. `deadline.date()` rend la date UTC:
+            # une echeance a 23:59 a Montreal vaut 03:59 UTC le lendemain, donc
+            # une tache due AUJOURD'HUI etait annoncee « due demain » (mesure
+            # 2026-08-29, echeance dans 17 h).
+            echeance = timezone.localtime(task.deadline)
+            days_left = (echeance.date() - target_date).days
+            if task.deadline < maintenant:
+                # En retard se juge sur l'INSTANT. Une tache due ce soir a
+                # 23:59 n'est pas en retard a 8 h du matin.
                 suggestions.append(Suggestion(
                     type='reminder',
-                    message=f"« {task.title} » est en retard ! Échéance : {task.deadline.strftime('%d/%m %H:%M')}",
+                    message=f"« {task.title} » est en retard ! Échéance : {echeance.strftime('%d/%m %H:%M')}",
                     task_id=task.id,
                     task_title=task.title,
                     action='schedule',
                     metadata={'urgency': 'critical'}
                 ))
-            elif days_left <= 1:
+            elif days_left == 0:
+                suggestions.append(Suggestion(
+                    type='reminder',
+                    message=f"« {task.title} » est due aujourd'hui à {echeance.strftime('%H:%M')}.",
+                    task_id=task.id,
+                    task_title=task.title,
+                    action='schedule',
+                    metadata={'urgency': 'critical'}
+                ))
+            elif days_left == 1:
                 suggestions.append(Suggestion(
                     type='reminder',
                     message=f"« {task.title} » est due demain. Planifie-la maintenant !",
@@ -207,8 +239,23 @@ class AIInsightsService:
         profile = user.profile
         from services.scheduling.placement import open_intervals
 
+        # Un creneau DEJA PASSE n'est pas une suggestion. La fenetre part donc
+        # de maintenant quand la date visee est aujourd'hui, arrondie au quart
+        # d'heure suivant. Sans ca, a 16 h le moteur proposait encore 08:00,
+        # la fenetre etant figee a 8 h - 22 h.
+        debut_fenetre = 8 * 60
+        if target_date == timezone.localdate():
+            murale = timezone.localtime()
+            debut_fenetre = max(
+                debut_fenetre,
+                ((murale.hour * 60 + murale.minute + 14) // 15) * 15,
+            )
+        # Plus assez de journee devant soi pour un creneau utile.
+        if debut_fenetre + 30 > 22 * 60:
+            return []
+
         gaps = []
-        for start_min, end_min in open_intervals(user, target_date, 8 * 60, 22 * 60):
+        for start_min, end_min in open_intervals(user, target_date, debut_fenetre, 22 * 60):
             duration = end_min - start_min
             if duration < 30:
                 continue
