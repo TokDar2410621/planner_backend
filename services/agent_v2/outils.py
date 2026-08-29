@@ -60,7 +60,7 @@ def autorise_destructif(message) -> bool:
 
 
 def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
-               tache: str, cache: dict):
+               tache: str, cache: dict, signaler=None):
     """Rend la coroutine que PydanticAI appellera avec les arguments du modele."""
 
     def _appel_ferme(*args, **kwargs):
@@ -91,7 +91,9 @@ def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
                     "l'utilisateur avant de la faire. Demande-la, n'invente pas."
                 ),
             )
-            registre.ajouter(outil.name, kwargs, refus)
+            action = registre.ajouter(outil.name, kwargs, refus)
+            if signaler:
+                signaler(action)
             return refus.to_string()
 
         # Meme marqueur que v1: le banc capte les appels d'outils par le
@@ -118,7 +120,9 @@ def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
                 deja = cache[cle]
                 logger.info("Idempotence: %s deja execute ce tour, resultat rejoue",
                             outil.name)
-                registre.ajouter(outil.name, kwargs, deja)
+                action = registre.ajouter(outil.name, kwargs, deja)
+                if signaler:
+                    signaler(action)
                 return deja.to_string()
 
         try:
@@ -136,7 +140,12 @@ def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
         # (429, timeout), et rejouer un echec empecherait toute reprise.
         if cle is not None and resultat.success:
             cache[cle] = resultat
-        registre.ajouter(outil.name, kwargs, resultat)
+        action = registre.ajouter(outil.name, kwargs, resultat)
+        # Diffuse au fil de l'execution: c'est ce qui meuble l'attente cote
+        # interface, la ou l'utilisateur ne voyait rien entre le raisonnement
+        # et le compte rendu final.
+        if signaler:
+            signaler(action)
 
         # Garde de terminaison, ici parce que c'est le seul point par lequel
         # TOUS les appels passent. Le budget d'etapes seul ne suffit pas: il
@@ -160,7 +169,7 @@ def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
 
 
 def outils_pour(user: User, registre: Registre, message_du_tour: str = "",
-                tache: str = "") -> list[Tool]:
+                tache: str = "", signaler=None) -> list[Tool]:
     """Les 30 outils de v1, prets pour PydanticAI, branches sur ce registre.
 
     `tache` identifie le tour: il entre dans la cle d'idempotence pour que
@@ -170,7 +179,8 @@ def outils_pour(user: User, registre: Registre, message_du_tour: str = "",
     cache: dict = {}
     return [
         Tool.from_schema(
-            _fabriquer(outil, user, registre, message_du_tour, tache, cache),
+            _fabriquer(outil, user, registre, message_du_tour, tache, cache,
+                       signaler),
             outil.name,
             outil.description,
             outil.parameters,

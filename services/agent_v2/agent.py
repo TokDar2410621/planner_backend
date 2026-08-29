@@ -97,6 +97,22 @@ class PlannerAgentV2:
         if self._file_pensees is not None and texte:
             self._file_pensees.put(("thinking", texte))
 
+    def signaler_outil(self, action) -> None:
+        """Diffuse un appel d'outil vers le flux, s'il y a un flux.
+
+        On envoie de quoi AFFICHER (nom, succes, message rendu par l'outil),
+        jamais le dictionnaire d'arguments: il peut porter du contenu
+        utilisateur, et le flux part vers le client.
+        """
+        if self._file_pensees is None or action is None:
+            return
+        self._file_pensees.put(("tool", {
+            "id": action.id,
+            "name": action.outil,
+            "ok": bool(action.succes),
+            "message": action.message or "",
+        }))
+
     # ------------------------------------------------------------------ AGIR
 
     def _agir(self, user: User, message: str, registre: Registre) -> str:
@@ -109,7 +125,8 @@ class PlannerAgentV2:
         agent = Agent(
             modele_agir(),
             system_prompt=prompt_agir(user),
-            tools=outils_pour(user, registre, message, tache=self._tache),
+            tools=outils_pour(user, registre, message, tache=self._tache,
+                              signaler=self.signaler_outil),
         )
         async def sur_evenements(_contexte, evenements):
             """Capte les fragments de raisonnement AU FIL de leur production.
@@ -276,7 +293,11 @@ class PlannerAgentV2:
             if element is None:
                 break
             fragments += 1
-            yield {"type": element[0], "text": element[1]}
+            genre, charge = element
+            # La file transporte deux formes: un fragment de raisonnement
+            # (texte nu) et un appel d'outil (dictionnaire deja pret).
+            yield ({"type": genre, "text": charge} if isinstance(charge, str)
+                   else {"type": genre, **charge})
         futur.result()  # remonte une panne du pool lui-meme, pas d'AGIR
         self._file_pensees = None
 
