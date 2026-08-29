@@ -9,6 +9,7 @@ systematiquement.
 from __future__ import annotations
 
 from django.conf import settings
+from openai import AsyncOpenAI
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.deepseek import DeepSeekProvider
@@ -17,13 +18,39 @@ from pydantic_ai.providers.deepseek import DeepSeekProvider
 REGLAGES_DIRE = {"extra_body": {"thinking": {"type": "disabled"}}}
 
 
+# Au-dela, on considere que le fournisseur ne repond plus assez vite pour un
+# usage conversationnel, et la chaine passe au suivant.
+#
+# Mesure du 2026-08-29. En production ce matin: mediane de 57 s par tour, un
+# tour a 397 s, jusqu'a 99 s pour un seul appel. Le meme code l'apres-midi:
+# mediane de 8,2 s, maximum 16,7 s, avec 15 a 350 jetons de raisonnement par
+# etape. Rien n'avait change chez nous: DeepSeek etait lent, voila tout.
+#
+# Or le client par defaut attend 600 SECONDES en lecture et reessaie deux
+# fois. Personne n'arretait donc le tour de 397 s. `FallbackModel` bascule sur
+# ModelAPIError, et un depassement de delai en leve un (verifie par sonde):
+# borner suffit a rendre la main a Gemini.
+#
+# `max_retries=0` est deliberé: rejouer un appel qui vient d'expirer chez un
+# fournisseur qui rame, c'est attendre trois fois. La resilience est assuree
+# par la chaine de repli, pas par l'acharnement.
+DELAI_MODELE = 60.0
+
+
 def _deepseek():
     cle = getattr(settings, "DEEPSEEK_API_KEY", "")
     if not cle:
         return None
     return OpenAIChatModel(
         getattr(settings, "DEEPSEEK_MODEL", "deepseek-v4-pro"),
-        provider=DeepSeekProvider(api_key=cle),
+        provider=DeepSeekProvider(
+            openai_client=AsyncOpenAI(
+                api_key=cle,
+                base_url="https://api.deepseek.com",
+                timeout=DELAI_MODELE,
+                max_retries=0,
+            )
+        ),
     )
 
 
