@@ -63,6 +63,25 @@ _POOL_AGIR = ThreadPoolExecutor(
 # sans poser sa sentinelle, un get() sans delai gelerait la connexion SSE
 # jusqu'au timeout du serveur.
 ATTENTE_PENSEE = 0.5
+
+
+def _cout(resultat, duree: float) -> dict:
+    """Ce qu'une phase a reellement coute: allers-retours, jetons, secondes.
+
+    `usage()` peut manquer selon le fournisseur. On ne fait alors pas semblant
+    de savoir: zero, et la ligne de log le montrera tel quel.
+    """
+    vide = {"etapes": 0, "entree": 0, "sortie": 0, "duree": duree}
+    try:
+        u = resultat.usage()
+    except Exception:  # noqa: BLE001
+        return vide
+    return {
+        "etapes": getattr(u, "requests", 0) or 0,
+        "entree": getattr(u, "input_tokens", 0) or 0,
+        "sortie": getattr(u, "output_tokens", 0) or 0,
+        "duree": duree,
+    }
 # Une lecture de semaine chargee depasse largement ce volume; on tronque plutot
 # que de laisser un seul outil manger le contexte de la redaction.
 EXTRAIT_MAX = 4000
@@ -143,16 +162,20 @@ class PlannerAgentV2:
                     self.pousser_pensee(fragment)
 
         try:
+            depart = time.perf_counter()
             resultat = agent.run_sync(
                 message,
                 message_history=self._historique(user),
                 usage_limits=UsageLimits(request_limit=BUDGET_ETAPES),
                 event_stream_handler=sur_evenements,
             )
+            self._cout_agir = _cout(resultat, time.perf_counter() - depart)
         except UsageLimitExceeded:
             # Le tour est tronque, pas rate: les outils deja executes ont
             # ecrit. Le bloc factuel le dira, c'est tout l'interet du registre.
             registre.budget_epuise = True
+            self._cout_agir = {"etapes": BUDGET_ETAPES, "entree": 0, "sortie": 0,
+                               "duree": time.perf_counter() - depart}
             return ""
         return self._raisonnement(resultat)
 
@@ -181,7 +204,10 @@ class PlannerAgentV2:
         def _rediger():
             close_old_connections()
             try:
-                return agent.run_sync(brief).output
+                depart_dire = time.perf_counter()
+                sortie = agent.run_sync(brief)
+                self._cout_dire = _cout(sortie, time.perf_counter() - depart_dire)
+                return sortie.output
             finally:
                 close_old_connections()
 
@@ -341,16 +367,30 @@ class PlannerAgentV2:
         # d'attraper, et une fuite est une affirmation d'action dans le canal
         # qu'elle ne protege pas. Ce sont LES deux signaux du projet; en INFO
         # ils se noieraient dans le bruit et personne ne les verrait passer.
+        cout_agir = getattr(self, "_cout_agir", None) or {}
+        cout_dire = getattr(self, "_cout_dire", None) or {}
         anormal = bool(rejetees or fuites)
         logger.log(
             logging.WARNING if anormal else logging.INFO,
-            "agent_v2 tour actions=%d rejetees=%d fuites=%d ecarts=%d%s",
+            "agent_v2 tour actions=%d rejetees=%d fuites=%d ecarts=%d%s"
+            " agir=%.1fs/%dep/%d->%dj dire=%.1fs/%dep/%d->%dj",
             len(registre.actions),
             rejetees,
             len(fuites),
             len(registre.ecarts),
             f" types={','.join(fuites)}" if fuites else "",
+            # CHRONO. Il entre dans LA ligne du tour plutot que d'en ouvrir une
+            # seconde: le contrat est une ligne agregee par tour, et c'est
+            # aussi ce qui permet de correler duree et verite sans jointure.
+            # En production le 2026-08-29, la mediane etait de 57 s et un tour
+            # a atteint 397 s sans qu'aucun log ne dise ou passait le temps: on
+            # ne pouvait qu'inferer des ecarts entre lignes httpx.
+            cout_agir.get("duree", 0.0), cout_agir.get("etapes", 0),
+            cout_agir.get("entree", 0), cout_agir.get("sortie", 0),
+            cout_dire.get("duree", 0.0), cout_dire.get("etapes", 0),
+            cout_dire.get("entree", 0), cout_dire.get("sortie", 0),
         )
+
 
         ConversationMessage.objects.create(
             user=user, role="assistant", content=texte)
