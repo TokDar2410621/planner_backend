@@ -71,15 +71,28 @@ def _cout(resultat, duree: float) -> dict:
     `usage()` peut manquer selon le fournisseur. On ne fait alors pas semblant
     de savoir: zero, et la ligne de log le montrera tel quel.
     """
-    vide = {"etapes": 0, "entree": 0, "sortie": 0, "duree": duree}
+    vide = {"etapes": 0, "entree": 0, "sortie": 0, "raisonnement": 0,
+            "cache": 0, "duree": duree}
     try:
         u = resultat.usage()
     except Exception:  # noqa: BLE001
         return vide
+    # `details` porte ce que le fournisseur ajoute. Sur DeepSeek: les jetons de
+    # RAISONNEMENT, et le partage entre succes et echecs de cache de prefixe.
+    #
+    # Ces deux nombres repondent a la question ouverte. Sonde du 2026-08-29:
+    # au deuxieme appel d'une conversation, 7680 jetons d'entree sur 7781
+    # etaient des succes de cache. Les trente schemas d'outils sont donc bien
+    # renvoyes a chaque etape, mais ni refactures ni retraites: la piste du
+    # contexte qui gonfle ne tient pas, et c'est le raisonnement qu'il faut
+    # regarder.
+    details = getattr(u, "details", None) or {}
     return {
         "etapes": getattr(u, "requests", 0) or 0,
         "entree": getattr(u, "input_tokens", 0) or 0,
         "sortie": getattr(u, "output_tokens", 0) or 0,
+        "raisonnement": details.get("reasoning_tokens", 0) or 0,
+        "cache": details.get("prompt_cache_hit_tokens", 0) or 0,
         "duree": duree,
     }
 # Une lecture de semaine chargee depasse largement ce volume; on tronque plutot
@@ -373,7 +386,7 @@ class PlannerAgentV2:
         logger.log(
             logging.WARNING if anormal else logging.INFO,
             "agent_v2 tour actions=%d rejetees=%d fuites=%d ecarts=%d%s"
-            " agir=%.1fs/%dep/%d->%dj dire=%.1fs/%dep/%d->%dj",
+            " agir=%.1fs/%dep/%d->%dj/r%d/c%d dire=%.1fs/%dep/%d->%dj/r%d",
             len(registre.actions),
             rejetees,
             len(fuites),
@@ -387,8 +400,10 @@ class PlannerAgentV2:
             # ne pouvait qu'inferer des ecarts entre lignes httpx.
             cout_agir.get("duree", 0.0), cout_agir.get("etapes", 0),
             cout_agir.get("entree", 0), cout_agir.get("sortie", 0),
+            cout_agir.get("raisonnement", 0), cout_agir.get("cache", 0),
             cout_dire.get("duree", 0.0), cout_dire.get("etapes", 0),
             cout_dire.get("entree", 0), cout_dire.get("sortie", 0),
+            cout_dire.get("raisonnement", 0),
         )
 
 
