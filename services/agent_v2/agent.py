@@ -23,13 +23,13 @@ from typing import Optional
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import close_old_connections
-from pydantic_ai import Agent
+from pydantic_ai import Agent, ModelRetry
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.usage import UsageLimits
 
 from core.models import ConversationMessage, UploadedDocument
-from services.agent_v2.mesure import fuites_reponse
+from services.agent_v2.mesure import epurer_reponse, fuites_reponse
 from services.agent_v2.modeles import REGLAGES_DIRE, modele_agir, modele_dire
 from services.agent_v2.outils import outils_pour
 from services.agent_v2.prompts import PROMPT_DIRE, prompt_agir
@@ -204,7 +204,36 @@ class PlannerAgentV2:
             output_type=ReponseDire,
             system_prompt=PROMPT_DIRE,
             model_settings=REGLAGES_DIRE,
+            output_retries=1,
         )
+
+        tentatives = {"n": 0}
+
+        @agent.output_validator
+        def _sans_affirmation_d_action(sortie: ReponseDire) -> ReponseDire:
+            # SECONDE CHANCE avant la guillotine, et JAMAIS plus. Contre-
+            # expertise du 2026-08-30: lever encore a la recidive faisait
+            # exploser run_sync (UnexpectedModelBehavior), la reponse entiere
+            # partait au repli et la guillotine ne coupait jamais. Ici la
+            # recidive est LIVREE a l'assemblage, qui supprime les phrases
+            # fautives: la verite ne depend pas de la cooperation du modele.
+            tentatives["n"] += 1
+            fuites = fuites_reponse(sortie)
+            if fuites and tentatives["n"] <= 1:
+                champs = ", ".join(sorted({f.split(":", 1)[0] for f in fuites}))
+                # Le message NE montre PAS comment reformuler l'affirmation:
+                # la premiere version listait les tournures interdites et
+                # poussait le modele vers le passif « a ete deplace »,
+                # indetectable a l'epoque. On demande de RETIRER, pas de
+                # deguiser.
+                raise ModelRetry(
+                    f"Les champs {champs} presentent une action comme faite, "
+                    "en cours ou a venir. SUPPRIME ces phrases: toute action "
+                    "reelle se cite uniquement dans `actions` avec sa "
+                    "reference. N'evoque aucune action dans la prose, sous "
+                    "aucune forme ni aucun temps."
+                )
+            return sortie
         brief = self._brief_dire(message, registre, etat, faits)
 
         # DIRE passe par le MEME pool qu'AGIR, et ce n'est pas un detail de
@@ -366,11 +395,19 @@ class PlannerAgentV2:
 
         texte = ""
         rejetees = 0
+        supprimees = 0
         fuites: list[str] = []
         try:
             brut = self._dire(user, message, registre, etat, faits)
+            # Fuites APRES la seconde chance du validateur: ce compteur dit
+            # ce que le modele persiste a affirmer, pas ce qui part.
             fuites = fuites_reponse(brut)
+            brut, supprimees = epurer_reponse(brut)
             texte, rejetees = assembler(brut, registre)
+            if not texte.strip():
+                # Tout etait mensonge: le compte rendu factuel reste la seule
+                # chose vraie a dire.
+                texte = self._repli(faits)
         except Exception as e:  # noqa: BLE001
             logger.error("DIRE a echoue: %s", e, exc_info=True)
             texte = self._repli(faits)
@@ -385,11 +422,12 @@ class PlannerAgentV2:
         anormal = bool(rejetees or fuites)
         logger.log(
             logging.WARNING if anormal else logging.INFO,
-            "agent_v2 tour actions=%d rejetees=%d fuites=%d ecarts=%d%s"
+            "agent_v2 tour actions=%d rejetees=%d fuites=%d supprimees=%d ecarts=%d%s"
             " agir=%.1fs/%dep/%d->%dj/r%d/c%d dire=%.1fs/%dep/%d->%dj/r%d",
             len(registre.actions),
             rejetees,
             len(fuites),
+            supprimees,
             len(registre.ecarts),
             f" types={','.join(fuites)}" if fuites else "",
             # CHRONO. Il entre dans LA ligne du tour plutot que d'en ouvrir une

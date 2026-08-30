@@ -62,8 +62,16 @@ class FluxMesureTests(TestCase):
         )
         self.assertIn("inspect the schedule", events[1]["text"])
         self.assertNotEqual(events[3]["text"], events[-1]["response"])
-        self.assertIn("Je vais organiser ton planning.", events[-1]["response"])
-        self.assertIn("J'ai supprime les doublons.", events[-1]["response"])
+        # CONTRAT RETOURNE le 2026-08-30, decision de bascule a l'appui: la
+        # prose qui AFFIRME une action ne part plus. « Je vais organiser » et
+        # « J'ai supprime les doublons » sont des fuites: la guillotine de
+        # prose les supprime (voir test_agent_v2_prose). Ce test verrouillait
+        # l'ancien monde ou elles etaient livrees telles quelles.
+        self.assertNotIn("Je vais organiser ton planning.", events[-1]["response"])
+        self.assertNotIn("J'ai supprime les doublons.", events[-1]["response"])
+        # L'action CITEE avec une vraie reference survit, elle: c'est tout
+        # l'interet du canal structure.
+        self.assertIn("Maths est cale.", events[-1]["response"])
         self.assertNotIn("tout reorganise", events[-1]["response"])
         self.assertEqual(events[-1]["raisonnement"], events[1]["text"])
 
@@ -94,6 +102,8 @@ class FluxMesureTests(TestCase):
         self.assertIn("actions=1", lignes[0])
         self.assertIn("rejetees=1", lignes[0])
         self.assertIn("fuites=1", lignes[0])
+        # La guillotine de prose a coupe l'ouverture menteuse: la ligne le dit.
+        self.assertIn("supprimees=", lignes[0])
         self.assertIn("ecarts=1", lignes[0])
         self.assertNotIn("secret utilisateur", lignes[0])
 
