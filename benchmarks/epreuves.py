@@ -29,6 +29,11 @@ def _semaine_type(m: Monde) -> None:
 # ------------------------------------------------------- 1. temporel (20 pts)
 
 def epreuve_temporel(p: Pilote) -> Note:
+    # 2026-08-30: items f a k ajoutes pour resserrer l'amplitude, mesuree a
+    # 7.1 points sur 20 sur les 5 passages v1 du 2026-08-27 au 2026-08-28
+    # (le plan agent-v2 exige moins de 3). Aucun item existant n'est touche:
+    # les nouveaux s'ajoutent au denominateur, qui passe de 28 a 40 points
+    # bruts. Face a l'historique, seule la comparaison item par item vaut.
     n = Note("Compréhension temporelle", 0, 0)
     maintenant = timezone.localtime()
 
@@ -107,6 +112,82 @@ def epreuve_temporel(p: Pilote) -> Note:
     n.tours.append(t)
     n.point(bool((t.reponse or "").strip()) and not t.erreur,
             "repond a un calcul de delai sans planter", 2)
+
+    # f) « demain » a 20h, un creneau libre chaque jour de la semaine type:
+    # la date visee est calculee (aujourd'hui + 1) a l'instant de l'envoi et
+    # la verification lit la base. Attrape « demain » pose sur le mauvais
+    # jour ou sur la semaine suivante.
+    m = monde_neuf("temps-f")
+    _semaine_type(m)
+    demain = timezone.localtime().date() + timedelta(days=1)
+    t = p.envoyer(m.user, "Planifie une séance de lecture demain de 20h à 21h.")
+    n.tours.append(t)
+    ok = any(hhmm(s.start_time) == "20:00" for s in m.places(demain)) or any(
+        b.day_of_week == demain.weekday() and hhmm(b.start_time) == "20:00"
+        for b in m.blocs())
+    n.point(ok, f"« demain » place le {demain} a 20:00", 2)
+
+    # g) Offset en jours: « dans 3 jours » = aujourd'hui + 3, verite
+    # calculee a l'instant de l'envoi. Attrape le decompte parti du mauvais
+    # jour et la confusion entre « dans 3 jours » et « le 3 ».
+    m = monde_neuf("temps-g")
+    _semaine_type(m)
+    cible = timezone.localtime().date() + timedelta(days=3)
+    t = p.envoyer(m.user, "Réserve 30 minutes pour un appel important dans 3 jours à 20h.")
+    n.tours.append(t)
+    ok = any(hhmm(s.start_time) == "20:00" for s in m.places(cible)) or any(
+        b.day_of_week == cible.weekday() and hhmm(b.start_time) == "20:00"
+        for b in m.blocs())
+    n.point(ok, f"« dans 3 jours » place le {cible} a 20:00", 2)
+
+    # h) Jour ET date coherents, miroir de l'item b: le prochain lundi est
+    # calcule depuis la semaine de reference, donc jour et date concordent
+    # par construction. L'agent doit ecrire sans redemander. Attrape l'exces
+    # de prudence autant que le mauvais decodage d'une date explicite.
+    m = monde_neuf("temps-h")
+    _semaine_type(m)
+    prochain_lundi = m.lundi + timedelta(days=7)
+    t = p.envoyer(m.user, f"Ajoute une étude de groupe le lundi "
+                          f"{prochain_lundi:%d %B} de 18h à 19h.")
+    n.tours.append(t)
+    ok = any(hhmm(s.start_time) == "18:00" for s in m.places(prochain_lundi)) or any(
+        b.day_of_week == 0 and hhmm(b.start_time) == "18:00" for b in m.blocs())
+    n.point(ok, f"jour et date coherents ({prochain_lundi}) ecrits sans redemander", 2)
+
+    # i) « mercredi prochain » en ECRITURE, la ou l'item e ne fait que
+    # lire. Deux lectures defendables existent (le mercredi rendu par
+    # _prochain_mercredi, ou celui d'apres): les deux dates sont CALCULEES et
+    # acceptees, tout autre jour echoue. Attrape « mercredi » resolu vers
+    # un autre jour de semaine.
+    m = monde_neuf("temps-i")
+    _semaine_type(m)
+    mercredi = _prochain_mercredi(timezone.localtime().date())
+    t = p.envoyer(m.user, "Planifie une réunion d'étude mercredi prochain de 18h à 19h.")
+    n.tours.append(t)
+    acceptees = {mercredi, mercredi + timedelta(days=7)}
+    ok = any(s.date in acceptees and hhmm(s.start_time) == "18:00"
+             for s in m.places()) or any(
+        b.day_of_week == 2 and hhmm(b.start_time) == "18:00" for b in m.blocs())
+    n.point(ok, f"« mercredi prochain » resolu vers {mercredi} (ou +7) a 18:00", 2)
+
+    # j) Arithmetique qui traverse minuit: le quart entrepot seme va de 23:00
+    # a 07:00, soit 8 heures. Une soustraction naive donne 16 (ou -16), que
+    # le motif ne matche pas. Verite deduite du bloc seme, jamais devinee.
+    m = monde_neuf("temps-j")
+    _semaine_type(m)
+    t = p.envoyer(m.user, "Mon quart à l'entrepôt dure combien d'heures ?")
+    n.tours.append(t)
+    n.point(bool(re.search(r"\b8\s*h|\b8\b|\bhuit\b", (t.reponse or "").lower())),
+            "la duree du quart overnight (8 h) est calculee a travers minuit", 2)
+
+    # k) Numero du jour courant, calcule a l'instant de l'envoi (complement
+    # du jour de semaine deja teste). Le motif exige le nombre isole: pour un
+    # 3 du mois, ni « 13h » ni « 30 » ne comptent.
+    jour_mois = timezone.localtime().day
+    t = p.envoyer(m.user, "Aujourd'hui, on est le combien ?")
+    n.tours.append(t)
+    n.point(bool(re.search(rf"\b{jour_mois}(?:er)?\b", t.reponse or "")),
+            f"le numero du jour courant est correct ({jour_mois})", 2)
     return n
 
 
@@ -209,9 +290,22 @@ def _dit_le_manque(txt: str) -> bool:
     return any(mot in bas for mot in ("manque", "reste", "n'ai pas pu", "seulement", "que 2"))
 
 
+def _sans_accents(txt: str) -> str:
+    """Minuscules sans accents, pour chercher un titre quels que soient la
+    casse et l'accent que l'agent a choisis."""
+    return unicodedata.normalize("NFKD", txt or "").encode("ascii", "ignore").decode().lower()
+
+
 # ------------------------------------------------- 4. vérité d'action (20 pts)
 
 def epreuve_verite(p: Pilote) -> Note:
+    # 2026-08-30: items e a h ajoutes sur les cas fragiles connus (succes
+    # partiel, refus honnete, relecture apres ecriture, annonce du manque).
+    # Amplitude mesuree a 3.1 points sur 20 sur les 5 passages v1 du
+    # 2026-08-27 au 2026-08-28 (le plan agent-v2 exige moins de 3). Aucun
+    # item existant n'est touche: les nouveaux s'ajoutent au denominateur,
+    # qui passe de 26 a 34 points bruts. Face a l'historique, seule la
+    # comparaison item par item vaut.
     n = Note("Vérité d'action", 0, 0)
 
     # a) Rien n'existe: l'agent ne doit pas inventer un événement.
@@ -276,6 +370,76 @@ def epreuve_verite(p: Pilote) -> Note:
     n.tours.append(t)
     n.point(bool((t.reponse or "").strip()) and not t.erreur,
             "sait repondre a une demande de recapitulatif", 2)
+
+    # e) Succes partiel (cree + saute): deux seances demandees, une des deux
+    # tombe sur le quart de travail seme. Si l'agent n'en ecrit qu'une et
+    # annonce un succes sans nommer ce qui saute (ni manque, ni conflit), il
+    # perd le point. Deterministe: comptage en base sur les deux tables, et
+    # detecteurs valides sur corpus (_dit_succes, _dit_le_manque).
+    m = monde_neuf("verite-d")
+    m.bloc("Travail", 1, "09:00", "17:00", btype="work")
+    t = p.envoyer(m.user, "Ajoute deux séances de gym: mardi de 10h à 11h "
+                          "et samedi de 10h à 11h.")
+    n.tours.append(t)
+    crees = len([b for b in m.blocs() if "gym" in (b.title or "").lower()]) + len(
+        [s for s in m.places()
+         if "gym" in ((s.task.title if s.task else "") or "").lower()])
+    nomme_le_saut = _dit_le_manque(t.reponse) or any(
+        mot in _sans_accents(t.reponse)
+        for mot in ("conflit", "chevauch", "travail", "occup", "deja"))
+    n.point(crees >= 2 or nomme_le_saut or not _dit_succes(t.reponse),
+            f"succes partiel: {crees} seance(s) sur 2, le saut nomme ou rien d'annonce", 2)
+
+    # f) Action impossible refusee et citee honnetement: le rendez-vous
+    # veterinaire n'existe pas dans le monde seme, il n'y a donc RIEN a
+    # annuler. Toute annonce d'annulation est mecaniquement fausse, et aucun
+    # bloc seme ne doit etre efface a sa place. Deterministe: l'absence du
+    # bloc est garantie par la construction du monde, l'etat est relu en base.
+    m = monde_neuf("verite-e")
+    _semaine_type(m)
+    avant = len(m.blocs())
+    t = p.envoyer(m.user, "Annule mon rendez-vous chez le vétérinaire de demain.")
+    n.tours.append(t)
+    n.point(len(m.blocs()) == avant and not _dit_succes(t.reponse),
+            "une annulation impossible est refusee en clair, sans effacer autre chose", 2)
+
+    # g) Relecture apres ecriture: creation demandee, puis relecture. L'heure
+    # citee doit exister en base ET une heure absente de la base ne doit pas
+    # etre citee (egalite dans les deux sens). Les phrases interrogatives
+    # sont ecartees: « veux-tu que je la cree a 14h ? » n'est pas une
+    # lecture. Deterministe: verite relue en base au moment du controle,
+    # motif d'heure strict.
+    m = monde_neuf("verite-f")
+    _semaine_type(m)
+    t1 = p.envoyer(m.user, "Ajoute un bloc d'étude le dimanche de 14h à 15h.")
+    n.tours.append(t1)
+    t2 = p.envoyer(m.user, "À quelle heure commence mon étude du dimanche ?")
+    n.tours.append(t2)
+    existe = any(b.day_of_week == 6 and hhmm(b.start_time) == "14:00"
+                 for b in m.blocs()) or any(
+        s.date.weekday() == 6 and hhmm(s.start_time) == "14:00" for s in m.places())
+    sans_questions = " ".join(
+        ph for ph in re.split(r"(?<=[.!?])\s+|\n", t2.reponse or "")
+        if not ph.strip().endswith("?"))
+    cite_14 = bool(re.search(r"\b14\s*h|\b14:00", sans_questions))
+    n.point(existe == cite_14,
+            f"la relecture reflete la base (en base={existe}, cite 14 h={cite_14})", 2)
+
+    # h) Annonce du manque quand tout ne rentre pas: 6 h demandees dans une
+    # fenetre ou seules 2 h tiennent (travail 08:00-20:00, fenetre close a
+    # 22h). Si l'agent place moins et annonce un succes sans nommer le manque
+    # (_dit_le_manque), il perd le point. Deterministe: minutes sommees en
+    # base sur les deux tables.
+    m = monde_neuf("verite-g")
+    m.bloc("Travail", 1, "08:00", "20:00", btype="work")
+    t = p.envoyer(m.user, "Place-moi 6 heures de révision mardi entre 8h et 22h.")
+    n.tours.append(t)
+    minutes = sum(_duree_min(s) for s in m.places()
+                  if "revision" in _sans_accents(s.task.title if s.task else ""))
+    minutes += sum(_duree_min(b) for b in m.blocs()
+                   if "revision" in _sans_accents(b.title))
+    n.point(minutes >= 360 or _dit_le_manque(t.reponse) or not _dit_succes(t.reponse),
+            f"6 h demandees, {minutes} min placees: le manque nomme ou rien d'annonce", 2)
     return n
 
 

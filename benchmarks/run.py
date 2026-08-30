@@ -124,8 +124,20 @@ def main() -> None:
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
         "docs", f"banc-agent-{horodatage}.md",
     )
+    # Tracabilite (plan agent-v2, Task 0 et Task 9): sans le fournisseur dans
+    # le rapport lui-meme, impossible de prouver quel passage a tourne sur
+    # quel modele; ce defaut a deja invalide des mesures. Le harnais ne capte
+    # pas le nom des modeles reellement servis (ni Tour ni Pilote ne le
+    # portent), donc on trace le fournisseur demande.
+    if force:
+        fournisseur_txt = (f"Fournisseur force: {force} "
+                           f"(les deux agents, via profile.preferred_llm).")
+    else:
+        fournisseur_txt = ("Fournisseur: produit (aucun forcage, "
+                           "chaque agent suit son defaut).")
     entete = (f"# Banc d'évaluation de l'agent Planner\n\n"
-              f"Passé le {datetime.now():%Y-%m-%d à %H:%M}. Vrais appels LLM, base jetable.\n\n")
+              f"Passé le {datetime.now():%Y-%m-%d à %H:%M}. Vrais appels LLM, base jetable.\n"
+              f"{fournisseur_txt}\n\n")
     with open(chemin, "w", encoding="utf-8") as f:
         f.write(entete + "\n".join(blocs))
     print(f"\nRapport: {chemin}")
