@@ -8,6 +8,7 @@ dans un total est exactement le defaut qu'on corrige.
 """
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 
 from pydantic import BaseModel, Field
@@ -169,3 +170,116 @@ def assembler(brut: ReponseDire, registre: Registre) -> tuple[str, int]:
     if brut.suite.strip():
         morceaux.append(brut.suite.strip())
     return "\n\n".join(morceaux), rejetees
+
+
+# ── La section RESTE: demande contre place, rendu par du code ─────────────
+#
+# Piece de la spec (6.x, « comparateur de quantite et section RESTE »)
+# signalee absente des la verification du plan du 2026-08-24, et reclamee par
+# les faits le 2026-08-30: quand l'utilisateur demande 6 h et que l'agent en
+# place 2, le compte rendu annonce un succes et rien ne nomme le manque. Le
+# modele ne peut pas etre charge de ce calcul: c'est une soustraction, elle
+# se rend par du code.
+
+_NOMBRES_EN_MOTS = {
+    "un": 1, "une": 1, "deux": 2, "trois": 3, "quatre": 4, "cinq": 5,
+    "six": 6, "sept": 7, "huit": 8, "neuf": 9, "dix": 10,
+}
+_HEURES_DEMANDEES = re.compile(
+    r"\b(\d+(?:[.,]\d+)?|" + "|".join(_NOMBRES_EN_MOTS) + r")\s*(?:h\b|heures?\b)",
+    re.IGNORECASE)
+_COMPTE_DEMANDE = re.compile(
+    r"\b(\d+|" + "|".join(_NOMBRES_EN_MOTS) + r")\s*"
+    r"(?:blocs?|s[ée]ances?|sessions?|cr[ée]neaux?|entra[iî]nements?)\b",
+    re.IGNORECASE)
+
+_CREATEURS = ("create_block", "schedule_task_at")
+
+
+def _en_nombre(brut: str) -> float:
+    brut = brut.lower().replace(",", ".")
+    return _NOMBRES_EN_MOTS.get(brut, 0) or float(brut)
+
+
+def _minutes(debut: str, fin: str, overnight: bool = False) -> int:
+    h1, m1 = int(debut[:2]), int(debut[3:5])
+    h2, m2 = int(fin[:2]), int(fin[3:5])
+    duree = (h2 * 60 + m2) - (h1 * 60 + m1)
+    if duree <= 0 or overnight:
+        duree += 24 * 60
+        duree %= 24 * 60
+    return duree
+
+
+def _fmt_minutes(minutes: int) -> str:
+    h, m = divmod(max(0, minutes), 60)
+    if h and m:
+        return f"{h} h {m:02d}"
+    if h:
+        return f"{h} h"
+    return f"{m} min"
+
+
+def _creations_du_tour(registre: Registre) -> tuple[int, int]:
+    """(nombre cree, minutes creees), dedoublonne par id.
+
+    Le dedoublonnage par id est essentiel: un rejeu idempotent inscrit la
+    MEME action une seconde fois au registre, et une somme naive compterait
+    double ce qui n'a ete cree qu'une fois.
+    """
+    vus: set = set()
+    compte = 0
+    minutes = 0
+    for a in registre.actions:
+        if not a.succes or a.outil not in _CREATEURS:
+            continue
+        donnees = a.donnees or {}
+        entrees = list(donnees.get("created") or [])
+        sb = donnees.get("scheduled_block")
+        if sb:
+            entrees.append(sb)
+        for e in entrees:
+            cle = (a.outil, e.get("id"))
+            if e.get("id") is not None and cle in vus:
+                continue
+            vus.add(cle)
+            compte += 1
+            debut, fin = e.get("start_time"), e.get("end_time")
+            if debut and fin:
+                minutes += _minutes(debut, fin, bool(e.get("overnight") or e.get("is_night_shift")))
+    return compte, minutes
+
+
+def bloc_reste(message: str, registre: Registre) -> str:
+    """Nomme le manque quand on a place moins que demande. Sinon, rien.
+
+    Trois conditions, toutes necessaires:
+    - le message porte une quantite explicite (heures ou nombre d'elements);
+    - le tour a reellement CREE quelque chose (sur une suppression ou un
+      refus, comparer n'aurait aucun sens et le succes n'est pas annonce);
+    - le place est strictement sous le demande. Quand tout rentre, la ligne
+      se tait: annoncer qu'il ne manque rien serait du bruit.
+    """
+    if not message:
+        return ""
+    compte, minutes = _creations_du_tour(registre)
+    if compte == 0:
+        return ""
+
+    m_heures = _HEURES_DEMANDEES.search(message)
+    if m_heures:
+        demande_min = int(round(_en_nombre(m_heures.group(1)) * 60))
+        if 0 < minutes < demande_min:
+            return (f"- Demandé : {_fmt_minutes(demande_min)}. "
+                    f"Placé : {_fmt_minutes(minutes)}. "
+                    f"Il manque {_fmt_minutes(demande_min - minutes)}.")
+        return ""
+
+    m_compte = _COMPTE_DEMANDE.search(message)
+    if m_compte:
+        demande_n = int(_en_nombre(m_compte.group(1)))
+        if 0 < compte < demande_n:
+            manque = demande_n - compte
+            return (f"- Demandé : {demande_n}. Créé : {compte}. "
+                    f"Il en manque {manque}.")
+    return ""

@@ -34,7 +34,8 @@ from services.agent_v2.modeles import REGLAGES_DIRE, modele_agir, modele_dire
 from services.agent_v2.outils import outils_pour
 from services.agent_v2.prompts import PROMPT_DIRE, prompt_agir
 from services.agent_v2.reconciliation import detecter_ecarts, reconcilier
-from services.agent_v2.redaction import ReponseDire, assembler, bloc_factuel
+from services.agent_v2.redaction import (ReponseDire, assembler,
+                                          bloc_factuel, bloc_reste)
 from services.agent_v2.registre import Registre
 
 logger = logging.getLogger(__name__)
@@ -388,6 +389,12 @@ class PlannerAgentV2:
             detecter_ecarts(registre)
 
         faits = bloc_factuel(registre)
+        # La section RESTE: demande contre place, une soustraction rendue par
+        # du code. Elle rejoint les faits AVANT la redaction et le flux: le
+        # manque se nomme au meme instant que le succes qu'il tempere.
+        reste = bloc_reste(message, registre)
+        if reste:
+            faits = f"{faits}\n{reste}" if faits else reste
         if faits:
             # Les faits partent AVANT la redaction: ils sont deja vrais, et
             # l'utilisateur n'a pas a attendre l'enrobage pour les voir.
