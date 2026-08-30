@@ -10,6 +10,8 @@ avec un agent sur /chat/ et l'autre sur /chat/stream/, donc un historique
 ecrit par deux boucles differentes.
 """
 import json
+
+from core.lecture_flux import corps_du_flux
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
@@ -70,7 +72,7 @@ class AiguillageTests(TestCase):
             v2.return_value.process_message_stream.return_value = iter(
                 [{'type': 'done', 'response': 'ok'}])
             reponse = self.client.post('/api/chat/stream/', {'message': 'salut'})
-            b''.join(reponse.streaming_content)
+            corps_du_flux(reponse).encode('utf-8')
         self.assertTrue(v2.called)
         self.assertFalse(v1.called)
 
@@ -79,7 +81,7 @@ class AiguillageTests(TestCase):
             v1.return_value.process_message_stream.return_value = iter(
                 [{'type': 'done', 'response': 'ok'}])
             reponse = self.client.post('/api/chat/stream/', {'message': 'salut'})
-            b''.join(reponse.streaming_content)
+            corps_du_flux(reponse).encode('utf-8')
         self.assertTrue(v1.called)
 
     def test_un_profil_absent_retombe_sur_v1(self):

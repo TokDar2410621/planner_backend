@@ -5,6 +5,7 @@ import json
 import logging
 from datetime import date, timedelta
 
+from asgiref.sync import sync_to_async
 from django.contrib.auth import authenticate
 from django.http import StreamingHttpResponse
 from django.contrib.auth.models import User
@@ -965,8 +966,37 @@ class ChatStreamView(APIView):
                     'error': 'Erreur interne lors du traitement du message.',
                 }) + "\n\n"
 
+        # ITERATEUR ASYNCHRONE, et ce n'est pas un detail de style.
+        #
+        # `event_stream` est un generateur SYNCHRONE. Sous ASGI, Django ne sait
+        # pas le servir au fil de l'eau: il le draine et n'envoie qu'a la fin,
+        # en le disant dans les logs (« StreamingHttpResponse must consume
+        # synchronous iterators in order to serve them asynchronously »).
+        #
+        # Mesure au navigateur le 2026-08-29, sur un tour de 9,4 s: le serveur
+        # emettait `status` a 0,07 s, le raisonnement des 2,78 s et les outils
+        # a 16,7 s, mais le CLIENT recevait status, thinking, tool, delta et
+        # done tous ensemble a 9,34 s. L'utilisateur ne voyait donc que trois
+        # points pendant tout le tour, et le streaming ne servait a rien.
+        #
+        # On pompe le generateur pas a pas dans un thread et on rend la main a
+        # la boucle entre chaque element: chaque fragment part des qu'il
+        # existe. `thread_sensitive=False` pour la meme raison qu'ailleurs dans
+        # l'agent: ce travail vit hors du cycle de requete et ne doit pas
+        # rejouer dans le thread qui attend la boucle.
+        FIN = object()
+
+        async def flux_asynchrone():
+            source = event_stream()
+            suivant = sync_to_async(lambda: next(source, FIN), thread_sensitive=False)
+            while True:
+                morceau = await suivant()
+                if morceau is FIN:
+                    return
+                yield morceau
+
         response = StreamingHttpResponse(
-            event_stream(), content_type='text/event-stream')
+            flux_asynchrone(), content_type='text/event-stream')
         response['Cache-Control'] = 'no-cache'
         # Anti-buffering (nginx/proxies): chaque frame doit partir immédiatement.
         response['X-Accel-Buffering'] = 'no'

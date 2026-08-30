@@ -9,6 +9,8 @@ Couvre les 3 étages:
      écho reasoning_content) et Gemini (deltas + fallback candidat vide).
 """
 import json
+
+from core.lecture_flux import corps_du_flux
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -180,7 +182,7 @@ class ChatStreamViewTests(TestCase):
             resp = self.client_api.post("/api/chat/stream/", {"message": "salut"})
             # streaming_content est PARESSEUX: consommer DANS le patch, sinon
             # c'est le vrai agent (LLM live) qui s'exécute à l'itération.
-            body = b"".join(resp.streaming_content).decode("utf-8")
+            body = corps_du_flux(resp)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp["Content-Type"], "text/event-stream")
         frames = [json.loads(line[len("data: "):])
@@ -195,7 +197,7 @@ class ChatStreamViewTests(TestCase):
         with patch.object(PlannerAgent, "process_message_stream",
                           side_effect=RuntimeError("boom")):
             resp = self.client_api.post("/api/chat/stream/", {"message": "salut"})
-            body = b"".join(resp.streaming_content).decode("utf-8")
+            body = corps_du_flux(resp)
         self.assertIn('"type": "error"', body)
 
 
