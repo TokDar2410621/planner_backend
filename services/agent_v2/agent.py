@@ -455,7 +455,7 @@ class PlannerAgentV2:
         ConversationMessage.objects.create(
             user=user, role="assistant", content=texte)
 
-        yield {
+        evenement = {
             "type": "done",
             "response": texte,
             "quick_replies": [],
@@ -463,6 +463,23 @@ class PlannerAgentV2:
             "tasks_created": self._crees(registre, "create_task", "task"),
             "raisonnement": raisonnement,
         }
+        formulaire = self._dernier_formulaire(registre)
+        if formulaire:
+            evenement["interactive_inputs"] = formulaire
+        yield evenement
+
+    @staticmethod
+    def _dernier_formulaire(registre: Registre):
+        """Le dernier formulaire presente avec succes, releve du registre.
+
+        Le prompt d'AGIR recommande present_form pour demander plusieurs
+        infos d'un coup, et la vue ne relaie que la cle interactive_inputs
+        du resultat. Sans ce releve, v2 presenterait des formulaires que
+        l'utilisateur ne verrait jamais."""
+        for a in reversed(registre.actions):
+            if a.outil == "present_form" and a.succes:
+                return (a.donnees or {}).get("interactive_inputs")
+        return None
 
     def process_message(
         self,

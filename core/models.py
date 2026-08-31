@@ -91,11 +91,11 @@ class UserProfile(models.Model):
     # utilisateur à une IA tierce (Gemini, Claude, DeepSeek, Hugging Face).
     # Null = jamais consenti ou révoqué; la date fait foi pour l'audit.
     ai_consent_at = models.DateTimeField(null=True, blank=True)
-    # Bascule vers l'agent v2 (spec du 2026-08-24). Faux par defaut: un
-    # deploiement ne bascule personne. La bascule ET le retour arriere sont
-    # des UPDATE, sans deploiement, pour pouvoir ramener un compte sur v1 en
-    # quelques secondes si v2 derape en production.
-    agent_v2 = models.BooleanField(default=False)
+    # Agent v2 pour tout le monde depuis le 2026-08-30 (serie decisive du
+    # banc: verite 20/20 x3, decision dans docs/decision-bascule-agent-v2).
+    # Le retour arriere par compte reste un UPDATE, sans deploiement, pour
+    # ramener un compte sur v1 en quelques secondes si v2 derape.
+    agent_v2 = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

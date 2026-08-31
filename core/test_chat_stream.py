@@ -19,6 +19,7 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 
 from services.agent.agent import PlannerAgent
+from services.agent_v2 import PlannerAgentV2
 from services.llm.base import FunctionCall, LLMResponse
 from services.llm.deepseek import DeepSeekProvider
 from services.llm.gemini import GeminiProvider
@@ -177,7 +178,7 @@ class ChatStreamViewTests(TestCase):
             {"type": "delta", "text": "là."},
             {"type": "done", "response": "Voilà.", "quick_replies": []},
         ]
-        with patch.object(PlannerAgent, "process_message_stream",
+        with patch.object(PlannerAgentV2, "process_message_stream",
                           return_value=iter(events)):
             resp = self.client_api.post("/api/chat/stream/", {"message": "salut"})
             # streaming_content est PARESSEUX: consommer DANS le patch, sinon
@@ -194,7 +195,7 @@ class ChatStreamViewTests(TestCase):
         self.assertEqual(resp.status_code, 400)
 
     def test_agent_crash_yields_error_frame(self):
-        with patch.object(PlannerAgent, "process_message_stream",
+        with patch.object(PlannerAgentV2, "process_message_stream",
                           side_effect=RuntimeError("boom")):
             resp = self.client_api.post("/api/chat/stream/", {"message": "salut"})
             body = corps_du_flux(resp)

@@ -35,12 +35,15 @@ class AiguillageTests(TestCase):
         self.user.profile.agent_v2 = valeur
         self.user.profile.save()
 
-    def test_le_drapeau_est_faux_par_defaut(self):
-        """Un deploiement ne doit basculer personne."""
-        self.assertFalse(User.objects.create_user(
+    def test_le_drapeau_est_vrai_par_defaut(self):
+        """Un nouveau compte nait sur v2 depuis la bascule du 2026-08-30
+        (verite 20/20 aux trois passages decisifs du banc). Le retour
+        arriere reste un UPDATE par compte, sans deploiement."""
+        self.assertTrue(User.objects.create_user(
             username='neuf', password='x').profile.agent_v2)
 
     def test_sans_drapeau_chat_utilise_v1(self):
+        self._basculer(False)
         with patch('core.views.PlannerAgent') as v1:
             v1.return_value.process_message.return_value = {'response': 'ok'}
             self.client.post('/api/chat/', {'message': 'salut'})
@@ -77,6 +80,7 @@ class AiguillageTests(TestCase):
         self.assertFalse(v1.called)
 
     def test_sans_drapeau_le_flux_utilise_v1(self):
+        self._basculer(False)
         with patch('core.views.PlannerAgent') as v1:
             v1.return_value.process_message_stream.return_value = iter(
                 [{'type': 'done', 'response': 'ok'}])
@@ -149,3 +153,40 @@ class FormatCommunTests(TestCase):
         self.assertEqual(res['raisonnement'], "PENSEE INTERNE SECRETE")
         for message in ConversationMessage.objects.filter(user=self.u2):
             self.assertNotIn("SECRETE", message.content)
+
+
+class FormulaireReleveTests(TestCase):
+    """La cle interactive_inputs doit survivre au passage par v2.
+
+    Decouvert a la bascule generale du 2026-08-30: le prompt d'AGIR
+    recommande present_form, l'outil est expose, mais l'evenement done ne
+    relayait pas son resultat. Un compte bascule aurait vu du texte et
+    jamais le formulaire.
+    """
+
+    def _registre(self, *actions):
+        from services.agent.tools.base import ToolResult
+        from services.agent_v2.registre import Registre
+        r = Registre()
+        for outil, succes, data in actions:
+            r.ajouter(outil, {}, ToolResult(success=succes, message="m", data=data))
+        return r
+
+    def test_le_dernier_formulaire_reussi_est_releve(self):
+        from services.agent_v2 import PlannerAgentV2
+        champs = [{"type": "text", "name": "titre"}]
+        r = self._registre(
+            ("present_form", True, {"interactive_inputs": [{"type": "text", "name": "vieux"}]}),
+            ("present_form", True, {"interactive_inputs": champs}),
+        )
+        self.assertEqual(PlannerAgentV2._dernier_formulaire(r), champs)
+
+    def test_un_formulaire_echoue_ne_compte_pas(self):
+        from services.agent_v2 import PlannerAgentV2
+        r = self._registre(("present_form", False, {"interactive_inputs": [1]}))
+        self.assertIsNone(PlannerAgentV2._dernier_formulaire(r))
+
+    def test_sans_formulaire_rien(self):
+        from services.agent_v2 import PlannerAgentV2
+        r = self._registre(("get_today_schedule", True, {"blocks": []}))
+        self.assertIsNone(PlannerAgentV2._dernier_formulaire(r))
