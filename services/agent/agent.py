@@ -379,7 +379,7 @@ def _ambiguous_scheduling_chips(user, tool_calls: list, user_message: str = ""):
     if not chips:
         return None
 
-    phrase = "⏱️ Ce créneau est pris — en voici de libres, choisis :"
+    phrase = "⏱️ Ce créneau est pris, en voici de libres : choisis."
     return phrase, chips
 
 
@@ -694,6 +694,14 @@ class PlannerAgent:
         legacy exact); les providers sans stream_with_history retombent
         d'eux-mêmes sur le chemin non-streamé.
         """
+        # Mesure formulaire: repondu / presente = taux de remplissage, passe = abandon.
+        # Memes phrases et meme comparaison que v2 (frontend: InteractiveInputs.tsx).
+        propre = (message or "").strip()
+        if propre.startswith("Voici mes réponses"):
+            logger.info("formulaire repondu user=%s", user.id)
+        elif propre == "On verra ça plus tard, continuons sans formulaire.":
+            logger.info("formulaire passe user=%s", user.id)
+
         # Select the provider based on THIS user's preference (the view builds
         # the agent without a user), falling back to settings.LLM_PROVIDER.
         self.user = user
@@ -1128,6 +1136,13 @@ class PlannerAgent:
         # Add interactive inputs if the AI presented a form
         if interactive_inputs:
             result["interactive_inputs"] = interactive_inputs
+            # Mesure: une ligne par formulaire AFFICHE, donc par tour, meme si
+            # le modele en a presente plusieurs (seul le dernier atteint l'utilisateur).
+            logger.info(
+                "formulaire presente user=%s champs=%d types=%s",
+                user.id, len(interactive_inputs),
+                ",".join(str(champ.get("type", "")) for champ in interactive_inputs),
+            )
 
         yield result
 

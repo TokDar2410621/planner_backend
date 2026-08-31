@@ -29,6 +29,7 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserProm
 from pydantic_ai.usage import UsageLimits
 
 from core.models import ConversationMessage, UploadedDocument
+from services.agent_v2.boutons import boutons_forces
 from services.agent_v2.mesure import epurer_reponse, fuites_reponse
 from services.agent_v2.modeles import REGLAGES_DIRE, modele_agir, modele_dire
 from services.agent_v2.outils import outils_pour
@@ -297,6 +298,7 @@ class PlannerAgentV2:
         """Contrat SSE additif: status, thinking, delta, done. Le done fait
         AUTORITE et le client remplace toujours la bulle par son response."""
         self.user = user
+        self._journaliser_reponse_formulaire(user, message)
 
         # Persiste d'abord, puis exclut CETTE ligne de l'historique par son id.
         # v1 devait s'en remettre a un filet (B9: message sauve, relu, puis
@@ -318,11 +320,17 @@ class PlannerAgentV2:
         # document (defaut observe le 2026-08-26 sur un tour reel). L'envoi
         # d'horaire est le premier chemin d'entree du produit.
         message_enrichi = message
+        # Lu AVANT l'attente: seul un document qui bascule pendant ce tour
+        # compte comme « traite ce tour » (equivalence avec v1 detaillee dans
+        # la docstring de boutons_forces).
+        deja_traite = attachment is not None and attachment.processed
         for evenement, complement in self._contexte_document(user, attachment):
             if evenement:
                 yield evenement
             if complement:
                 message_enrichi = f"{message_enrichi}\n\n{complement}"
+        attachment_traite_ce_tour = (
+            attachment is not None and not deja_traite and attachment.processed)
 
         yield {"type": "status", "text": "R\u00e9flexion..."}
 
@@ -451,6 +459,17 @@ class PlannerAgentV2:
             cout_dire.get("raisonnement", 0),
         )
 
+        # Boutons garantis par le code (fin de recurrence, creneaux libres).
+        # La phrase ajoutee est aussi PERSISTEE, libelles des creneaux compris
+        # puisque les chips ne le sont pas: au tour suivant, le modele doit
+        # savoir ce qu'il a propose pour lire « le 15 decembre » ou « 16:30 »
+        # comme une reponse. Le texte de done et la ligne en base sont le meme.
+        try:
+            texte, chips = boutons_forces(
+                user, message, attachment, registre, texte, attachment_traite_ce_tour)
+        except Exception:  # noqa: BLE001 - un bouton ne fait jamais tomber un tour
+            logger.error("Boutons forces indisponibles", exc_info=True)
+            chips = []
 
         ConversationMessage.objects.create(
             user=user, role="assistant", content=texte)
@@ -458,7 +477,7 @@ class PlannerAgentV2:
         evenement = {
             "type": "done",
             "response": texte,
-            "quick_replies": [],
+            "quick_replies": chips,
             "blocks_created": self._crees(registre, "create_block", "created"),
             "tasks_created": self._crees(registre, "create_task", "task"),
             "raisonnement": raisonnement,
@@ -466,7 +485,26 @@ class PlannerAgentV2:
         formulaire = self._dernier_formulaire(registre)
         if formulaire:
             evenement["interactive_inputs"] = formulaire
+            # Mesure: le denominateur du taux de remplissage. Une ligne par
+            # formulaire AFFICHE, donc par tour, meme si le modele en a
+            # presente plusieurs (seul le dernier atteint l'utilisateur).
+            logger.info(
+                "formulaire presente user=%s champs=%d types=%s",
+                user.id, len(formulaire),
+                ",".join(str(champ.get("type", "")) for champ in formulaire),
+            )
         yield evenement
+
+    @staticmethod
+    def _journaliser_reponse_formulaire(user: User, message: str) -> None:
+        """Mesure: numerateur (repondu) et abandon explicite (passe) du
+        formulaire. Les deux phrases sont celles que le frontend envoie
+        (InteractiveInputs.tsx, ChatContainer.tsx)."""
+        propre = (message or "").strip()
+        if propre.startswith("Voici mes réponses"):
+            logger.info("formulaire repondu user=%s", user.id)
+        elif propre == "On verra ça plus tard, continuons sans formulaire.":
+            logger.info("formulaire passe user=%s", user.id)
 
     @staticmethod
     def _dernier_formulaire(registre: Registre):
