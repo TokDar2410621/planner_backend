@@ -10,6 +10,7 @@ from django.contrib.auth import authenticate
 from django.http import StreamingHttpResponse
 from django.contrib.auth.models import User
 from django.core.exceptions import ImproperlyConfigured, ValidationError
+from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -1128,6 +1129,11 @@ class RecurringBlockViewSet(viewsets.ModelViewSet):
         updated = RecurringBlock.all_objects.filter(
             user=request.user, status=RecurringBlock.STATUS_PENDING
         ).update(status=RecurringBlock.STATUS_ACTIVE)
+        # update() n'emet aucun signal: les blocs confirmes doivent pourtant
+        # avoir leurs alarmes sans que l'utilisateur rouvre l'app.
+        from services.apns import reveiller_utilisateur
+        utilisateur = request.user
+        transaction.on_commit(lambda: reveiller_utilisateur(utilisateur, "planning"))
         return Response({'confirmed': updated})
 
     @action(detail=False, methods=['delete'])
@@ -2215,6 +2221,46 @@ class PushUnsubscribeView(APIView):
         deleted, _ = PushSubscription.objects.filter(
             user=request.user, endpoint=endpoint
         ).delete()
+        return Response({"deleted": deleted})
+
+
+class AppareilPushEnregistrerView(APIView):
+    """Enregistre (ou rafraichit) un appareil iOS pour le reveil silencieux APNs.
+
+    update_or_create par token: un token qui change de compte suit le compte.
+    """
+
+    def post(self, request):
+        from core.models import AppareilPush
+        token = request.data.get("token")
+        if not isinstance(token, str) or not token.strip():
+            return Response({"error": "token requis."}, status=status.HTTP_400_BAD_REQUEST)
+        _, created = AppareilPush.objects.update_or_create(
+            token=token.strip()[:200],
+            defaults={
+                "user": request.user,
+                "plateforme": str(request.data.get("plateforme") or "ios")[:10],
+                "app_version": str(request.data.get("app_version") or "")[:20],
+                "user_agent": request.META.get("HTTP_USER_AGENT", "")[:300],
+            },
+        )
+        return Response(
+            {"ok": True, "created": created},
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class AppareilPushRetirerView(APIView):
+    """Retire un appareil du reveil silencieux (deconnexion). 200 meme si absent."""
+
+    def post(self, request):
+        from core.models import AppareilPush
+        token = request.data.get("token")
+        deleted = 0
+        if isinstance(token, str) and token.strip():
+            deleted, _ = AppareilPush.objects.filter(
+                user=request.user, token=token.strip()
+            ).delete()
         return Response({"deleted": deleted})
 
 

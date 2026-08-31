@@ -240,6 +240,17 @@ VAPID_PUBLIC_KEY = os.getenv('VAPID_PUBLIC_KEY', '')
 VAPID_PRIVATE_KEY = os.getenv('VAPID_PRIVATE_KEY', '')
 VAPID_SUBJECT = os.getenv('VAPID_SUBJECT', 'mailto:tokamdarius@gmail.com')
 
+# ============== Reveil silencieux iOS (APNs) ==============
+# Quand un bloc change cote serveur, un push background reveille l'app iOS
+# qui relit le planning et pose ses alarmes locales (services/apns.py).
+# APNS_AUTH_KEY = contenu complet du fichier .p8, lignes BEGIN/END comprises
+# (les "\n" litteraux d'une variable Railway sont normalises a la lecture).
+# Absent -> reveil desactive (degrade silencieusement).
+APNS_TEAM_ID = os.getenv('APNS_TEAM_ID', '')
+APNS_KEY_ID = os.getenv('APNS_KEY_ID', '')
+APNS_AUTH_KEY = os.getenv('APNS_AUTH_KEY', '')
+APNS_BUNDLE_ID = os.getenv('APNS_BUNDLE_ID', 'com.tokamdarius.planner')
+
 # ============== LLM Configuration ==============
 # Default LLM provider: 'gemini' or 'claude'
 LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'gemini')
@@ -338,6 +349,10 @@ LOGGING = {
             'level': 'INFO',
             'propagate': False,
         },
+        # httpx journalise a INFO l'URL complete de chaque requete; celle
+        # d'APNs contient le jeton d'appareil en clair (/3/device/<token>).
+        'httpx': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
+        'httpcore': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
         'services': {
             'handlers': ['console'],
             'level': APP_LOG_LEVEL,

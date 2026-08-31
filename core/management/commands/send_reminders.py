@@ -22,6 +22,7 @@ from django.utils import timezone
 
 from core.models import PushSendLog, PushSubscription, RecurringBlock, ScheduledBlock
 from services.commute import commute_window
+from services.apns import rattraper_tous_les_reveils
 from services.push import push_configured, send_to_user
 
 # Rétro-regard: assez large pour couvrir la dérive des ticks (durée d'exécution
@@ -69,6 +70,13 @@ class Command(BaseCommand):
         parser.add_argument("--lead", type=int, default=15, help="Minutes ahead to remind.")
 
     def handle(self, *args, **opts):
+        # Filet de securite du reveil silencieux iOS: les reveils demandes
+        # qu'aucun Timer n'a rattrapes (processus web redemarre entre-temps).
+        try:
+            rattraper_tous_les_reveils()
+        except Exception as e:  # noqa: BLE001
+            self.stderr.write(f"Rattrapage des reveils APNs: {e}")
+
         if not push_configured():
             self.stdout.write("Web push not configured; nothing sent.")
             return

@@ -20,6 +20,8 @@ from .views import (
     PushUnsubscribeView,
     PushTestView,
     PushSendView,
+    AppareilPushEnregistrerView,
+    AppareilPushRetirerView,
     CalendarFeedView,
     CalendarICSView,
     WebhookEndpointView,
@@ -107,6 +109,9 @@ urlpatterns = [
     path('push/unsubscribe/', PushUnsubscribeView.as_view(), name='push-unsubscribe'),
     path('push/test/', PushTestView.as_view(), name='push-test'),
     path('push/send/', PushSendView.as_view(), name='push-send'),
+    # Reveil silencieux iOS (APNs): l'app enregistre son token d'appareil
+    path('push/appareil/', AppareilPushEnregistrerView.as_view(), name='push-appareil'),
+    path('push/appareil/retirer/', AppareilPushRetirerView.as_view(), name='push-appareil-retirer'),
 
     # iCal calendar feed (subscribe from Google/Apple/Outlook)
     path('calendar/feed/', CalendarFeedView.as_view(), name='calendar-feed'),

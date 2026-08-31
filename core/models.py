@@ -1069,3 +1069,53 @@ class McpOAuthCode(models.Model):
 
     def __str__(self):
         return f"McpOAuthCode {self.user.username} ({'used' if self.used else 'live'})"
+
+
+class AppareilPush(models.Model):
+    """Appareil iOS natif enregistre pour le reveil silencieux (APNs).
+
+    Distinct de PushSubscription (Web Push VAPID, PWA): ici le serveur ne
+    montre rien a l'utilisateur, il reveille l'app en arriere-plan pour
+    qu'elle relise le planning et pose ses alarmes locales. Un token = un
+    appareil; un token qui change de compte suit le compte. L'environnement
+    part en production et bascule en sandbox si Apple repond BadDeviceToken
+    (build Xcode), voir services/apns.py.
+    """
+
+    ENVIRONNEMENT_CHOICES = [
+        ('production', 'Production'),
+        ('sandbox', 'Sandbox'),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='appareils_push')
+    token = models.CharField(max_length=200, unique=True)
+    plateforme = models.CharField(max_length=10, default='ios')
+    environnement = models.CharField(
+        max_length=12, choices=ENVIRONNEMENT_CHOICES, default='production'
+    )
+    app_version = models.CharField(max_length=20, blank=True)
+    user_agent = models.CharField(max_length=300, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_seen_at = models.DateTimeField(auto_now=True)
+    derniere_erreur = models.CharField(max_length=200, blank=True)
+
+    class Meta:
+        ordering = ['-last_seen_at']
+
+    def __str__(self):
+        return f"AppareilPush {self.user.username} {self.plateforme} {self.token[:8]}"
+
+
+class ReveilPlanning(models.Model):
+    """Lissage des reveils APNs par utilisateur.
+
+    demande_a > envoye_a signifie qu'un reveil est du: le Timer du processus
+    ou le filet de send_reminders l'envoie et pose envoye_a.
+    """
+
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='reveil_planning')
+    demande_a = models.DateTimeField(null=True, blank=True)
+    envoye_a = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"ReveilPlanning {self.user_id} demande={self.demande_a} envoye={self.envoye_a}"

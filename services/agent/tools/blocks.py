@@ -534,6 +534,10 @@ class ClearAllBlocksTool(BaseTool):
             count = RecurringBlock.objects.filter(
                 user=user, active=True
             ).update(active=False)
+            # update() n'emet aucun signal: le reveil du telephone se demande
+            # a la main, sinon les alarmes des blocs archives sonneraient encore.
+            from services.apns import reveiller_utilisateur
+            transaction.on_commit(lambda: reveiller_utilisateur(user, "planning"))
         return ToolResult(
             success=True,
             data={"deleted_count": count, "reversible": True},
