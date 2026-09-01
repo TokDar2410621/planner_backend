@@ -138,3 +138,128 @@ class AncrageTemporelTests(TestCase):
         """Contre-epreuve du meme jour: sans elle, un detecteur qui signale
         tout ce qui porte la date du jour passerait les trois autres tests."""
         self.assertEqual(self._ecarts_a("2026-08-26 08:00", "2026-08-26", "12:00"), [])
+
+
+class ImportAuRegistreTests(TestCase):
+    """L'import d'un document est une entree du registre, pas un secret d'AGIR.
+
+    Deux tours reels du 2026-09-01 (compte vitrine, horaire en image): les
+    blocs etaient crees par le processeur de documents, AGIR le savait par le
+    message enrichi, mais DIRE recevait « REGISTRE DU TOUR: VIDE » et repondait
+    « Je n'ai pas encore recu ton horaire de session. Envoie-moi ton horaire ».
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='imp', password='x')
+        from services.agent_v2 import PlannerAgentV2
+        self.Agent = PlannerAgentV2
+
+    def _tour(self, attachment=None, texte="voici mon horaire, gere ca"):
+        vus = {}
+
+        def _agir(self_agent, user, message, registre):
+            vus['registre'] = registre
+            return None
+
+        with patch.object(self.Agent, '_agir', _agir), \
+             patch.object(self.Agent, '_dire', return_value=ReponseDire(ouverture="Ok.")):
+            resultat = self.Agent().process_message(self.user, texte, attachment)
+        return resultat, vus['registre']
+
+    def _document(self, nom='horaire.png', cours=None):
+        return UploadedDocument.objects.create(
+            user=self.user, file_name=nom, document_type='course_schedule',
+            processed=True, extracted_data={'courses': cours or []})
+
+    def test_le_document_du_tour_est_une_mutation_et_son_recap_est_affiche(self):
+        from core.models import RecurringBlock
+        doc = self._document(cours=[{'name': 'Physique'}, {'name': 'Anglais'}])
+        RecurringBlock.objects.create(
+            user=self.user, title='Physique', block_type='course', day_of_week=2,
+            start_time='13:30', end_time='15:20', source_document=doc)
+        RecurringBlock.objects.create(
+            user=self.user, title='Anglais', block_type='course', day_of_week=4,
+            start_time='09:00', end_time='11:00', source_document=doc)
+
+        resultat, registre = self._tour(doc)
+
+        imports = [a for a in registre.actions if a.outil == 'import_document']
+        self.assertEqual(len(imports), 1)
+        self.assertTrue(imports[0].est_mutation)
+        self.assertTrue(imports[0].succes)
+        # Le recap est rendu par du code, donc present meme quand DIRE ne dit
+        # que « Ok. »: l'utilisateur lit ses cours, pas une prose.
+        reponse = resultat['response']
+        self.assertIn('2 entrées ajoutées', reponse)
+        self.assertIn('Physique : mercredi 13:30-15:20', reponse)
+        self.assertIn('Anglais : vendredi 09:00-11:00', reponse)
+        self.assertIn('horaire.png', reponse)
+
+    def test_le_recap_nomme_les_cours_ecartes_par_le_processeur(self):
+        """5 cours lus, 4 crees: le manquant doit etre nomme, avec sa raison."""
+        from core.models import RecurringBlock
+        doc = self._document(cours=[
+            {'name': 'Physique', 'day': 'mercredi', 'start_time': '13:30', 'end_time': '15:20'},
+            {'name': 'Programmation Web', 'day': 'mardi', 'start_time': '15:00', 'end_time': '17:00'},
+        ])
+        RecurringBlock.objects.create(
+            user=self.user, title='Physique', block_type='course', day_of_week=2,
+            start_time='13:30', end_time='15:20', source_document=doc)
+
+        resultat, _ = self._tour(doc)
+
+        self.assertIn('1 entrée ajoutée', resultat['response'])
+        self.assertIn('Non ajouté : Programmation Web (mardi 15:00-17:00)', resultat['response'])
+
+    def test_le_brief_de_dire_ne_dit_plus_que_le_registre_est_vide(self):
+        from core.models import RecurringBlock
+        doc = self._document(cours=[{'name': 'Physique'}])
+        RecurringBlock.objects.create(
+            user=self.user, title='Physique', block_type='course', day_of_week=2,
+            start_time='13:30', end_time='15:20', source_document=doc)
+        _, registre = self._tour(doc)
+        brief = self.Agent._brief_dire("voici mon horaire", registre, {}, "")
+        self.assertNotIn('VIDE', brief)
+        self.assertIn('import_document', brief)
+
+    def test_un_import_recent_sans_piece_jointe_est_une_lecture(self):
+        """« c'est bon ? » au tour suivant: DIRE connait les blocs, mais le
+        bloc factuel ne rejoue pas l'import."""
+        from core.models import RecurringBlock
+        doc = self._document(nom='recent.pdf', cours=[{'name': 'Anglais'}])
+        RecurringBlock.objects.create(
+            user=self.user, title='Anglais', block_type='course', day_of_week=3,
+            start_time='14:00', end_time='16:00', source_document=doc)
+
+        resultat, registre = self._tour(None, texte="c'est bon ?")
+
+        lectures = [a for a in registre.actions if a.outil == 'import_recent']
+        self.assertEqual(len(lectures), 1)
+        self.assertFalse(lectures[0].est_mutation)
+        self.assertNotIn('Horaire importé', resultat['response'])
+        brief = self.Agent._brief_dire("c'est bon ?", registre, {}, "")
+        self.assertNotIn('VIDE', brief)
+        self.assertIn('Anglais', brief)
+
+    def test_un_document_sans_entree_exploitable_est_dit_sans_annoncer_un_import(self):
+        doc = self._document(nom='vide.pdf', cours=[])
+        resultat, registre = self._tour(doc)
+        self.assertEqual([a.outil for a in registre.actions], ['import_recent'])
+        self.assertIn('aucun cours', registre.actions[0].message)
+        self.assertNotIn('Horaire importé', resultat['response'])
+
+    def test_sans_import_le_registre_reste_vide(self):
+        _, registre = self._tour(None, texte="bonjour")
+        self.assertTrue(registre.vide())
+
+    def test_un_import_vieux_de_plus_de_vingt_minutes_ne_compte_plus(self):
+        from datetime import timedelta
+        from core.models import RecurringBlock
+        doc = self._document(nom='vieux.pdf', cours=[{'name': 'Anglais'}])
+        UploadedDocument.objects.filter(pk=doc.pk).update(
+            uploaded_at=timezone.now() - timedelta(minutes=45))
+        RecurringBlock.objects.create(
+            user=self.user, title='Anglais', block_type='course', day_of_week=3,
+            start_time='14:00', end_time='16:00', source_document=doc)
+        _, registre = self._tour(None, texte="c'est bon ?")
+        self.assertTrue(registre.vide())

@@ -22,6 +22,10 @@ OUTILS_DE_MUTATION = {
     "schedule_task_at", "cancel_scheduled_block",
     "optimize_week", "organize_day",
     "update_preferences", "create_goal", "update_goal",
+    # Pas un outil du modele: l'import d'un document envoye, fait par le
+    # systeme et inscrit par importation.py. C'est une ecriture en base
+    # comme une autre, et le bloc factuel doit la raconter.
+    "import_document",
 }
 
 

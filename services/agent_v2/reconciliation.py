@@ -38,6 +38,7 @@ LECTURES: dict[str, str] = {
     "update_preferences": "get_preferences",
     "create_goal": "list_goals",
     "update_goal": "list_goals",
+    "import_document": "list_blocks",
 }
 
 # Ou trouver la date obtenue, par outil. Chemins verifies dans le code v1.

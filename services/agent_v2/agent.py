@@ -35,6 +35,7 @@ from services.agent_v2.modeles import REGLAGES_DIRE, modele_agir, modele_dire
 from services.agent_v2.outils import outils_pour
 from services.agent_v2.prompts import PROMPT_DIRE, prompt_agir
 from services.agent_v2.reconciliation import detecter_ecarts, reconcilier
+from services.agent_v2.importation import inscrire_import
 from services.agent_v2.redaction import (ReponseDire, assembler,
                                           bloc_factuel, bloc_reste)
 from services.agent_v2.registre import Registre
@@ -331,6 +332,15 @@ class PlannerAgentV2:
                 message_enrichi = f"{message_enrichi}\n\n{complement}"
         attachment_traite_ce_tour = (
             attachment is not None and not deja_traite and attachment.processed)
+
+        # L'import fait par le systeme entre au registre AVANT AGIR, comme
+        # une action deja accomplie. Sans cela DIRE lit « registre vide » et
+        # propose de renvoyer l'horaire qui vient d'etre importe (deux tours
+        # reels le 2026-09-01). Detail dans importation.py.
+        try:
+            inscrire_import(registre, user, attachment)
+        except Exception:  # noqa: BLE001 - un recap absent vaut mieux qu'un tour tombe
+            logger.error("Import du document non inscrit au registre", exc_info=True)
 
         yield {"type": "status", "text": "R\u00e9flexion..."}
 
