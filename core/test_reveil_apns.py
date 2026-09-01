@@ -580,3 +580,26 @@ class JournauxSansJetonTests(SimpleTestCase):
         import logging
         self.assertGreaterEqual(logging.getLogger("httpx").getEffectiveLevel(), logging.WARNING)
         self.assertGreaterEqual(logging.getLogger("httpcore").getEffectiveLevel(), logging.WARNING)
+
+
+class TelemetrieAlarmesTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="tel", password="x")
+
+    def test_le_motif_est_journalise_sans_etre_stocke(self):
+        from rest_framework.test import APIClient
+        client = APIClient()
+        client.force_authenticate(self.user)
+        with self.assertLogs("core.views", level="INFO") as journal:
+            reponse = client.post("/api/telemetrie/alarmes/", {
+                "motif": "programmer: refuse en arriere-plan", "arriere_plan": True, "app_version": "1.1.0",
+            }, format="json")
+        self.assertEqual(reponse.status_code, 200)
+        self.assertTrue(any("repli alarmes" in l and "arriere_plan=True" in l for l in journal.output))
+
+    def test_sans_motif_400_et_sans_auth_401(self):
+        from rest_framework.test import APIClient
+        client = APIClient()
+        self.assertEqual(client.post("/api/telemetrie/alarmes/", {"motif": "x"}, format="json").status_code, 401)
+        client.force_authenticate(self.user)
+        self.assertEqual(client.post("/api/telemetrie/alarmes/", {}, format="json").status_code, 400)

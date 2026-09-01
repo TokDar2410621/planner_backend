@@ -2256,6 +2256,25 @@ class AppareilPushEnregistrerView(APIView):
         )
 
 
+class TelemetrieAlarmesView(APIView):
+    """Le telephone dit pourquoi un rappel est retombe en notification au
+    lieu d'une alarme AlarmKit. Vecu 2026-09-01: un bloc cree app fermee a
+    donne une notification a l'heure, pas une alarme, et rien ne disait si
+    c'etait l'etat d'autorisation ou l'appel natif. Journal seulement, pas de
+    stockage: c'est un outil de mise au point."""
+
+    def post(self, request):
+        motif = str(request.data.get("motif") or "")[:200]
+        if not motif:
+            return Response({"error": "motif requis."}, status=status.HTTP_400_BAD_REQUEST)
+        logger.info(
+            "repli alarmes: user=%s arriere_plan=%s app=%s motif=%s",
+            request.user.pk, bool(request.data.get("arriere_plan")),
+            str(request.data.get("app_version") or "?")[:20], motif,
+        )
+        return Response({"ok": True})
+
+
 class AppareilPushRetirerView(APIView):
     """Retire un appareil du reveil silencieux (deconnexion). 200 meme si absent."""
 

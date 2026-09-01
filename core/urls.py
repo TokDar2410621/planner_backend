@@ -22,6 +22,7 @@ from .views import (
     PushSendView,
     AppareilPushEnregistrerView,
     AppareilPushRetirerView,
+    TelemetrieAlarmesView,
     CalendarFeedView,
     CalendarICSView,
     WebhookEndpointView,
@@ -111,6 +112,7 @@ urlpatterns = [
     path('push/send/', PushSendView.as_view(), name='push-send'),
     # Reveil silencieux iOS (APNs): l'app enregistre son token d'appareil
     path('push/appareil/', AppareilPushEnregistrerView.as_view(), name='push-appareil'),
+    path('telemetrie/alarmes/', TelemetrieAlarmesView.as_view(), name='telemetrie-alarmes'),
     path('push/appareil/retirer/', AppareilPushRetirerView.as_view(), name='push-appareil-retirer'),
 
     # iCal calendar feed (subscribe from Google/Apple/Outlook)
