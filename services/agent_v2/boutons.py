@@ -51,17 +51,37 @@ def _fin_de_recurrence(attachment, texte: str):
     if not open_ended:
         return None
     titles = sorted({b.title for b in open_ended})
-    label = titles[0] if len(titles) == 1 else " et ".join(titles[:2])
+    if len(titles) == 1:
+        label = titles[0]
+        if "jusqu" not in texte.lower():
+            texte += (
+                f"\n\n⏳ « {label} » n'a pas de date de fin pour l'instant : "
+                "jusqu'à quand veux-tu le garder à l'horaire ?"
+            )
+        chips = [
+            {"label": "🏁 Je te donne la date de fin",
+             "value": f"Je vais te donner la date de fin pour {label}."},
+            {"label": "♾️ Pas de fin prévue",
+             "value": f"{label} n'a pas de date de fin, garde-le tel quel."},
+        ]
+        return texte, chips
+
+    # Plusieurs blocs: v1 collait deux titres entre guillemets avec un verbe
+    # au singulier (« Design d'interfaces et Economie globale » n'a pas de
+    # date de fin... le garder). Vu sur un import de cinq cours le
+    # 2026-09-01: faux en nombre et muet sur les trois autres.
+    apercu = ", ".join(titles[:3]) + ("…" if len(titles) > 3 else "")
     if "jusqu" not in texte.lower():
         texte += (
-            f"\n\n⏳ « {label} » n'a pas de date de fin pour l'instant : "
-            "jusqu'à quand veux-tu le garder à l'horaire ?"
+            f"\n\n⏳ Tes {len(open_ended)} blocs importés ({apercu}) n'ont pas de "
+            "date de fin pour l'instant : jusqu'à quand veux-tu les garder à "
+            "l'horaire ?"
         )
     chips = [
         {"label": "🏁 Je te donne la date de fin",
-         "value": f"Je vais te donner la date de fin pour {label}."},
+         "value": "Je vais te donner la date de fin pour ces blocs importés."},
         {"label": "♾️ Pas de fin prévue",
-         "value": f"{label} n'a pas de date de fin, garde-le tel quel."},
+         "value": "Ces blocs importés n'ont pas de date de fin, garde-les tels quels."},
     ]
     return texte, chips
 
