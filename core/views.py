@@ -2244,6 +2244,12 @@ class AppareilPushEnregistrerView(APIView):
                 "user_agent": request.META.get("HTTP_USER_AGENT", "")[:300],
             },
         )
+        # La seule trace qu'un telephone est inscrit (le guide la cherche);
+        # jamais le jeton entier.
+        logger.info(
+            "appareil push enregistre: user=%s cree=%s app=%s jeton=%s...",
+            request.user.pk, created, request.data.get("app_version") or "?", token.strip()[:8],
+        )
         return Response(
             {"ok": True, "created": created},
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,

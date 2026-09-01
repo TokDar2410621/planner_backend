@@ -135,6 +135,9 @@ def envoyer_reveil(appareil, raison: str = "planning") -> bool:
         if statut == 200:
             if appareil.derniere_erreur:
                 _noter_erreur(appareil, "")
+            # Une ligne par envoi accepte: c'est la seule trace qu'un reveil
+            # est parti (le guide de mise en service la cherche).
+            logger.info("APNs reveil accepte: appareil %s, raison %s", appareil.pk, raison)
             return True
 
         motif = _motif(reponse)
