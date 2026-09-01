@@ -33,8 +33,18 @@ DUREE_JETON_SECONDES = 50 * 60
 
 # Lissage par utilisateur: deux changements a moins de 10 s = un envoi
 # immediat + un rattrapage 12 s plus tard, jamais une rafale.
-LISSAGE_SECONDES = 10
-DELAI_RATTRAPAGE_SECONDES = 12
+# iOS rationne les pushes silencieux (vecu 2026-09-01: apres six reveils en
+# 35 minutes, plus aucun n'a atteint l'app). On regroupe donc plus large:
+# un reveil immediat, puis au plus un rattrapage par demi-minute.
+LISSAGE_SECONDES = 30
+DELAI_RATTRAPAGE_SECONDES = 35
+# Reveil confirme ou relance: le telephone renvoie un bilan apres chaque pose
+# (POST /telemetrie/alarmes/), qui vaut accuse de reception. Sans accuse dans
+# les deux minutes, le filet de send_reminders relance, au plus trois fois par
+# demande: un push saute par iOS est rattrape au tick suivant, sans que
+# l'utilisateur ouvre l'app.
+DELAI_RELANCE_SECONDES = 120
+MAX_RELANCES = 3
 # Filet de securite (tick send_reminders): une demande vieille de plus de 5 s
 # et jamais envoyee (worker redemarre avant son Timer) part a ce moment-la.
 DELAI_FILET_SECONDES = 5
@@ -233,8 +243,52 @@ def rattraper_reveil(user_id: int, raison: str = "planning") -> int:
     return _envoyer_a_tous(list(AppareilPush.objects.filter(user_id=user_id)), raison)
 
 
+def confirmer_reveil(user_id: int) -> None:
+    """Le telephone a repose ses alarmes: la derniere demande est servie."""
+    from core.models import ReveilPlanning
+
+    ReveilPlanning.objects.filter(user_id=user_id).update(confirme_a=timezone.now(), relances=0)
+
+
+def relancer_reveils_non_confirmes() -> int:
+    """Renvoie un reveil aux comptes dont le dernier envoi n'a pas ete confirme.
+
+    Un envoi accepte par Apple peut ne jamais atteindre l'app (budget iOS des
+    pushes silencieux). Sans bilan du telephone dans les DELAI_RELANCE_SECONDES
+    qui suivent, on relance, au plus MAX_RELANCES fois par demande.
+    """
+    if not apns_configured():
+        return 0
+    from django.db.models import F, Q
+
+    from core.models import AppareilPush, ReveilPlanning
+
+    maintenant = timezone.now()
+    limite = maintenant - timedelta(seconds=DELAI_RELANCE_SECONDES)
+    candidats = ReveilPlanning.objects.filter(
+        Q(confirme_a__isnull=True) | Q(confirme_a__lt=F("envoye_a")),
+        envoye_a__isnull=False,
+        envoye_a__lte=limite,
+        relances__lt=MAX_RELANCES,
+    )
+    envois = 0
+    for reveil in list(candidats):
+        appareils = list(AppareilPush.objects.filter(user_id=reveil.user_id))
+        if not appareils:
+            continue
+        # Reclamer la relance (idempotent entre workers) avant d'envoyer.
+        reclame = ReveilPlanning.objects.filter(pk=reveil.pk, relances=reveil.relances).update(
+            envoye_a=maintenant, relances=reveil.relances + 1
+        )
+        if not reclame:
+            continue
+        logger.info("APNs relance %d pour user=%s (aucun bilan depuis l'envoi)", reveil.relances + 1, reveil.user_id)
+        envois += _envoyer_a_tous(appareils, "planning")
+    return envois
+
+
 def rattraper_tous_les_reveils() -> int:
-    """Filet de securite: tous les reveils demandes depuis plus de 5 s et pas envoyes."""
+    """Filet de securite: reveils demandes et pas envoyes, puis envoyes et pas confirmes."""
     if not apns_configured():
         return 0
     from django.db.models import F, Q
@@ -246,7 +300,8 @@ def rattraper_tous_les_reveils() -> int:
         Q(envoye_a__isnull=True) | Q(demande_a__gt=F("envoye_a")),
         demande_a__lte=limite,
     ).values_list("user_id", flat=True)
-    return sum(rattraper_reveil(user_id) for user_id in list(en_attente))
+    envois = sum(rattraper_reveil(user_id) for user_id in list(en_attente))
+    return envois + relancer_reveils_non_confirmes()
 
 
 def _armer_rattrapage(user_id: int) -> None:

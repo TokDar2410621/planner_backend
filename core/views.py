@@ -2272,6 +2272,11 @@ class TelemetrieAlarmesView(APIView):
             request.user.pk, bool(request.data.get("arriere_plan")),
             str(request.data.get("app_version") or "?")[:20], motif,
         )
+        if motif.startswith("bilan:"):
+            # Le telephone a repose ses alarmes: le reveil est servi, le filet
+            # n'a plus a relancer.
+            from services.apns import confirmer_reveil
+            confirmer_reveil(request.user.pk)
         return Response({"ok": True})
 
 

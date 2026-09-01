@@ -1116,6 +1116,11 @@ class ReveilPlanning(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='reveil_planning')
     demande_a = models.DateTimeField(null=True, blank=True)
     envoye_a = models.DateTimeField(null=True, blank=True)
+    # Accuse de reception du telephone (bilan de pose recu) et nombre de
+    # relances depuis la derniere demande: un push accepte par Apple peut ne
+    # jamais atteindre l'app (budget iOS), le filet relance jusqu'a confirmation.
+    confirme_a = models.DateTimeField(null=True, blank=True)
+    relances = models.PositiveSmallIntegerField(default=0)
 
     def __str__(self):
         return f"ReveilPlanning {self.user_id} demande={self.demande_a} envoye={self.envoye_a}"

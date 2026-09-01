@@ -262,7 +262,7 @@ class LissageReveilTest(TestCase):
         self.assertLessEqual(reveil.demande_a, reveil.envoye_a)
 
     def test_envoi_immediat_quand_le_dernier_date_de_plus_de_10_s(self):
-        ReveilPlanning.objects.create(user=self.user, envoye_a=timezone.now() - timedelta(seconds=11))
+        ReveilPlanning.objects.create(user=self.user, envoye_a=timezone.now() - timedelta(seconds=apns.LISSAGE_SECONDES + 1))
         patcheur, client = _client(_reponse(200))
         with patcheur, patch.object(apns, "_armer_rattrapage") as armer:
             self.assertEqual(apns.reveiller_utilisateur(self.user), 1)
@@ -345,7 +345,7 @@ class LissageReveilTest(TestCase):
             apns._armer_rattrapage(7)
             apns._armer_rattrapage(8)
         self.assertEqual([m.args for m in crees], [(7,), (8,)])
-        self.assertEqual(crees[0].delai, 12)
+        self.assertEqual(crees[0].delai, apns.DELAI_RATTRAPAGE_SECONDES)
         self.assertIs(crees[0].fonction, apns._rattrapage_en_thread)
         self.assertTrue(all(m.daemon and m.demarree for m in crees))
 
@@ -603,3 +603,67 @@ class TelemetrieAlarmesTests(TestCase):
         self.assertEqual(client.post("/api/telemetrie/alarmes/", {"motif": "x"}, format="json").status_code, 401)
         client.force_authenticate(self.user)
         self.assertEqual(client.post("/api/telemetrie/alarmes/", {}, format="json").status_code, 400)
+
+
+
+@override_settings(APNS_TEAM_ID="T", APNS_KEY_ID="K", APNS_AUTH_KEY=CLE_PRIVEE_PEM)
+class ReveilConfirmeOuRelanceTests(TestCase):
+    """Un push accepte par Apple peut ne jamais atteindre l'app: sans bilan
+    du telephone, le filet relance, au plus MAX_RELANCES fois."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="relance", password="x")
+        AppareilPush.objects.create(user=self.user, token="a" * 64)
+
+    def _envoye_il_y_a(self, secondes, **extra):
+        return ReveilPlanning.objects.create(
+            user=self.user, demande_a=timezone.now() - timedelta(seconds=secondes + 1),
+            envoye_a=timezone.now() - timedelta(seconds=secondes), **extra,
+        )
+
+    def test_sans_bilan_apres_deux_minutes_on_relance_une_fois(self):
+        reveil = self._envoye_il_y_a(apns.DELAI_RELANCE_SECONDES + 1)
+        with patch("services.apns._envoyer_a_tous", return_value=1) as envoi:
+            self.assertEqual(apns.rattraper_tous_les_reveils(), 1)
+            envoi.assert_called_once()
+        reveil.refresh_from_db()
+        self.assertEqual(reveil.relances, 1)
+        # Trop tot pour une deuxieme relance: envoye_a vient d'etre repose.
+        with patch("services.apns._envoyer_a_tous", return_value=1) as envoi:
+            self.assertEqual(apns.rattraper_tous_les_reveils(), 0)
+            envoi.assert_not_called()
+
+    def test_un_bilan_recu_coupe_la_relance(self):
+        self._envoye_il_y_a(apns.DELAI_RELANCE_SECONDES + 1)
+        apns.confirmer_reveil(self.user.pk)
+        with patch("services.apns._envoyer_a_tous", return_value=1) as envoi:
+            self.assertEqual(apns.rattraper_tous_les_reveils(), 0)
+            envoi.assert_not_called()
+
+    def test_au_plus_trois_relances(self):
+        self._envoye_il_y_a(apns.DELAI_RELANCE_SECONDES + 1, relances=apns.MAX_RELANCES)
+        with patch("services.apns._envoyer_a_tous", return_value=1) as envoi:
+            self.assertEqual(apns.rattraper_tous_les_reveils(), 0)
+            envoi.assert_not_called()
+
+    def test_sans_appareil_aucune_relance(self):
+        AppareilPush.objects.all().delete()
+        self._envoye_il_y_a(apns.DELAI_RELANCE_SECONDES + 1)
+        with patch("services.apns._envoyer_a_tous", return_value=1) as envoi:
+            self.assertEqual(apns.rattraper_tous_les_reveils(), 0)
+            envoi.assert_not_called()
+
+    def test_le_bilan_de_telemetrie_confirme_et_remet_les_relances_a_zero(self):
+        reveil = self._envoye_il_y_a(10, relances=2)
+        from rest_framework.test import APIClient
+        client = APIClient()
+        client.force_authenticate(self.user)
+        client.post("/api/telemetrie/alarmes/", {"motif": "bilan: 2 alarme(s), 39 notification(s)"}, format="json")
+        reveil.refresh_from_db()
+        self.assertIsNotNone(reveil.confirme_a)
+        self.assertEqual(reveil.relances, 0)
+        # Un simple motif de repli n'est pas un accuse de reception.
+        ReveilPlanning.objects.filter(pk=reveil.pk).update(confirme_a=None)
+        client.post("/api/telemetrie/alarmes/", {"motif": "programmer: erreur 0"}, format="json")
+        reveil.refresh_from_db()
+        self.assertIsNone(reveil.confirme_a)
