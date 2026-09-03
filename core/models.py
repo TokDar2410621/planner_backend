@@ -819,9 +819,17 @@ class Goal(models.Model):
 class SharedSchedule(models.Model):
     """Shareable link for a user's schedule."""
 
+    SCOPE_WEEK = 'week'
+    SCOPE_TODAY = 'today'
+    SCOPE_CHOICES = [(SCOPE_WEEK, 'Semaine'), (SCOPE_TODAY, 'Journée')]
+
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='shared_schedules')
     share_token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
     title = models.CharField(max_length=100, blank=True, default='Mon planning')
+    # Ce que le lien montre: toute la semaine (l'horaire de session), ou la
+    # journee du jour ou on OUVRE le lien (lien vivant, pas fige a la date du
+    # partage). Demande de Darius du 2026-09-03.
+    scope = models.CharField(max_length=10, choices=SCOPE_CHOICES, default=SCOPE_WEEK)
     is_active = models.BooleanField(default=True)
     expires_at = models.DateTimeField(null=True, blank=True)
     include_tasks = models.BooleanField(default=False)  # Include scheduled tasks or just recurring

@@ -2045,11 +2045,14 @@ class ShareScheduleView(APIView):
         if serializer.validated_data.get('expires_in_days'):
             expires_at = timezone.now() + timedelta(days=serializer.validated_data['expires_in_days'])
 
+        scope = serializer.validated_data.get('scope', SharedSchedule.SCOPE_WEEK)
+        titre_defaut = 'Ma journée' if scope == SharedSchedule.SCOPE_TODAY else 'Mon planning'
         share = SharedSchedule.objects.create(
             user=request.user,
-            title=serializer.validated_data.get('title', 'Mon planning'),
+            title=serializer.validated_data.get('title') or titre_defaut,
             expires_at=expires_at,
             include_tasks=serializer.validated_data.get('include_tasks', False),
+            scope=scope,
         )
 
         return Response(SharedScheduleSerializer(share).data, status=status.HTTP_201_CREATED)
@@ -2104,20 +2107,37 @@ class PublicScheduleView(APIView):
             active=True
         )
 
+        # Un lien « journee » est VIVANT: il montre la journee du jour ou on
+        # l'ouvre (heure murale America/Toronto), occurrences sautees exclues
+        # et fenetres start/end_date respectees. Un lien « semaine » garde le
+        # comportement historique: tout l'horaire recurrent.
+        aujourd_hui = timezone.localdate()
+        mode_journee = share.scope == SharedSchedule.SCOPE_TODAY
+        if mode_journee:
+            sautes = RecurringBlockException.objects.filter(
+                user=share.user, date=aujourd_hui,
+            ).values_list('recurring_block_id', flat=True)
+            recurring_blocks = (recurring_blocks
+                                .filter(day_of_week=aujourd_hui.weekday())
+                                .filter(RecurringBlock.bounds_filter(aujourd_hui))
+                                .exclude(id__in=list(sautes)))
+
         response_data = {
             'title': share.title,
             'owner': share.user.first_name or share.user.username,
+            'scope': share.scope,
             'recurring_blocks': RecurringBlockSerializer(recurring_blocks, many=True).data,
             'scheduled_tasks': [],
         }
+        if mode_journee:
+            response_data['date'] = aujourd_hui.isoformat()
 
         # Include tasks if enabled
         if share.include_tasks:
-            today = timezone.now().date()
-            end_date = today + timedelta(days=7)
+            end_date = aujourd_hui + timedelta(days=1 if mode_journee else 7)
             scheduled_tasks = ScheduledBlock.objects.filter(
                 user=share.user,
-                date__gte=today,
+                date__gte=aujourd_hui,
                 date__lt=end_date
             )
             response_data['scheduled_tasks'] = ScheduledBlockSerializer(scheduled_tasks, many=True).data

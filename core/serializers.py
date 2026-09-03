@@ -617,6 +617,7 @@ class SharedScheduleSerializer(serializers.ModelSerializer):
             'is_active',
             'expires_at',
             'include_tasks',
+            'scope',
             'created_at',
             'view_count',
             'share_url',
@@ -631,6 +632,9 @@ class SharedScheduleSerializer(serializers.ModelSerializer):
 class CreateShareSerializer(serializers.Serializer):
     """Serializer for creating a share link."""
 
-    title = serializers.CharField(max_length=100, required=False, default='Mon planning')
+    # Titre vide = la vue choisit le defaut selon la portee (« Mon planning »
+    # ou « Ma journée »): un default fige ici masquerait la portee.
+    title = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
     expires_in_days = serializers.IntegerField(required=False, min_value=1, max_value=365)
     include_tasks = serializers.BooleanField(default=False)
+    scope = serializers.ChoiceField(choices=['week', 'today'], default='week')
