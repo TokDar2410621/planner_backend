@@ -1,8 +1,13 @@
 # Onboarding : backend Planner AI
 
-Bienvenue. Ce document te rend autonome sur le backend, l'agent IA et
-l'infrastructure. Son jumeau côté client vit dans le dépôt `day-wise-bot`
-(`ONBOARDING.md`). Public québécois, produit en français, tutoiement partout.
+Bienvenue. Si ton mandat porte d'abord sur l'interface (c'est le cas au
+départ), commence par l'onboarding du dépôt `day-wise-bot` : ce document-ci
+est ta référence pour comprendre le système, ses conventions et l'API que le
+client consomme. Public québécois, produit en français, tutoiement partout.
+
+L'essentiel de l'API pour un dev d'interface : endpoints dans
+`core/urls.py`, vues dans `core/views.py`, la vérité de ce que le client
+reçoit. Le client les appelle via `src/services/api.ts` côté frontend.
 
 ## Le produit en une ligne
 
