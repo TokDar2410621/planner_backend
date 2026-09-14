@@ -261,7 +261,7 @@ class CreateTaskTool(BaseTool):
                 existing.save(update_fields=["place"])
             return ToolResult(
                 success=True,
-                data={"task": _task_to_dict(existing)},
+                data={"task": _task_to_dict(existing), "deja_presente": True},
                 message=f"Tâche '{existing.title}' déjà présente (non dupliquée).",
             )
 
@@ -278,7 +278,7 @@ class CreateTaskTool(BaseTool):
         loc = f" à {place.name}" if place else ""
         return ToolResult(
             success=True,
-            data={"task": _task_to_dict(task)},
+            data={"task": _task_to_dict(task), "deja_presente": False},
             message=f"Tâche '{task.title}'{loc} créée (priorité {task.priority}).",
         )
 
@@ -393,7 +393,7 @@ class DeleteTaskTool(BaseTool):
         task.delete()
         return ToolResult(
             success=True,
-            data={"deleted_id": task_id},
+            data={"deleted_id": task_id, "title": title},
             message=f"Tâche '{title}' supprimée.",
         )
 

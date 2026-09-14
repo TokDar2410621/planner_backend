@@ -132,7 +132,7 @@ class ListBlocksTool(BaseTool):
 
 class CreateBlockTool(BaseTool):
     name = "create_block"
-    description = "Crée un ou plusieurs blocs récurrents HEBDOMADAIRES (une habitude qui revient chaque semaine: cours, travail, sport, sommeil...). Jours = liste (ex: [0,1,2,3,4] = lundi à vendredi); un bloc séparé par jour. Appelle-le DÈS que l'utilisateur décrit un horaire habituel. N'utilise JAMAIS create_block pour un événement unique daté ('ce samedi', une date précise) -> schedule_task_at. Gère un quart de nuit récurrent qui traverse minuit (ex: travail 22:00-06:00 chaque lundi): mets start_time/end_time tels quels, le passage de minuit est détecté automatiquement. Les conflits sont détectés et renvoyés automatiquement."
+    description = "Crée un ou plusieurs blocs récurrents HEBDOMADAIRES (une habitude qui revient chaque semaine: cours, travail, sport, sommeil...). Jours = liste (ex: [0,1,2,3,4] = lundi à vendredi); un bloc séparé par jour. Appelle-le quand l'utilisateur décrit un horaire habituel complet (jours, début, fin). Activité souple sans heure (sport, étude): choisis un créneau libre. Pour un rendez-vous, un cours, un quart, une réunion ou une leçon fixé par quelqu'un d'autre sans heure de début ou de fin: n'appelle pas cet outil, demande-lui (present_form ou present_choices). N'utilise JAMAIS create_block pour un événement unique daté ('ce samedi', une date précise) -> schedule_task_at. Gère un quart de nuit récurrent qui traverse minuit (ex: travail 22:00-06:00 chaque lundi): mets start_time/end_time tels quels, le passage de minuit est détecté automatiquement. Les conflits sont détectés et renvoyés automatiquement."
     parameters = {
         "type": "object",
         "properties": {
@@ -234,6 +234,10 @@ class CreateBlockTool(BaseTool):
 
         created = []
         skipped = []
+        # Donnees structurees pour le rendu cote utilisateur: le motif et les
+        # heures, a cote de la raison ecrite pour le modele (inchangee).
+        debut_hhmm = start_t.strftime("%H:%M")
+        fin_hhmm = end_t.strftime("%H:%M")
 
         # Opération multi-lignes: tout ou rien. Si une création échoue en cours
         # de route, aucun bloc partiel ne subsiste (D5: transaction.atomic).
@@ -241,7 +245,11 @@ class CreateBlockTool(BaseTool):
             with transaction.atomic():
                 for day in days:
                     if day < 0 or day > 6:
-                        skipped.append({"day": day, "reason": "Jour invalide"})
+                        skipped.append({
+                            "day": day, "reason": "Jour invalide",
+                            "motif": "jour_invalide", "titre": title,
+                            "debut": debut_hhmm, "fin": fin_hhmm,
+                        })
                         continue
 
                     # Anti-doublon EXACT, quelle que soit la flexibilité: un bloc
@@ -264,6 +272,11 @@ class CreateBlockTool(BaseTool):
                             "day": day,
                             "day_name": DAY_NAMES[day],
                             "reason": f"'{title}' existe déjà le {DAY_NAMES[day]} à {start_time} (aucun doublon créé)",
+                            "motif": "doublon",
+                            "titre": title,
+                            "debut": debut_hhmm,
+                            "fin": fin_hhmm,
+                            "avec": {"titre": title, "debut": debut_hhmm, "fin": fin_hhmm},
                         })
                         continue
 
@@ -282,6 +295,15 @@ class CreateBlockTool(BaseTool):
                             "day": day,
                             "day_name": DAY_NAMES[day],
                             "reason": f"Chevauchement avec '{overlap.title}' ({overlap.start_time.strftime('%H:%M')}-{overlap.end_time.strftime('%H:%M')})",
+                            "motif": "chevauchement",
+                            "titre": title,
+                            "debut": debut_hhmm,
+                            "fin": fin_hhmm,
+                            "avec": {
+                                "titre": overlap.title,
+                                "debut": overlap.start_time.strftime('%H:%M'),
+                                "fin": overlap.end_time.strftime('%H:%M'),
+                            },
                         })
                         continue
 
@@ -376,6 +398,15 @@ class UpdateBlockTool(BaseTool):
         if err:
             return ToolResult(success=False, data={}, message=err)
 
+        # L'etat AVANT modification, pour que le rendu dise ce qui a change.
+        avant = {
+            "title": block.title,
+            "day_of_week": block.day_of_week,
+            "start_time": block.start_time.strftime("%H:%M"),
+            "end_time": block.end_time.strftime("%H:%M"),
+            "flexibility": block.flexibility,
+        }
+
         # Heures effectives après modification (parse + valide si fournies).
         try:
             new_start = parse_time(kwargs["start_time"]) if kwargs.get("start_time") else block.start_time
@@ -422,7 +453,12 @@ class UpdateBlockTool(BaseTool):
             o = conflicts[0]
             return ToolResult(
                 success=False,
-                data={},
+                data={"conflit": {
+                    "titre": o.title,
+                    "debut": o.start_time.strftime('%H:%M'),
+                    "fin": o.end_time.strftime('%H:%M'),
+                    "jour": new_day,
+                }},
                 message=(
                     f"Modification annulée: chevauchement avec '{o.title}' "
                     f"({o.start_time.strftime('%H:%M')}-{o.end_time.strftime('%H:%M')})."
@@ -458,7 +494,7 @@ class UpdateBlockTool(BaseTool):
         block.save()
         return ToolResult(
             success=True,
-            data={"block": _block_to_dict(block)},
+            data={"block": _block_to_dict(block), "avant": avant},
             message=f"Bloc '{block.title}' mis à jour.",
         )
 
@@ -485,11 +521,13 @@ class DeleteBlockTool(BaseTool):
             return ToolResult(success=False, data={}, message=f"Bloc #{block_id} introuvable.")
 
         title = block.title
+        # Lu AVANT la desactivation: le rendu nomme le jour et les heures.
+        decrit = _block_to_dict(block)
         block.active = False
         block.save()
         return ToolResult(
             success=True,
-            data={"deleted_id": block_id},
+            data={"deleted_id": block_id, "block": decrit},
             message=f"Bloc '{title}' supprimé.",
         )
 
