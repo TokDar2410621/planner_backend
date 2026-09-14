@@ -14,14 +14,62 @@ Deux familles, heritees de v1 ou la regle de prompt seule etait une loterie
    AVANT lui (_creneaux_envisageables): une mutation reussie coupe tout, et
    une consultation sans intention de planifier reste une lecture.
 
-Le frontend affiche done.quick_replies des qu'elle est non vide: c'est le seul
-canal par lequel v2 peut GARANTIR un bouton.
+Deux sorties sur le meme calcul:
+- `question_forcee` (2026-09-14) rend {question, chips, motif}: la question
+  seule, sans les libelles, et des creneaux aux heures humaines (« 15 h a
+  16 h »). C'est la forme que le narrateur place dans la section QUESTION.
+- `boutons_forces` garde le contrat historique (texte complete, libelles v1).
+
+Une question forcee que l'utilisateur a ignoree deux fois de suite (il a
+repondu autre chose que ses boutons) n'est plus reposee: la reposer une
+troisieme fois, c'est le harceler sur un sujet qu'il a laisse de cote.
 """
 from __future__ import annotations
 
+import re
 import unicodedata
+from datetime import date
 
 from services.agent_v2.registre import Registre
+
+try:  # SEAM-INTEGRATION
+    from services.agent_v2.rendu import date_courte, plage
+except ImportError:  # SEAM-INTEGRATION: repli tant que rendu.py (b4) n'est pas fusionne
+    _JOURS_ABREGES = ("lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim.")  # SEAM-INTEGRATION
+    _MOIS_ABREGES = ("janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.",  # SEAM-INTEGRATION
+                     "août", "sept.", "oct.", "nov.", "déc.")
+
+    def _heure_repli(hhmm: str) -> str:  # SEAM-INTEGRATION
+        h, m = (int(x) for x in str(hhmm)[:5].split(":"))
+        if h == 0 and m == 0:
+            return "minuit"
+        return f"{h} h" if m == 0 else f"{h} h {m:02d}"
+
+    def plage(debut: str, fin: str) -> str:  # SEAM-INTEGRATION
+        return f"{_heure_repli(debut)} à {_heure_repli(fin)}"
+
+    def date_courte(iso: str, aujourdhui: date | None = None) -> str:  # SEAM-INTEGRATION
+        from django.utils import timezone
+
+        jour = date.fromisoformat(str(iso)[:10])
+        reference = aujourdhui or timezone.localdate()
+        ecart = (jour - reference).days
+        if ecart == 0:
+            return "aujourd'hui"
+        if ecart == 1:
+            return "demain"
+        if ecart == -1:
+            return "hier"
+        return f"{_JOURS_ABREGES[jour.weekday()]} {jour.day} {_MOIS_ABREGES[jour.month - 1]}"
+
+
+MOTIF_FIN_RECURRENCE = "fin_recurrence"
+MOTIF_CRENEAUX = "creneaux"
+
+_ISO = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+_PLAGE_V1 = re.compile(r"(\d{2}:\d{2})\s*[–-]\s*(\d{2}:\d{2})")
+_HEURES_VALEUR_V1 = re.compile(r"de (\d{2}:\d{2}) à (\d{2}:\d{2})")
+_TITRE_V1 = re.compile(r"«\s*(.+?)\s*»")
 
 
 def appels_outils(registre: Registre) -> list[dict]:
@@ -36,8 +84,8 @@ def appels_outils(registre: Registre) -> list[dict]:
     ]
 
 
-def _fin_de_recurrence(attachment, texte: str):
-    """(texte, chips) si l'import a laisse des blocs sans date de fin, sinon None.
+def _fin_de_recurrence(attachment):
+    """(question, chips) si l'import a laisse des blocs sans date de fin, sinon None.
 
     Meme requete, meme phrase et memes deux chips que v1. Les chips sont
     forcees MEME si le texte pose deja la question: les suggestions du modele
@@ -53,37 +101,35 @@ def _fin_de_recurrence(attachment, texte: str):
     titles = sorted({b.title for b in open_ended})
     if len(titles) == 1:
         label = titles[0]
-        if "jusqu" not in texte.lower():
-            texte += (
-                f"\n\n⏳ « {label} » n'a pas de date de fin pour l'instant : "
-                "jusqu'à quand veux-tu le garder à l'horaire ?"
-            )
+        question = (
+            f"« {label} » n'a pas de date de fin pour l'instant : "
+            "jusqu'à quand veux-tu le garder à l'horaire ?"
+        )
         chips = [
             {"label": "🏁 Je te donne la date de fin",
              "value": f"Je vais te donner la date de fin pour {label}."},
             {"label": "♾️ Pas de fin prévue",
              "value": f"{label} n'a pas de date de fin, garde-le tel quel."},
         ]
-        return texte, chips
+        return question, chips
 
     # Plusieurs blocs: v1 collait deux titres entre guillemets avec un verbe
     # au singulier (« Design d'interfaces et Economie globale » n'a pas de
     # date de fin... le garder). Vu sur un import de cinq cours le
     # 2026-09-01: faux en nombre et muet sur les trois autres.
     apercu = ", ".join(titles[:3]) + ("…" if len(titles) > 3 else "")
-    if "jusqu" not in texte.lower():
-        texte += (
-            f"\n\n⏳ Tes {len(open_ended)} blocs importés ({apercu}) n'ont pas de "
-            "date de fin pour l'instant : jusqu'à quand veux-tu les garder à "
-            "l'horaire ?"
-        )
+    question = (
+        f"Tes {len(open_ended)} blocs importés ({apercu}) n'ont pas de "
+        "date de fin pour l'instant : jusqu'à quand veux-tu les garder à "
+        "l'horaire ?"
+    )
     chips = [
         {"label": "🏁 Je te donne la date de fin",
          "value": "Je vais te donner la date de fin pour ces blocs importés."},
         {"label": "♾️ Pas de fin prévue",
          "value": "Ces blocs importés n'ont pas de date de fin, garde-les tels quels."},
     ]
-    return texte, chips
+    return question, chips
 
 
 def _intention_de_planifier(message: str) -> bool:
@@ -130,6 +176,136 @@ def _creneaux_envisageables(message: str, registre: Registre) -> bool:
     return True
 
 
+def _quand(iso: str) -> str:
+    """« aujourd'hui », « demain » ou « le jeu. 24 sept. »."""
+    court = date_courte(iso)
+    return court if court in ("aujourd'hui", "demain", "hier") else f"le {court}"
+
+
+def _chip_humaine(chip: dict) -> dict:
+    """Un chip de creneau v1 (« 🕐 15:00–16:00 ») aux heures humaines.
+
+    La valeur, qui s'affiche comme message de l'utilisateur au tap, perd elle
+    aussi ses dates ISO et ses HH:MM. Un chip illisible reste tel quel.
+    """
+    label, valeur = chip.get("label", ""), chip.get("value", "")
+    heures = _PLAGE_V1.search(label) or _HEURES_VALEUR_V1.search(valeur)
+    jour = _ISO.search(valeur)
+    if not heures or not jour:
+        return dict(chip)
+    lisible = plage(heures.group(1), heures.group(2))
+    quand = _quand(jour.group(1))
+    titre = _TITRE_V1.search(valeur)
+    if titre:
+        nouvelle = f"Planifie « {titre.group(1)} » {quand} de {lisible}."
+    else:
+        nouvelle = f"Va pour {lisible} {quand}."
+    return {"label": lisible, "value": nouvelle}
+
+
+def _question_creneaux(phrase_v1: str, chips_v1: list[dict]) -> str:
+    jour = next((m.group(1) for m in (_ISO.search(c.get("value", "")) for c in chips_v1) if m),
+                None)
+    quand = f" {_quand(jour)}" if jour else ""
+    if "pris" in phrase_v1:
+        return f"Ce créneau est pris. Quel créneau libre te va{quand} ?"
+    return f"Quel créneau libre te va{quand} ?"
+
+
+def _normaliser_reponse(texte) -> str:
+    return " ".join(str(texte or "").split()).casefold()
+
+
+def _ignoree_deux_fois(user, motif: str) -> bool:
+    """Les deux dernieres questions de ce motif sont-elles restees sans tap ?
+
+    On lit les messages persistes: chaque message assistant suivi
+    IMMEDIATEMENT d'un message utilisateur forme une paire. Sur les deux
+    dernieres paires, si les deux assistants portaient ce question_motif et
+    que la reponse n'etait aucune des valeurs de leurs boutons, la question
+    a ete ignoree deux fois.
+    """
+    if user is None or getattr(user, "pk", None) is None:
+        return False
+    from core.models import ConversationMessage
+
+    recents = list(ConversationMessage.objects.filter(user=user).order_by("-pk")[:12])
+    recents.reverse()
+    paires = [
+        (message, recents[rang + 1])
+        for rang, message in enumerate(recents[:-1])
+        if message.role == "assistant" and recents[rang + 1].role == "user"
+    ]
+    if len(paires) < 2:
+        return False
+    for assistant, reponse in paires[-2:]:
+        meta = assistant.metadata if isinstance(assistant.metadata, dict) else {}
+        if meta.get("question_motif") != motif:
+            return False
+        valeurs = {
+            _normaliser_reponse(chip.get("value"))
+            for chip in meta.get("quick_replies") or []
+            if isinstance(chip, dict)
+        }
+        if _normaliser_reponse(reponse.content) in valeurs:
+            return False
+    return True
+
+
+def _calcul_force(user, message: str, attachment, registre: Registre,
+                  attachment_traite_ce_tour: bool) -> dict | None:
+    """Le calcul commun aux deux sorties.
+
+    Priorite identique a v1: la fin de recurrence d'abord, les creneaux
+    ensuite, jamais les deux. Une question ignoree deux fois se tait et
+    laisse sa place a la suivante.
+    """
+    if attachment_traite_ce_tour and attachment is not None:
+        fin = _fin_de_recurrence(attachment)
+        if fin is not None and not _ignoree_deux_fois(user, MOTIF_FIN_RECURRENCE):
+            question, chips = fin
+            return {"motif": MOTIF_FIN_RECURRENCE, "question": question,
+                    "chips": chips, "chips_v1": chips, "phrase_v1": None}
+
+    if not _creneaux_envisageables(message, registre):
+        return None
+
+    from services.agent.agent import _ambiguous_scheduling_chips
+
+    ambigu = _ambiguous_scheduling_chips(user, appels_outils(registre), message)
+    if not ambigu:
+        return None
+    phrase, chips_v1 = ambigu
+    if not chips_v1 or _ignoree_deux_fois(user, MOTIF_CRENEAUX):
+        return None
+    return {
+        "motif": MOTIF_CRENEAUX,
+        "question": _question_creneaux(phrase, chips_v1),
+        "chips": [_chip_humaine(chip) for chip in chips_v1],
+        "chips_v1": chips_v1,
+        "phrase_v1": phrase,
+    }
+
+
+def question_forcee(user, message: str, attachment, registre: Registre,
+                    attachment_traite_ce_tour: bool) -> dict | None:
+    """{"question", "chips": [{"label", "value"}], "motif"} ou None.
+
+    `message` est le message BRUT de l'utilisateur, pas sa version enrichie
+    du contexte document (voir boutons_forces). La question ne contient pas
+    les libelles des boutons: le narrateur les rend a part, et l'historique
+    les retrouve dans les metadonnees du message.
+    """
+    calcul = _calcul_force(user, message, attachment, registre, attachment_traite_ce_tour)
+    if calcul is None:
+        return None
+    return {
+        "question": calcul["question"],
+        "chips": [dict(chip) for chip in calcul["chips"]],
+        "motif": calcul["motif"],
+    }
+
+
 def boutons_forces(user, message: str, attachment, registre: Registre,
                    texte: str, attachment_traite_ce_tour: bool) -> tuple[str, list[dict]]:
     """Rend (texte eventuellement complete, chips) ou (texte, []) si rien a forcer.
@@ -153,28 +329,16 @@ def boutons_forces(user, message: str, attachment, registre: Registre,
     `not deja_traite and attachment.processed` egale le drapeau de v1, borne
     a zero comprise (boucle vide des deux cotes).
 
-    Priorite identique a v1: la fin de recurrence d'abord, les creneaux
-    ensuite, jamais les deux.
-
-    Les creneaux sont ecrits dans le texte a la suite de la phrase, libelles
-    tels que fournis par le helper, separes par ', '. Le texte rendu est a la
-    fois affiche et persiste, et les chips ne le sont pas: sans les libelles,
-    l'historique du tour suivant contiendrait une annonce tronquee et le
-    modele ne saurait pas de quoi « le deuxieme » est la reponse.
+    Contrat historique, construit sur le meme calcul que question_forcee: les
+    creneaux sont ecrits dans le texte a la suite de la phrase, libelles v1
+    tels que fournis par le helper, separes par ', '.
     """
-    if attachment_traite_ce_tour and attachment is not None:
-        force = _fin_de_recurrence(attachment, texte)
-        if force is not None:
-            return force
-
-    if not _creneaux_envisageables(message, registre):
+    calcul = _calcul_force(user, message, attachment, registre, attachment_traite_ce_tour)
+    if calcul is None:
         return texte, []
-
-    from services.agent.agent import _ambiguous_scheduling_chips
-
-    ambigu = _ambiguous_scheduling_chips(user, appels_outils(registre), message)
-    if ambigu:
-        phrase, chips = ambigu
-        libelles = ", ".join(chip["label"] for chip in chips)
-        return f"{texte}\n\n{phrase} {libelles}", chips
-    return texte, []
+    if calcul["motif"] == MOTIF_FIN_RECURRENCE:
+        if "jusqu" not in texte.lower():
+            texte += f"\n\n⏳ {calcul['question']}"
+        return texte, calcul["chips_v1"]
+    libelles = ", ".join(chip["label"] for chip in calcul["chips_v1"])
+    return f"{texte}\n\n{calcul['phrase_v1']} {libelles}", calcul["chips_v1"]
