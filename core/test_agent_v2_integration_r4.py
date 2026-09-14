@@ -27,12 +27,13 @@ class ReemiseEtGardeTests(voix_r4.DemandeReemiseTests):
         self.assertTrue(RecurringBlock.all_objects.get(pk=self.quart.pk).active)
 
     def test_garder_tous_les_jeudis_apres_une_reemission_ne_supprime_rien(self):
-        cle = self._flou()
+        self._flou()
         done = self._tour("garde tous les jeudis")
         self.assertTrue(RecurringBlock.all_objects.get(pk=self.quart.pk).active)
-        # Reponse ambigue dans le sens sur: la question revient, rien n'est fait.
-        self.assertEqual(done["question_motif"], "portee_jour")
-        self.assertEqual([d["cle"] for d in self._meta()["demandes"]], [cle])
+        # Round 5 (revue de lisibilite du round 4): garder en nommant la
+        # portee est un refus clair, la question ne revient plus.
+        self.assertNotEqual(done["question_motif"], "portee_jour")
+        self.assertEqual(self._meta()["demandes"], [])
 
     def test_la_reponse_claire_apres_reemission_ferme_la_boucle(self):
         self._flou()

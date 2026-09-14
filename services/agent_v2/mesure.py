@@ -129,8 +129,13 @@ _CONDITIONNELLE = re.compile(
 # ── Questions ────────────────────────────────────────────────────────────
 # Une premiere personne au passe ou en cours est une fuite PARTOUT, question
 # comprise: « Tu gardes le bloc Gym que j'ai ajoute ? » affirme l'ajout.
+# Revue de verite du round 4: « Je l'ai mis jeudi », « je te les ai
+# inscrits » et « C'est noté pour jeudi » passaient (clitiques et
+# participes hors des racines).
 _PREMIERE_PERSONNE = re.compile(
-    r"(?<![a-z])(?:j'ai|je\s+t'ai|que\s+j'ai|je\s+viens\s+de|j'ai\s+deja|c'est\s+fait|voila\s+qui\s+est)\b")
+    r"(?<![a-z])(?:j'ai|je\s+t'ai|que\s+j'ai|je\s+viens\s+de|j'ai\s+deja|c'est\s+fait|voila\s+qui\s+est"
+    r"|je\s+(?:(?:l|t|m|s)'\s*|(?:le|la|les|lui|leur|te|vous|nous|en|y|me)\s+)+ai"
+    r"|c'est\s+(?:note|confirme|inscrit|enregistre|reserve))\b")
 # « j'ai besoin de », « j'ai une question »: aucune action, on les neutralise
 # avant la recherche pour ne pas tuer une clarification ordinaire.
 _PREMIERE_PERSONNE_NEUTRE = re.compile(
@@ -486,14 +491,49 @@ def epurer_reponse(reponse: ReponseDire) -> tuple[ReponseDire, int]:
     return reponse.model_copy(update=champs), supprimees
 
 
+# Une tete de question ou d'offre, en DEBUT de proposition.
+_TETE_DEMANDE = re.compile(
+    r"^(?:et\s+|alors\s+|sinon\s+|ou\s+|donc\s+|mais\s+)?(?:"
+    r"(?:quel|quelle|quels|quelles|quand|combien|lequel|laquelle|lesquels|lesquelles"
+    r"|ou|comment|pourquoi)\b"
+    r"|a\s+quelle\s+heure\b|pour\s+quel|est\s+ce\s+qu"
+    r"|(?:veux|voudrais|souhaites|preferes|aimerais|peux|pourrais|dois)\s+tu\b"
+    r"|tu\s+(?:veux|voudrais|preferes|aimerais|souhaites|peux)\b"
+    r"|ca\s+te\s+va\b)")
+# Ce qu'un brouillon ne peut JAMAIS porter, meme sous une tete de question.
+_AFFIRMATION_DE_BROUILLON = re.compile(
+    r"(?<![a-z])(?:j'ai|je\s+(?:(?:l|t|m|s)'\s*|(?:le|la|les|lui|leur|te|vous|nous|en|y|me)\s+)+ai"
+    r"|c'est\s+(?:note|bon|confirme|inscrit|reserve|enregistre|regle)"
+    r"|maintenant|desormais|ne\s+figure\s+plus|plus\s+de)\b")
+
+
+def _demande_structurelle(phrase: str) -> bool:
+    """Revue de verite du round 4: le filtre lexical laissait passer « Je l'ai
+    mis jeudi a 9 h, veux-tu que je change ? ». Une phrase ne passe que si
+    chaque proposition sauf la derniere, et la premiere toujours, est une
+    tete de question, d'offre ou de conditionnelle: une proposition
+    declarative devant le « ? » emporte la phrase entiere."""
+    clauses = [" ".join(_normaliser(c).replace("?", " ").split()) for c in _CLAUSE.split(phrase)]
+    clauses = [c for c in clauses if c]
+    if not clauses:
+        return False
+
+    def _tete(c):
+        return bool(_TETE_DEMANDE.match(c) or _OFFRE_EN_TETE.match(c) or _CONDITIONNELLE.match(c))
+
+    if len(clauses) == 1:
+        return _tete(clauses[0])
+    return all(_tete(c) for c in clauses[:-1])
+
+
 def questions_et_offres(texte) -> str:
     """Ce qui, d'un brouillon d'AGIR, peut entrer au brief de DIRE.
 
-    Seulement les phrases qui DEMANDENT: une vraie question (finit par « ? »)
-    ou une offre (« Veux-tu que je... », « Dis-moi l'heure et je le place »),
-    et seulement si fuite_question n'y trouve rien. Toute phrase declarative
-    tombe: c'est la que le modele raconte ses actions, y compris celles
-    qu'une garde a retenues (revue de verite du round 3).
+    Seulement les phrases qui DEMANDENT par leur STRUCTURE (voir
+    _demande_structurelle), sans aucune marque d'action acquise, et que
+    fuite_question juge propres. Toute phrase declarative tombe: c'est la que
+    le modele raconte ses actions, y compris celles qu'une garde a retenues
+    (revues de verite des rounds 3 et 4).
     """
     if not texte or not isinstance(texte, str):
         return ""
@@ -503,9 +543,12 @@ def questions_et_offres(texte) -> str:
         plat = _normaliser(nette).replace("?", " ").strip()
         if not plat:
             continue
-        demande = (_finit_par_question(nette) or bool(_OFFRE_EN_TETE.match(plat))
-                   or bool(_CONDITIONNELLE.match(plat)))
-        if demande and not fuite_question(nette):
+        if not (_finit_par_question(nette) or _OFFRE_EN_TETE.match(plat)
+                or _CONDITIONNELLE.match(plat)):
+            continue
+        if not _demande_structurelle(nette) or _AFFIRMATION_DE_BROUILLON.search(plat):
+            continue
+        if not fuite_question(nette):
             gardees.append(nette)
     return " ".join(gardees)
 

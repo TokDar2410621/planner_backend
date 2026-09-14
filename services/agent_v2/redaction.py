@@ -71,15 +71,20 @@ def bloc_lecture(registre: Registre, aujourdhui=None) -> str:
     return _charger_rendu().rendre_lecture(registre, aujourdhui)
 
 
-def bloc_factuel(registre: Registre, aujourdhui=None, cles_posees=None) -> str:
+def bloc_factuel(registre: Registre, aujourdhui=None, cles_posees=None,
+                 sans_lecture: bool = False) -> str:
     """Le compte rendu deterministe du tour: les faits, sinon la lecture.
 
     `cles_posees` dit quelles actions retenues sont couvertes par la question
     du tour: rendu.py tait celles-la et donne une ligne aux autres.
+    `sans_lecture`: la lecture n'a servi qu'a preparer un formulaire ou un
+    choix, elle ne se deverse pas au-dessus (banc du round 4, s02-1).
     """
     r = _charger_rendu()
-    return (r.rendre_faits(registre, aujourdhui, cles_posees)
-            or r.rendre_lecture(registre, aujourdhui))
+    faits = r.rendre_faits(registre, aujourdhui, cles_posees)
+    if faits or sans_lecture:
+        return faits or ""
+    return r.rendre_lecture(registre, aujourdhui)
 
 
 def question_code(demandes: list[dict], aujourdhui=None) -> tuple[str, list[dict], list[str]]:
@@ -210,12 +215,22 @@ def contient_question(texte: str) -> bool:
 # La mecanique de l'interface decrite a l'utilisateur (banc du round 3):
 # « Remplis ce qui te convient », « le tout est pré-rempli », « Réponds « Tous
 # les jeudis » », « ajuste les jours si besoin », « touche un des boutons ».
+# Revue de lisibilite du round 4: « Ta journée est bien remplie » et « au
+# champ de tir » tombaient. Seuls l'imperatif « remplis » et le champ d'une
+# saisie (« le champ », « ces champs ») restent de la mecanique.
 _MECANIQUE = re.compile(
-    r"\brempli(?:s|r|e|es)?\b|\bpr[ée][- ]?rempli\w*"
+    r"\brempli(?:s|r)\b|\bpr[ée][- ]?rempli\w*"
     r"|\br[ée]ponds?\s*(?:[«\"“]|par\b|avec\b)"
     r"|\bboutons?\b|\bcoch(?:e|es|er|ez|ée|ées)\b|\bclique\w*|\bappuie\w*\s+sur\b"
     r"|\bci-(?:dessous|dessus)\b|\bajuste\w*\b[^.?!]*\bsi\s+besoin\b"
-    r"|\bs[ée]lectionne\w*|\bchamps?\b",
+    r"|\bs[ée]lectionne\w*|\b(?:le|les|ce|ces|chaque|un|des)\s+champs?\b",
+    re.IGNORECASE)
+# Une absence affirmee alors que le code affiche la liste lue (banc du round
+# 4, s03-1: « Il n'y a pas de cours de maths » au-dessus de Calcul
+# différentiel). La liste fait foi; la phrase tombe.
+_ABSENCE = re.compile(
+    r"\bil\s+n['’]?\s*y\s+a\s+(?:pas|aucun\w*|rien)\b|\btu\s+n['’]?\s*as\s+(?:pas|aucun\w*)\b"
+    r"|\bn['’]?\s*(?:appara[iî]\w*|figure\w*)\s+pas\b|\baucun\w*\s+\w+\s+(?:dans|à|a)\s+ton\b",
     re.IGNORECASE)
 # Une demande a l'imperatif, seconde question deguisee quand le code demande
 # deja: « Dis-moi aussi vers quel jour tu veux le déplacer. »
@@ -273,6 +288,11 @@ def composer(brut: ReponseDire | None, registre: Registre, faits: str,
         ouverture, n1 = _sans_annonce_vide(ouverture)
         suite, n2 = _sans_annonce_vide(suite)
         lecture_sans_liste = bool(n1 or n2)
+    elif any(a.succes and a.outil in LECTURES_RENDUES for a in registre.actions):
+        ouverture = " ".join(p for p in _phrases(ouverture) if not _ABSENCE.search(p))
+        suite = " ".join(p for p in _phrases(suite) if not _ABSENCE.search(p))
+        if _ABSENCE.search(question):
+            question, options = "", []
 
     # Une question par reponse, et dans son champ (lot 3d, banc du round 3).
     # Une question ecrite en prose sort de la prose: elle devient LA question

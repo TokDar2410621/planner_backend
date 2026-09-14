@@ -71,6 +71,7 @@ REPLI_PROSE = "Voici ce qui a changé. Dis-moi si tu veux autre chose."
 REPLI_PROSE_LECTURE = "Dis-moi si tu veux autre chose."
 REPLI_QUESTION = "Je n'ai pas compris. Tu veux ajouter, déplacer ou voir quelque chose ?"
 PROSE_FORMULAIRE = "Il me manque quelques précisions."
+PROSE_REPRISE = "Il me faut juste cette précision avant de toucher à ton horaire."
 
 # POOL DE THREADS REUTILISES, et le mot « reutilises » porte tout le poids.
 #
@@ -131,6 +132,18 @@ def _garde_a_retenu(registre: Registre) -> bool:
                 or d.get("requires_confirmation") or d.get("heure_dite")):
             return True
     return False
+
+
+def _brouillon_interdit(registre: Registre) -> bool:
+    """Le brouillon d'AGIR est-il ecarte du brief ce tour ?
+
+    Revue de verite du round 4: _garde_a_retenu ignorait une date passee, une
+    erreur d'outil et les autres echecs, et le brouillon racontait l'action
+    ratee (« Je l'ai mis jeudi a 9 h, veux-tu... ? »). Toute action en echec
+    ce tour, retenue ou non, ecarte le brouillon entier.
+    """
+    return _garde_a_retenu(registre) or any(
+        not a.succes and a.outil != "import_recent" for a in registre.actions)
 
 
 def _cout(resultat, duree: float) -> dict:
@@ -422,7 +435,7 @@ class PlannerAgentV2:
         # 3). Seules ses questions et ses offres propres entrent au brief, et
         # rien du tout quand une garde a retenu une action ce tour: le code
         # pose alors la question.
-        brouillon = "" if _garde_a_retenu(registre) else questions_et_offres(brouillon)
+        brouillon = "" if _brouillon_interdit(registre) else questions_et_offres(brouillon)
         if brouillon:
             extrait = brouillon if len(brouillon) <= BROUILLON_MAX \
                 else f"{brouillon[:BROUILLON_MAX]}... (tronque)"
@@ -589,7 +602,12 @@ class PlannerAgentV2:
         par_demande = bool(gagnant) and gagnant.get("source") == "demande"
         cles_posees = set(gagnant.get("cles_posees") or []) if par_demande else set()
 
-        faits = bloc_factuel(registre, cles_posees=cles_posees)
+        # Une lecture qui n'a servi qu'a preparer un formulaire ou un choix ne
+        # se deverse pas au-dessus de la question (banc du round 4, s02-1).
+        sans_lecture = bool(gagnant) and (
+            gagnant.get("source") == "formulaire" or gagnant.get("motif") == "choix_modele"
+        ) and not any(a.succes and a.est_mutation for a in registre.actions)
+        faits = bloc_factuel(registre, cles_posees=cles_posees, sans_lecture=sans_lecture)
         # La section RESTE: demande contre place, une soustraction rendue par
         # du code. Elle rejoint les faits AVANT la redaction et le flux: le
         # manque se nomme au meme instant que le succes qu'il tempere.
@@ -631,6 +649,11 @@ class PlannerAgentV2:
         # source (banc du round 3, s06-1).
         prose, question = sans_tiret_long(compo.prose), sans_tiret_long(compo.question)
         motif, chips = compo.motif, compo.chips
+        if reemises and par_demande and cles_posees & {d.get("cle") for d in reemises}:
+            # Revue de lisibilite du round 4: DIRE lisait une reponse de garde
+            # et ecrivait « D'accord, je garde ta chimie. » juste avant la
+            # question de suppression reposee. Sur ce tour, le code parle seul.
+            prose = PROSE_REPRISE
         formulaire = gagnant.get("interactive_inputs") if gagnant and \
             gagnant.get("source") == "formulaire" else None
         mutation_reussie = any(a.succes and a.est_mutation for a in registre.actions)
@@ -786,8 +809,9 @@ class PlannerAgentV2:
 
         Relues depuis le message precedent (la seule source que la garde
         accepte), jamais reconstruites: la question reposee est celle que
-        l'utilisateur a deja vue. emise_le est rafraichi parce qu'elle est
-        montree de nouveau ce tour.
+        l'utilisateur a deja vue. emise_le reste celle d'origine pour que la
+        fenetre d'attente expire (revue du round 4), et le compte de
+        reemissions monte: le code ne repose qu'une fois.
         """
         cles = {c.get("cle") for c in choix
                 if c.get("cle") and c.get("option") is None
@@ -799,7 +823,6 @@ class PlannerAgentV2:
         except Exception:  # noqa: BLE001 - sans attente lisible, AGIR redemandera
             logger.error("Demandes a reposer illisibles", exc_info=True)
             return []
-        maintenant = timezone.now().isoformat()
         sortie: list[dict] = []
         vues: set = set()
         for d in attente:
@@ -807,7 +830,9 @@ class PlannerAgentV2:
             if cle in cles and cle not in vues:
                 vues.add(cle)
                 copie = {k: v for k, v in d.items() if k != "chips"}
-                copie["emise_le"] = maintenant
+                copie["reemissions"] = int(d.get("reemissions") or 0) + 1
+                if not copie.get("emise_le"):
+                    copie["emise_le"] = timezone.now().isoformat()
                 sortie.append(copie)
         return sortie
 

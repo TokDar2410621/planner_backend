@@ -503,10 +503,18 @@ def _reponse(ctx: _Contexte, cles: set, nom: str):
     return False, repondue, en_suspens
 
 
+# Une demande n'est reposee par le code qu'une fois: au-dela, elle collait a
+# la conversation et une suppression suivante y repondait (revue du round 4).
+REEMISSIONS_MAX = 1
+
+
 def _reposer(demande: dict) -> dict:
-    """La meme question, remise a l'heure, sans les puces du tour passe."""
+    """La meme question, sans les puces du tour passe. emise_le reste celle
+    d'ORIGINE: la fenetre d'attente doit pouvoir expirer."""
     copie = {k: v for k, v in demande.items() if k != "chips"}
-    copie["emise_le"] = timezone.now().isoformat()
+    copie["reemissions"] = int(demande.get("reemissions") or 0) + 1
+    if not copie.get("emise_le"):
+        copie["emise_le"] = timezone.now().isoformat()
     return copie
 
 
@@ -798,30 +806,36 @@ def _heure_dite_ignoree(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparati
             return communs[0] if not recurrent else dem.prochaine_occurrence(communs[0].weekday())
         return next(iter(dates)) if dates else dem.prochaine_occurrence(min(jours))
 
-    titre_situe = False
+    situe_avec_heure = False
     for s, e in _propositions(plat):
         morceau = plat[s:e]
         mots_morceau = {m[:-1] if m.endswith("s") and len(m) > 4 else m
                         for m in re.findall(r"[a-z0-9]+", morceau)}
         if not mots & mots_morceau:
             continue
-        titre_situe = True
         fermes = [(v, tol) for v, _ou, tol in _heures_fermes(plat, positions, s, e)]
         if not fermes:
             continue
+        situe_avec_heure = True
         jour_cible = _jour_cible(dem._dates_nommees(morceau, aujourdhui) or dates_message)
         if jour_cible is None:
             continue
         return _heure_dite_contredite(ctx, nom, kwargs, prep, titre, recurrent, debut,
                                       jour_cible, fermes)
-    if titre_situe:
+    if situe_avec_heure:
+        # Le titre porte sa propre heure, pour un autre jour: rien a opposer.
         return None
 
     # Revue du 2026-09-14 (round 3): un titre court ou vide de sens (« Gym »,
     # « cours ») ou renomme par le modele (« Entraînement » pour « gym ») ne se
     # retrouve dans aucune proposition. Si le message ne donne qu'UNE heure
     # ferme, elle vaut pour tout ajout du jour qu'il nomme (ou sans jour nomme).
-    fermes = _sans_fins_de_plage(plat, _heures_fermes(plat, positions, 0, len(plat)))
+    # Round 4: aussi quand le titre est dans une proposition SANS heure
+    # (« ajoute gym jeudi et mets-le a 15 h »). L'heure doit etre d'horloge
+    # (« a 15 h », « 15 h 30 ») et ne pas etre celle d'un autre element
+    # (« j'ai un cours a 14 h ») ni une fin de journee (« je finis a 17 h »).
+    fermes = [f for f in _sans_fins_de_plage(plat, _heures_fermes(plat, positions, 0, len(plat)))
+              if _heure_d_horloge(plat, f[1]) and not _heure_d_un_autre_element(plat, f[1], titre)]
     if len({v for v, _ou, _tol in fermes}) != 1:
         return None
     jour_cible = _jour_cible(dates_message)
@@ -844,6 +858,59 @@ def _heures_fermes(plat: str, positions, s: int, e: int) -> list[tuple[str, int,
         tolerance = TOLERANCE_APPROX if _HEURE_APPROX_AVANT.search(avant) else 0
         fermes.append((valeur, ou, tolerance))
     return fermes
+
+
+_AVANT_HORLOGE = re.compile(r"\b(?:a|au|de|des|vers|pour|entre)\s*$")
+
+
+def _heure_d_horloge(plat: str, ou: int) -> bool:
+    """« a 15 h », « de 14 h », « 15 h 30 », « 15:00 », midi: une heure
+    d'horloge. « Heures d'etude: 4 h » n'en est pas une (banc du round 4)."""
+    m = dem._RE_HEURE.match(plat, ou)
+    if m is None:
+        return False
+    if m.group(2) or m.group(3) is not None or m.group(5):
+        return True
+    return bool(_AVANT_HORLOGE.search(plat[:ou]))
+
+
+# Une proposition qui situe un element DEJA LA (« j'ai un cours a 14 h »,
+# « il commence a 15 h ») ou une fin de journee (« je finis a 17 h »).
+_CONTEXTE_EXISTANT = re.compile(
+    r"\b(?:j'ai|il y a|fini[st]?|termine\w*|commence\w*|sors|sort|quitte\w*|rentre\w*)\b")
+_VERBE_CREATEUR = re.compile(
+    r"\b(?:ajout\w*|mets|met|place\w*|planifi\w*|cale\w*|reserve\w*|programme\w*|"
+    r"inscri\w*|cree\w*|creer)\b")
+_NOM_APRES_ARTICLE = re.compile(r"\b(?:un|une|mon|ma|mes|le|la|l')\s*([a-z]{3,})")
+_PRONOM_EN_TETE = re.compile(r"^\s*(?:il|elle|ils|elles|ca)\b")
+
+
+def _heure_d_un_autre_element(plat: str, ou: int, titre: str) -> bool:
+    """L'heure a la position ou appartient-elle a autre chose que ce titre ?
+
+    Revue du round 4 (regressions): « j'ai un cours a 14 h demain, ajoute une
+    seance de muscu apres » imposait 14 h a la muscu, et « demain je finis a
+    17 h » imposait 17 h a l'etude. Seule une proposition de contexte (element
+    existant, fin de journee) sans verbe createur est ecartee, et encore:
+    si l'element qu'elle nomme est ce titre (« mon cours jeudi, il commence a
+    15 h » pour Cours), l'heure lui appartient.
+    """
+    propositions = _propositions(plat)
+    rang = next((i for i, (s, e) in enumerate(propositions) if s <= ou < e), None)
+    if rang is None:
+        return False
+    s, e = propositions[rang]
+    morceau = plat[s:e]
+    if not _CONTEXTE_EXISTANT.search(morceau) or _VERBE_CREATEUR.search(morceau):
+        return False
+    noms = _NOM_APRES_ARTICLE.findall(morceau)
+    if not noms and _PRONOM_EN_TETE.match(morceau) and rang > 0:
+        ps, pe = propositions[rang - 1]
+        noms = _NOM_APRES_ARTICLE.findall(plat[ps:pe])
+    if not noms:
+        return True
+    mots_titre = [m for m in re.findall(r"[a-z0-9]+", dem.sans_accents(titre or "")) if len(m) >= 3]
+    return not any(dem._meme_mot(n, t) for n in noms for t in mots_titre)
 
 
 _ENTRE_PLAGE = re.compile(r"\s*(?:a|au|-)\s*$")
@@ -1503,6 +1570,17 @@ def _appliquer(ctx: _Contexte) -> list[dict]:
     for demande in _attente(ctx):
         cle, motif = demande.get("cle"), demande.get("motif")
         option = dem.option_choisie(ctx.texte, demande)
+        if option is None and motif in MOTIFS_GARDES and not (
+                dem.reponse_plausible(ctx.texte, demande)
+                and int(demande.get("reemissions") or 0) < REEMISSIONS_MAX):
+            # Revue du round 4: un message sans rapport (« c'est quoi mon
+            # horaire demain ? ») ou une seconde reponse floue ne font plus
+            # reposer la question. Elle est laissee de cote; rien ne s'execute.
+            sorties.append({"cle": cle, "motif": motif, "option": None, "action_id": None,
+                            "resume": (f"QUESTION LAISSEE DE COTE: {_sujet(demande)}, "
+                                       "l'utilisateur est passe a autre chose; n'agis pas "
+                                       "sur ce point sans nouvelle demande explicite")})
+            continue
         if option is None:
             if motif in MOTIFS_GARDES:
                 # Banc du 2026-09-14 (s05-3): apres un oui vague, la demande
