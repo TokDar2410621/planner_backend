@@ -129,8 +129,25 @@ class Composition:
         return "\n\n".join(self.sections)
 
 
+# « jeudi 17 sept. ou tous les jeudis ? » est UNE phrase: un point
+# d'abreviation de mois ou de jour suivi d'une minuscule ne la coupe pas.
+# Sans cette couture, la question restait a moitie dans la prose (round 4).
+_ABREVIATION_EN_QUEUE = re.compile(
+    r"\b(?:janv|f[ée]vr|avr|juil|sept|oct|nov|d[ée]c|lun|mar|mer|jeu|ven|sam|dim)\.$",
+    re.IGNORECASE)
+_DEBUT_MINUSCULE = re.compile(r"^[a-zàâçéèêëîïôûùüÿœ0-9]")
+
+
 def _phrases(texte: str) -> list[str]:
-    return [p.strip() for p in _FIN_DE_PHRASE.split(texte or "") if p.strip()]
+    morceaux = [p.strip() for p in _FIN_DE_PHRASE.split(texte or "") if p.strip()]
+    phrases: list[str] = []
+    for morceau in morceaux:
+        if phrases and _ABREVIATION_EN_QUEUE.search(phrases[-1]) \
+                and _DEBUT_MINUSCULE.match(morceau):
+            phrases[-1] = f"{phrases[-1]} {morceau}"
+        else:
+            phrases.append(morceau)
+    return phrases
 
 
 def _sans_annonce_vide(texte: str) -> tuple[str, int]:
@@ -153,6 +170,58 @@ _VOCABULAIRE_INTERNE = re.compile(
 
 def _sans_vocabulaire_interne(texte: str) -> str:
     return " ".join(p for p in _phrases(texte) if not _VOCABULAIRE_INTERNE.search(p))
+
+
+# ── Tiret long, mecanique, questions hors champ (round 4) ──────────────────
+
+# U+2014 ecrit par echappement: la regle zero tiret long vaut aussi pour ce
+# fichier. Le premier devient « : », les suivants « ; », un tiret en tete ou
+# en queue disparait.
+_TIRET_LONG = re.compile("\\s*\u2014\\s*")
+
+
+def sans_tiret_long(texte):
+    """Retire tout tiret long d'un texte montre a l'utilisateur."""
+    if not isinstance(texte, str) or "\u2014" not in texte:
+        return texte
+    rang = {"n": 0}
+
+    def _remplacer(m):
+        if m.start() == 0 or m.end() == len(texte):
+            return " "
+        rang["n"] += 1
+        return " : " if rang["n"] == 1 else " ; "
+
+    return " ".join(_TIRET_LONG.sub(_remplacer, texte).split(" ")).strip()
+
+
+_FIN_QUESTION = re.compile(r"\?[\s\"'»)\]]*$")
+
+
+def _est_question(phrase: str) -> bool:
+    return bool(_FIN_QUESTION.search(phrase or ""))
+
+
+def contient_question(texte: str) -> bool:
+    """Une phrase du texte finit-elle par « ? » ?"""
+    return any(_est_question(p) for p in _phrases(texte or ""))
+
+
+# La mecanique de l'interface decrite a l'utilisateur (banc du round 3):
+# « Remplis ce qui te convient », « le tout est pré-rempli », « Réponds « Tous
+# les jeudis » », « ajuste les jours si besoin », « touche un des boutons ».
+_MECANIQUE = re.compile(
+    r"\brempli(?:s|r|e|es)?\b|\bpr[ée][- ]?rempli\w*"
+    r"|\br[ée]ponds?\s*(?:[«\"“]|par\b|avec\b)"
+    r"|\bboutons?\b|\bcoch(?:e|es|er|ez|ée|ées)\b|\bclique\w*|\bappuie\w*\s+sur\b"
+    r"|\bci-(?:dessous|dessus)\b|\bajuste\w*\b[^.?!]*\bsi\s+besoin\b"
+    r"|\bs[ée]lectionne\w*|\bchamps?\b",
+    re.IGNORECASE)
+# Une demande a l'imperatif, seconde question deguisee quand le code demande
+# deja: « Dis-moi aussi vers quel jour tu veux le déplacer. »
+_DEMANDE_EN_PROSE = re.compile(
+    r"^(?:et\s+|alors\s+|sinon\s+)?(?:dis|donne|indique|pr[ée]cise|confirme)[- ]moi\b",
+    re.IGNORECASE)
 
 
 def _references_rejetees(brut, registre: Registre) -> int:
@@ -185,16 +254,17 @@ def composer(brut: ReponseDire | None, registre: Registre, faits: str,
     ouverture = suite = question = ""
     options: list = []
     if brut is not None and not rejetees:
-        ouverture = (getattr(brut, "ouverture", "") or "").strip()
-        suite = (getattr(brut, "suite", "") or "").strip()
-        question = (getattr(brut, "question", "") or "").strip()
-        options = list(getattr(brut, "options", None) or [])
+        ouverture = sans_tiret_long((getattr(brut, "ouverture", "") or "").strip())
+        suite = sans_tiret_long((getattr(brut, "suite", "") or "").strip())
+        question = sans_tiret_long((getattr(brut, "question", "") or "").strip())
+        options = [sans_tiret_long(o) for o in list(getattr(brut, "options", None) or [])]
 
     # Le vocabulaire interne (« flexible », « verrouiller », « portee »,
-    # « clarifier ») ne parle pas a l'utilisateur (banc du 2026-09-14).
+    # « clarifier ») ne parle pas a l'utilisateur (banc du 2026-09-14), ni la
+    # mecanique de l'interface (banc du round 3).
     ouverture = _sans_vocabulaire_interne(ouverture)
     suite = _sans_vocabulaire_interne(suite)
-    if _VOCABULAIRE_INTERNE.search(question):
+    if _VOCABULAIRE_INTERNE.search(question) or _MECANIQUE.search(question):
         question, options = "", []
     options = [o for o in options if not _VOCABULAIRE_INTERNE.search(str(o or ""))]
 
@@ -203,13 +273,36 @@ def composer(brut: ReponseDire | None, registre: Registre, faits: str,
         ouverture, n1 = _sans_annonce_vide(ouverture)
         suite, n2 = _sans_annonce_vide(suite)
         lecture_sans_liste = bool(n1 or n2)
+
+    # Une question par reponse, et dans son champ (lot 3d, banc du round 3).
+    # Une question ecrite en prose sort de la prose: elle devient LA question
+    # s'il n'y en a aucune, sinon elle tombe. Quand le code, un formulaire ou
+    # un choix porte deja la question, toute question de DIRE tombe, et ses
+    # demandes a l'imperatif (« Dis-moi aussi... ») avec.
+    questions_en_prose: list[str] = []
+
+    def _garder(texte: str) -> str:
+        gardees = []
+        for phrase in _phrases(texte):
+            if _MECANIQUE.search(phrase):
+                continue
+            if _est_question(phrase):
+                questions_en_prose.append(phrase)
+                continue
+            if question_code and _DEMANDE_EN_PROSE.match(phrase):
+                continue
+            gardees.append(phrase)
+        return " ".join(gardees)
+
+    ouverture = _garder(ouverture)
+    suite = _garder(suite)
     prose = " ".join(p for p in (ouverture, suite) if p).strip()
 
     if question_code:
         return Composition(
             faits=faits,
             prose=prose,
-            question=(question_code.get("question") or "").strip(),
+            question=sans_tiret_long((question_code.get("question") or "").strip()),
             chips=[dict(c) for c in question_code.get("chips") or []],
             motif=question_code.get("motif") or "",
             demandes=list(question_code.get("demandes") or []),
@@ -224,6 +317,10 @@ def composer(brut: ReponseDire | None, registre: Registre, faits: str,
         if texte and texte not in propres:
             propres.append(texte)
     propres = propres[:OPTIONS_MAX]
+    if not question and questions_en_prose:
+        # Les options de DIRE repondaient a SON champ question, vide ici:
+        # elles ne suivent pas une question venue de la prose.
+        question, propres = questions_en_prose[0], []
     if not question or len(propres) < 2:
         propres = []
     return Composition(

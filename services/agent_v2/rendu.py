@@ -304,6 +304,9 @@ _MARQUEURS = (
     # seances, pas des « blocs »; il voit des champs, pas un « formulaire »
     # (banc du 2026-09-14).
     ("vocabulaire_systeme", re.compile(r"\b(?:blocs?|formulaires?)\b", re.IGNORECASE)),
+    # Le tiret long (U+2014) est banni de tout texte lu par l'utilisateur. Il
+    # a atteint done.response au banc du round 3 sans que ce compteur le voie.
+    ("tiret_long", re.compile("\u2014")),
 )
 
 

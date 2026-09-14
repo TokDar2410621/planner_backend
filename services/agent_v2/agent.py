@@ -30,6 +30,7 @@ from typing import Optional
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import close_old_connections
+from django.utils import timezone
 from pydantic_ai import Agent, ModelRetry
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (ModelRequest, ModelResponse, PartDeltaEvent,
@@ -38,7 +39,7 @@ from pydantic_ai.messages import (ModelRequest, ModelResponse, PartDeltaEvent,
 from pydantic_ai.usage import UsageLimits
 
 from core.models import ConversationMessage, UploadedDocument
-from services.agent_v2.mesure import epurer_reponse, fuites_reponse
+from services.agent_v2.mesure import epurer_reponse, fuites_reponse, questions_et_offres
 from services.agent_v2.modeles import REGLAGES_DIRE, modele_agir, modele_dire
 from services.agent_v2.outils import outils_pour
 from services.agent_v2.prompts import PROMPT_DIRE, prompt_agir
@@ -46,7 +47,8 @@ from services.agent_v2.reconciliation import detecter_ecarts, reconcilier
 from services.agent_v2.importation import inscrire_import
 from services.agent_v2.redaction import (LECTURES_RENDUES, ReponseDire,
                                           bloc_factuel, bloc_reste, composer,
-                                          marqueurs_bruts, question_code)
+                                          contient_question, marqueurs_bruts,
+                                          question_code, sans_tiret_long)
 from services.agent_v2.registre import Registre
 
 logger = logging.getLogger(__name__)
@@ -108,6 +110,29 @@ def _charger_appliquer_choix():
     return appliquer_choix_en_attente
 
 
+def _charger_demandes_en_attente():
+    """demandes.demandes_en_attente, charge par une fonction pour les tests."""
+    from services.agent_v2.demandes import demandes_en_attente
+    return demandes_en_attente
+
+
+# Les resumes de appliquer_choix_en_attente qui laissent une demande gardee
+# ouverte: la reponse n'a tranche aucune option.
+SANS_REPONSE_CLAIRE = "SANS REPONSE CLAIRE"
+
+
+def _garde_a_retenu(registre: Registre) -> bool:
+    """Une garde du code a-t-elle retenu une action ce tour ?"""
+    for a in registre.actions:
+        if a.succes:
+            continue
+        d = a.donnees or {}
+        if (isinstance(d.get("demande"), dict) or d.get("needs_confirmation")
+                or d.get("requires_confirmation") or d.get("heure_dite")):
+            return True
+    return False
+
+
 def _cout(resultat, duree: float) -> dict:
     """Ce qu'une phase a reellement coute: allers-retours, jetons, secondes.
 
@@ -162,7 +187,8 @@ def _chips_propres(chips, garder_option: bool) -> list[dict]:
     for chip in chips or []:
         if not isinstance(chip, dict) or not chip.get("label") or not chip.get("value"):
             continue
-        propre = {"label": str(chip["label"]), "value": str(chip["value"])}
+        propre = {"label": sans_tiret_long(str(chip["label"])),
+                  "value": sans_tiret_long(str(chip["value"]))}
         if garder_option and chip.get("option") is not None:
             propre["option"] = chip["option"]
         propres.append(propre)
@@ -391,11 +417,16 @@ class PlannerAgentV2:
         if question_code:
             lignes += ["", "QUESTION DEJA POSEE PAR LE CODE (laisse question et "
                        "options vides):", question_code]
+        # Le brouillon d'AGIR est le canal ou le modele raconte ses actions,
+        # y compris celles qu'une garde a retenues (revue de verite du round
+        # 3). Seules ses questions et ses offres propres entrent au brief, et
+        # rien du tout quand une garde a retenu une action ce tour: le code
+        # pose alors la question.
+        brouillon = "" if _garde_a_retenu(registre) else questions_et_offres(brouillon)
         if brouillon:
             extrait = brouillon if len(brouillon) <= BROUILLON_MAX \
                 else f"{brouillon[:BROUILLON_MAX]}... (tronque)"
-            lignes += ["", "BROUILLON D'AGIR (reprends ses questions et propositions, "
-                       "jamais ses affirmations d'action):", extrait]
+            lignes += ["", "BROUILLON D'AGIR (ses questions et offres seulement):", extrait]
         if etat:
             lignes += ["", f"ETAT RELU APRES ECRITURE: {list(etat)}"]
         return "\n".join(lignes)
@@ -478,6 +509,12 @@ class PlannerAgentV2:
         yield from self._vider_file()
         choix = [c for c in choix if isinstance(c, dict)]
         choix_code = sum(1 for c in choix if c.get("action_id"))
+        # Une reponse floue a une question gardee (« Oui, supprime ces trois
+        # blocs. » a « seulement ce jeudi ou tous les jeudis ? ») ne doit pas
+        # perdre la demande: le CODE la repose, avec ses boutons, et la
+        # persiste pour que la reponse claire du tour suivant la tranche
+        # (banc du round 3, s05-2 et s05-3).
+        reemises = self._demandes_a_reemettre(user, choix)
         resumes = [str(c["resume"]) for c in choix if c.get("resume")]
         if resumes:
             message_enrichi = (f"{message_enrichi}\n\nSUITE AU CHOIX DE L'UTILISATEUR:\n- "
@@ -547,7 +584,8 @@ class PlannerAgentV2:
         # retenues que cette question couvre n'ont pas a etre redites, les
         # autres recoivent leur ligne « pas encore ».
         gagnant = self._choisir_question(
-            user, message, attachment, registre, attachment_traite_ce_tour)
+            user, message, attachment, registre, attachment_traite_ce_tour,
+            reemises=reemises)
         par_demande = bool(gagnant) and gagnant.get("source") == "demande"
         cles_posees = set(gagnant.get("cles_posees") or []) if par_demande else set()
 
@@ -558,6 +596,7 @@ class PlannerAgentV2:
         reste = bloc_reste(message, registre)
         if reste:
             faits = f"{faits}\n{reste}" if faits else reste
+        faits = sans_tiret_long(faits or "")
 
         emis: list[str] = []
         if faits:
@@ -575,7 +614,7 @@ class PlannerAgentV2:
         panne_dire = False
         try:
             brut = self._dire(user, message, registre, etat, faits,
-                              brouillon=self._brouillon_agir,
+                              brouillon="" if reemises else self._brouillon_agir,
                               question_code=question_deja,
                               historique_court=self._deux_derniers_echanges(user))
             # Fuites APRES la seconde chance du validateur: ce compteur dit
@@ -588,7 +627,9 @@ class PlannerAgentV2:
             panne_dire = True
             compo = composer(None, registre, faits, gagnant)
 
-        prose, question = compo.prose, compo.question
+        # Zero tiret long dans ce que lit l'utilisateur, quelle que soit la
+        # source (banc du round 3, s06-1).
+        prose, question = sans_tiret_long(compo.prose), sans_tiret_long(compo.question)
         motif, chips = compo.motif, compo.chips
         formulaire = gagnant.get("interactive_inputs") if gagnant and \
             gagnant.get("source") == "formulaire" else None
@@ -612,7 +653,9 @@ class PlannerAgentV2:
         response = "".join(emis)
 
         quick_replies = _chips_propres(chips, garder_option=False)
-        question_posee = bool(gagnant) or bool(question)
+        # Une question restee dans la prose compte aussi: sinon des puces
+        # differees viennent contredire la question (banc du round 3, s05-2).
+        question_posee = bool(gagnant) or bool(question) or contient_question(prose)
         lecture_reussie = any(a.succes and a.outil in LECTURES_RENDUES
                               for a in registre.actions)
         lecture_sans_liste = compo.lecture_sans_liste or (lecture_reussie and not faits)
@@ -737,16 +780,52 @@ class PlannerAgentV2:
             if element is not None:
                 yield self._evenement_de_file(element)
 
+    @staticmethod
+    def _demandes_a_reemettre(user: User, choix: list) -> list[dict]:
+        """Les demandes gardees restees SANS REPONSE CLAIRE, pretes a reposer.
+
+        Relues depuis le message precedent (la seule source que la garde
+        accepte), jamais reconstruites: la question reposee est celle que
+        l'utilisateur a deja vue. emise_le est rafraichi parce qu'elle est
+        montree de nouveau ce tour.
+        """
+        cles = {c.get("cle") for c in choix
+                if c.get("cle") and c.get("option") is None
+                and str(c.get("resume") or "").startswith(SANS_REPONSE_CLAIRE)}
+        if not cles:
+            return []
+        try:
+            attente = list(_charger_demandes_en_attente()(user) or [])
+        except Exception:  # noqa: BLE001 - sans attente lisible, AGIR redemandera
+            logger.error("Demandes a reposer illisibles", exc_info=True)
+            return []
+        maintenant = timezone.now().isoformat()
+        sortie: list[dict] = []
+        vues: set = set()
+        for d in attente:
+            cle = d.get("cle") if isinstance(d, dict) else None
+            if cle in cles and cle not in vues:
+                vues.add(cle)
+                copie = {k: v for k, v in d.items() if k != "chips"}
+                copie["emise_le"] = maintenant
+                sortie.append(copie)
+        return sortie
+
     def _choisir_question(self, user: User, message: str, attachment,
-                          registre: Registre, attachment_traite_ce_tour: bool):
+                          registre: Registre, attachment_traite_ce_tour: bool,
+                          reemises=()):
         """La question UNIQUE du tour, selon PRIORITE, ou None.
 
         Rend {"source", "motif", "question", "chips", "demandes",
         "cles_posees", "interactive_inputs"}. Les demandes viennent du
-        registre (gardes du code, present_choices), dans l'ordre des actions.
+        registre (gardes du code, present_choices), dans l'ordre des actions,
+        puis des demandes reemises apres une reponse floue (une cle deja au
+        registre n'est pas doublee).
         """
         demandes = [a.donnees["demande"] for a in registre.actions
                     if isinstance((a.donnees or {}).get("demande"), dict)]
+        deja = {d.get("cle") for d in demandes}
+        demandes += [d for d in reemises or [] if d.get("cle") not in deja]
         formulaire = self._dernier_formulaire(registre)
         rang_formulaire = PRIORITE.index("formulaire")
 

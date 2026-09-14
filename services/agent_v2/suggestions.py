@@ -72,11 +72,18 @@ def tour_a_pose_une_question(user) -> bool:
     dernier = (ConversationMessage.objects
                .filter(user=user)
                .order_by("-pk")
-               .only("role", "metadata")
+               .only("role", "metadata", "content")
                .first())
     if dernier is None or dernier.role != "assistant":
         return False
     meta = dernier.metadata if isinstance(dernier.metadata, dict) else {}
-    return bool(meta.get("question_posee")
-                or meta.get("quick_replies")
-                or meta.get("interactive_inputs"))
+    if (meta.get("question_posee") or meta.get("quick_replies")
+            or meta.get("interactive_inputs")):
+        return True
+    # Filet (banc du round 3, s05-2): une question ecrite par v2 hors de son
+    # champ laissait question_posee a faux, et des puces generiques venaient
+    # contredire une question a deux issues.
+    return meta.get("agent") == "v2" and bool(_QUESTION_DANS_LE_TEXTE.search(dernier.content or ""))
+
+
+_QUESTION_DANS_LE_TEXTE = re.compile(r"\?(?:[\s\"'»)\]]|$)")
