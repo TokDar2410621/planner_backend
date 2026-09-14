@@ -8,14 +8,19 @@ perd ces phrases perd le comportement de l'agent.
 
 Ce test verrouille le contrat COMPLET, schema serialise compris. Verifie par
 sonde le 2026-08-24: Tool(fonction, name=..., description=...) sur une
-fonction **kwargs produit un schema VIDE, donc 30 outils sans le moindre
+fonction **kwargs produit un schema VIDE, donc des outils sans le moindre
 parametre. Seul Tool.from_schema transmet le vrai schema.
+
+Les gardes du code (confirmation au tour suivant, portee d'une suppression,
+heures dites) ont leurs propres tests: core/test_agent_v2_gardes.py et
+core/test_agent_v2_choix_executes.py.
 """
 import json
 
 from django.contrib.auth.models import User
 from django.test import TestCase, TransactionTestCase
 
+from core.models import ConversationMessage
 from services.agent.tools import ALL_TOOLS, TOOL_MAP
 from services.agent_v2 import outils as outils_v2
 from services.agent_v2.registre import Registre
@@ -30,8 +35,10 @@ class PariteDesOutilsTests(TestCase):
         }
 
     def test_les_30_outils_sont_exposes(self):
+        # Derive de ALL_TOOLS: le nombre d'outils change (present_choices), le
+        # contrat est que CHAQUE outil est expose une fois, sans doublon.
         attendus = {t.name for t in ALL_TOOLS}
-        self.assertEqual(len(attendus), 30, 'ALL_TOOLS a change de taille')
+        self.assertEqual(len(attendus), len(ALL_TOOLS), 'deux outils portent le meme nom')
         self.assertEqual(set(self.exposes), attendus)
 
     def test_chaque_description_est_identique_octet_pour_octet(self):
@@ -68,7 +75,10 @@ class PariteDesOutilsTests(TestCase):
 class GardeDestructiveTests(TestCase):
     """agent.py applique requires_confirmation (lignes 921 a 944), PAS
     execute_tool. Un adaptateur qui appelle les outils en direct contourne la
-    garde, et clear_all_blocks efface un planning sans confirmation."""
+    garde, et clear_all_blocks efface un planning sans confirmation.
+
+    autorise_destructif reste defini pour la parite v1; la garde v2 ne s'en
+    sert plus (voir core/test_agent_v2_gardes.py)."""
 
     def test_les_outils_destructifs_portent_le_drapeau(self):
         for nom in ('clear_all_blocks', 'delete_task'):
@@ -112,10 +122,11 @@ class ExecutionTests(TransactionTestCase):
     def setUp(self):
         self.user = User.objects.create_user(username='exec', password='x')
 
-    def _appeler(self, nom, message='', **kwargs):
+    def _appeler(self, nom, message='', tache='', **kwargs):
         import asyncio
         registre = Registre()
-        outils = {t.name: t for t in outils_v2.outils_pour(self.user, registre, message)}
+        outils = {t.name: t for t in outils_v2.outils_pour(
+            self.user, registre, message, tache=tache, message_brut=message)}
         fonction = outils[nom].function_schema.function
         asyncio.run(fonction(**kwargs))
         return registre
@@ -139,14 +150,37 @@ class ExecutionTests(TransactionTestCase):
         self.assertFalse(registre.actions[0].succes)
 
     def test_un_outil_destructif_sans_confirmation_est_refuse_ET_consigne(self):
+        ConversationMessage.objects.create(user=self.user, role='user', content='bonjour')
         registre = self._appeler('clear_all_blocks', message='bonjour', confirm=True)
         self.assertEqual(len(registre.actions), 1)
         action = registre.actions[0]
         self.assertFalse(action.succes)
         self.assertTrue(action.donnees.get('needs_confirmation'))
+        # La garde pose une question au lieu d'un texte pour le modele.
+        self.assertEqual(action.donnees['demande']['motif'], 'destructif')
+        self.assertEqual(action.donnees['demande']['cle'], 'clear_all_blocks')
 
     def test_un_outil_destructif_avec_confirmation_passe(self):
+        """Depuis le lot 1d, la confirmation vient du tour SUIVANT: « oui
+        efface tout » dans la demande elle-meme ne suffit plus."""
+        u1 = ConversationMessage.objects.create(
+            user=self.user, role='user', content='oui efface tout')
+        premier = self._appeler(
+            'clear_all_blocks', message='oui efface tout', tache='t1', confirm=True)
+        self.assertFalse(premier.actions[0].succes)
+        demande = dict(premier.actions[0].donnees['demande'])
+        demande['chips'] = [
+            {'label': 'Oui, confirme', 'value': 'Oui, je confirme.', 'option': 'confirmer'},
+            {'label': 'Non, garde tout', 'value': 'Non, ne change rien.', 'option': 'annuler'},
+        ]
+        ConversationMessage.objects.create(
+            user=self.user, role='assistant', content='Tu confirmes ?',
+            metadata={'en_reponse_a': u1.pk, 'demandes': [demande]})
+        ConversationMessage.objects.create(
+            user=self.user, role='user', content='Oui, je confirme.')
+
         registre = self._appeler(
-            'clear_all_blocks', message='oui efface tout', confirm=True)
+            'clear_all_blocks', message='Oui, je confirme.', tache='t2', confirm=True)
         self.assertEqual(len(registre.actions), 1)
+        self.assertTrue(registre.actions[0].succes)
         self.assertNotIn('needs_confirmation', registre.actions[0].donnees)

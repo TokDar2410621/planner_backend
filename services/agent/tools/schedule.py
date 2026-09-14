@@ -18,6 +18,12 @@ from services.scheduling.placement import (
 from services.scheduling.solve_day import solve_day, solve_placement
 from .base import BaseTool, ToolResult, validate_choice
 
+try:
+    from services.scheduling.placement import intervalles_sommeil_reporte
+except ImportError:  # SEAM-INTEGRATION
+    def intervalles_sommeil_reporte(user, date):
+        return []
+
 DAY_NAMES = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
 VALID_TASK_TYPES = {c[0] for c in Task.TASK_TYPE_CHOICES}
 
@@ -188,12 +194,21 @@ class GetWeekScheduleTool(BaseTool):
 
             day_minutes = 0
             block_list = []
+            detail = []
             for b in blocks:
                 start_min = _time_to_minutes(b.start_time)
                 end_min = _time_to_minutes(b.end_time)
                 duration = end_min - start_min if end_min > start_min else (24 * 60 - start_min + end_min)
                 day_minutes += duration
                 block_list.append(f"{b.title} ({b.start_time.strftime('%H:%M')}-{b.end_time.strftime('%H:%M')})")
+                # Forme structuree pour le rendu (la chaine "blocks" reste).
+                detail.append({
+                    "title": b.title,
+                    "start_time": b.start_time.strftime('%H:%M'),
+                    "end_time": b.end_time.strftime('%H:%M'),
+                    "block_type": b.block_type,
+                    "is_flexible": b.is_flexible,
+                })
 
             total_hours += day_minutes / 60
 
@@ -203,6 +218,7 @@ class GetWeekScheduleTool(BaseTool):
                 "block_count": blocks.count(),
                 "occupied_hours": round(day_minutes / 60, 1),
                 "blocks": block_list,
+                "detail": detail,
             })
 
         return ToolResult(
@@ -218,7 +234,7 @@ class GetWeekScheduleTool(BaseTool):
 
 class FindFreeSlotsTool(BaseTool):
     name = "find_free_slots"
-    description = "Trouve les créneaux libres d'un jour (overnight-aware: un quart de nuit occupe la soirée, le travail de la veille occupe le matin), avec une durée minimum optionnelle. Appelle-le AVANT de déclarer un jour 'libre' ou de choisir un créneau toi-même (ne demande pas l'heure à l'utilisateur si tu peux la trancher)."
+    description = "Trouve les créneaux libres d'un jour (overnight-aware: un quart de nuit occupe la soirée, le travail de la veille occupe le matin), avec une durée minimum optionnelle. Appelle-le AVANT de déclarer un jour 'libre' ou de choisir un créneau toi-même. Activité souple sans heure (lecture, étude, sport): choisis un créneau libre. Pour un rendez-vous, un cours, un quart, une réunion ou une leçon fixé par quelqu'un d'autre sans heure de début ou de fin, ou sans date: ne choisis pas à sa place, demande-lui (present_form ou present_choices)."
     parameters = {
         "type": "object",
         "properties": {
@@ -314,18 +330,44 @@ def _window_conflict(user, target_date, s, e, exclude_scheduled_id=None):
     for bs, be in fixed_busy_intervals(user, target_date, exclude_scheduled_id=exclude_scheduled_id):
         if s < be and bs < e:
             item = _first_conflicting_item(user, target_date, s, e, exclude_scheduled_id)
+            titre = None
             if item:
                 title, ibs, ibe = item
                 label = f"« {title} » ({_minutes_to_str(ibs)}-{_minutes_to_str(ibe)})"
                 bs, be = ibs, ibe
+                titre = title
             else:
                 label = f"une occupation existante ({_minutes_to_str(bs)}-{_minutes_to_str(be)})"
             return ToolResult(
                 success=False,
-                data={"conflict": {"start_time": _minutes_to_str(bs), "end_time": _minutes_to_str(be)}},
+                data={"conflict": {
+                    "start_time": _minutes_to_str(bs),
+                    "end_time": _minutes_to_str(be),
+                    "titre": titre,
+                    "sommeil": False,
+                }},
                 message=(
                     f"Ce créneau ({_minutes_to_str(s)}-{_minutes_to_str(e)}) chevauche "
                     f"{label}. Choisis un autre horaire libre."
+                ),
+            )
+    # Le sommeil reporte au lendemain d'un quart de nuit (placement.py) occupe
+    # le matin de ce jour: il est protege comme le sommeil place.
+    for bs, be in intervalles_sommeil_reporte(user, target_date):
+        if s < be and bs < e:
+            return ToolResult(
+                success=False,
+                data={"conflict": {
+                    "start_time": _minutes_to_str(bs),
+                    "end_time": _minutes_to_str(be),
+                    "titre": None,
+                    "sommeil": True,
+                }},
+                message=(
+                    f"Ce créneau ({_minutes_to_str(s)}-{_minutes_to_str(e)}) "
+                    f"chevauche le sommeil protégé "
+                    f"({_minutes_to_str(bs)}-{_minutes_to_str(be)}). "
+                    f"Choisis un autre horaire libre."
                 ),
             )
     for placement in place_day(user, target_date):
@@ -348,6 +390,8 @@ def _window_conflict(user, target_date, s, e, exclude_scheduled_id=None):
                     data={"conflict": {
                         "start_time": _minutes_to_str(conflict_start),
                         "end_time": _minutes_to_str(conflict_end),
+                        "titre": None,
+                        "sommeil": True,
                     }},
                     message=(
                         f"Ce créneau ({_minutes_to_str(s)}-{_minutes_to_str(e)}) "
@@ -366,9 +410,12 @@ class ScheduleTaskAtTool(BaseTool):
         "samedi 9h-11h', 'rdv mardi 14h-15h'). C'est l'outil pour un événement UNIQUE "
         "sur une date donnée: il crée directement le créneau (verrouillé, la "
         "replanification ne le bouge pas). N'utilise PAS create_block (qui crée une "
-        "habitude répétée CHAQUE semaine) pour un événement ponctuel. Si l'utilisateur "
-        "ne donne pas d'heure, choisis toi-même un créneau libre (find_free_slots) au "
-        "lieu de lui demander. Pour AJUSTER un événement déjà planifié (durée/heure: "
+        "habitude répétée CHAQUE semaine) pour un événement ponctuel. Sans heure donnée: "
+        "pour une activité souple (lecture, étude, sport), choisis un créneau libre "
+        "(find_free_slots); pour un rendez-vous, un cours, un quart, une réunion ou une "
+        "leçon fixé par quelqu'un d'autre sans heure de début ou de fin, ou sans date, "
+        "n'appelle pas cet outil: demande-lui (present_form ou present_choices). Une heure "
+        "donnée par l'utilisateur ne se change jamais sans lui demander. Pour AJUSTER un événement déjà planifié (durée/heure: "
         "'finalement 45 min'), ré-appelle schedule_task_at avec le même titre et la "
         "même date: ça MET À JOUR l'événement (upsert), ce n'est pas un doublon. "
         "Gère aussi un événement qui traverse minuit (ex: quart de nuit PONCTUEL "
