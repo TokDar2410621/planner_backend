@@ -783,3 +783,57 @@ class AucunTiretLongTests(SimpleTestCase):
     def test_le_module_n_a_aucun_tiret_long(self):
         import inspect
         self.assertNotIn(EM_DASH, inspect.getsource(rendu))
+
+
+class RevueLisibiliteTests(SimpleTestCase):
+    """Revue « lisibilite » et banc du 2026-09-14."""
+
+    def _recurrente(self):
+        return {"type": "choix", "motif": "heure_refusee", "cle": "hr", "outil": "create_block",
+                "cible": {"titre": "Statistiques", "jour": 2, "date": "2026-09-16", "debut": "10:00",
+                          "fin": "12:00", "recurrent": True},
+                "options": [{"id": "creneau_1", "effet": None,
+                             "cible": {"date": "2026-09-16", "jour": 2, "debut": "08:00", "fin": "10:00",
+                                       "recurrent": True}},
+                            {"id": "autre_jour", "effet": None}]}
+
+    def test_heure_refusee_recurrente_dit_le_jour_de_la_semaine(self):
+        demande = self._recurrente()
+        r = registre(("create_block", {"title": "Statistiques", "start_time": "10:00", "end_time": "12:00"},
+                      False,
+                      {"created": [], "demande": demande,
+                       "skipped": [{"day": 2, "motif": "chevauchement", "titre": "Statistiques",
+                                    "debut": "10:00", "fin": "12:00",
+                                    "avec": {"titre": "Calcul différentiel", "debut": "10:00", "fin": "11:50"}}]}))
+        sortie = faits(r)
+        self.assertIn("10 h le mercredi, c'est pris par Calcul différentiel.", sortie)
+        self.assertNotIn("sept.", sortie)
+        _question, chips, _cles = rendre_demandes([demande], AUJ)
+        self.assertEqual(chips[0]["value"], "Va pour 8 h à 10 h le mercredi.")
+
+    def test_les_ajouts_retenus_sont_tous_nommes(self):
+        base = {"motif": "creation_en_masse", "cle": "creation_en_masse",
+                "options": [{"id": "confirmer"}, {"id": "annuler"}]}
+        physique = dict(base, cible={"titre": "Physique", "titres": ["Physique"], "deja": 5,
+                                     "crees": ["Anglais", "Biologie"]})
+        economie = dict(base, cible={"titre": "Économie", "titres": ["Économie"], "deja": 5,
+                                     "crees": ["Anglais", "Biologie"]})
+        question, _chips, cles = rendre_demandes([physique, economie], AUJ)
+        self.assertEqual(question, "Ça fait déjà 5 ajouts d'un coup. Je continue avec Physique et Économie ?")
+        self.assertEqual(cles, ["creation_en_masse"])
+
+    def test_une_autre_annee_est_ecrite(self):
+        self.assertEqual(rendu.date_courte("2025-09-18", AUJ), "jeu. 18 sept. 2025")
+        self.assertEqual(rendu.date_courte("2026-09-24", AUJ), "jeu. 24 sept.")
+
+    def test_une_lecture_d_un_seul_jour_ne_compte_pas(self):
+        blocs = [
+            {"id": 1, "title": "Calcul différentiel", "block_type": "course", "day_of_week": 3,
+             "day_name": "Jeudi", "start_time": "10:00", "end_time": "11:50"},
+            {"id": 2, "title": "Quart", "block_type": "work", "day_of_week": 3, "day_name": "Jeudi",
+             "start_time": "19:00", "end_time": "02:00"},
+        ]
+        sortie = lecture(registre(("list_blocks", {"day": 3}, True, {"blocks": blocs, "count": 2})))
+        self.assertTrue(sortie.startswith("**Jeudi**"), sortie)
+        self.assertNotIn("compte", sortie)
+        self.assertEqual(marqueurs_bruts(sortie), [])

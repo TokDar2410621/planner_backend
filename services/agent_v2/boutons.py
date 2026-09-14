@@ -28,39 +28,9 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from datetime import date
 
 from services.agent_v2.registre import Registre
-
-try:  # SEAM-INTEGRATION
-    from services.agent_v2.rendu import date_courte, plage
-except ImportError:  # SEAM-INTEGRATION: repli tant que rendu.py (b4) n'est pas fusionne
-    _JOURS_ABREGES = ("lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim.")  # SEAM-INTEGRATION
-    _MOIS_ABREGES = ("janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.",  # SEAM-INTEGRATION
-                     "août", "sept.", "oct.", "nov.", "déc.")
-
-    def _heure_repli(hhmm: str) -> str:  # SEAM-INTEGRATION
-        h, m = (int(x) for x in str(hhmm)[:5].split(":"))
-        if h == 0 and m == 0:
-            return "minuit"
-        return f"{h} h" if m == 0 else f"{h} h {m:02d}"
-
-    def plage(debut: str, fin: str) -> str:  # SEAM-INTEGRATION
-        return f"{_heure_repli(debut)} à {_heure_repli(fin)}"
-
-    def date_courte(iso: str, aujourdhui: date | None = None) -> str:  # SEAM-INTEGRATION
-        from django.utils import timezone
-
-        jour = date.fromisoformat(str(iso)[:10])
-        reference = aujourdhui or timezone.localdate()
-        ecart = (jour - reference).days
-        if ecart == 0:
-            return "aujourd'hui"
-        if ecart == 1:
-            return "demain"
-        if ecart == -1:
-            return "hier"
-        return f"{_JOURS_ABREGES[jour.weekday()]} {jour.day} {_MOIS_ABREGES[jour.month - 1]}"
+from services.agent_v2.rendu import date_courte, plage
 
 
 MOTIF_FIN_RECURRENCE = "fin_recurrence"

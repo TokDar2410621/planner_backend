@@ -96,8 +96,10 @@ class RepetitionTests(TestCase):
         # On verifie le SENS, pas le vocabulaire d'implementation: l'utilisateur
         # doit comprendre que le tour a ete coupe et pourquoi, sans lire le mot
         # « boucle » qui ne veut rien dire pour lui.
-        self.assertIn("interrompu", rendu)
-        self.assertIn("sans progresser", rendu)
+        # Phrase du rendu en francais (lot b4): « Je me suis arrêté : je
+        # répétais la même étape. » Meme sens: coupe, et pourquoi.
+        self.assertIn("arrêté", rendu)
+        self.assertIn("répétais", rendu)
 
 
 class IdempotenceTests(TransactionTestCase):

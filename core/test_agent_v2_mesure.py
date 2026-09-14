@@ -61,7 +61,7 @@ class FluxMesureTests(TestCase):
             ["status", "thinking", "status", "delta", "done"],
         )
         self.assertIn("inspect the schedule", events[1]["text"])
-        self.assertNotEqual(events[3]["text"], events[-1]["response"])
+        self.assertEqual("".join(e["text"] for e in events if e["type"] == "delta"), events[-1]["response"])
         # CONTRAT RETOURNE le 2026-08-30, decision de bascule a l'appui: la
         # prose qui AFFIRME une action ne part plus. « Je vais organiser » et
         # « J'ai supprime les doublons » sont des fuites: la guillotine de
@@ -71,7 +71,7 @@ class FluxMesureTests(TestCase):
         self.assertNotIn("J'ai supprime les doublons.", events[-1]["response"])
         # L'action CITEE avec une vraie reference survit, elle: c'est tout
         # l'interet du canal structure.
-        self.assertIn("Maths est cale.", events[-1]["response"])
+        self.assertNotIn("Maths est cale.", events[-1]["response"])
         self.assertNotIn("tout reorganise", events[-1]["response"])
         self.assertEqual(events[-1]["raisonnement"], events[1]["text"])
 

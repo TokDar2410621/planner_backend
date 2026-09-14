@@ -85,3 +85,25 @@ class ResteTests(SimpleTestCase):
         ligne = bloc_reste("ajoute trois séances de sport",
                            _registre_cree(UN_BLOC_2H))
         self.assertIn("Il en manque 2", ligne)
+
+
+class HeuresDHorlogeTests(SimpleTestCase):
+    """Revue du 2026-09-14: une heure d'horloge lue comme une duree donnait
+    « Il manque 12 h » sur presque tout ajout avec une heure."""
+
+    def test_une_plage_ou_une_heure_n_est_pas_une_quantite(self):
+        for message in ("ajoute une révision de chimie dimanche de 14 h à 16 h",
+                        "gym 14h-16h mardi", "mets le dentiste à 9 h", "cours lundi 10 h",
+                        "révision dès 9 h", "vers 18 h"):
+            with self.subTest(message=message):
+                self.assertEqual(bloc_reste(message, _registre_cree(UN_BLOC_2H)), "")
+
+    def test_un_formulaire_rempli_n_invente_rien(self):
+        message = "Voici mes réponses :\nDate du rendez-vous: 2026-09-17\nHeure du rendez-vous: 10:30 - 11:30"
+        self.assertEqual(bloc_reste(message, _registre_cree(UN_BLOC_2H)), "")
+        self.assertEqual(bloc_reste("Date: 2026-09-17\nHeure: 10:30", _registre_cree(UN_BLOC_2H)), "")
+
+    def test_les_vraies_durees_comptent_encore(self):
+        self.assertEqual(bloc_reste("6 heures d'étude cette semaine", _registre_cree(UN_BLOC_2H)),
+                         "- Demandé : 6 h. Placé : 2 h. Il manque 4 h.")
+        self.assertIn("Il manque 1 h", bloc_reste("révise pendant 3 h", _registre_cree(UN_BLOC_2H)))

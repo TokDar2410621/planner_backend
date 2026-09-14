@@ -95,30 +95,8 @@ class CoutureRenduTests(SimpleTestCase):
             self.assertEqual(redaction.marqueurs_bruts('- Refus: x'), ['refus'])
 
 
-class CoutureDeRepliTests(SimpleTestCase):  # SEAM-INTEGRATION: supprimer avec les replis
-    """Tant que rendu.py n'est pas fusionne, l'ancien rendu tient la place."""
-
-    def test_sans_rendu_l_ancien_bloc_factuel_repond(self):
-        with patch.object(redaction, '_charger_rendu', return_value=None):
-            texte = bloc_factuel(_deux_creations())
-        self.assertIn('Maths', texte)
-
-    def test_sans_rendu_la_question_de_repli_confirme(self):
-        with patch.object(redaction, '_charger_rendu', return_value=None):
-            question, chips, cles = question_code([{'cle': 'd1', 'motif': 'destructif'}])
-        self.assertTrue(question.endswith('?'))
-        self.assertEqual([c['option'] for c in chips], ['confirmer', 'annuler'])
-        self.assertEqual(cles, ['d1'])
-
-    def test_sans_rendu_les_marqueurs_sont_quand_meme_comptes(self):
-        with patch.object(redaction, '_charger_rendu', return_value=None):
-            marqueurs = redaction.marqueurs_bruts('- Refus: 0 bloc(s) 2026-09-17 10:00')
-        for nom in ('refus', 'pluriel_machine', 'date_iso', 'heure_hhmm'):
-            self.assertIn(nom, marqueurs)
-
-
 class InvariantsDuRenduTests(SimpleTestCase):
-    """Vrais quel que soit le rendu branche (ancien ou rendu.py)."""
+    """Vrais sur le vrai rendu.py."""
 
     def test_un_registre_vide_ne_produit_aucun_bloc(self):
         self.assertEqual(bloc_factuel(Registre()), '')
@@ -201,3 +179,19 @@ class AssemblageTests(SimpleTestCase):
         texte, _ = assembler(
             ReponseDire(ouverture="Salut.", question="Autre chose ?"), _deux_creations())
         self.assertEqual(texte, "FAITS\n\nSalut.\n\nAutre chose ?")
+
+
+class VocabulaireInterneTests(SimpleTestCase):
+    """Banc du 2026-09-14: « Il est marqué flexible », « Veux-tu le verrouiller
+    à 17 h ? », « Je dois d'abord clarifier la portée. »"""
+
+    def test_les_mots_internes_ne_partent_pas(self):
+        from services.agent_v2.redaction import ReponseDire, composer
+
+        brut = ReponseDire(ouverture="Il est marqué flexible. Tu es libre jeudi.",
+                           suite="Je dois d'abord clarifier la portée.",
+                           question="Veux-tu le verrouiller à 17 h ?", options=["Oui", "Non"])
+        compo = composer(brut, Registre(), "", None)
+        self.assertEqual(compo.prose, "Tu es libre jeudi.")
+        self.assertEqual(compo.question, "")
+        self.assertEqual(compo.chips, [])

@@ -288,3 +288,72 @@ class QuestionsDeClarificationTests(SimpleTestCase):
         r = ReponseDire(ouverture="Salut.")
         self.assertEqual(fuites_reponse(r), [])
         self.assertIs(epurer_reponse(r)[0], r)
+
+
+class ExemptionParParticipeTests(SimpleTestCase):
+    """Revue de verite du 2026-09-14: un mot interrogatif n'importe ou dans la
+    clause exemptait le participe. Ces six phrases affirmaient une action
+    absente du registre et passaient, en suite, en question et dans
+    present_choices."""
+
+    AFFIRMATIONS = (
+        "Ton cours est déplacé à 14 h ou tu préfères 15 h ?",
+        "Quel autre bloc veux-tu ajouter maintenant que ton quart est placé ?",
+        "Où veux-tu mettre la révision maintenant que le Gym est calé à 9 h ?",
+        "Ton cours est bien ajouté pour quel jour déjà ?",
+        "Ton bloc Gym a été créé quand tu voulais, veux-tu autre chose ?",
+        "Ta séance est déplacée à 14 h quel autre changement veux-tu ?",
+        "Je supprime ton cours de jeudi, ça te va ?",
+    )
+    QUESTIONS = (
+        "Ton cours est placé à quelle heure ?",
+        "Est-ce que ton horaire a changé cette session ?",
+        "Le quart de jeudi est annulé ou juste décalé ?",
+        "Pour quelle journée ?",
+        "Tu veux que je le mette à quelle heure ?",
+        "Quelle place veux-tu lui donner ?",
+        "Tu veux qu'il soit déplacé à 15 h ?",
+    )
+
+    def test_les_affirmations_deguisees_sont_coupees_partout(self):
+        from services.agent.tools.interactive import PresentChoicesTool
+        from services.agent_v2.mesure import fuite_question
+
+        class AvecQuestion(ReponseDire):
+            pass
+
+        for phrase in self.AFFIRMATIONS:
+            with self.subTest(phrase=phrase):
+                self.assertTrue(fuite_question(phrase))
+                epuree, n = epurer_reponse(ReponseDire(suite=phrase))
+                self.assertEqual(epuree.suite, "")
+                self.assertGreaterEqual(n, 1)
+                epuree, _ = epurer_reponse(ReponseDire(question=phrase, options=["14 h", "15 h"]))
+                self.assertEqual(epuree.question, "")
+                self.assertEqual(epuree.options, [])
+                r = PresentChoicesTool().execute(
+                    None, question=phrase if len(phrase) <= 140 else phrase[:139] + "?",
+                    source="jours", options=[{"label": "Lundi", "value": "Lundi."},
+                                             {"label": "Jeudi", "value": "Jeudi."}])
+                self.assertFalse(r.success)
+
+    def test_les_vraies_questions_passent(self):
+        from services.agent_v2.mesure import fuite_question
+
+        for phrase in self.QUESTIONS + ("Dis-moi à quelle heure et je le crée.",
+                                        "Dis-moi à quelle heure commence ton quart et je le crée."):
+            with self.subTest(phrase=phrase):
+                self.assertEqual(fuite_question(phrase), [])
+
+    def test_une_valeur_de_puce_a_l_imperatif_passe(self):
+        """Le banc du 2026-09-14: « Place ma révision jeudi. » faisait refuser
+        un choix de jours reel."""
+        from services.agent.tools.interactive import PresentChoicesTool
+
+        r = PresentChoicesTool().execute(
+            None, question="Quel jour pour ta révision ?", source="jours",
+            options=[{"label": "Lundi (aujourd'hui)", "value": "Place ma révision aujourd'hui."},
+                     {"label": "Jeudi", "value": "Place ma révision jeudi."}])
+        self.assertTrue(r.success, r.message)
+        epuree, n = epurer_reponse(ReponseDire(ouverture="Ton cours est placé."))
+        self.assertEqual(n, 1)

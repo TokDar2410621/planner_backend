@@ -814,3 +814,120 @@ class LectureDesReponsesTests(SimpleTestCase):
         self.assertEqual(dem.date_visee('demain', 3, AUJOURDHUI), date(2026, 9, 17))
         # Lundi = jour 0: aujourd'hui compte.
         self.assertEqual(dem.date_visee('ce lundi', 0, AUJOURDHUI), AUJOURDHUI)
+
+
+class ContournementsDeLaRevueTests(HarnaisGardes, TransactionTestCase):
+    """Les contournements prouves par la revue « gardes » du 2026-09-14."""
+
+    def test_oui_avec_un_jour_ne_confirme_pas_la_serie(self):
+        chimie = self.bloc('Chimie générale', 3, '13:00', '15:00')
+        demande = puces(self.premier_tour('supprime mon cours de chimie', 'delete_block',
+                                          block_id=chimie.id).donnees['demande'])
+        self.assertEqual(demande['motif'], 'destructif')
+        for brut in ('oui pour jeudi seulement', 'oui juste cette fois', 'oui le 17 sept.',
+                     'ok demain'):
+            with self.subTest(brut=brut):
+                self.assertIsNone(dem.option_choisie(brut, demande))
+        for brut in ('oui merci', 'Oui, vas-y', "ok c'est bon", 'oui je confirme'):
+            with self.subTest(brut=brut):
+                self.assertEqual(dem.option_choisie(brut, demande), 'confirmer')
+        brut = 'oui pour jeudi seulement'
+        self.attendre([demande], brut)
+        registre = Registre()
+        outils_v2.appliquer_choix_en_attente(self.user, registre, brut, 'u:2')
+        self.assertFalse(any(a.succes for a in registre.actions))
+        self.assertActif(chimie)
+
+    def test_une_fin_proche_ou_demandee_comme_suppression_est_retenue(self):
+        chimie = self.bloc('Chimie générale', 1, '13:00', '15:00')
+        cas = (('supprime mon cours de chimie', '2026-09-15'),
+               ('enlève la chimie', '2026-12-20'),
+               ('mon cours de chimie finit mercredi', '2026-09-16'))
+        for i, (brut, fin) in enumerate(cas):
+            with self.subTest(brut=brut):
+                action = self.premier_tour(brut, 'update_block', tache=f'u:{i}',
+                                           block_id=chimie.id, end_date=fin)
+                self.assertFalse(action.succes)
+                self.assertEqual(action.donnees['demande']['motif'], 'destructif')
+                chimie.refresh_from_db()
+                self.assertIsNone(chimie.end_date)
+        action = self.premier_tour('efface la chimie', 'update_block', tache='u:9',
+                                   block_id=chimie.id, start_date='2027-01-10')
+        self.assertFalse(action.succes)
+        chimie.refresh_from_db()
+        self.assertIsNone(chimie.start_date)
+
+    def test_heure_dite_sans_essai_jamais_changee(self):
+        self.bloc('Calcul différentiel', 3, '10:00', '11:50')
+        brut = 'mets mon rendez-vous chez le dentiste jeudi à 10 h 30'
+        self.message_courant(brut)
+        registre, tools = self.outils(brut)
+        self.appeler(tools, 'find_free_slots', date='2026-09-17')
+        self.appeler(tools, 'schedule_task_at', title='Dentiste', date='2026-09-17',
+                     start_time='13:00', end_time='14:00')
+        refus = registre.actions[-1]
+        self.assertFalse(refus.succes)
+        demande = refus.donnees['demande']
+        self.assertEqual(demande['motif'], 'heure_refusee')
+        self.assertEqual(demande['cible']['debut'], '10:30')
+        self.assertTrue(any(o['id'].startswith('creneau_') for o in demande['options']))
+        self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 0)
+
+    def test_heure_dite_libre_mais_ignoree_est_reessayee(self):
+        brut = 'ajoute le dentiste jeudi à 15 h'
+        self.message_courant(brut)
+        registre, tools = self.outils(brut)
+        self.appeler(tools, 'schedule_task_at', title='Dentiste', date='2026-09-17',
+                     start_time='13:00', end_time='14:00')
+        self.assertFalse(registre.actions[-1].succes)
+        self.assertEqual(registre.actions[-1].donnees['heure_dite'], '15:00')
+        self.appeler(tools, 'schedule_task_at', title='Dentiste', date='2026-09-17',
+                     start_time='15:00', end_time='16:00')
+        self.assertTrue(registre.actions[-1].succes)
+
+    def test_une_borne_ou_l_heure_d_un_autre_element_ne_bloque_pas(self):
+        cas = (('place ma révision jeudi avant 10 h', 'Révision', '08:00', '09:30'),
+               ("j'ai un quart jeudi à 19 h, ajoute mon étude jeudi", 'Étude', '13:00', '14:00'))
+        for i, (brut, titre, debut, fin) in enumerate(cas):
+            with self.subTest(brut=brut):
+                self.message_courant(brut)
+                registre, tools = self.outils(brut, tache=f'u:{i}')
+                self.appeler(tools, 'schedule_task_at', title=titre, date='2026-09-17',
+                             start_time=debut, end_time=fin)
+                self.assertTrue(registre.actions[-1].succes, registre.actions[-1].message)
+
+    def test_une_date_passee_est_refusee(self):
+        brut = 'place ma révision jeudi'
+        self.message_courant(brut)
+        registre, tools = self.outils(brut)
+        self.appeler(tools, 'schedule_task_at', title='Révision', date='2025-09-18',
+                     start_time='14:00', end_time='15:00')
+        refus = registre.actions[-1]
+        self.assertFalse(refus.succes)
+        self.assertEqual(refus.donnees['date_passee'], '2025-09-18')
+        self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 0)
+
+    def test_la_question_des_ajouts_ne_nomme_que_le_retenu(self):
+        brut = 'ajoute mes cours du matin'
+        self.message_courant(brut)
+        registre, tools = self.outils(brut)
+        self.appeler(tools, 'create_block', title='Cours du matin', block_type='course',
+                     days=['lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi'],
+                     start_time='08:00', end_time='09:00')
+        self.appeler(tools, 'schedule_task_at', title='Lecture', date='2026-09-19',
+                     start_time='14:00', end_time='15:00')
+        cible = registre.actions[-1].donnees['demande']['cible']
+        self.assertEqual(cible['titres'], ['Lecture'])
+        self.assertEqual(cible['crees'], ['Cours du matin'])
+
+    def test_heure_refusee_d_un_bloc_recurrent_est_marquee(self):
+        self.bloc('Calcul différentiel', 2, '10:00', '11:50')
+        brut = 'ajoute Statistiques le mercredi à 10 h'
+        self.message_courant(brut)
+        registre, tools = self.outils(brut)
+        self.appeler(tools, 'create_block', title='Statistiques', block_type='course',
+                     days=['mercredi'], start_time='10:00', end_time='12:00')
+        demande = registre.actions[-1].donnees['demande']
+        self.assertEqual(demande['motif'], 'heure_refusee')
+        self.assertTrue(demande['cible']['recurrent'])
+        self.assertTrue(all(o['cible'].get('recurrent') for o in demande['options']))

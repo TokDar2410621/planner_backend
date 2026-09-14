@@ -260,7 +260,7 @@ class MesureDesFormulairesTests(TestCase):
              patch.object(self.Agent, "_dire", return_value=ReponseDire(ouverture="Ok.")), \
              self.assertLogs("services.agent_v2.agent", level="INFO") as logs:
             self.Agent().process_message(self.user, message)
-        return [ligne for ligne in logs.output if "formulaire" in ligne]
+        return [ligne for ligne in logs.output if "formulaire" in ligne and "agent_v2 tour" not in ligne]
 
     def test_un_formulaire_presente_est_journalise_avec_ses_types(self):
         def _presente(self_agent, user, message, registre):

@@ -424,9 +424,21 @@ def _analyser(ctx: _Contexte, nom: str, kwargs: dict):
                       _options_confirmer(nom, parametres, cible))
 
     if nom == "update_block":
+        # Revue du 2026-09-14: « supprime mon cours de chimie » + end_date=demain
+        # terminait la serie sans question. Une fin (ou un depart repousse)
+        # est destructive quand le message parle de supprimer, ou quand la
+        # fin tombe dans les 7 prochains jours. « mon quart finit le 15
+        # octobre » (fin lointaine, aucun verbe de suppression) passe.
+        aujourdhui = timezone.localdate()
+        suppression = dem.suppression_demandee(texte)
         fin = _date_iso(kwargs.get("end_date")) if str(kwargs.get("end_date") or "").strip() else None
-        if fin is None or fin > timezone.localdate():
+        depart = _date_iso(kwargs.get("start_date")) if str(kwargs.get("start_date") or "").strip() else None
+        fin_destructive = fin is not None and (suppression or fin <= aujourdhui + timedelta(days=7))
+        depart_destructif = depart is not None and suppression and depart > aujourdhui
+        if not (fin_destructive or depart_destructif):
             return None
+        if fin is None:
+            fin = depart
         bid = _entier(kwargs.get("block_id"))
         if bid is None:
             return None
@@ -453,6 +465,7 @@ def _garde_critique(nom: str, kwargs: dict) -> bool:
         nom in DESTRUCTIFS
         or nom == "skip_block_occurrence"
         or (nom == "update_block" and bool(str(kwargs.get("end_date") or "").strip()))
+        or (nom == "update_block" and bool(str(kwargs.get("start_date") or "").strip()))
         or (nom == "optimize_week" and bool(kwargs.get("apply")))
     )
 
@@ -599,15 +612,23 @@ def _demande_heure_refusee(ctx: _Contexte, nom: str, kwargs: dict, titre: str,
     cle = dem.cle_demande("heure_refusee", identite)
     cible = {"titre": titre, "date": jour.isoformat(), "jour": jour.weekday(),
              "debut": debut, "fin": fin}
+    if recurrent:
+        # Un bloc hebdomadaire se dit « le mercredi », jamais « mer. 16 sept. »:
+        # la date n'est que la prochaine occurrence qui a servi au calcul.
+        cible["recurrent"] = True
     if isinstance(avec, dict) and avec:
         cible["avec"] = dict(avec)
     options = []
     for i, (s, e) in enumerate(_creneaux(ctx.user, jour, duree, _minutes(debut)), start=1):
-        options.append({"id": f"creneau_{i}", "effet": None,
-                        "cible": {"titre": titre, "date": jour.isoformat(),
-                                  "jour": jour.weekday(), "debut": _fmt(s), "fin": _fmt(e)}})
-    options.append({"id": "autre_jour", "effet": None,
-                    "cible": {"titre": titre, "jour": jour.weekday(), "date": jour.isoformat()}})
+        cible_option = {"titre": titre, "date": jour.isoformat(),
+                        "jour": jour.weekday(), "debut": _fmt(s), "fin": _fmt(e)}
+        if recurrent:
+            cible_option["recurrent"] = True
+        options.append({"id": f"creneau_{i}", "effet": None, "cible": cible_option})
+    autre = {"titre": titre, "jour": jour.weekday(), "date": jour.isoformat()}
+    if recurrent:
+        autre["recurrent"] = True
+    options.append({"id": "autre_jour", "effet": None, "cible": autre})
     return dem.construire_demande("choix", "heure_refusee", nom, dict(kwargs), cible, options, cle)
 
 
@@ -673,6 +694,140 @@ def _refus_heure_armee(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparatio
     return None
 
 
+# ------------------------------------------------ heure dite, avant l'essai
+#
+# Revue du 2026-09-14: la garde d'heure ne s'armait qu'APRES un refus de
+# l'heure dite. Un modele qui lisait find_free_slots, voyait 10 h 30 pris et
+# reservait 13 h directement changeait l'heure en silence. Desormais, avant
+# tout appel createur qui vise le jour de la proposition ou l'utilisateur a
+# donne une heure ferme pour CE titre, une autre heure est retenue.
+
+_SEPARATEURS = re.compile(r"[,;.!?\n]|\bet\b|\bpuis\b|\bensuite\b|\bmais\b")
+# Une heure precedee de ces mots est une borne, pas l'heure du rendez-vous.
+_HEURE_SOUPLE_AVANT = re.compile(
+    r"\b(?:avant|apres|a partir d[e']|des|jusqu'?a|jusque|entre|au plus tard|passe|pas)\s*$")
+_HEURE_APPROX_AVANT = re.compile(r"\b(?:vers|environ|autour de|genre)\s*$")
+TOLERANCE_APPROX = 30
+_MOTS_VIDES_TITRE = {"avec", "pour", "dans", "chez", "cours", "bloc", "rendez", "vous",
+                     "rendez-vous", "tache", "evenement", "seance"}
+
+
+def _mots_du_titre(titre: str) -> set:
+    mots = set()
+    for mot in re.findall(r"[a-z0-9]+", dem.sans_accents(titre or "")):
+        if len(mot) < 4 or mot in _MOTS_VIDES_TITRE:
+            continue
+        mots.add(mot[:-1] if mot.endswith("s") and len(mot) > 4 else mot)
+    return mots
+
+
+def _propositions(plat: str) -> list[tuple[int, int]]:
+    bornes, debut = [], 0
+    for m in _SEPARATEURS.finditer(plat):
+        bornes.append((debut, m.start()))
+        debut = m.end()
+    bornes.append((debut, len(plat)))
+    return [(s, e) for s, e in bornes if plat[s:e].strip()]
+
+
+def _heure_dite_ignoree(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparation):
+    """ToolResult de refus quand l'appel pose une AUTRE heure que celle que
+    l'utilisateur a donnee pour ce titre et ce jour, sinon None."""
+    from services.scheduling.placement import open_intervals
+
+    if nom not in ("schedule_task_at", "create_block", "update_block"):
+        return None
+    if nom == "update_block" and kwargs.get("start_time") in (None, ""):
+        return None
+    cibles = _cibles_creation(ctx, nom, kwargs, prep)
+    if cibles is None:
+        return None
+    dates, jours, recurrent, debut = cibles
+    if debut is None or not jours:
+        return None
+    titre = str(kwargs.get("title") or (prep.bloc_update or {}).get("titre") or "").strip()
+    mots = _mots_du_titre(titre)
+    if not mots:
+        return None
+    plat = dem.sans_accents(ctx.texte)
+    positions = dem.heures_dites_positions(ctx.texte)
+    if not positions:
+        return None
+    aujourdhui = timezone.localdate()
+    dates_message = dem._dates_nommees(ctx.texte, aujourdhui)
+
+    for s, e in _propositions(plat):
+        morceau = plat[s:e]
+        mots_morceau = {m[:-1] if m.endswith("s") and len(m) > 4 else m
+                        for m in re.findall(r"[a-z0-9]+", morceau)}
+        if not mots & mots_morceau:
+            continue
+        fermes = []
+        for valeur, ou in positions:
+            if not (s <= ou < e):
+                continue
+            avant = plat[:ou]
+            if _HEURE_SOUPLE_AVANT.search(avant):
+                continue
+            tolerance = TOLERANCE_APPROX if _HEURE_APPROX_AVANT.search(avant) else 0
+            fermes.append((valeur, tolerance))
+        if not fermes:
+            continue
+        dates_visees = dem._dates_nommees(morceau, aujourdhui) or dates_message
+        if dates_visees:
+            if recurrent:
+                communs = [d for d in dates_visees if d.weekday() in jours]
+            else:
+                communs = [d for d in dates_visees if d in dates]
+            if not communs:
+                continue
+            jour_cible = communs[0] if not recurrent else dem.prochaine_occurrence(communs[0].weekday())
+        else:
+            jour_cible = next(iter(dates)) if dates else dem.prochaine_occurrence(min(jours))
+        if any(abs(_minutes(debut) - _minutes(v)) <= tol for v, tol in fermes):
+            return None
+
+        dite = fermes[0][0]
+        fin_appel = _heure_normale(kwargs.get("end_time")) or (prep.bloc_update or {}).get("fin")
+        duree = ((_minutes(fin_appel) - _minutes(debut)) % (24 * 60)) if fin_appel else 60
+        duree = duree or 60
+        fin_dite = _fmt((_minutes(dite) + duree) % (24 * 60))
+        debut_min = _minutes(dite)
+        fin_min = debut_min + duree
+        libre = fin_min <= 24 * 60 and any(
+            a <= debut_min and fin_min <= b for a, b in open_intervals(ctx.user, jour_cible, 0, 24 * 60))
+        if libre:
+            return ToolResult(
+                success=False, data={"heure_dite": dite},
+                message=(f"Retenu par le code: l'utilisateur a dit {dite} pour {_ascii(titre)}. "
+                         f"Refais l'appel avec start_time={dite}. Si cette heure ne convient pas, "
+                         "pose la question au lieu de changer l'heure."))
+        demande = _demande_heure_refusee(ctx, nom, kwargs, titre, jour_cible, dite, fin_dite,
+                                         None, recurrent=recurrent)
+        heures = [v for v, _tol in fermes]
+        if recurrent:
+            _armer(ctx, demande, heures, jour=jour_cible.weekday())
+        else:
+            _armer(ctx, demande, heures, date_armee=jour_cible)
+        return ToolResult(success=False, data={"demande": demande}, message=MESSAGE_RETENUE)
+    return None
+
+
+def _date_passee(nom: str, kwargs: dict):
+    """schedule_task_at ne place jamais un evenement a une date deja passee:
+    sans date du jour, AGIR a deja reserve en 2025 (banc du 2026-09-14)."""
+    if nom != "schedule_task_at":
+        return None
+    jour = _date_iso(kwargs.get("date"))
+    aujourdhui = timezone.localdate()
+    if jour is None or jour >= aujourdhui:
+        return None
+    return ToolResult(
+        success=False, data={"date_passee": jour.isoformat()},
+        message=(f"Refuse par le code: {jour.isoformat()} est deja passe. Aujourd'hui, "
+                 f"c'est le {aujourdhui.isoformat()}. Verifie le jour et l'annee, puis refais l'appel."))
+
+
 # ------------------------------------------------------- creations en masse
 
 def _crees_ce_tour(registre: Registre) -> tuple[int, list[str]]:
@@ -724,10 +879,11 @@ def _garde_creations(ctx: _Contexte, nom: str, kwargs: dict):
         if option is not None:
             return MESSAGE_DEJA_TRANCHE
     titre = str(kwargs.get("title") or "").strip()
-    tous = list(titres)
-    if titre and titre not in tous:
-        tous.append(titre)
-    cible = {"nombre": deja + prospectif, "deja": deja, "titre": titre, "titres": tous}
+    # « titres » ne nomme que ce qui est RETENU: la question « Je continue
+    # avec X ? » ne doit jamais lister ce qui vient d'etre ajoute (revue du
+    # 2026-09-14). Les titres deja crees vivent a part, pour le compte.
+    cible = {"nombre": deja + prospectif, "deja": deja, "titre": titre,
+             "titres": [titre] if titre else [], "crees": list(titres)}
     options = [{"id": "confirmer", "effet": None, "cible": dict(cible)},
                {"id": "annuler", "effet": None, "cible": dict(cible)}]
     demande = dem.construire_demande("confirmation", "creation_en_masse", nom, dict(kwargs),
@@ -932,7 +1088,11 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
                     else:
                         issue = _refus(garde.demande(), destructif=True)
             if issue is None:
+                issue = _date_passee(nom, kwargs)
+            if issue is None:
                 issue = _refus_heure_armee(ctx, nom, kwargs, prep)
+            if issue is None:
+                issue = _heure_dite_ignoree(ctx, nom, kwargs, prep)
             if issue is None:
                 issue = _garde_creations(ctx, nom, kwargs)
         except Exception:  # noqa: BLE001
@@ -1144,6 +1304,11 @@ def _resume_sans_effet(demande: dict, option: str) -> str:
                 "sans l'appliquer (apply=false)")
     if motif == "heure_refusee":
         if option.startswith("creneau_"):
+            jour = cible_option.get("jour", cible.get("jour"))
+            if (cible_option.get("recurrent") or cible.get("recurrent")) \
+                    and isinstance(jour, int) and 0 <= jour <= 6:
+                return (f"CHOISI PAR L'UTILISATEUR: {titre} les {_NOMS_JOURS[jour]}s "
+                        f"(bloc recurrent) de {cible_option.get('debut')} a {cible_option.get('fin')}")
             return (f"CHOISI PAR L'UTILISATEUR: {titre} le {cible_option.get('date')} "
                     f"de {cible_option.get('debut')} a {cible_option.get('fin')}")
         return f"CHOISI PAR L'UTILISATEUR: un autre jour pour {titre}"

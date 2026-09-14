@@ -290,16 +290,6 @@ class MessageBrutTests(NarrateurBase):
         self.assertTrue(kwargs["message_du_tour"].startswith("c'est bon ?\n\n"))
         self.assertNotEqual(kwargs["message_du_tour"], kwargs["message_brut"])
 
-    def test_outils_pour_sans_message_brut_reste_utilisable(self):  # SEAM-INTEGRATION
-        appels = []
-
-        def ancien(user, registre, message_du_tour="", tache="", signaler=None):
-            appels.append(message_du_tour)
-            return []
-
-        self._vrai_agir(ancien)
-        self.assertEqual(appels, ["c'est bon ?"])
-
     def test_le_texte_final_d_agir_devient_le_brouillon(self):
         vus = {}
 

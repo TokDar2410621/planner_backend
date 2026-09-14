@@ -15,14 +15,11 @@ par tour, choisie par agent.py selon PRIORITE).
 from __future__ import annotations
 
 import re
-from collections import defaultdict
 from dataclasses import dataclass, field
 
 from pydantic import BaseModel, Field
 
 from services.agent_v2.registre import Registre
-
-SEUIL_GROUPEMENT = 5
 
 # Les cinq lectures dont le resultat merite une liste rendue par le code. Un
 # tour ou l'une d'elles a reussi sans que rien ne s'affiche est compte dans
@@ -63,104 +60,15 @@ class ReponseDire(BaseModel):
 # ── Couture avec rendu.py ────────────────────────────────────────────────
 
 
-def _charger_rendu():  # SEAM-INTEGRATION
-    try:
-        from services.agent_v2 import rendu
-        return rendu
-    except ImportError:
-        return None
-
-
-# Les lectures qui montrent un horaire, pour l'ancien rendu seulement.
-LECTURES_D_HORAIRE = ("get_week_schedule", "get_today_schedule", "list_blocks")  # SEAM-INTEGRATION
-
-
-def _liste_de_lecture(action) -> list[str]:  # SEAM-INTEGRATION
-    """Ancien rendu d'une lecture, garde tant que rendu.py n'est pas fusionne."""
-    donnees = action.donnees or {}
-    lignes: list[str] = []
-
-    if action.outil == "get_week_schedule":
-        for jour in donnees.get("days") or []:
-            blocs = jour.get("blocks") or []
-            if not blocs:
-                continue
-            lignes.append(f"- {jour.get('day_name', '?')} : " + ", ".join(blocs))
-        return lignes
-
-    if action.outil == "get_today_schedule":
-        blocs = donnees.get("blocks") or []
-        jour = donnees.get("day_name", "Aujourd'hui")
-        for b in blocs:
-            if isinstance(b, str):
-                lignes.append(f"- {jour} : {b}")
-            else:
-                titre = b.get("title", "?")
-                debut, fin = b.get("start_time", ""), b.get("end_time", "")
-                lignes.append(f"- {jour} : {titre} ({debut}-{fin})")
-        return lignes
-
-    if action.outil == "list_blocks":
-        par_jour: dict[str, list[str]] = defaultdict(list)
-        ordre: list[str] = []
-        for b in donnees.get("blocks") or []:
-            jour = b.get("day_name") or "?"
-            if jour not in par_jour:
-                ordre.append(jour)
-            debut, fin = b.get("start_time", ""), b.get("end_time", "")
-            par_jour[jour].append(f"{b.get('title', '?')} ({debut}-{fin})")
-        for jour in ordre:
-            lignes.append(f"- {jour} : " + ", ".join(par_jour[jour]))
-        return lignes
-
-    return lignes
-
-
-def _bloc_lecture_ancien(registre: Registre) -> str:  # SEAM-INTEGRATION
-    if any(a.succes and a.est_mutation for a in registre.actions):
-        return ""
-    lectures = [a for a in registre.actions
-                if a.succes and a.outil in LECTURES_D_HORAIRE]
-    for action in reversed(lectures):
-        lignes = _liste_de_lecture(action)
-        if lignes:
-            return "\n".join(lignes)
-    return ""
-
-
-def _bloc_factuel_ancien(registre: Registre) -> str:  # SEAM-INTEGRATION
-    reussites = [a for a in registre.actions if a.succes and a.est_mutation]
-    echecs = [a for a in registre.actions if not a.succes]
-    interrompu = registre.budget_epuise or getattr(registre, "boucle_interrompue", False)
-    lecture = _bloc_lecture_ancien(registre)
-    if not reussites and not echecs and not registre.ecarts and not interrompu:
-        return lecture
-
-    lignes: list[str] = []
-    if len(reussites) <= SEUIL_GROUPEMENT:
-        lignes += [f"- {a.message}" for a in reussites]
-    else:
-        par_outil: dict[str, list] = defaultdict(list)
-        for a in reussites:
-            par_outil[a.outil].append(a)
-        for outil, actions in par_outil.items():
-            lignes.append(f"- {len(actions)} x {outil}")
-    lignes += [f"- Refus: {a.message}" for a in echecs]
-    lignes += [f"- Ecart: {e.description}" for e in registre.ecarts]
-    if registre.budget_epuise:
-        lignes.append("- Traitement interrompu: la limite d'etapes du tour a ete atteinte.")
-    if getattr(registre, "boucle_interrompue", False):
-        lignes.append(
-            "- Traitement interrompu: je repetais la meme action sans progresser.")
-    return "\n".join(lignes)
+def _charger_rendu():
+    """rendu.py, charge par une fonction pour que les tests puissent le simuler."""
+    from services.agent_v2 import rendu
+    return rendu
 
 
 def bloc_lecture(registre: Registre, aujourdhui=None) -> str:
     """Ce que l'agent a VU, rendu par du code, sur un tour sans mutation."""
-    r = _charger_rendu()
-    if r is None:
-        return _bloc_lecture_ancien(registre)
-    return r.rendre_lecture(registre, aujourdhui)
+    return _charger_rendu().rendre_lecture(registre, aujourdhui)
 
 
 def bloc_factuel(registre: Registre, aujourdhui=None, cles_posees=None) -> str:
@@ -170,8 +78,6 @@ def bloc_factuel(registre: Registre, aujourdhui=None, cles_posees=None) -> str:
     du tour: rendu.py tait celles-la et donne une ligne aux autres.
     """
     r = _charger_rendu()
-    if r is None:
-        return _bloc_factuel_ancien(registre)
     return (r.rendre_faits(registre, aujourdhui, cles_posees)
             or r.rendre_lecture(registre, aujourdhui))
 
@@ -180,36 +86,13 @@ def question_code(demandes: list[dict], aujourdhui=None) -> tuple[str, list[dict
     """(question, chips avec leur option, cles rendues) pour les demandes du tour."""
     if not demandes:
         return "", [], []
-    r = _charger_rendu()
-    if r is None:  # SEAM-INTEGRATION
-        premiere = demandes[0]
-        return ("Tu confirmes ?", [
-            {"label": "Oui, confirme", "value": "Oui, je confirme.", "option": "confirmer"},
-            {"label": "Non, garde tout", "value": "Non, ne change rien.", "option": "annuler"},
-        ], [premiere.get("cle")] if premiere.get("cle") else [])
-    return r.rendre_demandes(demandes, aujourdhui)
-
-
-_MARQUEURS_REPLI = (  # SEAM-INTEGRATION
-    ("anglais", re.compile(r"\b(?:created|skipped|block|tool)\b")),
-    ("compte_outil", re.compile(r"\d+ x [a-z_]+")),
-    ("date_iso", re.compile(r"\b\d{4}-\d{2}-\d{2}\b")),
-    ("ecart", re.compile(r"\b[EeÉé]cart\b")),
-    ("heure_hhmm", re.compile(r"\b\d{2}:\d{2}\b")),
-    ("id_interne", re.compile(r"#\d+")),
-    ("nom_outil", re.compile(r"\b[a-z]+_[a-z_]+\b")),
-    ("pluriel_machine", re.compile(r"\(s\)")),
-    ("ref_registre", re.compile(r"\(\s*[ae]\d+\s*\)")),
-    ("refus", re.compile(r"\b[Rr]efus\b")),
-)
+    return _charger_rendu().rendre_demandes(demandes, aujourdhui)
 
 
 def marqueurs_bruts(texte: str) -> list[str]:
     """Les traces de texte ecrit pour le modele dans ce que lit l'utilisateur."""
-    r = _charger_rendu()
-    if r is not None:
-        return list(r.marqueurs_bruts(texte or ""))
-    return sorted({nom for nom, motif in _MARQUEURS_REPLI if motif.search(texte or "")})  # SEAM-INTEGRATION
+    return list(_charger_rendu().marqueurs_bruts(texte or ""))
+
 
 
 # ── Composition de la reponse ────────────────────────────────────────────
@@ -262,6 +145,14 @@ def _sans_annonce_vide(texte: str) -> tuple[str, int]:
     return " ".join(gardees), retirees
 
 
+_VOCABULAIRE_INTERNE = re.compile(
+    r"\b(?:flexibles?|verrouill\w*|port[ée]e|clarifi\w*)\b", re.IGNORECASE)
+
+
+def _sans_vocabulaire_interne(texte: str) -> str:
+    return " ".join(p for p in _phrases(texte) if not _VOCABULAIRE_INTERNE.search(p))
+
+
 def _references_rejetees(brut, registre: Registre) -> int:
     rejetees = 0
     for ref in getattr(brut, "refs", None) or []:
@@ -296,6 +187,14 @@ def composer(brut: ReponseDire | None, registre: Registre, faits: str,
         suite = (getattr(brut, "suite", "") or "").strip()
         question = (getattr(brut, "question", "") or "").strip()
         options = list(getattr(brut, "options", None) or [])
+
+    # Le vocabulaire interne (« flexible », « verrouiller », « portee »,
+    # « clarifier ») ne parle pas a l'utilisateur (banc du 2026-09-14).
+    ouverture = _sans_vocabulaire_interne(ouverture)
+    suite = _sans_vocabulaire_interne(suite)
+    if _VOCABULAIRE_INTERNE.search(question):
+        question, options = "", []
+    options = [o for o in options if not _VOCABULAIRE_INTERNE.search(str(o or ""))]
 
     lecture_sans_liste = False
     if not faits:
@@ -355,13 +254,40 @@ _NOMBRES_EN_MOTS = {
     "un": 1, "une": 1, "deux": 2, "trois": 3, "quatre": 4, "cinq": 5,
     "six": 6, "sept": 7, "huit": 8, "neuf": 9, "dix": 10,
 }
+# Une DUREE, jamais une heure d'horloge (revue du 2026-09-14: « de 14 h à
+# 16 h » donnait « Il manque 12 h », et « 2026-09-17\nHeure du rendez-vous »
+# lisait 17 h parce que \s traversait le saut de ligne). Trois formes
+# comptent: « N heures », « N h de/d' » + nom, « pendant N h ». Un nombre colle
+# a un chiffre, un tiret, deux-points ou une barre (date, plage) ne compte pas,
+# ni un « N h » precede de de/à/vers/dès/avant/après ou suivi d'une autre heure.
+_NOMBRE = r"(\d+(?:[.,]\d+)?|" + "|".join(_NOMBRES_EN_MOTS) + r")"
 _HEURES_DEMANDEES = re.compile(
-    r"\b(\d+(?:[.,]\d+)?|" + "|".join(_NOMBRES_EN_MOTS) + r")\s*(?:h\b|heures?\b)",
+    r"(?<![\w:/.,\-–])" + _NOMBRE + r"[ \t]*(heures?\b|h\b)",
     re.IGNORECASE)
+_AVANT_HORLOGE = re.compile(
+    r"(?:\b(?:de|des|dès|a|à|vers|avant|apres|après|jusqu'?(?:a|à)|entre|et|ou|midi|minuit)"
+    r"|[\-–])[ \t]*$",
+    re.IGNORECASE)
+_APRES_HORLOGE = re.compile(r"^[ \t]*(?:\d|[aà][ \t]+\d|[\-–]|jusqu)", re.IGNORECASE)
+_SUIVI_DE_NOM = re.compile(r"^[ \t]*(?:de\b|d['’])", re.IGNORECASE)
+_AVANT_DUREE = re.compile(r"\b(?:pendant|durant|environ|au total|en tout|total de)[ \t]*$", re.IGNORECASE)
 _COMPTE_DEMANDE = re.compile(
-    r"\b(\d+|" + "|".join(_NOMBRES_EN_MOTS) + r")\s*"
+    r"(?<![\w:/.,\-–])(\d+|" + "|".join(_NOMBRES_EN_MOTS) + r")[ \t]*"
     r"(?:blocs?|s[ée]ances?|sessions?|cr[ée]neaux?|entra[iî]nements?)\b",
     re.IGNORECASE)
+_RESUME_DE_FORMULAIRE = re.compile(r"^\s*voici mes r[ée]ponses", re.IGNORECASE)
+
+
+def _duree_demandee(message: str):
+    """Le premier « N h » du message qui est une vraie duree, ou None."""
+    for m in _HEURES_DEMANDEES.finditer(message):
+        avant, apres = message[:m.start()], message[m.end():]
+        if _AVANT_HORLOGE.search(avant) or _APRES_HORLOGE.match(apres):
+            continue
+        unite = m.group(2).lower()
+        if unite.startswith("heure") or _SUIVI_DE_NOM.match(apres) or _AVANT_DUREE.search(avant):
+            return m
+    return None
 
 _CREATEURS = ("create_block", "schedule_task_at")
 
@@ -430,13 +356,15 @@ def bloc_reste(message: str, registre: Registre) -> str:
     - le place est strictement sous le demande. Quand tout rentre, la ligne
       se tait: annoncer qu'il ne manque rien serait du bruit.
     """
-    if not message:
+    if not message or _RESUME_DE_FORMULAIRE.match(message):
+        # Un formulaire rempli porte des dates et des heures, jamais une
+        # quantite demandee.
         return ""
     compte, minutes = _creations_du_tour(registre)
     if compte == 0:
         return ""
 
-    m_heures = _HEURES_DEMANDEES.search(message)
+    m_heures = _duree_demandee(message)
     if m_heures:
         demande_min = int(round(_en_nombre(m_heures.group(1)) * 60))
         if 0 < minutes < demande_min:

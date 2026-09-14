@@ -159,6 +159,8 @@ _AVANT_VERBE_OU_NOM = {
     "le", "la", "les", "y", "en", "me", "te", "se", "lui", "leur", "ne",
     "un", "une", "des", "de", "du", "ta", "ma", "sa", "ton", "mon", "son",
     "tes", "mes", "ses", "ce", "cet", "cette", "ces", "notre", "votre", "leurs",
+    # Determinants interrogatifs et indefinis: « quelle place », « une autre place ».
+    "quel", "quelle", "quels", "quelles", "autre", "autres", "chaque", "aucune", "aucun",
 }
 _CLAUSE = re.compile(r"[,;:]")
 _FIN_QUESTION = re.compile(r"\?[\s\"'»)\]]*$")
@@ -214,18 +216,95 @@ def _fuites_d_une_phrase(phrase: str) -> list[str]:
     return fuites
 
 
+# Un imperatif en tete de proposition, suivi d'un determinant: « Place ma
+# revision jeudi. », « Ajoute le gym a 9 h. » C'est l'utilisateur qui parle
+# (valeur d'une puce), pas un participe qui raconte une action faite.
+_DETERMINANT_APRES = re.compile(
+    r"^\s+(?:ma|ta|mon|ton|mes|tes|le|la|les|l'|un|une|des|du|ce|cet|cette|ces|notre|votre|nos|vos|moi|toi|y|en)\b")
+
+
+def _imperatif_en_tete(clause: str, debut: int, fin: int) -> bool:
+    return not clause[:debut].split() and bool(_DETERMINANT_APRES.match(clause[fin:]))
+
+
 def _participe_nu(clause: str) -> bool:
     """Un participe de mutation qui n'est ni un verbe conjugue ni un nom."""
     for trouve in _PARTICIPE_NU.finditer(clause):
         avant = clause[:trouve.start()].split()
+        if _imperatif_en_tete(clause, trouve.start(), trouve.end()):
+            continue
         if not avant or avant[-1] not in _AVANT_VERBE_OU_NOM:
             return True
     return False
 
 
+# Revue de verite du 2026-09-14: exempter toute la clause des qu'elle portait
+# un mot interrogatif laissait passer « Ton cours est deplace a 14 h ou tu
+# preferes 15 h ? ». L'exemption est desormais PAR PARTICIPE: seul le mot
+# interrogatif qui GOUVERNE le participe (juste apres, au plus une
+# preposition entre les deux) en fait une vraie question sur l'etat.
+_PARTICIPE_OU_LOCUTION = re.compile(
+    r"(?<![a-z'])(?:(?:%s)(?:e|ee|es|ees)|mis(?:e|es)?\s+a\s+jour|mis(?:e|es)?\s+en\s+place)\b"
+    % "|".join(sorted(set(_RACINES) | set(_RACINES_PARTICIPE_NU), key=len, reverse=True)))
+_AUXILIAIRE_AVANT = re.compile(
+    r"\b(a|ont|est|sont|etait|etaient)\s+((?:ete\s+)?)((?:(?:bien|deja|tout|aussi|donc)\s+)*)$")
+_GOUVERNE = re.compile(
+    r"^(?:(?:a|pour|vers|en|le|la|des|depuis|jusqu'a|jusqu a|jusque)\s+)?"
+    r"(quel|quelle|quels|quelles|quand|combien|lequel|laquelle|lesquels|lesquelles"
+    r"|ou|comment|pourquoi)\b(?:\s+(\S+))?")
+_PRONOMS_SUJETS = {"je", "j'", "tu", "il", "elle", "on", "nous", "vous", "ils", "elles", "t'", "c'est"}
+# « maintenant que ton quart est place », « vu que le gym est cale »: une
+# subordonnee qui pose l'action comme acquise, quelle que soit la suite.
+_ACQUIS = re.compile(
+    r"\b(?:maintenant|vu|puisque|puis|depuis|une\s+fois|comme)\s*(?:qu'|que\s+|qu\s+)?.*"
+    r"\b(?:a|ont|est|sont)\s+(?:ete\s+)?(?:(?:bien|deja|tout|aussi|donc)\s+)*"
+    r"(?:(?:%s)(?:e|ee|es|ees)\b|mis(?:e|es)?\s+a\s+jour)" % "|".join(_RACINES))
+_EST_CE_QUE_EN_TETE = re.compile(r"^(?:et\s+|alors\s+|donc\s+)?est\s+ce\s+qu")
+# Un passif hypothetique ou a l'infinitif n'affirme rien: « Tu veux qu'il
+# soit deplace ? », « Ca doit etre place avant midi ? ».
+_HYPOTHETIQUE = {"soit", "soient", "sois", "etre"}
+
+
+def _participe_exempte(clause: str, debut: int, fin: int) -> bool:
+    """Ce participe precis est-il ce que la question demande ?"""
+    avant = clause[:debut]
+    mots_avant = avant.split()
+    if mots_avant and mots_avant[-1] in _HYPOTHETIQUE:
+        return True
+    # Alternative d'une vraie question: « annule ou juste decale ? ».
+    if re.search(r"\bou\s+(?:juste|seulement|plutot|bien|simplement)?\s*$", avant):
+        return True
+    aux = _AUXILIAIRE_AVANT.search(avant)
+    passe_accompli = bool(aux and (aux.group(2) or aux.group(1) in ("a", "ont")))
+    confirmation = bool(aux and aux.group(3)) or " deja" in f" {clause}"
+    if _EST_CE_QUE_EN_TETE.match(clause) and aux and not confirmation:
+        # « Est-ce que ton horaire a change ? », question fermee sur l'etat.
+        return True
+    if passe_accompli or confirmation:
+        # « a ete deplace a quelle heure ? » affirme le deplacement.
+        return False
+    gouverne = _GOUVERNE.match(clause[fin:].strip())
+    if not gouverne:
+        return False
+    if gouverne.group(1) == "ou":
+        suivant = gouverne.group(2) or ""
+        # « deplace a 14 h ou tu preferes » : le « ou » ouvre une autre
+        # proposition, il ne questionne pas le participe.
+        if suivant in _PRONOMS_SUJETS or suivant.startswith(("j'", "t'")):
+            return False
+    return True
+
+
 def _resultat_sans_marque(phrase: str) -> bool:
-    """La regle « resultat », clause par clause, exemptee par une vraie
-    marque interrogative ou une offre en tete de clause.
+    """La regle « resultat », clause par clause et PARTICIPE par participe.
+
+    Un participe de mutation (lie a un auxiliaire ou nu) est une fuite, sauf
+    quand la question porte sur lui: mot interrogatif qui le gouverne
+    (« place a quelle heure », « place quand »), alternative (« annule ou
+    juste decale »), « est-ce que » en tete d'une question fermee, ou passif
+    hypothetique (« qu'il soit deplace »). Une marque ailleurs dans la clause
+    (« ou tu preferes », « quel autre bloc ») n'exempte rien, et « maintenant
+    que X est place » est une affirmation sans condition.
 
     Le decoupage se fait sur la phrase BRUTE: _normaliser efface les
     virgules, et « Ton cours deplace, ou autre chose ? » passait entier grace
@@ -238,10 +317,25 @@ def _resultat_sans_marque(phrase: str) -> bool:
             continue
         if not (regle_resultat.search(clause) or _participe_nu(clause)):
             continue
-        if _MARQUE_INTERROGATIVE.search(clause) or _OFFRE_EN_TETE.match(clause):
-            continue
-        return True
+        if _ACQUIS.search(clause):
+            return True
+        for trouve in _PARTICIPE_OU_LOCUTION.finditer(clause):
+            mots_avant = clause[:trouve.start()].split()
+            lie = bool(_AUXILIAIRE_AVANT.search(clause[:trouve.start()]))
+            nu = not mots_avant or mots_avant[-1] not in _AVANT_VERBE_OU_NOM
+            if not (lie or nu):
+                continue  # verbe conjugue ou nom: « je le place », « une place »
+            if not lie and _imperatif_en_tete(clause, trouve.start(), trouve.end()):
+                continue
+            if not _participe_exempte(clause, trouve.start(), trouve.end()):
+                return True
     return False
+
+
+# « Je supprime ton cours de jeudi, ca te va ? »: un present d'action suivi
+# d'une demande d'aval est une annonce, pas une offre.
+_AVAL_EN_QUEUE = re.compile(
+    r"^(?:ok|okay|ca\s+te\s+va|ca\s+va|ca\s+marche|d'accord|c'est\s+bon|tu\s+es\s+d'accord|parfait)$")
 
 
 def fuite_question(texte) -> list[str]:
@@ -276,6 +370,14 @@ def fuite_question(texte) -> list[str]:
                 _noter(nom)
         if _resultat_sans_marque(phrase):
             _noter("resultat")
+        clauses = [c for c in _CLAUSE.split(phrase) if _normaliser(c).replace("?", " ").strip()]
+        if len(clauses) >= 2:
+            queue = " ".join(_normaliser(clauses[-1]).replace("?", " ").split())
+            tete = " ".join(_normaliser(" ".join(clauses[:-1])).replace("?", " ").split())
+            if _AVAL_EN_QUEUE.match(queue):
+                for nom in ("present", "futur"):
+                    if dict(_REGLES)[nom].search(tete):
+                        _noter(nom)
     return fuites
 
 

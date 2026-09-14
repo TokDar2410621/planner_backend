@@ -168,10 +168,14 @@ def date_courte(iso: str, aujourdhui: date | None = None) -> str:
     d = _date(iso)
     if d is None:
         return _txt(iso)
-    relatif = _RELATIFS.get((d - _aujourdhui(aujourdhui)).days)
+    auj = _aujourdhui(aujourdhui)
+    relatif = _RELATIFS.get((d - auj).days)
     if relatif:
         return relatif
-    return f"{_JOURS_ABREGES[d.weekday()]} {_jour_mois(d)}"
+    # Banc du 2026-09-14: une revision placee en 2025 s'affichait « jeu. 18
+    # sept. », sans rien qui trahisse la mauvaise annee.
+    annee = f" {d.year}" if d.year != auj.year else ""
+    return f"{_JOURS_ABREGES[d.weekday()]} {_jour_mois(d)}{annee}"
 
 
 def _quand(iso, aujourdhui) -> str:
@@ -866,7 +870,9 @@ class _Narrateur:
         p = a.parametres or {}
         debut = cible.get("debut") or p.get("start_time")
         moment = heure(debut) if _hm(debut) else ""
-        if cible.get("date") and _date(cible.get("date")):
+        if cible.get("recurrent") and _dow(cible.get("jour")) is not None:
+            moment = f"{moment} le {jour(cible['jour'])}".strip()
+        elif cible.get("date") and _date(cible.get("date")):
             moment = f"{moment} {date_courte(cible['date'], self.auj)}".strip()
         elif _dow(cible.get("jour")) is not None:
             moment = f"{moment} le {jour(cible['jour'])}".strip()
@@ -1255,6 +1261,17 @@ def _rendre_jours(jours_data: list[tuple], sujet: str, dire_vides: bool) -> str:
         tete = f"Rien de prévu {sujet[1]}." if dire_vides else f"Aucun bloc {sujet[1]}."
         return tete + (f"\n\n{ligne_sommeil}" if ligne_sommeil else "")
 
+    if len(jours_data) == 1 and not dire_vides:
+        # Une lecture filtree sur un seul jour: le jour en tete suffit. Un
+        # compte (« Ton horaire compte 2 blocs ») y passait pour tout l'horaire
+        # et sautait le sommeil (banc du 2026-09-14).
+        dow, items = visibles[0]
+        lignes = [_ligne_item(i) for i in sorted(items, key=_ordre)]
+        sections = [f"**{JOURS[dow].capitalize()}**\n" + "\n".join(lignes)]
+        if ligne_sommeil:
+            sections.append(ligne_sommeil)
+        return "\n\n".join(sections)
+
     tete = f"{sujet[0]} compte {pluriel(total, 'bloc')}"
     # Une semaine datee dit « mardi »; un horaire recurrent dit « le mardi ».
     article = "" if dire_vides else "le "
@@ -1510,7 +1527,10 @@ def _question_heure_refusee(demandes, auj):
                 continue
             iso = c.get("date") or cible_demande.get("date")
             etiquette = plage(debut, fin)
-            if _date(iso):
+            dow_option = _dow(c.get("jour") if c.get("jour") is not None else cible_demande.get("jour"))
+            if (c.get("recurrent") or cible_demande.get("recurrent")) and dow_option is not None:
+                valeur = f"Va pour {etiquette} le {JOURS[dow_option]}."
+            elif _date(iso):
                 valeur = _fin(f"Va pour {etiquette} {date_courte(iso, auj)}.")
             elif _dow(c.get("jour") if c.get("jour") is not None else cible_demande.get("jour")) is not None:
                 j = _dow(c.get("jour") if c.get("jour") is not None else cible_demande.get("jour"))
@@ -1610,22 +1630,20 @@ def rendre_demandes(demandes: list[dict], aujourdhui: date | None = None) -> tup
     if not valides:
         return "", [], []
     motif = next(m for m in PRIORITE if any(d["motif"] == m for d in valides))
-    choisies: list[dict] = []
-    vues: set = set()
-    for d in valides:
-        if d["motif"] != motif:
-            continue
-        cle = _txt(d.get("cle"))
-        if cle and cle in vues:
-            continue
-        if cle:
-            vues.add(cle)
-        choisies.append(d)
+    # Toutes les demandes du motif entrent dans la question, meme celles qui
+    # partagent une cle: deux ajouts retenus sous « creation_en_masse » doivent
+    # etre nommes tous les deux (revue du 2026-09-14). Chaque fonction de
+    # question dedoublonne ses objets; les cles rendues restent uniques.
+    choisies = [d for d in valides if d["motif"] == motif]
     if motif == "choix_modele":
         # Deux questions du modele ne fusionnent pas: la premiere seule.
         choisies = choisies[:1]
     question, chips = _QUESTIONS[motif](choisies, _aujourdhui(aujourdhui))
     if not question:
         return "", [], []
-    cles = [_txt(d.get("cle")) for d in choisies if _txt(d.get("cle"))]
+    cles: list[str] = []
+    for d in choisies:
+        cle = _txt(d.get("cle"))
+        if cle and cle not in cles:
+            cles.append(cle)
     return question, chips, cles

@@ -191,13 +191,33 @@ def _r1(message_brut: str, demande: dict, ids: set):
     return None
 
 
+# Revue du 2026-09-14: « oui pour jeudi seulement » confirmait la SERIE, parce
+# que le reste ne contenait aucun verbe interdit. Le reste d'un oui ne peut
+# plus porter que de la politesse: toute portee, tout jour, toute date ou tout
+# autre mot fait reposer la question.
+_RESTE_POLI = {
+    "oui", "ok", "okay", "ouais", "yes", "je", "confirme", "confirmer", "vas-y", "vas", "y",
+    "go", "c'est", "c", "est", "bon", "d'accord", "d", "accord", "daccord", "merci", "stp",
+    "svp", "s'il", "te", "plait", "parfait", "super", "bien", "sur", "vraiment", "absolument",
+    "tout", "a", "fait", "exactement", "allez", "fais-le", "fais", "le", "applique", "continue",
+    "les", "ajouts", "plan", "la", "certain", "certaine", "sure",
+}
+
+
+def _reste_poli(reste: str) -> bool:
+    mots = [m.strip("-'") for m in reste.split()]
+    return all(m in _RESTE_POLI for m in mots if m)
+
+
 def _r2(plat: str):
     if not plat or len(plat.split()) > 8:
         return None
     oui = _TETE_OUI.match(plat)
     if oui:
         reste = plat[oui.end():]
-        return None if _RESTE_INTERDIT.search(reste) else "confirmer"
+        if _RESTE_INTERDIT.search(reste) or not _reste_poli(reste):
+            return None
+        return "confirmer"
     if _TETE_NON.match(plat):
         return "annuler"
     return None
@@ -343,8 +363,18 @@ def heures_dites(message_brut) -> list[str]:
     « 10h30 », « 10 h 30 », « 10:30 » et « 14h » comptent; une duree
     (« pendant 2 h », « 2 h de lecture ») ne compte pas.
     """
-    plat = sans_accents(message_brut)
     heures: list[str] = []
+    for valeur, _debut in heures_dites_positions(message_brut):
+        if valeur not in heures:
+            heures.append(valeur)
+    return heures
+
+
+def heures_dites_positions(message_brut) -> list[tuple[str, int]]:
+    """Comme heures_dites, avec la position de chaque heure dans le texte
+    SANS ACCENTS (meme longueur utile pour decouper en propositions)."""
+    plat = sans_accents(message_brut)
+    sortie: list[tuple[str, int]] = []
     for m in _RE_HEURE.finditer(plat):
         if m.group(5):
             valeur = "12:00" if m.group(5) == "midi" else "00:00"
@@ -358,6 +388,5 @@ def heures_dites(message_brut) -> list[str]:
             if _AVANT_DUREE.search(plat[:m.start()]):
                 continue
             valeur = f"{h:02d}:{mn:02d}"
-        if valeur not in heures:
-            heures.append(valeur)
-    return heures
+        sortie.append((valeur, m.start()))
+    return sortie

@@ -1729,6 +1729,7 @@ class ScheduleView(APIView):
                     'preferred': placement['preferred'],
                     'shrunk': placement['shrunk'],
                     'overnight_kept': placement['overnight_kept'],
+                    'reporte_au_lendemain': placement.get('reporte_au_lendemain'),
                 })
             day_cursor += timedelta(days=1)
 

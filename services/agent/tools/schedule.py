@@ -11,18 +11,13 @@ from services.scheduling.exceptions import skipped_block_ids
 from services.scheduling.overlap import parse_time
 from services.scheduling.placement import (
     fixed_busy_intervals,
+    intervalles_sommeil_reporte,
     occupied_intervals,
     open_intervals,
     place_day,
 )
 from services.scheduling.solve_day import solve_day, solve_placement
 from .base import BaseTool, ToolResult, validate_choice
-
-try:
-    from services.scheduling.placement import intervalles_sommeil_reporte
-except ImportError:  # SEAM-INTEGRATION
-    def intervalles_sommeil_reporte(user, date):
-        return []
 
 DAY_NAMES = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
 VALID_TASK_TYPES = {c[0] for c in Task.TASK_TYPE_CHOICES}
@@ -688,7 +683,7 @@ class OrganizeDayTool(BaseTool):
         arrangement = solve_placement(user, target_date)  # fenêtre pleine journée
         placed = [r for r in arrangement if not r["skipped"] and not r["overnight_kept"]]
         overnight = [r for r in arrangement if r["overnight_kept"]]
-        skipped = [r for r in arrangement if r["skipped"]]
+        skipped = [r for r in arrangement if r["skipped"] and not r.get("reporte_au_lendemain")]
 
         moved = []
         if apply:
@@ -765,7 +760,7 @@ class OptimizeWeekTool(BaseTool):
             arrangement = solve_placement(user, day)
             placed = [r for r in arrangement if not r["skipped"] and not r["overnight_kept"]]
             overnight = [r for r in arrangement if r["overnight_kept"]]
-            skipped = [r for r in arrangement if r["skipped"]]
+            skipped = [r for r in arrangement if r["skipped"] and not r.get("reporte_au_lendemain")]
 
             moved = []
             if apply:

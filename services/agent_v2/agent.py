@@ -93,43 +93,19 @@ _POOL_AGIR = ThreadPoolExecutor(
 ATTENTE_PENSEE = 0.5
 
 
-# ── Coutures avec les lots b3 (gardes) et b5 (questions) ─────────────────
+# ── Chargeurs de boutons.py et outils.py (simulables par les tests) ──────
 
 
-def _question_forcee_de_repli(user, message, attachment, registre,
-                              attachment_traite_ce_tour):  # SEAM-INTEGRATION
-    """boutons_forces rendu sous la forme de question_forcee, sans texte colle."""
-    from services.agent.agent import _ambiguous_scheduling_chips
-    from services.agent_v2 import boutons
-
-    if attachment_traite_ce_tour and attachment is not None:
-        force = boutons._fin_de_recurrence(attachment, "")
-        if force is not None:
-            texte, chips = force
-            return {"question": texte.strip(), "chips": chips, "motif": "fin_recurrence"}
-    if not boutons._creneaux_envisageables(message, registre):
-        return None
-    ambigu = _ambiguous_scheduling_chips(user, boutons.appels_outils(registre), message)
-    if not ambigu:
-        return None
-    phrase, chips = ambigu
-    return {"question": phrase.strip(), "chips": chips, "motif": "creneaux"}
+def _charger_question_forcee():
+    """boutons.question_forcee, charge par une fonction pour que les tests la simulent."""
+    from services.agent_v2.boutons import question_forcee
+    return question_forcee
 
 
-def _charger_question_forcee():  # SEAM-INTEGRATION
-    try:
-        from services.agent_v2.boutons import question_forcee
-        return question_forcee
-    except ImportError:
-        return _question_forcee_de_repli
-
-
-def _charger_appliquer_choix():  # SEAM-INTEGRATION
-    try:
-        from services.agent_v2.outils import appliquer_choix_en_attente
-        return appliquer_choix_en_attente
-    except ImportError:
-        return lambda *a, **k: []
+def _charger_appliquer_choix():
+    """outils.appliquer_choix_en_attente, charge par une fonction pour les tests."""
+    from services.agent_v2.outils import appliquer_choix_en_attente
+    return appliquer_choix_en_attente
 
 
 def _cout(resultat, duree: float) -> dict:
@@ -276,16 +252,17 @@ class PlannerAgentV2:
         # Les regles de la garde (confirmation, heure dite, portee d'un jour)
         # lisent le message TAPE, jamais sa version enrichie du document.
         brut = self._message_brut if self._message_brut is not None else message
-        try:  # SEAM-INTEGRATION: outils_pour sans message_brut avant le lot b3
-            outils = outils_pour(user, registre, message_du_tour=message,
-                                 tache=self._tache, signaler=self.signaler_outil,
-                                 message_brut=brut)
-        except TypeError:
-            outils = outils_pour(user, registre, message_du_tour=message,
-                                 tache=self._tache, signaler=self.signaler_outil)
+        outils = outils_pour(user, registre, message_du_tour=message,
+                             tache=self._tache, signaler=self.signaler_outil,
+                             message_brut=brut)
+        # instructions= et non system_prompt=: pydantic-ai n'ajoute les system
+        # prompts QUE si l'historique est vide. Sur tout tour de suivi, AGIR
+        # tournait sans date, sans table de decision ni semaine type, et a
+        # place une revision en 2025 (banc du 2026-09-14). Les instructions
+        # partent a chaque requete.
         agent = Agent(
             modele_agir(),
-            system_prompt=prompt_agir(user),
+            instructions=prompt_agir(user),
             tools=outils,
         )
 
