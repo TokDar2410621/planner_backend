@@ -246,7 +246,12 @@ _MECANIQUE = re.compile(
     r"\brempli(?:s|r)\s+(?:le|les|ce|ces)\s+(?:formulaires?|champs?)\b"
     r"|\bpr[ée][- ]?rempli\w*"
     r"|\br[ée]ponds?\s*[«\"“]"
-    r"|\bboutons?\b|\bpuces?\b|\bcoch(?:e|es|er|ez|ée|ées)\b|\bclique\w*|\bappuie\w*\s+sur\b"
+    # Round 9 (K5): « puce » seule avalait « marché aux puces ». Elle ne tombe
+    # qu'avec un determinant d'interface (la, les, une, cette, ces, chaque,
+    # une des, l'une des), jamais apres « aux », ni devant « électronique ».
+    r"|\bboutons?\b"
+    r"|\b(?:la|les|une|cette|ces|chaque|(?:l['’])?(?:une|un)\s+des)\s+puces?\b(?!\s+[ée]lectroniques?\b)"
+    r"|\bcoch(?:e|es|er|ez|ée|ées)\b|\bclique\w*|\bappuie\w*\s+sur\b"
     r"|\bci-(?:dessous|dessus)\b"
     r"|\b(?:le|les|ce|ces|chaque|un|des)\s+champs?\b",
     re.IGNORECASE)

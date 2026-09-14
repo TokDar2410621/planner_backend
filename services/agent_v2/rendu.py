@@ -610,14 +610,31 @@ class _Narrateur:
             return
         for titre, morceaux in par_titre.items():
             morceaux.sort(key=lambda c: (_txt(c.get("date")), _txt(c.get("start_time"))))
-            premier, dernier = morceaux[0], morceaux[-1]
-            texte = f"Annulé : {titre or 'ton événement'}"
-            quand = self.quand(premier.get("date"))
-            if quand:
-                texte += f", {quand}"
-            if _hm(premier.get("start_time")) and _hm(dernier.get("end_time")):
-                texte += f" de {plage(premier['start_time'], dernier['end_time'])}"
-            self.ajouter_fait(_Fait(texte + ".", "evenement_annule", titre))
+            # Round 9 (K2): chaque creneau garde ses propres heures. Seule la
+            # queue de minuit (lendemain a 00:00, apres un morceau fini a
+            # 23:59) se rattache au morceau du soir: « Lecture » 9-10 h et
+            # 14-15 h ne devient jamais « de 9 h à 15 h ».
+            creneaux: list[list] = []
+            for c in morceaux:
+                prec = creneaux[-1] if creneaux else None
+                jour, jour_prec = _date(c.get("date")), _date(prec[0]) if prec else None
+                if (prec and jour and jour_prec and (jour - jour_prec).days == 1
+                        and _hm(prec[2]) == (23, 59) and _hm(c.get("start_time")) == (0, 0)):
+                    prec[2] = c.get("end_time")
+                    continue
+                creneaux.append([c.get("date"), c.get("start_time"), c.get("end_time")])
+            par_jour: dict[str, list] = {}
+            for jour, debut, fin in creneaux:
+                par_jour.setdefault(_txt(jour), []).append((debut, fin))
+            for jour, heures in par_jour.items():
+                texte = f"Annulé : {titre or 'ton événement'}"
+                quand = self.quand(jour)
+                if quand:
+                    texte += f", {quand}"
+                plages = [f"de {plage(debut, fin)}" for debut, fin in heures if _hm(debut) and _hm(fin)]
+                if plages:
+                    texte += f" {_liste(plages)}"
+                self.ajouter_fait(_Fait(texte + ".", "evenement_annule", titre))
 
     def _ok_organize_day(self, a, d, p):
         quand = self.quand(d.get("date") or p.get("date")) or "ta journée"
