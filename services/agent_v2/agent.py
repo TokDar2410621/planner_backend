@@ -4,8 +4,15 @@ La boucle: AGIR, RECONCILIER, DIRE.
 La difference de fond avec v1 tient en une phrase: le recit d'action n'est plus
 produit par le modele. AGIR outille et alimente un registre ecrit par le
 runtime; le code rend un compte rendu factuel depuis ce registre; DIRE ne fait
-qu'enrober, et toute phrase citant une action qui n'existe pas est supprimee a
+qu'enrober, et toute sortie citant une action qui n'existe pas est ecartee a
 l'assemblage.
+
+Depuis le 2026-09-14 (lots 1 a 3), un tour s'affiche en trois sections
+streamees dans leur ordre final: FAITS (code), PROSE (DIRE epuree), QUESTION
+(une seule, choisie par PRIORITE). done.response est exactement la
+concatenation des deltas, et le message persiste porte ses boutons et ses
+demandes en metadonnees pour que le tour suivant sache a quoi l'utilisateur
+repond.
 
 La surface publique porte les QUATRE points d'entree que core/views.py et le
 banc exigent. views.py:861 lit result['response'] par indexation DIRECTE: une
@@ -25,25 +32,43 @@ from django.contrib.auth.models import User
 from django.db import close_old_connections
 from pydantic_ai import Agent, ModelRetry
 from pydantic_ai.exceptions import UsageLimitExceeded
-from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.messages import (ModelRequest, ModelResponse, PartDeltaEvent,
+                                  PartStartEvent, TextPart, ThinkingPart,
+                                  ThinkingPartDelta, UserPromptPart)
 from pydantic_ai.usage import UsageLimits
 
 from core.models import ConversationMessage, UploadedDocument
-from services.agent_v2.boutons import boutons_forces
 from services.agent_v2.mesure import epurer_reponse, fuites_reponse
 from services.agent_v2.modeles import REGLAGES_DIRE, modele_agir, modele_dire
 from services.agent_v2.outils import outils_pour
 from services.agent_v2.prompts import PROMPT_DIRE, prompt_agir
 from services.agent_v2.reconciliation import detecter_ecarts, reconcilier
 from services.agent_v2.importation import inscrire_import
-from services.agent_v2.redaction import (ReponseDire, assembler,
-                                          bloc_factuel, bloc_reste)
+from services.agent_v2.redaction import (LECTURES_RENDUES, ReponseDire,
+                                          bloc_factuel, bloc_reste, composer,
+                                          marqueurs_bruts, question_code)
 from services.agent_v2.registre import Registre
 
 logger = logging.getLogger(__name__)
 
 BUDGET_ETAPES = 10
 HISTORIQUE_MAX = 20
+
+# Une question par tour, la premiere presente dans cet ordre. Les gardes du
+# code passent avant tout: une suppression retenue sans sa question serait un
+# refus muet. Le formulaire passe avant le choix du modele, et DIRE ferme la
+# marche.
+PRIORITE = [
+    "portee_jour", "destructif", "heure_refusee", "creation_en_masse",
+    "optimisation", "formulaire", "choix_modele", "chevauchement",
+    "fin_recurrence", "creneaux", "dire",
+]
+CHIPS_MAX = 4
+
+REPLI_PROSE = "Voici ce qui a changé. Dis-moi si tu veux autre chose."
+REPLI_PROSE_LECTURE = "Dis-moi si tu veux autre chose."
+REPLI_QUESTION = "Je n'ai pas compris. Tu veux ajouter, déplacer ou voir quelque chose ?"
+PROSE_FORMULAIRE = "Il me manque quelques précisions."
 
 # POOL DE THREADS REUTILISES, et le mot « reutilises » porte tout le poids.
 #
@@ -66,6 +91,45 @@ _POOL_AGIR = ThreadPoolExecutor(
 # sans poser sa sentinelle, un get() sans delai gelerait la connexion SSE
 # jusqu'au timeout du serveur.
 ATTENTE_PENSEE = 0.5
+
+
+# ── Coutures avec les lots b3 (gardes) et b5 (questions) ─────────────────
+
+
+def _question_forcee_de_repli(user, message, attachment, registre,
+                              attachment_traite_ce_tour):  # SEAM-INTEGRATION
+    """boutons_forces rendu sous la forme de question_forcee, sans texte colle."""
+    from services.agent.agent import _ambiguous_scheduling_chips
+    from services.agent_v2 import boutons
+
+    if attachment_traite_ce_tour and attachment is not None:
+        force = boutons._fin_de_recurrence(attachment, "")
+        if force is not None:
+            texte, chips = force
+            return {"question": texte.strip(), "chips": chips, "motif": "fin_recurrence"}
+    if not boutons._creneaux_envisageables(message, registre):
+        return None
+    ambigu = _ambiguous_scheduling_chips(user, boutons.appels_outils(registre), message)
+    if not ambigu:
+        return None
+    phrase, chips = ambigu
+    return {"question": phrase.strip(), "chips": chips, "motif": "creneaux"}
+
+
+def _charger_question_forcee():  # SEAM-INTEGRATION
+    try:
+        from services.agent_v2.boutons import question_forcee
+        return question_forcee
+    except ImportError:
+        return _question_forcee_de_repli
+
+
+def _charger_appliquer_choix():  # SEAM-INTEGRATION
+    try:
+        from services.agent_v2.outils import appliquer_choix_en_attente
+        return appliquer_choix_en_attente
+    except ImportError:
+        return lambda *a, **k: []
 
 
 def _cout(resultat, duree: float) -> dict:
@@ -101,6 +165,8 @@ def _cout(resultat, duree: float) -> dict:
 # Une lecture de semaine chargee depasse largement ce volume; on tronque plutot
 # que de laisser un seul outil manger le contexte de la redaction.
 EXTRAIT_MAX = 4000
+BROUILLON_MAX = 1500
+ECHANGE_MAX = 400
 
 
 def _extrait(donnees: dict) -> str:
@@ -108,6 +174,28 @@ def _extrait(donnees: dict) -> str:
     if len(brut) <= EXTRAIT_MAX:
         return brut
     return f"{brut[:EXTRAIT_MAX]}... (tronque)"
+
+
+def _json_sur(valeur):
+    """Les metadonnees passent en JSONField: tout ce qui n'est pas natif devient texte."""
+    return json.loads(json.dumps(valeur, ensure_ascii=False, default=str))
+
+
+def _chips_propres(chips, garder_option: bool) -> list[dict]:
+    propres: list[dict] = []
+    for chip in chips or []:
+        if not isinstance(chip, dict) or not chip.get("label") or not chip.get("value"):
+            continue
+        propre = {"label": str(chip["label"]), "value": str(chip["value"])}
+        if garder_option and chip.get("option") is not None:
+            propre["option"] = chip["option"]
+        propres.append(propre)
+    return propres[:CHIPS_MAX]
+
+
+def _rang(motif) -> int:
+    # Un motif inconnu est traite comme informatif, au rang du chevauchement.
+    return PRIORITE.index(motif) if motif in PRIORITE else PRIORITE.index("chevauchement")
 
 
 class PlannerAgentV2:
@@ -121,6 +209,8 @@ class PlannerAgentV2:
         self._tache: str = ""
         self._exclu: Optional[int] = None
         self._file_pensees: Optional[queue.Queue] = None
+        self._message_brut: Optional[str] = None
+        self._brouillon_agir: str = ""
 
     def pousser_pensee(self, texte: str) -> None:
         """Emet un fragment de raisonnement vers le flux, s'il y a un flux.
@@ -150,40 +240,62 @@ class PlannerAgentV2:
 
     # ------------------------------------------------------------------ AGIR
 
+    async def _sur_evenements(self, _contexte, evenements) -> None:
+        """Capte le RAISONNEMENT au fil de sa production, et rien d'autre.
+
+        run_sync execute le graphe en entier, donc tous les outils tournent;
+        run_stream_sync s'arreterait a la premiere sortie « finale » et
+        sauterait les appels suivants. Le handler est le seul moyen d'avoir
+        les deux.
+
+        Deux defauts corriges le 2026-09-14: la version precedente lisait
+        `content_delta` sur tout evenement, donc les brouillons en francais
+        d'AGIR (TextPartDelta) se melaient au raisonnement anglais du volet;
+        et elle ignorait PartStartEvent, qui porte le PREMIER fragment de
+        chaque partie (d'ou « user wants » sans « The »).
+        """
+        async for evenement in evenements:
+            if isinstance(evenement, PartStartEvent):
+                if isinstance(evenement.part, ThinkingPart):
+                    self.pousser_pensee(evenement.part.content)
+            elif isinstance(evenement, PartDeltaEvent):
+                if isinstance(evenement.delta, ThinkingPartDelta):
+                    self.pousser_pensee(evenement.delta.content_delta)
+
     def _agir(self, user: User, message: str, registre: Registre) -> str:
         """Laisse le modele outiller. Rend son raisonnement, jamais persiste.
 
         Le registre est alimente par l'adaptateur d'outils a chaque execution:
         cette methode ne l'ecrit pas elle-meme, et c'est voulu. Une action ne
         peut entrer dans le registre qu'en ayant reellement ete executee.
+
+        Le texte final d'AGIR est garde dans `_brouillon_agir`: c'est la que
+        vivent ses questions de clarification, que DIRE doit reprendre.
         """
+        self._brouillon_agir = ""
+        # Les regles de la garde (confirmation, heure dite, portee d'un jour)
+        # lisent le message TAPE, jamais sa version enrichie du document.
+        brut = self._message_brut if self._message_brut is not None else message
+        try:  # SEAM-INTEGRATION: outils_pour sans message_brut avant le lot b3
+            outils = outils_pour(user, registre, message_du_tour=message,
+                                 tache=self._tache, signaler=self.signaler_outil,
+                                 message_brut=brut)
+        except TypeError:
+            outils = outils_pour(user, registre, message_du_tour=message,
+                                 tache=self._tache, signaler=self.signaler_outil)
         agent = Agent(
             modele_agir(),
             system_prompt=prompt_agir(user),
-            tools=outils_pour(user, registre, message, tache=self._tache,
-                              signaler=self.signaler_outil),
+            tools=outils,
         )
-        async def sur_evenements(_contexte, evenements):
-            """Capte les fragments de raisonnement AU FIL de leur production.
 
-            run_sync execute le graphe en entier, donc tous les outils
-            tournent; run_stream_sync s'arreterait a la premiere sortie
-            « finale » et sauterait les appels suivants, ce qui serait faux
-            ici. Le handler est le seul moyen d'avoir les deux.
-            """
-            async for evenement in evenements:
-                delta = getattr(evenement, "delta", None)
-                fragment = getattr(delta, "content_delta", None)
-                if fragment:
-                    self.pousser_pensee(fragment)
-
+        depart = time.perf_counter()
         try:
-            depart = time.perf_counter()
             resultat = agent.run_sync(
                 message,
                 message_history=self._historique(user),
                 usage_limits=UsageLimits(request_limit=BUDGET_ETAPES),
-                event_stream_handler=sur_evenements,
+                event_stream_handler=self._sur_evenements,
             )
             self._cout_agir = _cout(resultat, time.perf_counter() - depart)
         except UsageLimitExceeded:
@@ -193,12 +305,15 @@ class PlannerAgentV2:
             self._cout_agir = {"etapes": BUDGET_ETAPES, "entree": 0, "sortie": 0,
                                "duree": time.perf_counter() - depart}
             return ""
+        sortie = getattr(resultat, "output", "")
+        self._brouillon_agir = sortie.strip() if isinstance(sortie, str) else ""
         return self._raisonnement(resultat)
 
     # ------------------------------------------------------------------ DIRE
 
     def _dire(self, user: User, message: str, registre: Registre,
-              etat: dict, faits: str) -> ReponseDire:
+              etat: dict, faits: str, brouillon: str = "",
+              question_code: str = "", historique_court: str = "") -> ReponseDire:
         """Redige, sans outil. REGLAGES_DIRE coupe le raisonnement: verifie par
         sonde, DeepSeek refuse tool_choice=required en mode thinking, or c'est
         ainsi que PydanticAI force une sortie structuree."""
@@ -224,20 +339,22 @@ class PlannerAgentV2:
             fuites = fuites_reponse(sortie)
             if fuites and tentatives["n"] <= 1:
                 champs = ", ".join(sorted({f.split(":", 1)[0] for f in fuites}))
-                # Le message NE montre PAS comment reformuler l'affirmation:
-                # la premiere version listait les tournures interdites et
-                # poussait le modele vers le passif « a ete deplace »,
-                # indetectable a l'epoque. On demande de RETIRER, pas de
-                # deguiser.
+                # On demande de RETIRER, pas de deguiser en passif. Mais on dit
+                # aussi ce qui reste permis: la version precedente faisait
+                # fuir les questions et les offres avec les affirmations, et
+                # l'agent ne demandait plus rien.
                 raise ModelRetry(
-                    f"Les champs {champs} presentent une action comme faite, "
-                    "en cours ou a venir. SUPPRIME ces phrases: toute action "
-                    "reelle se cite uniquement dans `actions` avec sa "
-                    "reference. N'evoque aucune action dans la prose, sous "
-                    "aucune forme ni aucun temps."
+                    f"Les champs {champs} presentent une action comme deja "
+                    "faite ou en cours. SUPPRIME ces phrases: les actions "
+                    "reelles sont deja affichees par le code. Les questions et "
+                    "les offres restent permises, par exemple « Veux-tu que je "
+                    "le deplace a 14 h ? » ou « Donne-moi l'heure et je le "
+                    "place. »"
                 )
             return sortie
-        brief = self._brief_dire(message, registre, etat, faits)
+        brief = self._brief_dire(message, registre, etat, faits,
+                                 brouillon=brouillon, question_code=question_code,
+                                 historique_court=historique_court)
 
         # DIRE passe par le MEME pool qu'AGIR, et ce n'est pas un detail de
         # style. Mesure du 2026-08-28: appeler run_sync depuis le thread
@@ -259,12 +376,24 @@ class PlannerAgentV2:
         return _POOL_AGIR.submit(_rediger).result()
 
     @staticmethod
-    def _brief_dire(message: str, registre: Registre, etat: dict, faits: str) -> str:
-        lignes = [f"MESSAGE DE L'UTILISATEUR:\n{message}", ""]
+    def _brief_dire(message: str, registre: Registre, etat: dict, faits: str,
+                    brouillon: str = "", question_code: str = "",
+                    historique_court: str = "") -> str:
+        lignes: list[str] = []
+        if historique_court:
+            lignes += ["DEUX DERNIERS ECHANGES (contexte, ne les repete pas):",
+                       historique_court, ""]
+        lignes += [f"MESSAGE DE L'UTILISATEUR:\n{message}", ""]
         if registre.actions:
             lignes.append("REGISTRE DU TOUR (seules ces references existent):")
             for a in registre.actions:
-                etiquette = "OK" if a.succes else "ECHEC"
+                if a.outil == "import_recent":
+                    # Un import d'un tour precedent: DIRE s'en sert pour
+                    # repondre, mais le citer a chaque tour pendant vingt
+                    # minutes redisait « c'est importe » a toute question.
+                    etiquette = "CONTEXTE (ne pas citer)"
+                else:
+                    etiquette = "OK" if a.succes else "ECHEC"
                 lignes.append(f"  {a.id} [{etiquette}] {a.outil}: {a.message}")
                 # Le CONTENU des lectures, sans quoi DIRE ne peut repondre a
                 # « c'est quoi mon planning ? »: il saurait qu'un outil a
@@ -280,7 +409,16 @@ class PlannerAgentV2:
         for e in registre.ecarts:
             lignes.append(f"  {e.id} [ECART] {e.description}")
         if faits:
-            lignes += ["", "COMPTE RENDU DEJA AFFICHE (ne le repete pas):", faits]
+            lignes += ["", "COMPTE RENDU DEJA AFFICHE (ne repete ni ses noms, ni ses "
+                       "heures, ni ses nombres):", faits]
+        if question_code:
+            lignes += ["", "QUESTION DEJA POSEE PAR LE CODE (laisse question et "
+                       "options vides):", question_code]
+        if brouillon:
+            extrait = brouillon if len(brouillon) <= BROUILLON_MAX \
+                else f"{brouillon[:BROUILLON_MAX]}... (tronque)"
+            lignes += ["", "BROUILLON D'AGIR (reprends ses questions et propositions, "
+                       "jamais ses affirmations d'action):", extrait]
         if etat:
             lignes += ["", f"ETAT RELU APRES ECRITURE: {list(etat)}"]
         return "\n".join(lignes)
@@ -296,9 +434,14 @@ class PlannerAgentV2:
         use_streaming: bool = True,
         generate_quick_replies: bool = False,
     ):
-        """Contrat SSE additif: status, thinking, delta, done. Le done fait
-        AUTORITE et le client remplace toujours la bulle par son response."""
+        """Contrat SSE additif: status, thinking, tool, delta, done. Les deltas
+        arrivent dans l'ordre final (faits, prose, question) et done.response
+        en est exactement la concatenation."""
         self.user = user
+        # Le message TAPE, avant tout enrichissement: c'est lui que lisent la
+        # garde et les boutons forces.
+        self._message_brut = message
+        self._brouillon_agir = ""
         self._journaliser_reponse_formulaire(user, message)
 
         # Persiste d'abord, puis exclut CETTE ligne de l'historique par son id.
@@ -342,7 +485,28 @@ class PlannerAgentV2:
         except Exception:  # noqa: BLE001 - un recap absent vaut mieux qu'un tour tombe
             logger.error("Import du document non inscrit au registre", exc_info=True)
 
-        yield {"type": "status", "text": "R\u00e9flexion..."}
+        # La reponse a une question du tour precedent s'execute par le CODE,
+        # avant AGIR: un tap sur « Tous les jeudis » supprime la serie sans
+        # qu'un modele ait a le refaire (ni a pouvoir le rater). AGIR recoit
+        # le bilan pour ne pas le rejouer; le message brut reste intact.
+        self._file_pensees = queue.Queue()
+        choix: list = []
+        try:
+            choix = list(_charger_appliquer_choix()(
+                user, registre, message, tache=self._tache,
+                signaler=self.signaler_outil) or [])
+        except Exception:  # noqa: BLE001 - un choix non applique se redemande
+            logger.error("Choix en attente non appliques", exc_info=True)
+            choix = []
+        yield from self._vider_file()
+        choix = [c for c in choix if isinstance(c, dict)]
+        choix_code = sum(1 for c in choix if c.get("action_id"))
+        resumes = [str(c["resume"]) for c in choix if c.get("resume")]
+        if resumes:
+            message_enrichi = (f"{message_enrichi}\n\nSUITE AU CHOIX DE L'UTILISATEUR:\n- "
+                               + "\n- ".join(resumes))
+
+        yield {"type": "status", "text": "Réflexion..."}
 
         # AGIR tourne dans un THREAD pour qu'on puisse emettre pendant qu'il
         # travaille. Mesure du 2026-08-28: sur une demande multi-etapes il
@@ -350,7 +514,7 @@ class PlannerAgentV2:
         # pendant ce temps. Le raisonnement etait bien capte, mais emis apres
         # coup: il decrivait une reflexion deja terminee.
         raisonnement, panne = "", None
-        self._file_pensees = queue.Queue()
+        file_agir = self._file_pensees
 
         def travailler():
             nonlocal raisonnement, panne
@@ -363,13 +527,13 @@ class PlannerAgentV2:
                 panne = e
             finally:
                 close_old_connections()
-                self._file_pensees.put(None)  # sentinelle de fin
+                file_agir.put(None)  # sentinelle de fin
 
         futur = _POOL_AGIR.submit(travailler)
         fragments = 0
         while True:
             try:
-                element = self._file_pensees.get(timeout=ATTENTE_PENSEE)
+                element = file_agir.get(timeout=ATTENTE_PENSEE)
             except queue.Empty:
                 # Filet: si le thread s'est termine sans poser sa sentinelle
                 # (arret brutal du worker), on sort au lieu d'attendre pour
@@ -380,11 +544,7 @@ class PlannerAgentV2:
             if element is None:
                 break
             fragments += 1
-            genre, charge = element
-            # La file transporte deux formes: un fragment de raisonnement
-            # (texte nu) et un appel d'outil (dictionnaire deja pret).
-            yield ({"type": genre, "text": charge} if isinstance(charge, str)
-                   else {"type": genre, **charge})
+            yield self._evenement_de_file(element)
         futur.result()  # remonte une panne du pool lui-meme, pas d'AGIR
         self._file_pensees = None
 
@@ -406,36 +566,84 @@ class PlannerAgentV2:
             etat = reconcilier(user, registre)
             detecter_ecarts(registre)
 
-        faits = bloc_factuel(registre)
+        # La question du tour est choisie AVANT les faits: les actions
+        # retenues que cette question couvre n'ont pas a etre redites, les
+        # autres recoivent leur ligne « pas encore ».
+        gagnant = self._choisir_question(
+            user, message, attachment, registre, attachment_traite_ce_tour)
+        par_demande = bool(gagnant) and gagnant.get("source") == "demande"
+        cles_posees = set(gagnant.get("cles_posees") or []) if par_demande else set()
+
+        faits = bloc_factuel(registre, cles_posees=cles_posees)
         # La section RESTE: demande contre place, une soustraction rendue par
         # du code. Elle rejoint les faits AVANT la redaction et le flux: le
         # manque se nomme au meme instant que le succes qu'il tempere.
         reste = bloc_reste(message, registre)
         if reste:
             faits = f"{faits}\n{reste}" if faits else reste
+
+        emis: list[str] = []
         if faits:
             # Les faits partent AVANT la redaction: ils sont deja vrais, et
             # l'utilisateur n'a pas a attendre l'enrobage pour les voir.
+            emis.append(faits)
             yield {"type": "delta", "text": faits}
 
-        texte = ""
-        rejetees = 0
+        question_deja = ""
+        if gagnant:
+            question_deja = gagnant.get("question") or "(un formulaire est affiché)"
+
         supprimees = 0
         fuites: list[str] = []
+        panne_dire = False
         try:
-            brut = self._dire(user, message, registre, etat, faits)
+            brut = self._dire(user, message, registre, etat, faits,
+                              brouillon=self._brouillon_agir,
+                              question_code=question_deja,
+                              historique_court=self._deux_derniers_echanges(user))
             # Fuites APRES la seconde chance du validateur: ce compteur dit
             # ce que le modele persiste a affirmer, pas ce qui part.
             fuites = fuites_reponse(brut)
             brut, supprimees = epurer_reponse(brut)
-            texte, rejetees = assembler(brut, registre)
-            if not texte.strip():
-                # Tout etait mensonge: le compte rendu factuel reste la seule
-                # chose vraie a dire.
-                texte = self._repli(faits)
+            compo = composer(brut, registre, faits, gagnant)
         except Exception as e:  # noqa: BLE001
             logger.error("DIRE a echoue: %s", e, exc_info=True)
-            texte = self._repli(faits)
+            panne_dire = True
+            compo = composer(None, registre, faits, gagnant)
+
+        prose, question = compo.prose, compo.question
+        motif, chips = compo.motif, compo.chips
+        formulaire = gagnant.get("interactive_inputs") if gagnant and \
+            gagnant.get("source") == "formulaire" else None
+        mutation_reussie = any(a.succes and a.est_mutation for a in registre.actions)
+        if panne_dire and faits and not prose:
+            # DIRE est tombe. Se taire laisserait croire que rien n'a eu lieu.
+            prose = REPLI_PROSE if mutation_reussie else REPLI_PROSE_LECTURE
+        if formulaire and not faits and not prose:
+            prose = PROSE_FORMULAIRE
+        if not faits and not prose and not question and not formulaire:
+            question, motif, chips = REPLI_QUESTION, "dire", []
+
+        if prose:
+            morceau = ("\n\n" if emis else "") + prose
+            emis.append(morceau)
+            yield {"type": "delta", "text": morceau}
+        if question:
+            morceau = ("\n\n" if emis else "") + question
+            emis.append(morceau)
+            yield {"type": "delta", "text": morceau}
+        response = "".join(emis)
+
+        quick_replies = _chips_propres(chips, garder_option=False)
+        question_posee = bool(gagnant) or bool(question)
+        lecture_reussie = any(a.succes and a.outil in LECTURES_RENDUES
+                              for a in registre.actions)
+        lecture_sans_liste = compo.lecture_sans_liste or (lecture_reussie and not faits)
+        try:
+            marqueurs = list(marqueurs_bruts(response))
+        except Exception:  # noqa: BLE001 - une mesure ne casse pas un tour
+            marqueurs = []
+        rejetees = compo.rejetees
 
         # Une seule ligne par tour, mais pas toujours au meme niveau: une
         # reference rejetee est un mensonge que la garantie structurelle vient
@@ -448,7 +656,9 @@ class PlannerAgentV2:
         logger.log(
             logging.WARNING if anormal else logging.INFO,
             "agent_v2 tour actions=%d rejetees=%d fuites=%d supprimees=%d ecarts=%d%s"
-            " agir=%.1fs/%dep/%d->%dj/r%d/c%d dire=%.1fs/%dep/%d->%dj/r%d",
+            " agir=%.1fs/%dep/%d->%dj/r%d/c%d dire=%.1fs/%dep/%d->%dj/r%d"
+            " asked=%d form=%d choices=%d read_without_list=%d raw_marker_count=%d"
+            " motif=%s choix_code=%d",
             len(registre.actions),
             rejetees,
             len(fuites),
@@ -467,32 +677,57 @@ class PlannerAgentV2:
             cout_dire.get("duree", 0.0), cout_dire.get("etapes", 0),
             cout_dire.get("entree", 0), cout_dire.get("sortie", 0),
             cout_dire.get("raisonnement", 0),
+            # MESURE DES QUESTIONS (lot 3g): a-t-on demande, par quel canal,
+            # combien de boutons, une lecture sans liste, du texte machine.
+            1 if question_posee else 0,
+            1 if formulaire else 0,
+            len(quick_replies),
+            1 if lecture_sans_liste else 0,
+            len(marqueurs),
+            motif or "-",
+            choix_code,
         )
 
-        # Boutons garantis par le code (fin de recurrence, creneaux libres).
-        # La phrase ajoutee est aussi PERSISTEE, libelles des creneaux compris
-        # puisque les chips ne le sont pas: au tour suivant, le modele doit
-        # savoir ce qu'il a propose pour lire « le 15 decembre » ou « 16:30 »
-        # comme une reponse. Le texte de done et la ligne en base sont le meme.
-        try:
-            texte, chips = boutons_forces(
-                user, message, attachment, registre, texte, attachment_traite_ce_tour)
-        except Exception:  # noqa: BLE001 - un bouton ne fait jamais tomber un tour
-            logger.error("Boutons forces indisponibles", exc_info=True)
-            chips = []
-
+        question_affichee = "" if motif == "formulaire" else question
+        metadonnees = {
+            "agent": "v2",
+            "en_reponse_a": self._exclu,
+            "quick_replies": quick_replies,
+            "interactive_inputs": formulaire or [],
+            "question_posee": question_posee,
+            "question": question_affichee,
+            "question_motif": motif or "",
+            # SEULEMENT les demandes rendues dans la question gagnante: une
+            # demande que l'utilisateur n'a pas vue ne doit jamais pouvoir
+            # etre autorisee par sa reponse.
+            "demandes": [
+                {**d, "chips": _chips_propres(d.get("chips"), garder_option=True)}
+                for d in compo.demandes
+            ] if par_demande else [],
+            "faits_rendus": faits,
+            "raw_markers": marqueurs,
+            "lecture_sans_liste": lecture_sans_liste,
+            "actions": [
+                {"id": a.id, "outil": a.outil, "succes": bool(a.succes),
+                 "par_le_code": bool((a.donnees or {}).get("par_le_code"))}
+                for a in registre.actions
+            ],
+        }
         ConversationMessage.objects.create(
-            user=user, role="assistant", content=texte)
+            user=user, role="assistant", content=response,
+            metadata=_json_sur(metadonnees))
 
         evenement = {
             "type": "done",
-            "response": texte,
-            "quick_replies": chips,
+            "response": response,
+            "quick_replies": quick_replies,
             "blocks_created": self._crees(registre, "create_block", "created"),
             "tasks_created": self._crees(registre, "create_task", "task"),
             "raisonnement": raisonnement,
+            "question_posee": question_posee,
+            "question": question_affichee,
+            "question_motif": motif or "",
         }
-        formulaire = self._dernier_formulaire(registre)
         if formulaire:
             evenement["interactive_inputs"] = formulaire
             # Mesure: le denominateur du taux de remplissage. Une ligne par
@@ -504,6 +739,108 @@ class PlannerAgentV2:
                 ",".join(str(champ.get("type", "")) for champ in formulaire),
             )
         yield evenement
+
+    @staticmethod
+    def _evenement_de_file(element) -> dict:
+        # La file transporte deux formes: un fragment de raisonnement (texte
+        # nu) et un appel d'outil (dictionnaire deja pret).
+        genre, charge = element
+        return ({"type": genre, "text": charge} if isinstance(charge, str)
+                else {"type": genre, **charge})
+
+    def _vider_file(self):
+        """Emet ce que la file contient deja, sans attendre."""
+        if self._file_pensees is None:
+            return
+        while True:
+            try:
+                element = self._file_pensees.get_nowait()
+            except queue.Empty:
+                return
+            if element is not None:
+                yield self._evenement_de_file(element)
+
+    def _choisir_question(self, user: User, message: str, attachment,
+                          registre: Registre, attachment_traite_ce_tour: bool):
+        """La question UNIQUE du tour, selon PRIORITE, ou None.
+
+        Rend {"source", "motif", "question", "chips", "demandes",
+        "cles_posees", "interactive_inputs"}. Les demandes viennent du
+        registre (gardes du code, present_choices), dans l'ordre des actions.
+        """
+        demandes = [a.donnees["demande"] for a in registre.actions
+                    if isinstance((a.donnees or {}).get("demande"), dict)]
+        formulaire = self._dernier_formulaire(registre)
+        rang_formulaire = PRIORITE.index("formulaire")
+
+        if demandes:
+            haut = min(_rang(d.get("motif")) for d in demandes)
+            if not formulaire or haut < rang_formulaire:
+                code = self._question_des_demandes(demandes)
+                if code:
+                    return code
+
+        if formulaire:
+            return {"source": "formulaire", "motif": "formulaire", "question": "",
+                    "chips": [], "demandes": [], "cles_posees": [],
+                    "interactive_inputs": formulaire}
+
+        try:
+            forcee = _charger_question_forcee()(
+                user, message, attachment, registre, attachment_traite_ce_tour)
+        except Exception:  # noqa: BLE001 - un bouton ne fait jamais tomber un tour
+            logger.error("Question forcee indisponible", exc_info=True)
+            forcee = None
+        if isinstance(forcee, dict):
+            chips = _chips_propres(forcee.get("chips"), garder_option=False)
+            texte = (forcee.get("question") or "").strip()
+            if texte or chips:
+                return {"source": "forcee", "motif": forcee.get("motif") or "creneaux",
+                        "question": texte, "chips": chips, "demandes": [],
+                        "cles_posees": [], "interactive_inputs": None}
+        return None
+
+    @staticmethod
+    def _question_des_demandes(demandes: list[dict]):
+        texte, chips, cles = question_code(demandes)
+        texte = (texte or "").strip()
+        chips = _chips_propres(chips, garder_option=True)
+        if not texte and not chips:
+            return None
+        cles = [c for c in (cles or []) if c]
+        rendues = set(cles)
+        posees: list[dict] = []
+        vues: set = set()
+        for d in demandes:
+            cle = d.get("cle")
+            if cle in rendues and cle not in vues:
+                vues.add(cle)
+                posees.append({**d, "chips": chips})
+        if posees:
+            motif = posees[0].get("motif") or ""
+        else:
+            motif = min(demandes, key=lambda d: _rang(d.get("motif"))).get("motif") or ""
+        return {"source": "demande", "motif": motif, "question": texte,
+                "chips": chips, "demandes": posees, "cles_posees": cles,
+                "interactive_inputs": None}
+
+    def _deux_derniers_echanges(self, user: User) -> str:
+        """Les quatre derniers messages avant celui-ci, courts, pour DIRE."""
+        try:
+            lignes = list(ConversationMessage.objects
+                          .filter(user=user).exclude(pk=self._exclu)
+                          .order_by("-created_at", "-pk")[:4])
+        except Exception:  # noqa: BLE001 - un contexte absent ne casse pas un tour
+            logger.debug("Historique court illisible", exc_info=True)
+            return ""
+        sortie = []
+        for ligne in reversed(lignes):
+            qui = "Utilisateur" if ligne.role == "user" else "Assistant"
+            contenu = " ".join((ligne.content or "").split())
+            if len(contenu) > ECHANGE_MAX:
+                contenu = f"{contenu[:ECHANGE_MAX]}..."
+            sortie.append(f"{qui}: {contenu}")
+        return "\n".join(sortie)
 
     @staticmethod
     def _journaliser_reponse_formulaire(user: User, message: str) -> None:
@@ -612,8 +949,17 @@ class PlannerAgentV2:
         for ligne in reversed(list(lignes)):
             if ligne.role == "user":
                 messages.append(ModelRequest(parts=[UserPromptPart(content=ligne.content)]))
-            else:
-                messages.append(ModelResponse(parts=[TextPart(content=ligne.content)]))
+                continue
+            texte = ligne.content
+            # Les boutons ne sont plus colles au texte: sans cette ligne, le
+            # modele ne saurait pas que « 15 h 50 à 17 h 20 » repond a un choix
+            # qu'il a lui-meme propose au tour precedent.
+            proposes = (ligne.metadata or {}).get("quick_replies") or []
+            libelles = [str(c.get("label")) for c in proposes
+                        if isinstance(c, dict) and c.get("label")]
+            if libelles:
+                texte = f"{texte}\n[Choix proposés : {' | '.join(libelles)}]"
+            messages.append(ModelResponse(parts=[TextPart(content=texte)]))
         return messages
 
     @staticmethod
@@ -634,8 +980,8 @@ class PlannerAgentV2:
         """DIRE est tombe. Se taire laisserait l'utilisateur croire que rien
         n'a eu lieu, alors que son planning a peut-etre change."""
         if faits:
-            return f"{faits}\n\nJe n'ai pas pu rediger de reponse complete, mais voici ce qui a ete fait."
-        return "Je n'ai pas reussi a traiter ta demande. Peux-tu reformuler ?"
+            return f"{faits}\n\n{REPLI_PROSE}"
+        return REPLI_QUESTION
 
     @staticmethod
     def _crees(registre: Registre, outil: str, cle: str) -> list:

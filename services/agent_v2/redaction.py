@@ -1,21 +1,34 @@
 """
 La partie factuelle de la reponse est rendue par du CODE, pas par un modele.
 
-Granularite (decision du 2026-08-24): une ligne par action jusqu'a 5, puis
-groupement des REUSSITES par outil avec un compte. Les echecs et les ecarts
-restent detailles un par un quel que soit le volume, parce qu'un refus noye
-dans un total est exactement le defaut qu'on corrige.
+Depuis le 2026-09-14, UN SEUL NARRATEUR. Avant, DIRE ecrivait une phrase par
+action ET le code imprimait une ligne pour la meme action: « J'ai mis a jour
+le bloc Gym » trois fois, puis « Bloc Gym mis a jour » trois fois, sans heure.
+Desormais le compte rendu des actions vient uniquement de rendu.py (lot b4),
+et la prose de DIRE ne le repete jamais: les phrases `actions` ne sont plus
+rendues, elles ne servent qu'a compter les references inventees.
+
+Un tour s'affiche en trois sections, dans l'ordre ou elles sont streamees:
+FAITS (code), PROSE (ouverture + suite de DIRE, epurees), QUESTION (une seule
+par tour, choisie par agent.py selon PRIORITE).
 """
 from __future__ import annotations
 
 import re
 from collections import defaultdict
+from dataclasses import dataclass, field
 
 from pydantic import BaseModel, Field
 
 from services.agent_v2.registre import Registre
 
 SEUIL_GROUPEMENT = 5
+
+# Les cinq lectures dont le resultat merite une liste rendue par le code. Un
+# tour ou l'une d'elles a reussi sans que rien ne s'affiche est compte dans
+# read_without_list: c'est le defaut « que voici » suivi de rien.
+LECTURES_RENDUES = ("get_week_schedule", "get_today_schedule", "list_blocks",
+                    "find_free_slots", "list_tasks")
 
 
 class ActionCitee(BaseModel):
@@ -24,33 +37,46 @@ class ActionCitee(BaseModel):
 
 
 class ReponseDire(BaseModel):
-    ouverture: str = Field(default="", description="Une phrase d'accroche, AUCUNE affirmation d'action")
-    actions: list[ActionCitee] = Field(default_factory=list)
-    suite: str = Field(default="", description="Une phrase de suite, AUCUNE affirmation d'action")
+    ouverture: str = Field(
+        default="",
+        description="Facultative, au plus 12 mots. Répond d'abord. Aucune action "
+                    "affirmée, aucun fait déjà affiché répété.")
+    suite: str = Field(
+        default="",
+        description="Facultative, une phrase. Aucune action affirmée. Pas de question ici.")
+    question: str = Field(
+        default="",
+        description="Au plus UNE question, finit par '?'. Vide si le code pose déjà une question.")
+    options: list[str] = Field(
+        default_factory=list,
+        description="0, ou 2 à 4 réponses courtes à `question`, tirées des vraies "
+                    "entités du registre (créneaux, blocs, jours).")
+    refs: list[str] = Field(
+        default_factory=list,
+        description="Références du registre dont ouverture ou suite parlent, ex. a1.")
+    # Garde pour compatibilite: un modele qui la remplit encore voit ses
+    # references verifiees, mais ses phrases ne sont JAMAIS rendues.
+    actions: list[ActionCitee] = Field(
+        default_factory=list, description="Obsolète: laisse vide.")
 
 
-# Les lectures qui montrent un horaire. Leur resultat contient deja tout ce
-# qu'il faut pour ecrire la liste; on ne demande donc pas au modele de la
-# recopier de memoire.
-LECTURES_D_HORAIRE = ("get_week_schedule", "get_today_schedule", "list_blocks")
+# ── Couture avec rendu.py ────────────────────────────────────────────────
 
 
-def _liste_de_lecture(action) -> list[str]:
-    """La liste des blocs vus, rendue par du CODE.
+def _charger_rendu():  # SEAM-INTEGRATION
+    try:
+        from services.agent_v2 import rendu
+        return rendu
+    except ImportError:
+        return None
 
-    Defaut remonte par Darius le 2026-08-30: a « qu'est-ce que j'ai cette
-    semaine ? », l'agent repondait « deux grosses journees (lundi avec cours
-    et quart au depanneur) et trois jours bien degages ». Des noms noyes dans
-    une prose, aucune heure, rien a lire.
 
-    La cause tenait a la portee de la garantie: `bloc_factuel` ne rend que les
-    MUTATIONS. Sur un tour de lecture il est vide, donc tout ce que
-    l'utilisateur lit est de la prose du modele, et un modele resume.
+# Les lectures qui montrent un horaire, pour l'ancien rendu seulement.
+LECTURES_D_HORAIRE = ("get_week_schedule", "get_today_schedule", "list_blocks")  # SEAM-INTEGRATION
 
-    Or les outils rendent deja la matiere exacte: `get_week_schedule` donne
-    `days[].blocks` sous la forme « Cours de geologie (09:00-12:00) ». On la
-    met en page, on n'en fabrique rien.
-    """
+
+def _liste_de_lecture(action) -> list[str]:  # SEAM-INTEGRATION
+    """Ancien rendu d'une lecture, garde tant que rendu.py n'est pas fusionne."""
     donnees = action.donnees or {}
     lignes: list[str] = []
 
@@ -75,8 +101,6 @@ def _liste_de_lecture(action) -> list[str]:
         return lignes
 
     if action.outil == "list_blocks":
-        # Groupe par jour, dans l'ordre de la semaine: une liste a plat obligerait
-        # a la trier de tete.
         par_jour: dict[str, list[str]] = defaultdict(list)
         ordre: list[str] = []
         for b in donnees.get("blocks") or []:
@@ -92,22 +116,11 @@ def _liste_de_lecture(action) -> list[str]:
     return lignes
 
 
-def bloc_lecture(registre: Registre) -> str:
-    """Ce que l'agent a VU, quand il n'a rien fait d'autre que regarder.
-
-    Uniquement sur un tour SANS mutation: si quelque chose a change, c'est le
-    changement qui compte et le compte rendu le dit deja. Empiler les deux
-    noierait l'important.
-
-    On prend la DERNIERE lecture reussie: si l'agent a relu apres coup, c'est
-    la vue la plus recente qui fait foi.
-    """
+def _bloc_lecture_ancien(registre: Registre) -> str:  # SEAM-INTEGRATION
     if any(a.succes and a.est_mutation for a in registre.actions):
         return ""
     lectures = [a for a in registre.actions
                 if a.succes and a.outil in LECTURES_D_HORAIRE]
-    if not lectures:
-        return ""
     for action in reversed(lectures):
         lignes = _liste_de_lecture(action)
         if lignes:
@@ -115,12 +128,11 @@ def bloc_lecture(registre: Registre) -> str:
     return ""
 
 
-def bloc_factuel(registre: Registre) -> str:
-    """Le compte rendu deterministe de ce qui s'est passe."""
+def _bloc_factuel_ancien(registre: Registre) -> str:  # SEAM-INTEGRATION
     reussites = [a for a in registre.actions if a.succes and a.est_mutation]
     echecs = [a for a in registre.actions if not a.succes]
     interrompu = registre.budget_epuise or getattr(registre, "boucle_interrompue", False)
-    lecture = bloc_lecture(registre)
+    lecture = _bloc_lecture_ancien(registre)
     if not reussites and not echecs and not registre.ecarts and not interrompu:
         return lecture
 
@@ -133,43 +145,201 @@ def bloc_factuel(registre: Registre) -> str:
             par_outil[a.outil].append(a)
         for outil, actions in par_outil.items():
             lignes.append(f"- {len(actions)} x {outil}")
-
-    # Jamais groupes: un refus ou un ecart se lit en toutes lettres.
     lignes += [f"- Refus: {a.message}" for a in echecs]
     lignes += [f"- Ecart: {e.description}" for e in registre.ecarts]
     if registre.budget_epuise:
         lignes.append("- Traitement interrompu: la limite d'etapes du tour a ete atteinte.")
     if getattr(registre, "boucle_interrompue", False):
-        # Dit a l'utilisateur, pas seulement journalise: un tour tronque sans
-        # explication ressemble a une panne, et il a le droit de savoir que
-        # l'agent tournait en rond plutot que de travailler.
         lignes.append(
             "- Traitement interrompu: je repetais la meme action sans progresser.")
     return "\n".join(lignes)
 
 
-def assembler(brut: ReponseDire, registre: Registre) -> tuple[str, int]:
-    """Assemble la reponse finale et compte les actions rejetees.
+def bloc_lecture(registre: Registre, aujourdhui=None) -> str:
+    """Ce que l'agent a VU, rendu par du code, sur un tour sans mutation."""
+    r = _charger_rendu()
+    if r is None:
+        return _bloc_lecture_ancien(registre)
+    return r.rendre_lecture(registre, aujourdhui)
 
-    Une action dont la reference n'existe pas dans le registre est SUPPRIMEE.
-    C'est le point ou le mensonge meurt.
+
+def bloc_factuel(registre: Registre, aujourdhui=None, cles_posees=None) -> str:
+    """Le compte rendu deterministe du tour: les faits, sinon la lecture.
+
+    `cles_posees` dit quelles actions retenues sont couvertes par la question
+    du tour: rendu.py tait celles-la et donne une ligne aux autres.
     """
-    rejetees = 0
-    phrases: list[str] = []
-    for citee in brut.actions:
-        if registre.par_id(citee.ref) is None:
-            rejetees += 1
-            continue
-        if citee.phrase.strip():
-            phrases.append(citee.phrase.strip())
+    r = _charger_rendu()
+    if r is None:
+        return _bloc_factuel_ancien(registre)
+    return (r.rendre_faits(registre, aujourdhui, cles_posees)
+            or r.rendre_lecture(registre, aujourdhui))
 
-    morceaux = [m for m in [brut.ouverture.strip()] + phrases if m]
-    faits = bloc_factuel(registre)
-    if faits:
-        morceaux.append(faits)
-    if brut.suite.strip():
-        morceaux.append(brut.suite.strip())
-    return "\n\n".join(morceaux), rejetees
+
+def question_code(demandes: list[dict], aujourdhui=None) -> tuple[str, list[dict], list[str]]:
+    """(question, chips avec leur option, cles rendues) pour les demandes du tour."""
+    if not demandes:
+        return "", [], []
+    r = _charger_rendu()
+    if r is None:  # SEAM-INTEGRATION
+        premiere = demandes[0]
+        return ("Tu confirmes ?", [
+            {"label": "Oui, confirme", "value": "Oui, je confirme.", "option": "confirmer"},
+            {"label": "Non, garde tout", "value": "Non, ne change rien.", "option": "annuler"},
+        ], [premiere.get("cle")] if premiere.get("cle") else [])
+    return r.rendre_demandes(demandes, aujourdhui)
+
+
+_MARQUEURS_REPLI = (  # SEAM-INTEGRATION
+    ("anglais", re.compile(r"\b(?:created|skipped|block|tool)\b")),
+    ("compte_outil", re.compile(r"\d+ x [a-z_]+")),
+    ("date_iso", re.compile(r"\b\d{4}-\d{2}-\d{2}\b")),
+    ("ecart", re.compile(r"\b[EeÉé]cart\b")),
+    ("heure_hhmm", re.compile(r"\b\d{2}:\d{2}\b")),
+    ("id_interne", re.compile(r"#\d+")),
+    ("nom_outil", re.compile(r"\b[a-z]+_[a-z_]+\b")),
+    ("pluriel_machine", re.compile(r"\(s\)")),
+    ("ref_registre", re.compile(r"\(\s*[ae]\d+\s*\)")),
+    ("refus", re.compile(r"\b[Rr]efus\b")),
+)
+
+
+def marqueurs_bruts(texte: str) -> list[str]:
+    """Les traces de texte ecrit pour le modele dans ce que lit l'utilisateur."""
+    r = _charger_rendu()
+    if r is not None:
+        return list(r.marqueurs_bruts(texte or ""))
+    return sorted({nom for nom, motif in _MARQUEURS_REPLI if motif.search(texte or "")})  # SEAM-INTEGRATION
+
+
+# ── Composition de la reponse ────────────────────────────────────────────
+
+_FIN_DE_PHRASE = re.compile(r"(?<=[.!?…])\s+")
+_VOICI = re.compile(r"\b(?:que\s+)?voici\b", re.IGNORECASE)
+# Un compte nu: « 3 créneaux », « deux blocs ». « un bloc » n'est pas un
+# compte, et le retirer tuerait des offres legitimes.
+_COMPTE_NU = re.compile(
+    r"\b(?:\d+|deux|trois|quatre|cinq|six|sept|huit|neuf|dix)\s+"
+    r"(?:blocs?|cr[ée]neaux?|t[âa]ches?)\b",
+    re.IGNORECASE)
+OPTIONS_MAX = 4
+
+
+@dataclass
+class Composition:
+    faits: str = ""
+    prose: str = ""
+    question: str = ""
+    chips: list[dict] = field(default_factory=list)
+    motif: str = ""
+    demandes: list[dict] = field(default_factory=list)
+    cles_posees: list[str] = field(default_factory=list)
+    rejetees: int = 0
+    lecture_sans_liste: bool = False
+
+    @property
+    def sections(self) -> list[str]:
+        return [s for s in (self.faits, self.prose, self.question) if s]
+
+    @property
+    def texte(self) -> str:
+        return "\n\n".join(self.sections)
+
+
+def _phrases(texte: str) -> list[str]:
+    return [p.strip() for p in _FIN_DE_PHRASE.split(texte or "") if p.strip()]
+
+
+def _sans_annonce_vide(texte: str) -> tuple[str, int]:
+    """Retire « que voici » et les comptes nus quand rien n'est affiche."""
+    gardees: list[str] = []
+    retirees = 0
+    for phrase in _phrases(texte):
+        if _VOICI.search(phrase) or _COMPTE_NU.search(phrase):
+            retirees += 1
+            continue
+        gardees.append(phrase)
+    return " ".join(gardees), retirees
+
+
+def _references_rejetees(brut, registre: Registre) -> int:
+    rejetees = 0
+    for ref in getattr(brut, "refs", None) or []:
+        if registre.par_id(ref) is None:
+            rejetees += 1
+    for citee in getattr(brut, "actions", None) or []:
+        if registre.par_id(getattr(citee, "ref", None)) is None:
+            rejetees += 1
+    return rejetees
+
+
+def composer(brut: ReponseDire | None, registre: Registre, faits: str,
+             question_code: dict | None) -> Composition:
+    """Assemble les trois sections a partir d'une sortie DIRE deja epuree.
+
+    (b) une seule reference inconnue et TOUT ce que DIRE a ecrit tombe:
+        ouverture, suite, question et options. Un redacteur qui invente une
+        action n'est pas cru sur le reste.
+    (c) les options ne partent qu'avec une question et seulement a 2, 3 ou 4.
+    (e) sans faits affiches, une phrase qui annonce une liste (« que voici »,
+        « 3 créneaux ») est retiree: elle promettrait ce qui ne suit pas.
+    (f) si le code pose deja une question, celle de DIRE est ecartee.
+    Les phrases de `actions` ne sont jamais rendues (un seul narrateur).
+    """
+    faits = faits or ""
+    rejetees = _references_rejetees(brut, registre) if brut is not None else 0
+
+    ouverture = suite = question = ""
+    options: list = []
+    if brut is not None and not rejetees:
+        ouverture = (getattr(brut, "ouverture", "") or "").strip()
+        suite = (getattr(brut, "suite", "") or "").strip()
+        question = (getattr(brut, "question", "") or "").strip()
+        options = list(getattr(brut, "options", None) or [])
+
+    lecture_sans_liste = False
+    if not faits:
+        ouverture, n1 = _sans_annonce_vide(ouverture)
+        suite, n2 = _sans_annonce_vide(suite)
+        lecture_sans_liste = bool(n1 or n2)
+    prose = " ".join(p for p in (ouverture, suite) if p).strip()
+
+    if question_code:
+        return Composition(
+            faits=faits,
+            prose=prose,
+            question=(question_code.get("question") or "").strip(),
+            chips=[dict(c) for c in question_code.get("chips") or []],
+            motif=question_code.get("motif") or "",
+            demandes=list(question_code.get("demandes") or []),
+            cles_posees=list(question_code.get("cles_posees") or []),
+            rejetees=rejetees,
+            lecture_sans_liste=lecture_sans_liste,
+        )
+
+    propres: list[str] = []
+    for option in options:
+        texte = str(option or "").strip()
+        if texte and texte not in propres:
+            propres.append(texte)
+    propres = propres[:OPTIONS_MAX]
+    if not question or len(propres) < 2:
+        propres = []
+    return Composition(
+        faits=faits,
+        prose=prose,
+        question=question,
+        chips=[{"label": o, "value": o} for o in propres],
+        motif="dire" if question else "",
+        rejetees=rejetees,
+        lecture_sans_liste=lecture_sans_liste,
+    )
+
+
+def assembler(brut: ReponseDire, registre: Registre) -> tuple[str, int]:
+    """Le texte final (faits, prose, question) et le nombre de references rejetees."""
+    compo = composer(brut, registre, bloc_factuel(registre), None)
+    return compo.texte, compo.rejetees
 
 
 # ── La section RESTE: demande contre place, rendu par du code ─────────────
