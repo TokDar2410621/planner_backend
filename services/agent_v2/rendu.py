@@ -1229,6 +1229,12 @@ def rendre_faits(registre: Registre, aujourdhui: date | None = None,
         # soit l'outil sous lequel les gardes l'ont consignee. Plusieurs
         # demandes abandonnees partagent cette ligne unique.
         if (a.donnees or {}).get("abandonnee_par_le_code"):
+            # Round 9 (K1): une cible changee depuis la question a sa propre
+            # ligne, ecrite par le code; elle remplace la ligne generique.
+            ligne = (a.donnees or {}).get("ligne_cible_changee")
+            if isinstance(ligne, str) and ligne.strip():
+                n.ajouter_refus(ligne.strip())
+                continue
             objet = _objet_abandonne(_dict((a.donnees or {}).get("demande")))
             if objet not in abandonnes:
                 abandonnes.append(objet)

@@ -51,7 +51,7 @@ class K1CibleChangeeTests(HarnaisGardes, TransactionTestCase):
         ligne = action.donnees['ligne_cible_changee']
         self.assertIn('a changé depuis ma question', ligne)
         self.assertTrue(ligne.endswith('Redis-le si tu veux toujours.'), ligne)
-        self.assertNotIn('—', ligne)
+        self.assertNotIn(chr(0x2014), ligne)
         self.assertEqual(sorties[0]['decision_code'], 'abandonnee')
         self.assertIsNone(sorties[0]['action_id'])
         self.assertIn('CIBLE CHANGEE', sorties[0]['resume'])
