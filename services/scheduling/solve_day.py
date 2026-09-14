@@ -17,7 +17,13 @@ from dataclasses import dataclass
 from typing import Optional
 
 from services.scheduling.overlap import MINUTES_PER_DAY, is_overnight, time_to_min
-from services.scheduling.placement import fixed_busy_intervals
+from services.scheduling.placement import (
+    _blocs_du_jour,
+    _fmt,
+    _reports_du_jour,
+    fixed_busy_intervals,
+    intervalles_sommeil_reporte,
+)
 
 
 @dataclass
@@ -57,18 +63,23 @@ def _flexible_candidates(user, date):
     sommeil 23:00-07:00) occupe CE jour aux DEUX bouts — le soir (start->minuit)
     ET le matin (minuit->end) — reconstruits depuis le bloc du JOUR MÊME (pas de
     la veille), exactement comme `sleep_pieces = [(ps,1440),(0,pe)]`.
-    """
-    from core.models import RecurringBlock
-    from services.scheduling.exceptions import skipped_block_ids
 
-    cands, extra_walls = [], []
-    for b in RecurringBlock.objects.filter(
-        user=user, active=True, day_of_week=date.weekday()
-    ).exclude(id__in=skipped_block_ids(user, date)).order_by('id'):
+    Parite avec le report au lendemain de place_day: un sommeil reporte apres
+    un quart de nuit ne mure que son morceau du matin, et le sommeil reporte de
+    la veille (intervalles_sommeil_reporte) mure le matin du jour.
+    """
+    blocs = _blocs_du_jour(user, date)
+    reports = _reports_du_jour(blocs, getattr(user, "profile", None), date)
+
+    cands, extra_walls = [], list(intervalles_sommeil_reporte(user, date))
+    for b in blocs:
         if not b.is_flexible:
             continue
         start = time_to_min(b.start_time)
         duration = b.effective_duration_minutes()
+        if b.id in reports:
+            extra_walls.append((0, time_to_min(b.end_time)))   # matin seulement
+            continue
         if is_overnight(b.start_time, b.end_time, b.is_night_shift):
             extra_walls.append((start, MINUTES_PER_DAY))       # soir
             extra_walls.append((0, time_to_min(b.end_time)))   # matin
@@ -178,7 +189,8 @@ def solve_day(user, date, extra=None, day_start=0, day_end=MINUTES_PER_DAY, time
 
 
 def _placement_dict(block, start_min, end_min, *, preferred, shrunk, skipped,
-                    overnight_kept, start_time=None, end_time=None):
+                    overnight_kept, start_time=None, end_time=None,
+                    reporte_au_lendemain=None):
     """Même forme que placement._result (contrat consommé par tout le rendu)."""
     def fmt(x):
         return f"{x // 60:02d}:{x % 60:02d}" if x is not None else None
@@ -194,6 +206,7 @@ def _placement_dict(block, start_min, end_min, *, preferred, shrunk, skipped,
         "shrunk": shrunk,
         "skipped": skipped,
         "overnight_kept": overnight_kept,
+        "reporte_au_lendemain": reporte_au_lendemain,
     }
 
 
@@ -207,20 +220,31 @@ def solve_placement(user, date, day_start=0, day_end=MINUTES_PER_DAY, time_limit
     les sauts que le glouton fait par optimum local. Overnight = gardé en place.
     """
     from ortools.sat.python import cp_model
-    from core.models import RecurringBlock
-    from services.scheduling.exceptions import skipped_block_ids
 
     fixed = _merge(_clip(list(fixed_busy_intervals(user, date)), day_start, day_end))
-    skipped = skipped_block_ids(user, date)
+    blocs = _blocs_du_jour(user, date)
+    reports = _reports_du_jour(blocs, getattr(user, "profile", None), date)
 
-    results, extra_walls, candidates = [], [], []
-    for b in RecurringBlock.objects.filter(
-        user=user, active=True, day_of_week=date.weekday()
-    ).exclude(id__in=skipped).order_by('id'):
+    # Le sommeil reporte de la veille (apres un quart de nuit) mure le matin.
+    results, extra_walls, candidates = [], list(intervalles_sommeil_reporte(user, date)), []
+    for b in blocs:
         if not b.is_flexible:
             continue
         start = time_to_min(b.start_time)
         duration = b.effective_duration_minutes()
+        report = reports.get(b.id)
+        if report is not None:
+            # Meme regle que place_day: sommeil reporte au lendemain, jamais
+            # pose dans la journee du quart; seul son morceau du matin mure.
+            results.append(_placement_dict(
+                b, None, None, preferred=False, shrunk=False, skipped=True,
+                overnight_kept=False,
+                reporte_au_lendemain={
+                    "start_time": _fmt(report["start_min"]),
+                    "end_time": _fmt(report["end_min"]),
+                }))
+            extra_walls.append((0, time_to_min(b.end_time)))
+            continue
         if is_overnight(b.start_time, b.end_time, b.is_night_shift):
             results.append(_placement_dict(
                 b, start, time_to_min(b.end_time), preferred=True, shrunk=False,
