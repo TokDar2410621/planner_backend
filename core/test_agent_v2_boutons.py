@@ -214,11 +214,11 @@ class FinDeRecurrenceTests(TestCase):
             start_time=dtime(9, 0), end_time=dtime(11, 0), source_document=self.doc)
         texte, chips = boutons_forces(
             self.user, "voici mon horaire", self.doc, Registre(), "Import terminé.", True)
-        self.assertIn("Tes 2 blocs importés (Anglais, Physique) n'ont pas de date de fin", texte)
+        self.assertIn("Tes 2 activités importées (Anglais, Physique) n'ont pas de date de fin", texte)
         self.assertIn("jusqu'à quand veux-tu les garder à l'horaire ?", texte)
         self.assertEqual([c["label"] for c in chips],
                          ["🏁 Je te donne la date de fin", "♾️ Pas de fin prévue"])
-        self.assertIn("garde-les tels quels", chips[1]["value"])
+        self.assertIn("garde-les telles quelles", chips[1]["value"])
 
     def test_la_phrase_n_est_pas_doublee_si_le_texte_la_pose_deja(self):
         """Les chips restent forcees: seule la phrase est evitee."""

@@ -145,8 +145,10 @@ def _sans_annonce_vide(texte: str) -> tuple[str, int]:
     return " ".join(gardees), retirees
 
 
+# « bloc » et « formulaire » s'y ajoutent: « Remplis le formulaire »,
+# « le bloc de sommeil chevauche ton quart » (banc du 2026-09-14, round 2).
 _VOCABULAIRE_INTERNE = re.compile(
-    r"\b(?:flexibles?|verrouill\w*|port[ée]e|clarifi\w*)\b", re.IGNORECASE)
+    r"\b(?:flexibles?|verrouill\w*|port[ée]e|clarifi\w*|blocs?|formulaires?)\b", re.IGNORECASE)
 
 
 def _sans_vocabulaire_interne(texte: str) -> str:

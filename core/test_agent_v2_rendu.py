@@ -194,7 +194,7 @@ class CreationDeBlocsTests(SimpleTestCase):
                         {"created": [cree(t, i, "08:00", "09:30", ident=i)], "skipped": []})
                        for i, t in enumerate(titres)])
         sortie = faits(r)
-        self.assertIn("6 blocs ajoutés à ton horaire", sortie)
+        self.assertIn("6 créneaux ajoutés à ton horaire", sortie)
         self.assertIn("Anglais, Biologie, Histoire, Chimie, Physique et Philosophie", sortie)
         self.assertEqual(sortie.count("\n"), 0)
 
@@ -323,7 +323,7 @@ class AutresMutationsTests(SimpleTestCase):
 
     def test_vider_le_planning(self):
         r = registre(("clear_all_blocks", {"confirm": True}, True, {"deleted_count": 23, "reversible": True}))
-        self.assertEqual(faits(r), "Ton planning est vidé : 23 blocs archivés, tu peux les récupérer.")
+        self.assertEqual(faits(r), "Ton planning est vidé : 23 créneaux archivés, tu peux les récupérer.")
 
     def test_organisation_proposee(self):
         r = registre(("organize_day", {"date": "2026-09-23"}, True,
@@ -360,11 +360,11 @@ class AutresMutationsTests(SimpleTestCase):
     def test_echec_generique_nomme_le_titre(self):
         r = registre(("update_block", {"block_id": 9999}, False, {}, "Bloc #9999 introuvable."))
         sortie = faits(r)
-        self.assertEqual(sortie, "Je n'ai pas pu modifier ce bloc, rien n'a changé.")
+        self.assertEqual(sortie, "Je n'ai pas pu modifier ce créneau, rien n'a changé.")
         self.assertEqual(marqueurs_bruts(sortie), [])
         # Pour une modification, `title` est le NOUVEAU nom: il ne designe pas la cible.
         renomme = registre(("update_block", {"block_id": 9999, "title": "X"}, False, {}, "introuvable"))
-        self.assertEqual(faits(renomme), "Je n'ai pas pu modifier ce bloc, rien n'a changé.")
+        self.assertEqual(faits(renomme), "Je n'ai pas pu modifier ce créneau, rien n'a changé.")
         cree_rate = registre(("schedule_task_at", {"title": "Gym", "start_time": "9h"}, False, {},
                               "Heure invalide (attendu HH:MM)."))
         self.assertEqual(faits(cree_rate), "Je n'ai pas pu planifier Gym, rien n'a changé.")
@@ -635,10 +635,43 @@ class LecturesTests(SimpleTestCase):
              "start_time": "18:00", "end_time": "19:30"},
         ]
         sortie = lecture(registre(("list_blocks", {}, True, {"blocks": blocs, "count": 2})))
-        self.assertTrue(sortie.startswith("Ton horaire compte 2 blocs"))
+        # Banc du 2026-09-14 (round 2): plus de compte de « blocs » en tete.
+        self.assertTrue(sortie.startswith("Ton horaire : les plus chargées sont le lundi et le samedi."))
+        self.assertNotIn("compte", sortie)
         self.assertIn("**Samedi**\n- 18 h à 19 h 30 · Soccer", sortie)
         self.assertNotIn("Rien de prévu", sortie)
         self.assertEqual(marqueurs_bruts(sortie), [])
+
+    def test_lecture_sans_mot_du_systeme(self):
+        """Banc du 2026-09-14, round 2: « Ta semaine compte 10 blocs »."""
+        sortie = lecture(registre(("get_week_schedule", {}, True, semaine())))
+        self.assertNotIn("compte", sortie)
+        self.assertNotIn("vocabulaire_systeme", marqueurs_bruts(sortie))
+        self.assertEqual(marqueurs_bruts(sortie), [])
+        self.assertIn("vocabulaire_systeme", marqueurs_bruts("Remplis le formulaire."))
+        self.assertIn("vocabulaire_systeme", marqueurs_bruts("Le bloc du soir est libre."))
+        self.assertEqual(lecture(registre(("list_blocks", {}, True, {"blocks": [], "count": 0}))),
+                         "Rien à ton horaire pour l'instant.")
+
+    def test_ajout_retenu_pour_un_choix_de_jour(self):
+        from services.agent_v2.rendu import rendre_demandes, rendre_faits
+
+        demande = {"type": "choix", "motif": "choix_modele", "cle": "choix:abc", "outil": "schedule_task_at",
+                   "parametres": {}, "cible": {"titre": "Révision"}, "source": "jours",
+                   "question": "Quel jour veux-tu placer Révision ?",
+                   "options": [{"id": "o1", "effet": None, "libelle": "Aujourd'hui",
+                                "valeur": "Place Révision aujourd'hui."},
+                               {"id": "o2", "effet": None, "libelle": "Demain",
+                                "valeur": "Place Révision demain."}]}
+        r = registre(("schedule_task_at", {"title": "Révision", "date": "2026-09-14"}, False,
+                      {"demande": demande}))
+        self.assertEqual(rendre_faits(r, AUJ, {"choix:abc"}), "")
+        self.assertEqual(rendre_faits(r, AUJ, set()),
+                         "Je n'ai pas encore planifié Révision : redemande-le-moi après ta réponse.")
+        question, chips, cles = rendre_demandes([demande], AUJ)
+        self.assertEqual(question, "Quel jour veux-tu placer Révision ?")
+        self.assertEqual([c["label"] for c in chips], ["Aujourd'hui", "Demain"])
+        self.assertEqual(cles, ["choix:abc"])
 
     def test_lecture_tue_par_une_mutation(self):
         r = registre(("get_week_schedule", {}, True, semaine()),

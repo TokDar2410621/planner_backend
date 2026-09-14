@@ -300,6 +300,10 @@ _MARQUEURS = (
     ("compte_outil", re.compile(r"\b\d+ x [a-z_]+")),
     ("id_interne", re.compile(r"#\d+")),
     ("anglais", re.compile(r"\b(?:created|skipped|block|tool)\b", re.IGNORECASE)),
+    # Les mots du systeme: l'utilisateur a des cours, des quarts et des
+    # seances, pas des « blocs »; il voit des champs, pas un « formulaire »
+    # (banc du 2026-09-14).
+    ("vocabulaire_systeme", re.compile(r"\b(?:blocs?|formulaires?)\b", re.IGNORECASE)),
 )
 
 
@@ -356,9 +360,9 @@ class _Fait:
 
 
 _FAMILLES = {
-    "bloc_ajoute": ("bloc ajouté à ton horaire", "blocs ajoutés à ton horaire"),
-    "bloc_modifie": ("bloc modifié", "blocs modifiés"),
-    "bloc_supprime": ("bloc retiré de ton horaire", "blocs retirés de ton horaire"),
+    "bloc_ajoute": ("créneau ajouté à ton horaire", "créneaux ajoutés à ton horaire"),
+    "bloc_modifie": ("créneau modifié", "créneaux modifiés"),
+    "bloc_supprime": ("créneau retiré de ton horaire", "créneaux retirés de ton horaire"),
     "occurrence_sautee": ("séance retirée pour une fois", "séances retirées pour une fois"),
     "occurrence_remise": ("séance remise", "séances remises"),
     "evenement_planifie": ("événement planifié", "événements planifiés"),
@@ -487,7 +491,7 @@ class _Narrateur:
 
     def _ok_update_block(self, a, d, p):
         b = _dict(d.get("block"))
-        titre = _txt(b.get("title")) or _txt(p.get("title")) or "Ce bloc"
+        titre = _txt(b.get("title")) or _txt(p.get("title")) or "Ce créneau"
         avant = _dict(d.get("avant"))
         dow = _dow(b.get("day_of_week"))
         maintenant = ""
@@ -522,7 +526,7 @@ class _Narrateur:
         b = _dict(d.get("block"))
         titre = _txt(b.get("title"))
         if not titre:
-            self.ajouter_fait(_Fait("Un bloc est retiré de ton horaire.", "bloc_supprime", ""))
+            self.ajouter_fait(_Fait("Un créneau est retiré de ton horaire.", "bloc_supprime", ""))
             return
         dow = _dow(b.get("day_of_week"))
         detail = ""
@@ -537,13 +541,13 @@ class _Narrateur:
         elif n == 0:
             self.ajouter_fait(_Fait("Ton planning était déjà vide."))
         else:
-            texte = f"Ton planning est vidé : {pluriel(n, 'bloc archivé', 'blocs archivés')}"
+            texte = f"Ton planning est vidé : {pluriel(n, 'créneau archivé', 'créneaux archivés')}"
             if d.get("reversible"):
                 texte += ", tu peux les récupérer"
             self.ajouter_fait(_Fait(texte + "."))
 
     def _ok_skip_block_occurrence(self, a, d, p):
-        titre = _txt(d.get("title")) or _txt(p.get("title")) or "Ce bloc"
+        titre = _txt(d.get("title")) or _txt(p.get("title")) or "Ce créneau"
         iso = d.get("date") or p.get("date")
         quand = self.quand(iso)
         jour_date = _date(iso)
@@ -556,7 +560,7 @@ class _Narrateur:
         if d.get("restored") is False:
             self.dire_ecart(a, "rien_a_restaurer", {"titre": d.get("title"), "date": d.get("date")})
             return
-        titre = _txt(d.get("title")) or _txt(p.get("title")) or "Ce bloc"
+        titre = _txt(d.get("title")) or _txt(p.get("title")) or "Ce créneau"
         quand = self.quand(d.get("date") or p.get("date"))
         self.ajouter_fait(_Fait(f"{titre} est de retour {quand}.".replace(" .", "."),
                                 "occurrence_remise", titre))
@@ -731,7 +735,7 @@ class _Narrateur:
             self.ajouter_refus(self._phrase_saut(g))
 
     def _phrase_saut(self, g) -> str:
-        titre = g["titre"] or "ce bloc"
+        titre = g["titre"] or "ce créneau"
         le_jour = _le_jour(g["jours"])
         if g["motif"] == "doublon":
             texte = f"{titre} est déjà à ton horaire"
@@ -771,6 +775,11 @@ class _Narrateur:
         if motif == "heure_refusee":
             self.heure_refusee(a, demande)
             return
+        if motif == "choix_modele" and outil != "present_choices":
+            # Un ajout retenu par le code en attendant un choix (jour a
+            # choisir): la question le couvre, sinon une ligne d'attente.
+            self.retenue(a, demande)
+            return
         if d.get("needs_confirmation") or d.get("requires_confirmation"):
             objet = _objet_retenu(outil, _txt(p.get("title")))
             self.ajouter_refus(f"Je n'ai pas encore {objet} : il me faut ton accord d'abord.")
@@ -805,7 +814,7 @@ class _Narrateur:
 
         if outil == "update_block" and _dict(d.get("conflit")):
             c = _dict(d["conflit"])
-            titre = (_titre_demande(demande) if demande else "") or _txt(p.get("title")) or "ce bloc"
+            titre = (_titre_demande(demande) if demande else "") or _txt(p.get("title")) or "ce créneau"
             texte = f"Je n'ai pas modifié {titre}"
             if _txt(c.get("titre")):
                 texte += f" : ça tombe en même temps que {c['titre']}"
@@ -821,7 +830,7 @@ class _Narrateur:
             noms = [_txt(c.get("title")) for c in _dicts(d.get("candidates"))]
             quand = self.quand(p.get("date"))
             self.ajouter_refus(
-                f"Je n'ai rien pu {verbe} {quand} : il y a plusieurs blocs ce jour-là "
+                f"Je n'ai rien pu {verbe} {quand} : il y a plusieurs créneaux ce jour-là "
                 f"({_liste(noms)}), dis-moi lequel.".replace("  ", " "))
             return
 
@@ -956,21 +965,23 @@ def _objet_retenu(outil: str, titre: str) -> str:
     if outil == "cancel_scheduled_block":
         return f"annulé {titre}" if titre else "annulé cet événement"
     if outil == "update_block":
-        return f"arrêté {titre}" if titre else "arrêté ce bloc"
+        return f"arrêté {titre}" if titre else "arrêté ce créneau"
     if outil == "delete_task":
         return f"supprimé {titre}" if titre else "supprimé cette tâche"
     if outil == "optimize_week":
         return "appliqué le plan de la semaine"
-    return f"supprimé {titre}" if titre else "supprimé ce bloc"
+    if outil == "schedule_task_at":
+        return f"planifié {titre}" if titre else "planifié cet événement"
+    return f"supprimé {titre}" if titre else "supprimé ce créneau"
 
 
 _VERBES_ECHEC = {
-    "create_block": ("ajouter", "ce bloc"),
-    "update_block": ("modifier", "ce bloc"),
-    "delete_block": ("supprimer", "ce bloc"),
+    "create_block": ("ajouter", "ce créneau"),
+    "update_block": ("modifier", "ce créneau"),
+    "delete_block": ("supprimer", "ce créneau"),
     "clear_all_blocks": ("vider ton planning", ""),
-    "skip_block_occurrence": ("retirer", "ce bloc pour une fois"),
-    "restore_block_occurrence": ("remettre", "ce bloc"),
+    "skip_block_occurrence": ("retirer", "ce créneau pour une fois"),
+    "restore_block_occurrence": ("remettre", "ce créneau"),
     "create_task": ("ajouter", "cette tâche"),
     "update_task": ("modifier", "cette tâche"),
     "delete_task": ("supprimer", "cette tâche"),
@@ -1123,10 +1134,10 @@ def _recap_import(donnees: dict, auj: date) -> str:
         ) if m)
         titre = _txt(i.get("titre")) or "Un cours"
         verifier.append(f"{titre}{f' ({moment})' if moment else ''} n'est pas ajouté : "
-                        "il tombe en même temps qu'un bloc déjà en place.")
+                        "il tombe en même temps qu'un créneau déjà en place.")
     if en_attente:
         pronom = "le" if en_attente == 1 else "les"
-        verifier.append(f"{pluriel(en_attente, 'bloc lu', 'blocs lus')} avec un doute : "
+        verifier.append(f"{pluriel(en_attente, 'créneau lu', 'créneaux lus')} avec un doute : "
                         f"confirme-{pronom} dans ton planning.")
 
     texte = tete
@@ -1258,7 +1269,7 @@ def _rendre_jours(jours_data: list[tuple], sujet: str, dire_vides: bool) -> str:
                 ligne_sommeil = f"Sommeil : {plage(debut, fin)}"
 
     if total == 0:
-        tete = f"Rien de prévu {sujet[1]}." if dire_vides else f"Aucun bloc {sujet[1]}."
+        tete = f"Rien de prévu {sujet[1]}." if dire_vides else f"Rien {sujet[1]}."
         return tete + (f"\n\n{ligne_sommeil}" if ligne_sommeil else "")
 
     if len(jours_data) == 1 and not dire_vides:
@@ -1272,18 +1283,21 @@ def _rendre_jours(jours_data: list[tuple], sujet: str, dire_vides: bool) -> str:
             sections.append(ligne_sommeil)
         return "\n\n".join(sections)
 
-    tete = f"{sujet[0]} compte {pluriel(total, 'bloc')}"
+    # Pas de compte en tete: « Ton horaire compte 10 blocs » parlait la langue
+    # de l'outil (banc du 2026-09-14, s03-1, s04-1, s10-1bis). La tete dit ce
+    # qui aide a lire: la journee la plus chargee.
     # Une semaine datee dit « mardi »; un horaire recurrent dit « le mardi ».
     article = "" if dire_vides else "le "
+    tete = f"{sujet[0]}, jour par jour"
     charges = [(sum(_duree(i) for i in items), dow) for dow, items in visibles if items]
     if len(charges) > 1:
         maximum = max(c for c, _ in charges)
         plus = [dow for c, dow in charges if c == maximum and maximum > 0]
         if len(plus) == 1:
-            tete += f" : la journée la plus chargée est {article}{JOURS[plus[0]]}"
+            tete = f"{sujet[0]} : la journée la plus chargée est {article}{JOURS[plus[0]]}"
         elif len(plus) == 2:
-            tete += (f" : les plus chargées sont {article}{JOURS[plus[0]]} "
-                     f"et {article}{JOURS[plus[1]]}")
+            tete = (f"{sujet[0]} : les plus chargées sont {article}{JOURS[plus[0]]} "
+                    f"et {article}{JOURS[plus[1]]}")
     sections = [tete + "."]
 
     vides = []
@@ -1323,7 +1337,7 @@ def _lecture_horaire(d: dict, auj: date) -> str:
             "titre": _txt(b.get("title")), "debut": b.get("start_time"), "fin": b.get("end_time"),
             "sommeil": _ressemble_sommeil(_txt(b.get("title")), b.get("block_type"))})
     if not par_jour:
-        return "Aucun bloc à ton horaire pour l'instant." if "blocks" in d else ""
+        return "Rien à ton horaire pour l'instant." if "blocks" in d else ""
     jours_data = [(dow, par_jour[dow]) for dow in sorted(par_jour)]
     return _rendre_jours(jours_data, ("Ton horaire", "à ton horaire"), dire_vides=False)
 
@@ -1453,7 +1467,7 @@ def _question_portee_jour(demandes, auj):
     cibles = [_dict(d.get("cible")) for d in demandes]
     dows = {_dow_cible(c) for c in cibles}
     dates = {_date(c.get("date")) for c in cibles if _date(c.get("date"))}
-    nommes = _liste(titres) or "ce bloc"
+    nommes = _liste(titres) or "ce créneau"
     if len(dows) == 1 and None not in dows:
         j = JOURS[next(iter(dows))]
         date_txt = f" {_jour_mois(next(iter(dates)))}" if len(dates) == 1 else ""
@@ -1484,12 +1498,12 @@ def _objet_destructif(demande, auj) -> str:
         quand = _quand(cible.get("date"), auj)
         return f"annuler {titre or 'cet événement'}{' ' + quand if quand else ''}"
     if outil == "update_block":
-        return f"arrêter {titre}" if titre else "arrêter ce bloc"
+        return f"arrêter {titre}" if titre else "arrêter ce créneau"
     detail = ""
     dow = _dow_cible(cible)
     if dow is not None and _hm(cible.get("debut")) and _hm(cible.get("fin")):
         detail = f" ({_les_jours([dow])} de {plage(cible['debut'], cible['fin'])})"
-    return f"supprimer {titre}{detail}" if titre else "supprimer ce bloc"
+    return f"supprimer {titre}{detail}" if titre else "supprimer ce créneau"
 
 
 def _question_destructif(demandes, auj):

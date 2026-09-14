@@ -348,13 +348,21 @@ def date_visee(message_brut, dow_bloc: int, aujourdhui: date | None = None) -> d
 
 
 _RE_HEURE = re.compile(
-    r"(?<![\d:])([01]?\d|2[0-3])\s*(?:heures?|h)(?![a-z])\s*([0-5]\d)?(?!\d)"
+    # [ \t]* et non \s*: « 2026-09-17\nHeure du rendez-vous » se lisait 17:00.
+    r"(?<![\d:-])([01]?\d|2[0-3])[ \t]*(?:heures?|h)(?![a-z])[ \t]*([0-5]\d)?(?!\d)"
     r"|(?<![\d:])([01]?\d|2[0-3]):([0-5]\d)(?!\d)"
     r"|(?<![-\w])(midi|minuit)\b"
 )
 # « pour » n'en fait pas partie: « Va pour 11 h 50 » est la valeur d'une puce.
 _AVANT_DUREE = re.compile(r"(pendant|durant|dure|duree de)\s*$")
-_APRES_DUREE = re.compile(r"^\s*(de|d')\s")
+_APRES_DUREE = re.compile(r"^\s*(de\s|d'|par (jour|semaine|soir|seance)\b)")
+# Une reponse de formulaire « Durée: 1 h » ou « Temps d'étude total: 4 h »
+# donne une DUREE. Lue comme 01:00 ou 04:00, elle faisait retenir les ajouts
+# du formulaire d'etude (banc du 2026-09-14, s02-2). Le libelle se lit sur la
+# meme ligne, avant les deux-points.
+_LIBELLE_DUREE = re.compile(
+    r"(?:^|\n)[^\n:]*\b(dure\w*|temps|total\w*|combien|longueur|nombre d'heures|"
+    r"heures par|volume)\b[^\n:]*:\s*$")
 
 
 def heures_dites(message_brut) -> list[str]:
@@ -385,7 +393,7 @@ def heures_dites_positions(message_brut) -> list[tuple[str, int]]:
                     continue
             else:
                 h, mn = int(m.group(3)), int(m.group(4))
-            if _AVANT_DUREE.search(plat[:m.start()]):
+            if _AVANT_DUREE.search(plat[:m.start()]) or _LIBELLE_DUREE.search(plat[:m.start()]):
                 continue
             valeur = f"{h:02d}:{mn:02d}"
         sortie.append((valeur, m.start()))

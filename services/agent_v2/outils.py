@@ -828,6 +828,98 @@ def _date_passee(nom: str, kwargs: dict):
                  f"c'est le {aujourdhui.isoformat()}. Verifie le jour et l'annee, puis refais l'appel."))
 
 
+# --------------------------------------------------- echeance sans jour choisi
+
+_JOURS_RE = "lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche"
+_ECHEANCE = re.compile(
+    r"\b(avant|d'ici(?: a)?|au plus tard)\s+(?:(?:ce|le)\s+)?"
+    r"(" + _JOURS_RE + r"|demain|la fin de (?:la )?semaine|la fin de semaine)\b"
+    r"|\bdans la semaine\b")
+_MOIS_LONGS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août",
+               "septembre", "octobre", "novembre", "décembre"]
+MAX_JOURS_PROPOSES = 4
+
+
+def _jours_avant_echeance(m, aujourdhui: date) -> list[date]:
+    """Les jours candidats, aujourd'hui compris, jusqu'a l'echeance nommee.
+    « avant X » exclut X; « d'ici X » et « au plus tard X » l'incluent."""
+    if m.group(1) is None:  # « dans la semaine »
+        fin = aujourdhui + timedelta(days=6 - aujourdhui.weekday())
+        return [aujourdhui + timedelta(days=i) for i in range((fin - aujourdhui).days + 1)]
+    borne = m.group(2)
+    if borne == "demain":
+        echeance = aujourdhui + timedelta(days=1)
+    elif borne.startswith("la fin de"):
+        echeance = aujourdhui + timedelta(days=6 - aujourdhui.weekday())
+    else:
+        dow = _NOMS_JOURS.index(borne)
+        echeance = aujourdhui + timedelta(days=(dow - aujourdhui.weekday()) % 7 or 7)
+    inclus = m.group(1) != "avant"
+    derniere = echeance if inclus else echeance - timedelta(days=1)
+    return [aujourdhui + timedelta(days=i) for i in range((derniere - aujourdhui).days + 1)]
+
+
+def _jour_a_choisir(ctx: _Contexte, nom: str, kwargs: dict):
+    """schedule_task_at lance sur une echeance (« avant vendredi ») sans jour
+    choisi: le code retient l'appel et propose les jours libres.
+
+    Banc du 2026-09-14 (s09-1): AGIR a place la revision aujourd'hui en
+    trouvant la question « borderline ». La reponse depend du tirage du
+    modele; la garde la rend stable. Un message qui nomme un jour hors de
+    l'echeance (« mercredi avant vendredi »), ou une puce de choix, passe.
+    """
+    from services.scheduling.placement import open_intervals
+
+    if nom != "schedule_task_at":
+        return None
+    plat = dem.sans_accents(ctx.texte)
+    m = _ECHEANCE.search(plat)
+    if m is None:
+        return None
+    reste = plat[:m.start()] + " " + plat[m.end():]
+    if dem.jour_vise(reste):
+        return None
+    debut, fin = _heure_normale(kwargs.get("start_time")), _heure_normale(kwargs.get("end_time"))
+    duree = ((_minutes(fin) - _minutes(debut)) % (24 * 60)) if debut and fin else 60
+    duree = duree or 60
+    maintenant = timezone.localtime()
+    aujourdhui = timezone.localdate()
+    libres: list[date] = []
+    for jour in _jours_avant_echeance(m, aujourdhui):
+        plancher = maintenant.hour * 60 + maintenant.minute if jour == aujourdhui else 0
+        if any(min(b, 24 * 60) - max(a, plancher) >= duree
+               for a, b in open_intervals(ctx.user, jour, 0, 24 * 60)):
+            libres.append(jour)
+        if len(libres) == MAX_JOURS_PROPOSES:
+            break
+    if len(libres) < 2:
+        return None
+
+    titre = str(kwargs.get("title") or "").strip()
+    options = []
+    for jour in libres:
+        if jour == aujourdhui:
+            libelle, nomme = "Aujourd'hui", "aujourd'hui"
+        elif jour == aujourdhui + timedelta(days=1):
+            libelle, nomme = "Demain", "demain"
+        else:
+            nomme = f"{_NOMS_JOURS[jour.weekday()]} {jour.day} {_MOIS_LONGS[jour.month - 1]}"
+            libelle = nomme[0].upper() + nomme[1:]
+        valeur = f"Place {titre} {nomme}." if titre else f"Place-le {nomme}."
+        options.append({"label": libelle, "value": valeur, "cible": {"date": jour.isoformat()}})
+    question = (f"Quel jour veux-tu placer {titre} ?" if titre else "Quel jour te convient ?")
+    cle = "choix:" + hashlib.sha1(question.encode("utf-8")).hexdigest()[:12]
+    demande = dem.construire_demande(
+        "choix", "choix_modele", nom, dict(kwargs), {"titre": titre},
+        [{"id": f"o{rang}", "effet": None, "cible": o["cible"],
+          "libelle": o["label"], "valeur": o["value"]}
+         for rang, o in enumerate(options, start=1)],
+        cle)
+    demande["question"] = question
+    demande["source"] = "jours"
+    return ToolResult(success=False, data={"demande": demande}, message=MESSAGE_RETENUE)
+
+
 # ------------------------------------------------------- creations en masse
 
 def _crees_ce_tour(registre: Registre) -> tuple[int, list[str]]:
@@ -1093,6 +1185,8 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
                 issue = _refus_heure_armee(ctx, nom, kwargs, prep)
             if issue is None:
                 issue = _heure_dite_ignoree(ctx, nom, kwargs, prep)
+            if issue is None:
+                issue = _jour_a_choisir(ctx, nom, kwargs)
             if issue is None:
                 issue = _garde_creations(ctx, nom, kwargs)
         except Exception:  # noqa: BLE001

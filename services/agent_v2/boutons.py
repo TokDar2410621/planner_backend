@@ -89,15 +89,15 @@ def _fin_de_recurrence(attachment):
     # 2026-09-01: faux en nombre et muet sur les trois autres.
     apercu = ", ".join(titles[:3]) + ("…" if len(titles) > 3 else "")
     question = (
-        f"Tes {len(open_ended)} blocs importés ({apercu}) n'ont pas de "
+        f"Tes {len(open_ended)} activités importées ({apercu}) n'ont pas de "
         "date de fin pour l'instant : jusqu'à quand veux-tu les garder à "
         "l'horaire ?"
     )
     chips = [
         {"label": "🏁 Je te donne la date de fin",
-         "value": "Je vais te donner la date de fin pour ces blocs importés."},
+         "value": "Je vais te donner la date de fin pour ces activités importées."},
         {"label": "♾️ Pas de fin prévue",
-         "value": "Ces blocs importés n'ont pas de date de fin, garde-les tels quels."},
+         "value": "Ces activités importées n'ont pas de date de fin, garde-les telles quelles."},
     ]
     return question, chips
 

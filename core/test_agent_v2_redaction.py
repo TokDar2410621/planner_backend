@@ -195,3 +195,18 @@ class VocabulaireInterneTests(SimpleTestCase):
         self.assertEqual(compo.prose, "Tu es libre jeudi.")
         self.assertEqual(compo.question, "")
         self.assertEqual(compo.chips, [])
+
+    def test_bloc_et_formulaire_ne_partent_pas(self):
+        """Banc du 2026-09-14, round 2: s02-1, s03-2, s08-1, s10-1."""
+        from services.agent_v2.redaction import ReponseDire, composer
+
+        brut = ReponseDire(
+            ouverture="Remplis le formulaire et je m'occupe du reste.",
+            suite="Par contre, le bloc de sommeil chevauche ton quart. Samedi reste libre.")
+        compo = composer(brut, Registre(), "FAITS", None)
+        self.assertEqual(compo.prose, "Samedi reste libre.")
+        brut = ReponseDire(suite="Le bloc du soir est bien dégagé.",
+                           question="Lequel de tes blocs veux-tu déplacer ?",
+                           options=["Chimie", "Physique"])
+        compo = composer(brut, Registre(), "FAITS", None)
+        self.assertEqual((compo.prose, compo.question, compo.chips), ("", "", []))

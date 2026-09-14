@@ -793,7 +793,16 @@ class LectureDesReponsesTests(SimpleTestCase):
                '10h30 puis 14h': ['10:30', '14:00'], 'à 10:30': ['10:30'],
                'Va pour 11 h 50 à 12 h 50 jeu. 17 sept.': ['11:50', '12:50'],
                'planifie 2 h de lecture jeudi': [], 'pendant 1h30': [],
-               'rien à cette heure-là': []}
+               'rien à cette heure-là': [],
+               # Reponses de formulaire: une duree n'est pas une heure (banc s02-2).
+               "Voici mes réponses :\nTemps d'étude total: 4 h\nJours: Mar, Mer, Sam, Dim": [],
+               "Temps d'étude en plus: 4 h": [], 'Durée: 1 h': [], 'Durée : 1 h 30': [],
+               'Voici mes réponses :\nJours de gym: Lundi, Mercredi, Vendredi\nDurée: 1 h': [],
+               'Combien d\'heures: 3 h': [], '2 h par jour': [],
+               'Voici mes réponses :\nDate du rendez-vous: 2026-09-17\n'
+               'Heure du rendez-vous: 10:30 - 11:30': ['10:30', '11:30'],
+               'Voici mes réponses :\nJours: Mardi, Jeudi\nHoraire: 16:00 - 17:50':
+                   ['16:00', '17:50']}
         for brut, attendu in cas.items():
             with self.subTest(brut=brut):
                 self.assertEqual(dem.heures_dites(brut), attendu)
@@ -814,6 +823,49 @@ class LectureDesReponsesTests(SimpleTestCase):
         self.assertEqual(dem.date_visee('demain', 3, AUJOURDHUI), date(2026, 9, 17))
         # Lundi = jour 0: aujourd'hui compte.
         self.assertEqual(dem.date_visee('ce lundi', 0, AUJOURDHUI), AUJOURDHUI)
+
+
+class EcheanceSansJourTests(HarnaisGardes, TransactionTestCase):
+    """Banc du 2026-09-14, round 2 (s09-1): « place ma revision de chimie 2h
+    avant vendredi » a ete place aujourd'hui sans demander le jour."""
+
+    def test_echeance_sans_jour_propose_les_jours_libres(self):
+        brut = 'place ma revision de chimie 2h avant vendredi'
+        self.message_courant(brut)
+        registre, tools = self.outils(brut)
+        self.appeler(tools, 'schedule_task_at', title='Révision de chimie', date='2026-09-14',
+                     start_time='16:00', end_time='18:00')
+        refus = registre.actions[-1]
+        self.assertFalse(refus.succes)
+        demande = refus.donnees['demande']
+        self.assertEqual((demande['motif'], demande['source']), ('choix_modele', 'jours'))
+        self.assertEqual(demande['question'], 'Quel jour veux-tu placer Révision de chimie ?')
+        self.assertEqual([o['libelle'] for o in demande['options']],
+                         ["Aujourd'hui", 'Demain', 'Mercredi 16 septembre', 'Jeudi 17 septembre'])
+        self.assertEqual([o['cible']['date'] for o in demande['options']],
+                         ['2026-09-14', '2026-09-15', '2026-09-16', '2026-09-17'])
+        self.assertTrue(all(o['effet'] is None for o in demande['options']))
+        self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 0)
+
+        # Le tap sur une puce nomme le jour: l'ajout passe.
+        valeur = demande['options'][2]['valeur']
+        self.assertEqual(valeur, 'Place Révision de chimie mercredi 16 septembre.')
+        self.message_courant(valeur)
+        registre, tools = self.outils(valeur, tache='u:2')
+        self.appeler(tools, 'schedule_task_at', title='Révision de chimie', date='2026-09-16',
+                     start_time='16:00', end_time='18:00')
+        self.assertTrue(registre.actions[-1].succes, registre.actions[-1].donnees)
+
+    def test_un_jour_nomme_ou_sans_echeance_passe(self):
+        for i, brut in enumerate(('place ma révision mercredi avant vendredi',
+                                  "d'ici jeudi, mets ma lecture demain",
+                                  'place ma révision mercredi')):
+            with self.subTest(brut=brut):
+                self.message_courant(brut)
+                registre, tools = self.outils(brut, tache=f'u:{i}')
+                self.appeler(tools, 'schedule_task_at', title=f'Révision {i}', date='2026-09-16',
+                             start_time=f'{9 + 2 * i}:00', end_time=f'{10 + 2 * i}:00')
+                self.assertTrue(registre.actions[-1].succes, registre.actions[-1].donnees)
 
 
 class ContournementsDeLaRevueTests(HarnaisGardes, TransactionTestCase):
@@ -872,6 +924,21 @@ class ContournementsDeLaRevueTests(HarnaisGardes, TransactionTestCase):
         self.assertEqual(demande['cible']['debut'], '10:30')
         self.assertTrue(any(o['id'].startswith('creneau_') for o in demande['options']))
         self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 0)
+
+    def test_duree_de_formulaire_ne_retient_pas_les_ajouts(self):
+        """Banc du 2026-09-14 (s02-2): « Temps d'étude total: 4 h » etait lu
+        comme 04:00 et les quatre evenements d'etude etaient retenus."""
+        cas = ("Voici mes réponses :\nTemps d'étude total: 4 h\nJours: Mar, Mer, Sam, Dim",
+               'Voici mes réponses :\nDurée: 1 h\nÉtude: mardi')
+        for i, brut in enumerate(cas):
+            with self.subTest(brut=brut):
+                self.message_courant(brut)
+                registre, tools = self.outils(brut, tache=f'u:{i}')
+                self.appeler(tools, 'schedule_task_at', title=f'Étude {i + 1}', date='2026-09-15',
+                             start_time=f'{16 + i}:00', end_time=f'{17 + i}:00')
+                self.assertTrue(registre.actions[-1].succes, registre.actions[-1].donnees)
+                self.assertNotIn('heure_dite', registre.actions[-1].donnees)
+        self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 2)
 
     def test_heure_dite_libre_mais_ignoree_est_reessayee(self):
         brut = 'ajoute le dentiste jeudi à 15 h'

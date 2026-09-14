@@ -217,10 +217,10 @@ class ComposerTests(SimpleTestCase):
 
     def test_sans_faits_les_annonces_vides_tombent(self):
         brut = ReponseDire(ouverture="Tu as 3 créneaux libres, que voici.",
-                           suite="Je peux ajouter un bloc si tu veux.")
+                           suite="Je peux ajouter une séance si tu veux.")
         compo = composer(brut, Registre(), "", None)
         self.assertNotIn("voici", compo.prose)
-        self.assertEqual(compo.prose, "Je peux ajouter un bloc si tu veux.")
+        self.assertEqual(compo.prose, "Je peux ajouter une séance si tu veux.")
         self.assertTrue(compo.lecture_sans_liste)
 
     def test_avec_faits_l_annonce_reste(self):
