@@ -30,6 +30,15 @@ appris, et que cette version encode:
 - le detecteur travaille PAR PHRASE, comme la guillotine: normaliser le
   champ entier faisait matcher « Je vais bien. Organiser ta semaine est mon
   travail. » a cheval sur deux phrases.
+
+Le 2026-09-14, l'enquete « l'agent ne demande pas » a montre l'autre face:
+la regle « resultat » restait active dans les questions et tuait de vraies
+clarifications (« Ton cours est place a quelle heure ? »), la regle du
+present tuait « Dis-moi a quelle heure commence ton quart et je le cree. »,
+et la regle de l'orphelin emportait la question suivante. `fuite_question`
+tranche desormais les phrases qui finissent par « ? », les champs question
+et options: une premiere personne au passe reste toujours une fuite, un
+participe de mutation n'en est une que sans marque interrogative ni offre.
 """
 from __future__ import annotations
 
@@ -107,6 +116,52 @@ _REGLES_D_INTENTION = {"futur", "present", "prise_en_charge", "passe_recent"}
 _MARQUE_OFFRE = re.compile(
     r"\b(?:veux|voudrais|souhaites?|aimerais|peux|pourrais|dois|devrais)\s*-?\s*(?:tu|je|on)\b"
     r"|\bque\s+j(?:e\b|\s*')")
+# Clarification conditionnelle: « Dis-moi a quelle heure commence ton quart
+# et je le cree. » L'action est suspendue a la reponse, ce n'est pas une
+# affirmation. Seules les regles d'INTENTION se taisent, comme pour une offre.
+_CONDITIONNELLE = re.compile(
+    r"^(?:et\s+|alors\s+|sinon\s+)?(?:dis|donne|indique|precise|confirme)\s+moi\b.*\bet\s+je\b")
+
+# ── Questions ────────────────────────────────────────────────────────────
+# Une premiere personne au passe ou en cours est une fuite PARTOUT, question
+# comprise: « Tu gardes le bloc Gym que j'ai ajoute ? » affirme l'ajout.
+_PREMIERE_PERSONNE = re.compile(
+    r"(?<![a-z])(?:j'ai|je\s+t'ai|que\s+j'ai|je\s+viens\s+de|j'ai\s+deja|c'est\s+fait|voila\s+qui\s+est)\b")
+# « j'ai besoin de », « j'ai une question »: aucune action, on les neutralise
+# avant la recherche pour ne pas tuer une clarification ordinaire.
+_PREMIERE_PERSONNE_NEUTRE = re.compile(
+    r"(?<![a-z])j'ai\s+(?=besoin\s+d|une\s+(?:petite\s+|derniere\s+)?question|un\s+doute)")
+
+# Marques qui font d'une proposition une vraie question sur l'etat du monde:
+# « Ton cours est place a quelle heure ? », « annule ou juste decale ? ».
+_MARQUE_INTERROGATIVE = re.compile(
+    r"\b(?:(?:quel|quelle|quels|quelles|quand|combien|lequel|laquelle|lesquels|lesquelles"
+    r"|ou|comment|pourquoi)\b|a\s+quelle\s+heure\b|pour\s+quel|est\s+ce\s+qu)")
+_OFFRE_EN_TETE = re.compile(
+    r"^(?:et\s+|alors\s+|sinon\s+|ou\s+|donc\s+)?"
+    r"(?:veux\s+tu|tu\s+veux|voudrais\s+tu|souhaites\s+tu|preferes\s+tu|je\s+peux|est\s+ce\s+que\s+je)\b"
+    r"|" + _CONDITIONNELLE.pattern)
+
+# Participe NU d'une mutation, sans auxiliaire: « Ton cours deplace a 14 h te
+# convient ? ». Liste plus etroite que _RACINES: « programme », « vide »,
+# « complete » ou « change » sont aussi des noms et des adjectifs courants.
+_RACINES_PARTICIPE_NU = (
+    "deplac", "replac", "plac", "ajout", "supprim", "cre", "reorganis", "organis",
+    "annul", "effac", "modifi", "planifi", "decal", "boug", "retir", "enlev",
+    "restaur", "optimis", "configur", "cal",
+)
+_PARTICIPE_NU = re.compile(
+    r"(?<![a-z'])(?:%s)(?:e|ee|es|ees)\b" % "|".join(_RACINES_PARTICIPE_NU))
+# Un mot qui precede un verbe conjugue ou un nom, pas un participe:
+# « je le place », « que je deplace », « une place », « des places ».
+_AVANT_VERBE_OU_NOM = {
+    "je", "tu", "il", "elle", "on", "nous", "vous", "ils", "elles",
+    "le", "la", "les", "y", "en", "me", "te", "se", "lui", "leur", "ne",
+    "un", "une", "des", "de", "du", "ta", "ma", "sa", "ton", "mon", "son",
+    "tes", "mes", "ses", "ce", "cet", "cette", "ces", "notre", "votre", "leurs",
+}
+_CLAUSE = re.compile(r"[,;:]")
+_FIN_QUESTION = re.compile(r"\?[\s\"'»)\]]*$")
 
 _APOSTROPHES = str.maketrans({
     "‘": "'",
@@ -142,7 +197,11 @@ def _fuites_d_une_phrase(phrase: str) -> list[str]:
     plat = _normaliser(phrase)
     if not plat.strip():
         return []
-    interrogative = "?" in plat or bool(_MARQUE_OFFRE.search(plat))
+    interrogative = (
+        "?" in plat
+        or bool(_MARQUE_OFFRE.search(plat))
+        or bool(_CONDITIONNELLE.match(plat.strip()))
+    )
     sans_marque = plat.replace("?", " ")
     fuites = []
     for nom, regle in _REGLES:
@@ -153,6 +212,83 @@ def _fuites_d_une_phrase(phrase: str) -> list[str]:
     if _NOMINALE.match(sans_marque.strip()):
         fuites.append("nominale")
     return fuites
+
+
+def _participe_nu(clause: str) -> bool:
+    """Un participe de mutation qui n'est ni un verbe conjugue ni un nom."""
+    for trouve in _PARTICIPE_NU.finditer(clause):
+        avant = clause[:trouve.start()].split()
+        if not avant or avant[-1] not in _AVANT_VERBE_OU_NOM:
+            return True
+    return False
+
+
+def _resultat_sans_marque(phrase: str) -> bool:
+    """La regle « resultat », clause par clause, exemptee par une vraie
+    marque interrogative ou une offre en tete de clause.
+
+    Le decoupage se fait sur la phrase BRUTE: _normaliser efface les
+    virgules, et « Ton cours deplace, ou autre chose ? » passait entier grace
+    au « ou » de la seconde clause.
+    """
+    regle_resultat = dict(_REGLES)["resultat"]
+    for brute in _CLAUSE.split(phrase):
+        clause = " ".join(_normaliser(brute).replace("?", " ").split())
+        if not clause:
+            continue
+        if not (regle_resultat.search(clause) or _participe_nu(clause)):
+            continue
+        if _MARQUE_INTERROGATIVE.search(clause) or _OFFRE_EN_TETE.match(clause):
+            continue
+        return True
+    return False
+
+
+def fuite_question(texte) -> list[str]:
+    """Les regles qui fuient dans une question, un champ question ou une
+    option. [] veut dire propre.
+
+    - « premiere_personne »: j'ai, je t'ai, que j'ai, je viens de, c'est
+      fait, voila qui est. Toujours une fuite, meme dans une question.
+    - toute la guillotine existante, phrase par phrase (une phrase qui ne
+      finit pas par « ? » garde ses regles d'intention);
+    - « resultat » (passif ou participe nu d'une mutation), SAUF dans une
+      clause qui porte une marque interrogative (quel, quand, ou, a quelle
+      heure, est-ce que...) ou qui commence par une offre (veux-tu, tu veux,
+      je peux, dis-moi ... et je).
+    """
+    if not texte or not isinstance(texte, str):
+        return []
+    fuites: list[str] = []
+
+    def _noter(nom: str) -> None:
+        if nom not in fuites:
+            fuites.append(nom)
+
+    for phrase in _phrases(texte):
+        plat = _normaliser(phrase)
+        if not plat.strip():
+            continue
+        if _PREMIERE_PERSONNE.search(_PREMIERE_PERSONNE_NEUTRE.sub("il faut ", plat)):
+            _noter("premiere_personne")
+        for nom in _fuites_d_une_phrase(phrase):
+            if nom != "resultat":
+                _noter(nom)
+        if _resultat_sans_marque(phrase):
+            _noter("resultat")
+    return fuites
+
+
+def _finit_par_question(phrase: str) -> bool:
+    return bool(_FIN_QUESTION.search(phrase or ""))
+
+
+def _fuites_de_prose(phrase: str) -> list[str]:
+    """Le meme arbitre pour le detecteur et la guillotine: une phrase qui
+    finit par « ? » passe par fuite_question, les autres par la guillotine."""
+    if _finit_par_question(phrase):
+        return fuite_question(phrase)
+    return _fuites_d_une_phrase(phrase)
 
 
 def fuite_lexicale(texte) -> list[str]:
@@ -166,53 +302,95 @@ def fuite_lexicale(texte) -> list[str]:
         return []
     fuites: list[str] = []
     for phrase in _phrases(texte):
-        for f in _fuites_d_une_phrase(phrase):
+        for f in _fuites_de_prose(phrase):
             if f not in fuites:
                 fuites.append(f)
     return fuites
 
 
 # Un fragment orphelin qui suivait une phrase supprimee: « ... si tu
-# confirmes, bien sur. » sans sa principale. On le supprime avec elle.
+# confirmes, bien sur. » sans sa principale. On le supprime avec elle. Une
+# question n'est JAMAIS un orphelin: « Et pour la duree, 1 h te va ? » tient
+# debout seule.
 _ORPHELIN = re.compile(
     r"^(?:si|et|mais|donc|car|ou|puis|alors|ensuite|sinon|comme)\b", re.IGNORECASE)
+
+
+def _champs_du_schema(reponse) -> dict:
+    return getattr(type(reponse), "model_fields", None) or {}
 
 
 def epurer_reponse(reponse: ReponseDire) -> tuple[ReponseDire, int]:
     """Retire de la prose toute phrase qui affirme une action.
 
-    Rend la reponse epuree et le nombre de phrases supprimees. Ne touche pas
-    aux actions structurees: elles ont leur propre garde (les references
+    Rend la reponse epuree et le nombre d'elements supprimes: phrases de
+    ouverture et suite, question, options. Une question qui fuit emporte ses
+    options avec elle; une option qui fuit part seule. question et options ne
+    sont traites que s'ils existent dans le schema de la reponse. Ne touche
+    pas aux actions structurees: elles ont leur propre garde (les references
     inconnues meurent dans assembler).
     """
+    schema = _champs_du_schema(reponse)
     supprimees = 0
-    champs: dict[str, str] = {}
+    champs: dict = {}
     for champ in ("ouverture", "suite"):
         gardees: list[str] = []
         precedente_supprimee = False
+        coupees = 0
         for phrase in _phrases(getattr(reponse, champ, "") or ""):
             nette = phrase.strip()
-            if _fuites_d_une_phrase(nette):
-                supprimees += 1
+            if _fuites_de_prose(nette):
+                coupees += 1
                 precedente_supprimee = True
                 continue
-            if precedente_supprimee and _ORPHELIN.match(nette):
+            if (precedente_supprimee and _ORPHELIN.match(nette)
+                    and not _finit_par_question(nette)):
                 # Subordonnee detachee par « ... »: seule, elle n'a plus de
                 # tete et mutile la voix davantage qu'elle ne la sert.
-                supprimees += 1
+                coupees += 1
                 continue
             precedente_supprimee = False
             gardees.append(nette)
-        champs[champ] = " ".join(gardees)
+        if coupees:
+            supprimees += coupees
+            champs[champ] = " ".join(gardees)
+
+    if "question" in schema:
+        question = getattr(reponse, "question", "") or ""
+        if question.strip() and fuite_question(question):
+            supprimees += 1
+            champs["question"] = ""
+            if "options" in schema and getattr(reponse, "options", None):
+                champs["options"] = []
+    if "options" in schema and "options" not in champs:
+        options = list(getattr(reponse, "options", None) or [])
+        gardees_opt = [o for o in options
+                       if not (isinstance(o, str) and fuite_question(o))]
+        if len(gardees_opt) != len(options):
+            supprimees += len(options) - len(gardees_opt)
+            champs["options"] = gardees_opt
+
     if not supprimees:
         return reponse, 0
     return reponse.model_copy(update=champs), supprimees
 
 
 def fuites_reponse(reponse: ReponseDire) -> list[str]:
-    """Observe seulement ouverture et suite, pas les actions structurees."""
+    """Observe ouverture, suite, question et options (ces deux-la seulement
+    s'ils existent dans le schema), pas les actions structurees."""
+    schema = _champs_du_schema(reponse)
     fuites: list[str] = []
     for champ in ("ouverture", "suite"):
         for fuite in fuite_lexicale(getattr(reponse, champ, "")):
             fuites.append(f"{champ}:{fuite}")
+    if "question" in schema:
+        for fuite in fuite_question(getattr(reponse, "question", "") or ""):
+            fuites.append(f"question:{fuite}")
+    if "options" in schema:
+        vues: list[str] = []
+        for option in getattr(reponse, "options", None) or []:
+            for fuite in fuite_question(option):
+                if fuite not in vues:
+                    vues.append(fuite)
+        fuites.extend(f"options:{fuite}" for fuite in vues)
     return fuites

@@ -153,3 +153,138 @@ class CorpusAdversarialTests(SimpleTestCase):
         epuree, n = epurer_reponse(r)
         self.assertEqual(epuree.ouverture, "")
         self.assertEqual(n, 2)
+
+
+class ReponseAvecQuestion(ReponseDire):
+    """Le schema de DIRE avec ses champs question et options (lot 3d). Tant que
+    redaction.py ne les porte pas, ce sous-modele les simule; une fois fusionne,
+    il ne fait que redeclarer les memes champs."""
+
+    question: str = ""
+    options: list[str] = []
+
+
+class QuestionsDeClarificationTests(SimpleTestCase):
+    """L'enquete du 2026-09-14: la guillotine tuait de vraies questions.
+
+    La regle « resultat » restait active dans les phrases interrogatives, la
+    regle du present tuait les clarifications conditionnelles, et l'orphelin
+    emportait la question qui suivait une phrase supprimee. Ces questions
+    doivent passer, sans rouvrir le canal des affirmations d'action.
+    """
+
+    GARDEES = [
+        "Ton cours est placé à quelle heure ?",
+        "Est-ce que ton horaire a changé cette session ?",
+        "Le quart de jeudi est annulé ou juste décalé ?",
+        "Dis-moi à quelle heure commence ton quart et je le crée.",
+        "Pour quelle journée ?",
+        "Tu veux que je le mette à quelle heure ?",
+        # Offres au present et verbes conjugues: pas des participes.
+        "Je le cale samedi à 10 h ?",
+        "Tu préfères que je le place à 19 h ?",
+        "Tu veux que je supprime toute la série, ou seulement ce jeudi ?",
+        # Noms qui ressemblent a des participes.
+        "Il te reste une place jeudi ?",
+        "Ton programme de la semaine te convient ?",
+        "J'ai besoin de savoir : tu commences à quelle heure ?",
+    ]
+
+    COUPEES = [
+        "J'ai déplacé ton cours.",
+        "Ton planning a été réorganisé, autre chose ?",
+        "C'est fait !",
+        "Je vais supprimer tes blocs.",
+        "Planning mis à jour !",
+        "Ton cours déplacé à 14 h te convient ?",
+        "Tu gardes le bloc Gym que j'ai ajouté ?",
+        "Ton cours a été déplacé ?",
+        # Le « ou » d'une autre clause n'excuse pas le participe.
+        "Ton cours déplacé, ou autre chose ?",
+        "Voilà qui est réglé, autre chose ?",
+        "Je viens de caler ta révision, ça te va ?",
+        "Je t'ai trouvé un créneau, il te va ?",
+    ]
+
+    def test_les_clarifications_survivent_intactes(self):
+        for phrase in self.GARDEES:
+            with self.subTest(phrase=phrase):
+                r = ReponseDire(suite=phrase)
+                epuree, n = epurer_reponse(r)
+                self.assertEqual(n, 0, f"tuee a tort: {phrase!r}")
+                self.assertEqual(epuree.suite, phrase)
+                self.assertEqual(fuites_reponse(r), [])
+
+    def test_la_guillotine_reste_intacte(self):
+        for phrase in self.COUPEES:
+            with self.subTest(phrase=phrase):
+                r = ReponseDire(suite=phrase)
+                epuree, n = epurer_reponse(r)
+                self.assertGreaterEqual(n, 1, f"passe encore: {phrase!r}")
+                self.assertEqual(epuree.suite, "")
+                self.assertTrue(fuites_reponse(r))
+
+    def test_une_question_n_est_jamais_un_orphelin(self):
+        r = ReponseDire(suite="J'ai déplacé ton cours. Et pour la durée, 1 h te va ?")
+        epuree, n = epurer_reponse(r)
+        self.assertEqual(epuree.suite, "Et pour la durée, 1 h te va ?")
+        self.assertEqual(n, 1)
+
+    def test_la_conditionnelle_n_excuse_pas_le_passe(self):
+        r = ReponseDire(suite="Dis-moi si ça te va et je te dis que j'ai déjà déplacé ton cours.")
+        _, n = epurer_reponse(r)
+        self.assertEqual(n, 1)
+
+    def test_fuite_question(self):
+        from services.agent_v2.mesure import fuite_question
+        self.assertEqual(
+            fuite_question("Tu veux que je supprime toute la série, ou seulement ce jeudi ?"), [])
+        self.assertNotEqual(fuite_question("Tu gardes le bloc que j'ai ajouté ?"), [])
+        self.assertIn("premiere_personne", fuite_question("J'ai supprimé tes blocs, lequel remettre ?"))
+        self.assertIn("resultat", fuite_question("Ton cours a été déplacé ?"))
+        for vide in ("", None, 12):
+            self.assertEqual(fuite_question(vide), [])
+
+    def test_les_options_de_reponse_sont_propres(self):
+        from services.agent_v2.mesure import fuite_question
+        for option in ("19 h", "13 h à 14 h", "Tous les jeudis (supprimer la série).",
+                       "Seulement ce jeudi 17 sept. (sauter l'occurrence).",
+                       "Oui, je confirme.", "Calcul différentiel", "Non, ne change rien."):
+            with self.subTest(option=option):
+                self.assertEqual(fuite_question(option), [])
+        for option in ("J'ai tout effacé", "Cours déplacé", "Bloc Gym ajouté", "C'est fait"):
+            with self.subTest(option=option):
+                self.assertNotEqual(fuite_question(option), [])
+
+    def test_question_et_options_filtrees(self):
+        r = ReponseAvecQuestion(question="J'ai supprimé tes blocs, autre chose ?",
+                                options=["Oui", "Non"])
+        fuites = fuites_reponse(r)
+        self.assertTrue(any(f.startswith("question:") for f in fuites), fuites)
+        epuree, n = epurer_reponse(r)
+        self.assertEqual(epuree.question, "")
+        self.assertEqual(epuree.options, [])
+        self.assertEqual(n, 1)
+
+        r = ReponseAvecQuestion(question="À quelle heure commence ton quart ?",
+                                options=["J'ai tout effacé", "19 h", "22 h"])
+        self.assertIn("options:premiere_personne", fuites_reponse(r))
+        epuree, n = epurer_reponse(r)
+        self.assertEqual(epuree.question, "À quelle heure commence ton quart ?")
+        self.assertEqual(epuree.options, ["19 h", "22 h"])
+        self.assertEqual(n, 1)
+
+    def test_une_question_propre_rend_l_objet_intact(self):
+        r = ReponseAvecQuestion(ouverture="Pas de trouble.",
+                                question="Ton rendez-vous est à quelle heure ?",
+                                options=["9 h", "14 h"])
+        epuree, n = epurer_reponse(r)
+        self.assertEqual(n, 0)
+        self.assertIs(epuree, r)
+        self.assertEqual(fuites_reponse(r), [])
+
+    def test_sans_champ_question_le_schema_actuel_est_respecte(self):
+        """question et options ne sont lus que s'ils existent dans le schema."""
+        r = ReponseDire(ouverture="Salut.")
+        self.assertEqual(fuites_reponse(r), [])
+        self.assertIs(epurer_reponse(r)[0], r)
