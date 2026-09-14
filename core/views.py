@@ -1,16 +1,23 @@
 """
 API Views for Planner AI backend.
 """
+import concurrent.futures
 import json
 import logging
+import queue
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
+from typing import AsyncGenerator, Iterator
 
 from asgiref.sync import sync_to_async
+from django.conf import settings
 from django.contrib.auth import authenticate
 from django.http import StreamingHttpResponse
 from django.contrib.auth.models import User
 from django.core.exceptions import ImproperlyConfigured, ValidationError
-from django.db import transaction
+from django.db import close_old_connections, transaction
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -818,6 +825,165 @@ def _create_chat_attachment(request, attachment_file):
     return doc, None
 
 
+# ============== Flux de chat detache ==============
+#
+# UN TOUR SE TERMINE COTE SERVEUR, que le client reste ou non.
+#
+# Avant, la vue pompait le generateur de l'agent pas a pas depuis la boucle
+# asynchrone: quand le client partait (onglet ferme, reseau coupe, app mise en
+# arriere-plan), Django annulait la reponse et plus personne ne demandait
+# l'element suivant. Le tour s'arretait la ou il en etait: des outils avaient
+# deja ecrit, mais ni message de l'assistant ni ligne de tour n'etaient
+# sauves. En production, 12 messages utilisateur sur 138 sont restes sans
+# reponse de cette facon.
+#
+# Le generateur tourne maintenant dans un thread du pool qui le draine
+# JUSQU'AU BOUT et depose chaque trame dans une file. La boucle asynchrone ne
+# fait que lire la file: si elle est annulee, seul le lecteur disparait.
+#
+# POOL REUTILISE, jamais un threading.Thread par requete: services/agent_v2/
+# agent.py (_POOL_AGIR) documente un blocage silencieux au deuxieme tour d'un
+# meme processus avec des threads neufs.
+_POOL_FLUX = ThreadPoolExecutor(
+    max_workers=getattr(settings, 'CHAT_STREAM_THREADS', 8),
+    thread_name_prefix='flux',
+)
+
+# La lecture attend par tranches: un get() sans delai bloquerait un thread de
+# l'executeur pour toujours si le drain mourait sans poser sa sentinelle, et
+# une annulation devrait attendre la fin de ce get() pour aboutir.
+ATTENTE_FLUX = 0.5
+
+# Au-dela, un drain qui n'a pas demarre attend une place dans le pool: on le
+# dit plutot que de laisser trois points muets.
+DELAI_STATUT_ATTENTE = 1.0
+STATUT_ATTENTE = {
+    'type': 'status',
+    'text': 'Un instant, je termine une autre demande...',
+}
+
+# Octet pour octet la trame d'erreur d'avant le drain detache (json.dumps
+# sans ensure_ascii=False, le texte est en ASCII).
+TRAME_ERREUR = "data: " + json.dumps({
+    'type': 'error',
+    'error': 'Erreur interne lors du traitement du message.',
+}) + "\n\n"
+
+_FIN_FLUX = object()
+
+
+def _trame(evenement) -> str:
+    # default=str: un evenement non serialisable ne doit pas interrompre le
+    # drain, sinon le tour s'arreterait avant de sauver sa reponse. Pour tout
+    # evenement serialisable, les octets sont identiques a ceux d'avant.
+    return f"data: {json.dumps(evenement, ensure_ascii=False, default=str)}\n\n"
+
+
+def _journaliser_fin_abandon(user_id, etat) -> None:
+    logger.info(
+        'tour abandonne termine user=%s evenements=%d done=%s',
+        user_id, etat['evenements'], etat['done'],
+    )
+
+
+def lancer_flux(
+    evenements: Iterator[dict], user_id: int,
+) -> tuple[AsyncGenerator[str, None], concurrent.futures.Future]:
+    """Draine `evenements` dans le pool et rend (lecteur asynchrone, futur).
+
+    Le drain part des l'appel, pas a la premiere lecture: un client qui coupe
+    avant meme de lire ne doit pas empecher le tour d'aboutir. Le lecteur rend
+    des trames SSE `data: {json}\\n\\n`. Le futur se termine quand le
+    generateur est epuise (ou en panne), que le lecteur soit encore la ou non.
+    """
+    file: queue.Queue = queue.Queue()  # sans borne: le drain n'attend jamais le client
+    verrou = threading.Lock()
+    etat = {
+        'demarre': False,
+        'abandonne': False,
+        'fini': False,
+        'evenements': 0,
+        'done': False,
+        'outils': [],  # (nom, ok) des evenements tool, dans l'ordre
+    }
+
+    def drainer():
+        etat['demarre'] = True
+        # Ce thread vit hors du cycle de requete Django, qui ferme les
+        # connexions: on s'en charge des deux cotes.
+        close_old_connections()
+        try:
+            for evenement in evenements:
+                if isinstance(evenement, dict):
+                    genre = evenement.get('type')
+                    if genre == 'tool':
+                        etat['outils'].append(
+                            (str(evenement.get('name') or ''), bool(evenement.get('ok'))))
+                    elif genre == 'done':
+                        etat['done'] = True
+                etat['evenements'] += 1
+                file.put(_trame(evenement))
+        except Exception as e:  # noqa: BLE001 - never leak internals into the stream
+            logger.error(f"PlannerAgent stream error: {e}", exc_info=True)
+            file.put(TRAME_ERREUR)
+        finally:
+            file.put(_FIN_FLUX)
+            close_old_connections()
+            # Le verrou garantit UNE seule ligne « termine » par abandon, que
+            # le client parte avant ou apres la fin du drain.
+            with verrou:
+                etat['fini'] = True
+                abandonne = etat['abandonne']
+            if abandonne:
+                _journaliser_fin_abandon(user_id, etat)
+
+    futur = _POOL_FLUX.submit(drainer)
+
+    async def lire():
+        prendre = sync_to_async(
+            lambda: file.get(timeout=ATTENTE_FLUX), thread_sensitive=False)
+        debut = time.monotonic()
+        fin_lue = False
+        deja_emis = False
+        try:
+            while True:
+                try:
+                    morceau = await prendre()
+                except queue.Empty:
+                    if futur.done() and file.empty():
+                        # Drain termine sans sentinelle lisible (futur annule
+                        # avant de demarrer): rien d'autre ne viendra.
+                        fin_lue = True
+                        return
+                    if (not deja_emis and not etat['demarre']
+                            and time.monotonic() - debut >= DELAI_STATUT_ATTENTE):
+                        deja_emis = True
+                        yield _trame(STATUT_ATTENTE)
+                    continue
+                if morceau is _FIN_FLUX:
+                    fin_lue = True
+                    return
+                deja_emis = True
+                yield morceau
+        finally:
+            # Couvre aclose() (GeneratorExit sur un yield) et l'annulation
+            # (CancelledError leve dans l'attente du get). Aucun await ici.
+            if not fin_lue:
+                with verrou:
+                    etat['abandonne'] = True
+                    deja_fini = etat['fini']
+                outils = list(etat['outils'])
+                logger.warning(
+                    'tour abandonne user=%s outils=%d ok=%d noms=%s',
+                    user_id, len(outils), sum(1 for _, ok in outils if ok),
+                    ','.join(nom for nom, _ in outils) or '-',
+                )
+                if deja_fini:
+                    _journaliser_fin_abandon(user_id, etat)
+
+    return lire(), futur
+
+
 class ChatView(APIView):
     """Chat endpoint for conversational AI."""
 
@@ -884,6 +1050,12 @@ class ChatView(APIView):
             response_data['blocks_created'] = result['blocks_created']
         if result.get('tasks_created'):
             response_data['tasks_created'] = result['tasks_created']
+        # Relayes des qu'ils sont presents, meme faux ou vides: une question
+        # vide est celle d'un formulaire, et le client doit savoir qu'une
+        # question a ete posee pour ne pas demander de suggestions par-dessus.
+        for cle in ('question_posee', 'question', 'question_motif'):
+            if cle in result:
+                response_data[cle] = result[cle]
 
         return Response(response_data)
 
@@ -900,6 +1072,21 @@ class ChatQuickRepliesView(APIView):
         denied = ai_consent_denied(request.user)
         if denied is not None:
             return denied
+        # Import local, comme _agent_pour: le paquet agent_v2 ne se charge
+        # que si une vue en a besoin.
+        from services.agent_v2.suggestions import (filtrer_suggestions,
+                                                   tour_a_pose_une_question)
+
+        # Le tour vient de poser une question: des suggestions generiques
+        # sous ses choix brouilleraient la reponse attendue. Pas d'appel au
+        # modele du tout.
+        try:
+            if tour_a_pose_une_question(request.user):
+                return Response({'quick_replies': []})
+        except Exception as e:  # noqa: BLE001 - suggestions never fail the client
+            logger.debug("quick-replies question check error: %s", e, exc_info=True)
+            return Response({'quick_replies': []})
+
         message = request.data.get('message', '') or ''
         response_text = request.data.get('response', '') or ''
         try:
@@ -909,7 +1096,9 @@ class ChatQuickRepliesView(APIView):
         except Exception as e:  # noqa: BLE001 - suggestions never fail the client
             logger.debug("quick-replies endpoint error: %s", e, exc_info=True)
             replies = []
-        return Response({'quick_replies': replies or []})
+        # Jamais destructives: ces suggestions ne passent par aucune garde,
+        # un tap enverrait une suppression que l'utilisateur n'a pas formulee.
+        return Response({'quick_replies': filtrer_suggestions(replies or [])})
 
 
 class DailyBriefView(APIView):
@@ -932,6 +1121,8 @@ class ChatStreamView(APIView):
     `response` fait autorité (le client remplace la bulle par done.response).
     Quick replies: jamais inline ici, le client passe par /chat/quick-replies/.
     Le front retombe sur /chat/ classique si ce flux échoue.
+    Le tour tourne dans un drain detache (lancer_flux): il se termine et se
+    sauve meme si le client se deconnecte en cours de route.
     """
 
     parser_classes = [MultiPartParser, FormParser]
@@ -955,24 +1146,19 @@ class ChatStreamView(APIView):
         user = request.user
         final_message = message or "J'ai uploadé un document."
 
-        def event_stream():
-            try:
-                agent = _agent_pour(user)
-                for event in agent.process_message_stream(user, final_message, attachment):
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-            except Exception as e:  # noqa: BLE001 - never leak internals into the stream
-                logger.error(f"PlannerAgent stream error: {e}", exc_info=True)
-                yield "data: " + json.dumps({
-                    'type': 'error',
-                    'error': 'Erreur interne lors du traitement du message.',
-                }) + "\n\n"
+        def evenements():
+            # Execute dans le thread du drain, pas dans la requete: une panne
+            # ici (agent introuvable, crash du flux) devient la trame
+            # d'erreur habituelle, posee par lancer_flux.
+            agent = _agent_pour(user)
+            yield from agent.process_message_stream(user, final_message, attachment)
 
         # ITERATEUR ASYNCHRONE, et ce n'est pas un detail de style.
         #
-        # `event_stream` est un generateur SYNCHRONE. Sous ASGI, Django ne sait
-        # pas le servir au fil de l'eau: il le draine et n'envoie qu'a la fin,
-        # en le disant dans les logs (« StreamingHttpResponse must consume
-        # synchronous iterators in order to serve them asynchronously »).
+        # Un generateur SYNCHRONE, Django sous ASGI ne sait pas le servir au
+        # fil de l'eau: il le draine et n'envoie qu'a la fin, en le disant
+        # dans les logs (« StreamingHttpResponse must consume synchronous
+        # iterators in order to serve them asynchronously »).
         #
         # Mesure au navigateur le 2026-08-29, sur un tour de 9,4 s: le serveur
         # emettait `status` a 0,07 s, le raisonnement des 2,78 s et les outils
@@ -980,24 +1166,12 @@ class ChatStreamView(APIView):
         # done tous ensemble a 9,34 s. L'utilisateur ne voyait donc que trois
         # points pendant tout le tour, et le streaming ne servait a rien.
         #
-        # On pompe le generateur pas a pas dans un thread et on rend la main a
-        # la boucle entre chaque element: chaque fragment part des qu'il
-        # existe. `thread_sensitive=False` pour la meme raison qu'ailleurs dans
-        # l'agent: ce travail vit hors du cycle de requete et ne doit pas
-        # rejouer dans le thread qui attend la boucle.
-        FIN = object()
+        # lancer_flux garde cette propriete (chaque trame part des qu'elle est
+        # dans la file) ET detache le tour du client: voir le bloc « Flux de
+        # chat detache » plus haut.
+        flux, _futur = lancer_flux(evenements(), user.id)
 
-        async def flux_asynchrone():
-            source = event_stream()
-            suivant = sync_to_async(lambda: next(source, FIN), thread_sensitive=False)
-            while True:
-                morceau = await suivant()
-                if morceau is FIN:
-                    return
-                yield morceau
-
-        response = StreamingHttpResponse(
-            flux_asynchrone(), content_type='text/event-stream')
+        response = StreamingHttpResponse(flux, content_type='text/event-stream')
         response['Cache-Control'] = 'no-cache'
         # Anti-buffering (nginx/proxies): chaque frame doit partir immédiatement.
         response['X-Accel-Buffering'] = 'no'
