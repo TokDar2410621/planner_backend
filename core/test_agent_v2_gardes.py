@@ -240,8 +240,15 @@ class GardesDestructivesTests(HarnaisGardes, TransactionTestCase):
         self.assertEqual(demande['cible']['titre'], 'Chimie générale')
         self.assertActif(chimie)
 
+        # Round 6 (D1): un oui libre n'autorise plus rien; seule la puce le fait.
         self.attendre([puces(demande)], 'Oui, vas-y')
         registre, tools = self.outils('Oui, vas-y', tache='u:2')
+        self.appeler(tools, 'delete_block', block_id=chimie.id)
+        self.assertFalse(registre.actions[-1].succes)
+        self.assertActif(chimie)
+
+        self.attendre([puces(demande)], 'Oui, je confirme.')
+        registre, tools = self.outils('Oui, je confirme.', tache='u:3')
         self.appeler(tools, 'delete_block', block_id=chimie.id)
         self.assertTrue(registre.actions[-1].succes)
         self.assertActif(chimie, False)
@@ -762,24 +769,37 @@ class LectureDesReponsesTests(SimpleTestCase):
         self.assertEqual(len(dem.cle_demande('x', {})), 12)
 
     def test_oui_non(self):
-        cas = {'Oui, vas-y': 'confirmer', 'oui': 'confirmer', "d'accord": 'confirmer',
-               'c’est bon': 'confirmer', 'Oui, je confirme.': 'confirmer',
+        # Round 6 (D1): sans puce, aucun oui libre ne confirme; « non » ferme.
+        cas = {'Oui, vas-y': None, 'oui': None, "d'accord": None,
+               'c’est bon': None, 'Oui, je confirme.': None,
                'non merci': 'annuler', 'ok mais enlève aussi la chimie': None,
                'ok efface tout mon planning': None,
                'oui je pense que ce serait bien de le faire un jour': None}
         for brut, attendu in cas.items():
             with self.subTest(brut=brut):
                 self.assertEqual(dem.option_choisie(brut, self.DESTRUCTIF), attendu)
+        avec_puces = puces(dict(self.DESTRUCTIF, cible={}))
+        for brut, attendu in {'Oui, je confirme.': 'confirmer', 'Oui, confirme': 'confirmer',
+                              'Oui, vas-y': None, 'Non, ne change rien.': 'annuler'}.items():
+            with self.subTest(brut=brut, puces=True):
+                self.assertEqual(dem.option_choisie(brut, avec_puces), attendu)
 
     def test_portee(self):
-        cas = {'Tous les jeudis (supprimer la série).': 'serie', 'la série': 'serie',
-               "Seulement ce jeudi 17 sept. (sauter l'occurrence).": 'occurrence',
-               'juste celui-là': 'occurrence', 'non': 'annuler', 'oui': None,
+        # Round 6 (D1): la portee ne se lit plus en texte libre; la puce seule.
+        cas = {'Tous les jeudis (supprimer la série).': None, 'la série': None,
+               "Seulement ce jeudi 17 sept. (sauter l'occurrence).": None,
+               'juste celui-là': None, 'non': 'annuler', 'oui': None,
                'je ne veux pas tous les jeudis': None,
                'pas tous les jeudis, juste celui-là': None}
         for brut, attendu in cas.items():
             with self.subTest(brut=brut):
                 self.assertEqual(dem.option_choisie(brut, self.PORTEE), attendu)
+        avec_puces = puces(dict(self.PORTEE, cible={'jour': 3, 'date': '2026-09-17'}))
+        for brut, attendu in {'Tous les jeudis (supprimer la série).': 'serie',
+                              "Seulement ce jeudi 17 sept. (sauter l'occurrence).": 'occurrence',
+                              'la série': None, 'juste celui-là': None}.items():
+            with self.subTest(brut=brut, puces=True):
+                self.assertEqual(dem.option_choisie(brut, avec_puces), attendu)
 
     def test_une_puce_ne_repond_qu_a_sa_demande(self):
         etrangere = dict(self.DESTRUCTIF, chips=[
@@ -880,7 +900,11 @@ class ContournementsDeLaRevueTests(HarnaisGardes, TransactionTestCase):
                      'ok demain'):
             with self.subTest(brut=brut):
                 self.assertIsNone(dem.option_choisie(brut, demande))
-        for brut in ('oui merci', 'Oui, vas-y', "ok c'est bon", 'oui je confirme'):
+        # Round 6 (D1): un oui poli ne confirme plus; la puce exacte, oui.
+        for brut in ('oui merci', 'Oui, vas-y', "ok c'est bon"):
+            with self.subTest(brut=brut):
+                self.assertIsNone(dem.option_choisie(brut, demande))
+        for brut in ('oui je confirme', 'Oui, je confirme.', 'Oui, confirme'):
             with self.subTest(brut=brut):
                 self.assertEqual(dem.option_choisie(brut, demande), 'confirmer')
         brut = 'oui pour jeudi seulement'

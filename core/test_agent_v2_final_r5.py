@@ -68,7 +68,12 @@ class G1LecteurTests(SimpleTestCase):
         for brut in ('oui ?', 'ok ?', 'Oui?'):
             with self.subTest(brut=brut):
                 self.assertIsNone(dem.option_choisie(brut, DESTR))
-        self.assertEqual(dem.option_choisie('oui', DESTR), 'confirmer')
+        # Round 6 (D1): « oui » libre ne confirme plus; la puce exacte confirme,
+        # et son echo interrogatif non plus.
+        self.assertIsNone(dem.option_choisie('oui', DESTR))
+        avec_puces = puces(dict(DESTR, cible={}))
+        self.assertEqual(dem.option_choisie('Oui, je confirme.', avec_puces), 'confirmer')
+        self.assertIsNone(dem.option_choisie('Oui, je confirme ?', avec_puces))
 
     def test_garder_en_nommant_la_portee_tranche(self):
         for brut in ('Non, garde tous les jeudis.', 'Non garde tous les jeudis',
@@ -78,15 +83,26 @@ class G1LecteurTests(SimpleTestCase):
             with self.subTest(brut=brut):
                 self.assertEqual(dem.option_choisie(brut, PORTEE_JEUDI), 'annuler')
 
-    def test_les_reponses_claires_restent_lisibles(self):
-        cas = {'tous les jeudis': 'serie', 'Tous les jeudis': 'serie',
-               'supprime tous les jeudis': 'serie', 'enlève le quart tous les jeudis': 'serie',
-               'oui mais seulement ce jeudi': 'occurrence', 'juste celui-là': 'occurrence',
-               'Tous les jeudis (supprimer la série).': 'serie',
+    def test_seule_la_puce_tranche_la_portee(self):
+        # Round 6 (D1): remplace « les reponses claires restent lisibles ».
+        # Sans puce, aucune tournure ne tranche; avec les puces, seule la puce
+        # exacte (valeur ou libelle) le fait.
+        cas = {'tous les jeudis': None, 'Tous les jeudis': None,
+               'supprime tous les jeudis': None, 'enlève le quart tous les jeudis': None,
+               'oui mais seulement ce jeudi': None, 'juste celui-là': None,
+               'Tous les jeudis (supprimer la série).': None,
                'non pas tous les jeudis': None, 'laisse tomber ce cours, tous les jeudis': None}
         for brut, attendu in cas.items():
             with self.subTest(brut=brut):
                 self.assertEqual(dem.option_choisie(brut, PORTEE_JEUDI), attendu)
+        avec_puces = puces(PORTEE_JEUDI)
+        cas = {'tous les jeudis': 'serie', 'Tous les jeudis': 'serie',
+               'Tous les jeudis (supprimer la série).': 'serie', 'Seulement ce jeudi': 'occurrence',
+               'supprime tous les jeudis': None, 'juste celui-là': None,
+               'oui mais seulement ce jeudi': None}
+        for brut, attendu in cas.items():
+            with self.subTest(brut=brut, puces=True):
+                self.assertEqual(dem.option_choisie(brut, avec_puces), attendu)
 
 
 class G1BoutEnBoutTests(HarnaisGardes, TransactionTestCase):
@@ -102,7 +118,8 @@ class G1BoutEnBoutTests(HarnaisGardes, TransactionTestCase):
                 self.attendre([demande], brut)
                 registre = Registre()
                 outils_v2.appliquer_choix_en_attente(self.user, registre, brut, f'e:{i}')
-                self.assertFalse(any(a.succes for a in registre.actions))
+                # Round 6: une decision « annulee » est un succes sans mutation.
+                self.assertFalse(any(a.succes and a.est_mutation for a in registre.actions))
                 self.assertActif(self.q)
                 self.assertActif(gym)
                 self.assertEqual(RecurringBlockException.objects.filter(
@@ -115,8 +132,11 @@ class G1BoutEnBoutTests(HarnaisGardes, TransactionTestCase):
 class R2ReemissionTests(HarnaisGardes, TransactionTestCase):
 
     def _reemises(self, registre):
+        # Round 6 (D2): une demande abandonnee est consignee avec sa demande
+        # pour que la voix dise l'abandon; seule la question reposee compte ici.
         return [a.donnees['demande'] for a in registre.actions
-                if isinstance((a.donnees or {}).get('demande'), dict)]
+                if isinstance((a.donnees or {}).get('demande'), dict)
+                and (a.donnees or {}).get('reposee_par_le_code')]
 
     def test_un_message_sans_rapport_ne_repose_pas(self):
         for i, brut in enumerate(("c'est quoi mon horaire demain ?", 'ajoute gym demain à 18 h',
@@ -216,8 +236,11 @@ class G2HeureDiteTests(HarnaisGardes, TransactionTestCase):
                         or (d.get('demande') or {}).get('motif') == 'heure_refusee', d)
 
     def test_heure_dans_une_autre_proposition(self):
-        for i, brut in enumerate(('ajoute gym jeudi et mets-le à 15 h', 'ajoute gym jeudi, à 15 h',
-                                  'Gym jeudi. À 15 h.')):
+        # Round 6 (D3): « ajoute gym jeudi et mets-le a 15 h » (heure par
+        # pronom) est l'ecart accepte, verrouille dans
+        # test_agent_v2_gardes_r6.D3HeureDiteTests. Une heure seule coupee par
+        # la ponctuation reste rattachee a la proposition du titre.
+        for i, brut in enumerate(('ajoute gym jeudi, à 15 h', 'Gym jeudi. À 15 h.')):
             with self.subTest(brut=brut, outil='schedule_task_at'):
                 self._refusee(self._appel(brut, 'schedule_task_at', f'p:{i}', title='Gym',
                                           date='2026-09-17', start_time='13:00',

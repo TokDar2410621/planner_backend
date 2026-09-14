@@ -375,9 +375,13 @@ def _analyser(ctx: _Contexte, nom: str, kwargs: dict):
         cle = _cle_portee(block.id, jour.isoformat())
         cible = _cible_bloc(block)
         cible["date"] = jour.isoformat()
+        # Round 6 (D1): une question de portee en attente sur CE bloc et CE
+        # jour ne se tranche que par sa puce. « juste celui-la » ne laisse pas
+        # le modele sauter l'occurrence a la place de la puce.
+        en_attente = any(d.get("cle") == cle for d in _attente(ctx))
         return _Garde("portee_jour", cle, {cle}, nom, dict(kwargs), cible,
-                      _options_portee(block, jour, cible), actif=_saut_suspect(texte),
-                      type="choix")
+                      _options_portee(block, jour, cible),
+                      actif=_saut_suspect(texte) or en_attente, type="choix")
 
     if nom == "clear_all_blocks":
         nombre = RecurringBlock.objects.filter(user=user, active=True).count()
@@ -490,8 +494,13 @@ def _reponse(ctx: _Contexte, cles: set, nom: str):
     en_suspens: une demande sans reponse claire, a reposer telle quelle.
     """
     repondue = en_suspens = None
+    abandonnees = ctx.etat.attente.get("abandonnees") or set()
     for demande in _attente(ctx):
         if demande.get("cle") not in cles:
+            continue
+        if demande.get("cle") in abandonnees:
+            # Abandonnee par le code ce tour (D2): une nouvelle suppression de
+            # la meme cible pose une question NEUVE, jamais la perimee.
             continue
         option = dem.option_choisie(ctx.texte, demande)
         if _autorise(demande.get("motif"), nom, option):
@@ -506,6 +515,19 @@ def _reponse(ctx: _Contexte, cles: set, nom: str):
 # Une demande n'est reposee par le code qu'une fois: au-dela, elle collait a
 # la conversation et une suppression suivante y repondait (revue du round 4).
 REEMISSIONS_MAX = 1
+
+# Les decisions que appliquer_choix_en_attente consigne (ToolResult.data
+# « decision_code »), lues par la voix et par tour_entierement_decide_par_le_code.
+DECISION_EXECUTE = "execute"
+DECISION_REPOSEE = "reposee"
+DECISION_ABANDONNEE = "abandonnee"
+DECISION_ANNULEE = "annulee"
+DECISIONS_DU_CODE = {DECISION_EXECUTE, DECISION_REPOSEE, DECISION_ABANDONNEE, DECISION_ANNULEE}
+# Nom de registre des decisions sans outil execute. Pas une mutation.
+OUTIL_DECISION = "decision_du_code"
+MESSAGE_ABANDON = ("Question laissee de cote par le code: rien n'a change. "
+                   "N'agis pas sur ce point sans nouvelle demande explicite.")
+MESSAGE_ANNULEE = "Refuse par l'utilisateur: rien n'a change, n'y touche pas."
 
 
 def _reposer(demande: dict) -> dict:
@@ -787,7 +809,11 @@ def _heure_dite_ignoree(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparati
     if debut is None or not jours:
         return None
     titre = str(kwargs.get("title") or (prep.bloc_update or {}).get("titre") or "").strip()
-    mots = _mots_du_titre(titre)
+    # « Cours » ou « Rendez-vous » n'ont que des mots vides: leurs mots bruts
+    # servent alors a retrouver la proposition.
+    mots = _mots_du_titre(titre) or {
+        m[:-1] if m.endswith("s") and len(m) > 4 else m
+        for m in re.findall(r"[a-z0-9]+", dem.sans_accents(titre)) if len(m) >= 2}
     plat = dem.sans_accents(ctx.texte)
     positions = dem.heures_dites_positions(ctx.texte)
     if not positions:
@@ -806,8 +832,19 @@ def _heure_dite_ignoree(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparati
             return communs[0] if not recurrent else dem.prochaine_occurrence(communs[0].weekday())
         return next(iter(dates)) if dates else dem.prochaine_occurrence(min(jours))
 
-    situe_avec_heure = False
-    for s, e in _propositions(plat):
+    # Round 6 (D3): le repli « une seule heure ferme dans le message » est
+    # retire. Il imposait l'heure donnee a autre chose (« mon cours finit a
+    # 15 h, place ma lecture ») et chaque revue trouvait une tournure neuve.
+    # La garde ne vaut plus que si le titre de l'appel est dans une
+    # proposition qui porte sa propre heure ferme.
+    #
+    # ECART ACCEPTE: un titre renomme par le modele (« Entrainement » pour
+    # « gym ») ou une heure donnee par pronom dans une autre proposition
+    # (« ajoute gym jeudi et mets-le a 15 h ») n'est pas garde par le code.
+    # La regle du prompt d'AGIR le couvre. Production main n'a aucune garde
+    # d'heure dite: c'est strictement mieux. La garde armee (R1), elle, tient
+    # toujours le meme element apres un refus.
+    for s, e in _propositions_rattachees(plat):
         morceau = plat[s:e]
         mots_morceau = {m[:-1] if m.endswith("s") and len(m) > 4 else m
                         for m in re.findall(r"[a-z0-9]+", morceau)}
@@ -816,33 +853,31 @@ def _heure_dite_ignoree(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparati
         fermes = [(v, tol) for v, _ou, tol in _heures_fermes(plat, positions, s, e)]
         if not fermes:
             continue
-        situe_avec_heure = True
         jour_cible = _jour_cible(dem._dates_nommees(morceau, aujourdhui) or dates_message)
         if jour_cible is None:
-            continue
+            # Le titre porte sa propre heure, pour un autre jour: rien a opposer.
+            return None
         return _heure_dite_contredite(ctx, nom, kwargs, prep, titre, recurrent, debut,
                                       jour_cible, fermes)
-    if situe_avec_heure:
-        # Le titre porte sa propre heure, pour un autre jour: rien a opposer.
-        return None
+    return None
 
-    # Revue du 2026-09-14 (round 3): un titre court ou vide de sens (« Gym »,
-    # « cours ») ou renomme par le modele (« Entraînement » pour « gym ») ne se
-    # retrouve dans aucune proposition. Si le message ne donne qu'UNE heure
-    # ferme, elle vaut pour tout ajout du jour qu'il nomme (ou sans jour nomme).
-    # Round 4: aussi quand le titre est dans une proposition SANS heure
-    # (« ajoute gym jeudi et mets-le a 15 h »). L'heure doit etre d'horloge
-    # (« a 15 h », « 15 h 30 ») et ne pas etre celle d'un autre element
-    # (« j'ai un cours a 14 h ») ni une fin de journee (« je finis a 17 h »).
-    fermes = [f for f in _sans_fins_de_plage(plat, _heures_fermes(plat, positions, 0, len(plat)))
-              if _heure_d_horloge(plat, f[1]) and not _heure_d_un_autre_element(plat, f[1], titre)]
-    if len({v for v, _ou, _tol in fermes}) != 1:
-        return None
-    jour_cible = _jour_cible(dates_message)
-    if jour_cible is None:
-        return None
-    return _heure_dite_contredite(ctx, nom, kwargs, prep, titre, recurrent, debut, jour_cible,
-                                  [(v, tol) for v, _ou, tol in fermes])
+
+# Une proposition faite seulement d'une heure (« Gym jeudi. A 15 h. ») se
+# rattache a la precedente: c'est la meme phrase coupee par la ponctuation.
+_MOTS_D_HEURE_SEULE = {"a", "au", "vers", "environ", "autour", "de", "genre", "pile"}
+
+
+def _propositions_rattachees(plat: str) -> list[tuple[int, int]]:
+    sortie: list[tuple[int, int]] = []
+    for s, e in _propositions(plat):
+        morceau = plat[s:e]
+        reste = re.findall(r"[a-z]+", dem._RE_HEURE.sub(" ", morceau))
+        if (sortie and dem._RE_HEURE.search(morceau)
+                and all(m in _MOTS_D_HEURE_SEULE for m in reste)):
+            sortie[-1] = (sortie[-1][0], e)
+            continue
+        sortie.append((s, e))
+    return sortie
 
 
 def _heures_fermes(plat: str, positions, s: int, e: int) -> list[tuple[str, int, int]]:
@@ -858,75 +893,6 @@ def _heures_fermes(plat: str, positions, s: int, e: int) -> list[tuple[str, int,
         tolerance = TOLERANCE_APPROX if _HEURE_APPROX_AVANT.search(avant) else 0
         fermes.append((valeur, ou, tolerance))
     return fermes
-
-
-_AVANT_HORLOGE = re.compile(r"\b(?:a|au|de|des|vers|pour|entre)\s*$")
-
-
-def _heure_d_horloge(plat: str, ou: int) -> bool:
-    """« a 15 h », « de 14 h », « 15 h 30 », « 15:00 », midi: une heure
-    d'horloge. « Heures d'etude: 4 h » n'en est pas une (banc du round 4)."""
-    m = dem._RE_HEURE.match(plat, ou)
-    if m is None:
-        return False
-    if m.group(2) or m.group(3) is not None or m.group(5):
-        return True
-    return bool(_AVANT_HORLOGE.search(plat[:ou]))
-
-
-# Une proposition qui situe un element DEJA LA (« j'ai un cours a 14 h »,
-# « il commence a 15 h ») ou une fin de journee (« je finis a 17 h »).
-_CONTEXTE_EXISTANT = re.compile(
-    r"\b(?:j'ai|il y a|fini[st]?|termine\w*|commence\w*|sors|sort|quitte\w*|rentre\w*)\b")
-_VERBE_CREATEUR = re.compile(
-    r"\b(?:ajout\w*|mets|met|place\w*|planifi\w*|cale\w*|reserve\w*|programme\w*|"
-    r"inscri\w*|cree\w*|creer)\b")
-_NOM_APRES_ARTICLE = re.compile(r"\b(?:un|une|mon|ma|mes|le|la|l')\s*([a-z]{3,})")
-_PRONOM_EN_TETE = re.compile(r"^\s*(?:il|elle|ils|elles|ca)\b")
-
-
-def _heure_d_un_autre_element(plat: str, ou: int, titre: str) -> bool:
-    """L'heure a la position ou appartient-elle a autre chose que ce titre ?
-
-    Revue du round 4 (regressions): « j'ai un cours a 14 h demain, ajoute une
-    seance de muscu apres » imposait 14 h a la muscu, et « demain je finis a
-    17 h » imposait 17 h a l'etude. Seule une proposition de contexte (element
-    existant, fin de journee) sans verbe createur est ecartee, et encore:
-    si l'element qu'elle nomme est ce titre (« mon cours jeudi, il commence a
-    15 h » pour Cours), l'heure lui appartient.
-    """
-    propositions = _propositions(plat)
-    rang = next((i for i, (s, e) in enumerate(propositions) if s <= ou < e), None)
-    if rang is None:
-        return False
-    s, e = propositions[rang]
-    morceau = plat[s:e]
-    if not _CONTEXTE_EXISTANT.search(morceau) or _VERBE_CREATEUR.search(morceau):
-        return False
-    noms = _NOM_APRES_ARTICLE.findall(morceau)
-    if not noms and _PRONOM_EN_TETE.match(morceau) and rang > 0:
-        ps, pe = propositions[rang - 1]
-        noms = _NOM_APRES_ARTICLE.findall(plat[ps:pe])
-    if not noms:
-        return True
-    mots_titre = [m for m in re.findall(r"[a-z0-9]+", dem.sans_accents(titre or "")) if len(m) >= 3]
-    return not any(dem._meme_mot(n, t) for n in noms for t in mots_titre)
-
-
-_ENTRE_PLAGE = re.compile(r"\s*(?:a|au|-)\s*$")
-
-
-def _sans_fins_de_plage(plat: str, fermes):
-    """« de 14 h a 15 h » ou « 10:30 - 11:30 » donnent UNE heure de debut."""
-    fins = {m.start(): m.end() for m in dem._RE_HEURE.finditer(plat)}
-    gardees, fin_precedente = [], None
-    for valeur, ou, tolerance in sorted(fermes, key=lambda f: f[1]):
-        if fin_precedente is not None and _ENTRE_PLAGE.match(plat[fin_precedente:ou]):
-            fin_precedente = None
-            continue
-        gardees.append((valeur, ou, tolerance))
-        fin_precedente = fins.get(ou)
-    return gardees
 
 
 def _heure_dite_contredite(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparation,
@@ -1356,7 +1322,8 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
             logger.error("Proposition de plan en panne: %s", e, exc_info=True)
             proposition, empreinte = ToolResult(success=False, data={}, message=f"Erreur de l'outil: {e}"), None
         if empreinte is None or empreinte != (choix.get("parametres") or {}).get("plan_hash"):
-            donnees = {"cle_demande": choix.get("cle"), "par_le_code": True}
+            donnees = {"cle_demande": choix.get("cle"), "par_le_code": True,
+                       "decision_code": DECISION_EXECUTE}
             if empreinte is not None:
                 donnees["demande"] = _demande_optimisation(kwargs, empreinte, proposition)
                 message = MESSAGE_RETENUE
@@ -1381,7 +1348,8 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
     if choix is not None:
         resultat = ToolResult(
             success=resultat.success,
-            data={**(resultat.data or {}), "cle_demande": choix.get("cle"), "par_le_code": True},
+            data={**(resultat.data or {}), "cle_demande": choix.get("cle"), "par_le_code": True,
+                  "decision_code": DECISION_EXECUTE},
             message=resultat.message,
         )
     else:
@@ -1565,54 +1533,95 @@ def _resume_sans_effet(demande: dict, option: str) -> str:
     return f"CHOISI PAR L'UTILISATEUR: {_sujet(demande)} ({option})"
 
 
+def _consigner_decision(ctx: _Contexte, demande: dict, resultat: ToolResult):
+    """Une decision du code sans outil execute (annulee, abandonnee). Consignee
+    sous un nom qui n'est pas une mutation: rendu.py ne la raconte jamais comme
+    un fait, et la voix la rend depuis decision_code."""
+    return _consigner(ctx, OUTIL_DECISION, {"cle": demande.get("cle")}, resultat)
+
+
 def _appliquer(ctx: _Contexte) -> list[dict]:
     sorties: list[dict] = []
-    for demande in _attente(ctx):
+    attente = _attente(ctx)
+    etat = ctx.etat
+    abandonnees = etat.attente.setdefault("abandonnees", set())
+    options = {id(d): dem.option_choisie(ctx.texte, d) for d in attente}
+    # D2: un message qui ne repond a aucune demande (ni puce, ni garde, ni
+    # reponse meme floue) porte une nouvelle requete. Cette lecture choisit
+    # seulement entre reposer et abandonner; elle n'autorise jamais rien.
+    nouvelle = bool(attente) and not any(options.values()) and not any(
+        dem.reponse_plausible(ctx.texte, d) for d in attente)
+    decisions: dict = {}
+    codes: dict = {}
+    for demande in attente:
         cle, motif = demande.get("cle"), demande.get("motif")
-        option = dem.option_choisie(ctx.texte, demande)
-        if option is None and motif in MOTIFS_GARDES and not (
-                dem.reponse_plausible(ctx.texte, demande)
-                and int(demande.get("reemissions") or 0) < REEMISSIONS_MAX):
-            # Revue du round 4: un message sans rapport (« c'est quoi mon
-            # horaire demain ? ») ou une seconde reponse floue ne font plus
-            # reposer la question. Elle est laissee de cote; rien ne s'execute.
+        option = options[id(demande)]
+        if option is None:
+            if motif not in MOTIFS_GARDES:
+                decisions[cle] = None
+                continue
+            if not nouvelle and int(demande.get("reemissions") or 0) < REEMISSIONS_MAX:
+                # Banc du 2026-09-14 (s05-3): apres un oui vague, la demande
+                # se perdait. Le CODE repose la meme demande, UNE fois, avec
+                # sa date d'origine: la fenetre de 30 minutes doit expirer.
+                reposee = ToolResult(
+                    success=False,
+                    data={"demande": _reposer(demande), "reposee_par_le_code": True,
+                          "decision_code": DECISION_REPOSEE,
+                          **({"needs_confirmation": True} if motif != "creation_en_masse" else {})},
+                    message=MESSAGE_RETENUE)
+                action = _consigner(ctx, str(demande.get("outil") or ""),
+                                    dict(demande.get("parametres") or {}), reposee)
+                decisions[cle] = codes[cle] = DECISION_REPOSEE
+                sorties.append({"cle": cle, "motif": motif, "option": None, "action_id": None,
+                                "resume": (f"SANS REPONSE CLAIRE: {_sujet(demande)}, n'agis pas "
+                                           f"({action.id}: le code repose la question)")})
+                continue
+            # D2: deja reposee une fois, ou nouvelle requete. La demande est
+            # abandonnee et consignee pour que la voix le dise en une ligne;
+            # elle ne revient jamais sur un tour sans rapport.
+            abandon = ToolResult(
+                success=False,
+                data={"demande": {k: v for k, v in demande.items() if k != "chips"},
+                      "abandonnee_par_le_code": True, "decision_code": DECISION_ABANDONNEE},
+                message=MESSAGE_ABANDON)
+            _consigner_decision(ctx, demande, abandon)
+            abandonnees.add(cle)
+            decisions[cle] = codes[cle] = DECISION_ABANDONNEE
             sorties.append({"cle": cle, "motif": motif, "option": None, "action_id": None,
                             "resume": (f"QUESTION LAISSEE DE COTE: {_sujet(demande)}, "
                                        "l'utilisateur est passe a autre chose; n'agis pas "
                                        "sur ce point sans nouvelle demande explicite")})
             continue
-        if option is None:
-            if motif in MOTIFS_GARDES:
-                # Banc du 2026-09-14 (s05-3): apres un oui vague, la demande
-                # se perdait et « Tous les jeudis » au tour suivant ne trouvait
-                # plus rien a trancher. Le CODE repose la meme demande: elle
-                # entre au registre, la question du tour la rend avec ses
-                # puces et la persiste, et une reponse claire la tranchera.
-                reposee = ToolResult(
-                    success=False,
-                    data={"demande": _reposer(demande), "reposee_par_le_code": True,
-                          **({"needs_confirmation": True} if motif != "creation_en_masse" else {})},
-                    message=MESSAGE_RETENUE)
-                action = _consigner(ctx, str(demande.get("outil") or ""),
-                                    dict(demande.get("parametres") or {}), reposee)
-                sorties.append({"cle": cle, "motif": motif, "option": None, "action_id": None,
-                                "resume": (f"SANS REPONSE CLAIRE: {_sujet(demande)}, n'agis pas "
-                                           f"({action.id}: le code repose la question)")})
-            continue
         choisie = next((o for o in demande.get("options") or []
                         if isinstance(o, dict) and o.get("id") == option), None) or {}
         effet = choisie.get("effet")
         if not effet:
+            if option == "annuler":
+                _consigner_decision(ctx, demande, ToolResult(
+                    success=True,
+                    data={"decision_code": DECISION_ANNULEE, "cle_demande": cle, "motif": motif,
+                          "cible": dict(demande.get("cible") or {}), "par_le_code": True},
+                    message=MESSAGE_ANNULEE))
+                codes[cle] = DECISION_ANNULEE
+                # « Montre d'abord » (optimisation) demande encore a AGIR de
+                # montrer la proposition: le tour n'est pas decide par le code.
+                decisions[cle] = DECISION_ANNULEE if motif != "optimisation" else None
+            else:
+                # Un creneau, un jour, la suite des ajouts: AGIR doit agir.
+                decisions[cle] = None
             sorties.append({"cle": cle, "motif": motif, "option": option, "action_id": None,
                             "resume": _resume_sans_effet(demande, option)})
             continue
         if not isinstance(effet, dict) or not _effet_valide(demande, option, effet):
             logger.warning("Effet de demande rejete cle=%s option=%s", cle, option)
+            decisions[cle] = None
             sorties.append({"cle": cle, "motif": motif, "option": option, "action_id": None,
                             "resume": f"SANS REPONSE CLAIRE: {_sujet(demande)}, n'agis pas"})
             continue
 
         outil = TOOL_MAP[effet["outil"]]
+        decisions[cle] = codes[cle] = DECISION_EXECUTE
         retour = _executer_appel(ctx, outil, dict(effet["parametres"]), choix=demande)
         action = next((a for a in reversed(ctx.registre.actions)
                        if a.outil == outil.name and a.donnees.get("cle_demande") == cle), None)
@@ -1630,7 +1639,36 @@ def _appliquer(ctx: _Contexte) -> list[dict]:
             resume = f"ECHEC DU CODE ({action_id}): {sujet} n'a pas abouti, n'insiste pas"
         sorties.append({"cle": cle, "motif": motif, "option": option,
                         "action_id": action_id, "resume": resume})
+    etat.attente["decide"] = {"texte": ctx.texte, "decisions": decisions, "nouvelle": nouvelle}
+    for sortie in sorties:
+        code = codes.get(sortie["cle"])
+        if code:
+            sortie["decision_code"] = code
     return sorties
+
+
+def tour_entierement_decide_par_le_code(registre: Registre, message) -> bool:
+    """D6: le message ne fait que repondre (ou ne pas repondre) aux demandes
+    en attente, et le code a tout tranche. AGIR peut alors etre saute.
+
+    Vrai seulement si appliquer_choix_en_attente a tourne sur CE registre et
+    CE message, que chaque demande en attente a recu une decision du code
+    (execute, reposee, abandonnee, annulee) et que le message ne porte aucune
+    nouvelle requete. Une puce qui demande une suite au modele (creneau,
+    jour, ajouts confirmes, « Montre d'abord ») rend Faux.
+    """
+    with _ETATS_VERROU:
+        try:
+            etat = _ETATS.get(registre)
+        except TypeError:
+            return False
+    info = etat.attente.get("decide") if etat is not None else None
+    if not isinstance(info, dict) or info.get("texte") != (message or ""):
+        return False
+    decisions = info.get("decisions") or {}
+    if not decisions or info.get("nouvelle"):
+        return False
+    return all(v in DECISIONS_DU_CODE for v in decisions.values())
 
 
 def appliquer_choix_en_attente(user, registre: Registre, message_brut: str, tache: str,

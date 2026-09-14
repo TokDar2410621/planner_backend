@@ -98,7 +98,11 @@ class ChoixExecutesTests(HarnaisGardes, TransactionTestCase):
         self.assertEqual(sorties[0]['option'], 'annuler')
         self.assertIsNone(sorties[0]['action_id'])
         self.assertIn('REFUSE', sorties[0]['resume'])
-        self.assertEqual(registre.actions, [])
+        self.assertEqual(sorties[0]['decision_code'], 'annulee')
+        # Round 6 (D2): la seule trace est la decision du code, jamais une mutation.
+        self.assertEqual([(a.outil, a.succes, a.est_mutation, a.donnees['decision_code'])
+                          for a in registre.actions],
+                         [(outils_v2.OUTIL_DECISION, True, False, 'annulee')])
         self.assertActif(self.q)
 
     def test_sans_reponse_claire_n_agit_pas(self):
