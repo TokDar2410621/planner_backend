@@ -99,6 +99,9 @@ def resume_import(doc: UploadedDocument) -> dict:
         "blocs": [{
             "id": b.id,
             "titre": b.title,
+            # Pour le recap rendu (rendu.py): « 3 cours » ou « 2 quarts »
+            # selon la nature du bloc. message_import ne le lit pas.
+            "type": b.block_type,
             "jour": JOURS[b.day_of_week] if 0 <= b.day_of_week < 7 else "?",
             "debut": _hm(b.start_time),
             "fin": _hm(b.end_time),

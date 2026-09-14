@@ -7,7 +7,7 @@ de parler d'une action.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from services.agent.tools.base import ToolResult
 
@@ -45,9 +45,21 @@ class Action:
 
 @dataclass(frozen=True)
 class Ecart:
+    """Un ecart entre l'intention et le resultat relu.
+
+    `description` reste ecrite pour le MODELE (brief de DIRE). L'utilisateur,
+    lui, lit une phrase construite par rendu.py depuis `genre` et `donnees`:
+    « Ecart: CREE mais dans le passe » a atteint des utilisateurs dans la
+    moitie des tours de production relus le 2026-09-13.
+
+    Genres connus: passe, date_differente, tache_existante, plan_propose,
+    preferences_inchangees, rien_a_restaurer. Un genre vide ne se rend pas.
+    """
     id: str
     action_id: str
     description: str
+    genre: str = ""
+    donnees: dict = field(default_factory=dict)
 
 
 # Deux appels identiques peuvent etre legitimes: relire apres avoir ecrit est
@@ -102,9 +114,11 @@ class Registre:
         self._index[action.id] = action
         return action
 
-    def ajouter_ecart(self, action_id: str, description: str) -> Ecart:
+    def ajouter_ecart(self, action_id: str, description: str,
+                      genre: str = "", donnees: dict | None = None) -> Ecart:
         ecart = Ecart(id=f"e{len(self.ecarts) + 1}",
-                      action_id=action_id, description=description)
+                      action_id=action_id, description=description,
+                      genre=genre or "", donnees=dict(donnees or {}))
         self.ecarts.append(ecart)
         self._index[ecart.id] = ecart
         return ecart

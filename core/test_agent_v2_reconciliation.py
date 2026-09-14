@@ -50,9 +50,13 @@ class EcartDeDateTests(TestCase):
         self.assertEqual(r.ecarts, [])
 
     def test_skip_block_occurrence_date_a_la_racine(self):
+        # Dates relatives: les dates fixes 2026-09-01 / 2026-09-08 sont passees
+        # depuis le 2026-09-08, et l'ecart « passe » s'ajoutait au compte.
         r = Registre()
-        r.ajouter('skip_block_occurrence', {'date': '2026-09-01'},
-                  ToolResult(success=True, data={'date': '2026-09-08', 'title': 'Maths'}))
+        demande = (date.today() + timedelta(days=10)).isoformat()
+        obtenue = (date.today() + timedelta(days=17)).isoformat()
+        r.ajouter('skip_block_occurrence', {'date': demande},
+                  ToolResult(success=True, data={'date': obtenue, 'title': 'Maths'}))
         detecter_ecarts(r)
         self.assertEqual(len(r.ecarts), 1)
 
@@ -85,6 +89,74 @@ class SuccesSansMutationTests(TestCase):
         detecter_ecarts(r)
         self.assertEqual(len(r.ecarts), 1)
         self.assertIn('propos', r.ecarts[0].description.lower())
+
+
+class GenresDEcartTests(TestCase):
+    """Chaque cas de detecter_ecarts porte un genre et des donnees pour rendu.py,
+    et sa description (pour le modele) reste celle d'avant."""
+
+    def test_passe(self):
+        r = Registre()
+        hier = (date.today() - timedelta(days=1)).isoformat()
+        r.ajouter('schedule_task_at', {'date': hier, 'title': 'Révision'},
+                  ToolResult(success=True, data={'scheduled_block': {
+                      'date': hier, 'title': 'Révision',
+                      'start_time': '14:00', 'end_time': '15:00'}}))
+        detecter_ecarts(r)
+        self.assertEqual([e.genre for e in r.ecarts], ['passe'])
+        e = r.ecarts[0]
+        self.assertTrue(e.description.startswith('CREE mais dans le passe'))
+        self.assertEqual(e.donnees, {'date': hier, 'debut': '14:00', 'fin': '15:00',
+                                     'titre': 'Révision'})
+
+    def test_date_differente(self):
+        r = Registre()
+        demande = (date.today() + timedelta(days=1)).isoformat()
+        obtenue = (date.today() + timedelta(days=3)).isoformat()
+        r.ajouter('schedule_task_at', {'date': demande, 'title': 'Lecture'},
+                  ToolResult(success=True, data={'scheduled_block': {
+                      'date': obtenue, 'title': 'Lecture', 'end_time': '23:00'}}))
+        detecter_ecarts(r)
+        self.assertEqual([e.genre for e in r.ecarts], ['date_differente'])
+        self.assertEqual(r.ecarts[0].description,
+                         f'date demandee {demande}, date obtenue {obtenue}')
+        self.assertEqual(r.ecarts[0].donnees,
+                         {'demandee': demande, 'obtenue': obtenue, 'titre': 'Lecture'})
+
+    def test_tache_existante(self):
+        r = Registre()
+        r.ajouter('create_task', {'title': 'Reviser'},
+                  ToolResult(success=True, message='Tache deja presente (non dupliquee)',
+                             data={'task': {'id': 1, 'title': 'Reviser'}}))
+        detecter_ecarts(r)
+        self.assertEqual([e.genre for e in r.ecarts], ['tache_existante'])
+        self.assertEqual(r.ecarts[0].description, "tache deja presente, rien n'a ete cree")
+        self.assertEqual(r.ecarts[0].donnees, {'titre': 'Reviser'})
+
+    def test_plan_propose(self):
+        r = Registre()
+        r.ajouter('organize_day', {'date': '2099-01-01'},
+                  ToolResult(success=True, data={'applied': False, 'date': '2099-01-01'}))
+        detecter_ecarts(r)
+        self.assertEqual([e.genre for e in r.ecarts], ['plan_propose'])
+        self.assertEqual(r.ecarts[0].description, "plan seulement propose, rien n'a ete applique")
+
+    def test_preferences_inchangees(self):
+        r = Registre()
+        r.ajouter('update_preferences', {}, ToolResult(success=True, data={'updated_fields': []}))
+        detecter_ecarts(r)
+        self.assertEqual([e.genre for e in r.ecarts], ['preferences_inchangees'])
+        self.assertEqual(r.ecarts[0].description, "aucune preference n'a change")
+
+    def test_rien_a_restaurer(self):
+        r = Registre()
+        futur = (date.today() + timedelta(days=2)).isoformat()
+        r.ajouter('restore_block_occurrence', {'date': futur},
+                  ToolResult(success=True, data={'date': futur, 'title': 'Gym', 'restored': False}))
+        detecter_ecarts(r)
+        self.assertEqual([e.genre for e in r.ecarts], ['rien_a_restaurer'])
+        self.assertEqual(r.ecarts[0].description, 'aucune occurrence sautee a restaurer')
+        self.assertEqual(r.ecarts[0].donnees, {'date': futur, 'titre': 'Gym'})
 
 
 class ReconciliationTests(TestCase):
