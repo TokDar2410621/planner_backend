@@ -401,11 +401,13 @@ def _window_conflict(user, target_date, s, e, exclude_scheduled_id=None):
 class ScheduleTaskAtTool(BaseTool):
     name = "schedule_task_at"
     description = (
-        "Planifie un événement PONCTUEL daté à une heure précise (ex: 'lecture ce "
-        "samedi 9h-11h', 'rdv mardi 14h-15h'). C'est l'outil pour un événement UNIQUE "
+        "Planifie un événement PONCTUEL daté à une heure précise (ex: 'atelier ce "
+        "dimanche 10h-12h', 'rdv mardi 14h-15h'). C'est l'outil pour un événement UNIQUE "
         "sur une date donnée: il crée directement le créneau (verrouillé, la "
         "replanification ne le bouge pas). N'utilise PAS create_block (qui crée une "
-        "habitude répétée CHAQUE semaine) pour un événement ponctuel. Sans heure donnée: "
+        "habitude répétée CHAQUE semaine) pour un événement ponctuel. Un jour nommé "
+        "sans mot de récurrence (« repas mercredi 12h », sans « chaque » ni « tous les ») "
+        "est un événement unique: c'est cet outil, à la prochaine date de ce jour. Sans heure donnée: "
         "pour une activité souple (lecture, étude, sport), choisis un créneau libre "
         "(find_free_slots); pour un rendez-vous, un cours, un quart, une réunion ou une "
         "leçon fixé par quelqu'un d'autre sans heure de début ou de fin, ou sans date, "
@@ -420,7 +422,7 @@ class ScheduleTaskAtTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "title": {"type": "string", "description": "Titre de l'événement (ex: 'Lecture')."},
+            "title": {"type": "string", "description": "Titre de l'événement (ex: 'Atelier')."},
             "date": {"type": "string", "description": "Date de l'événement (YYYY-MM-DD). Déduis-la de la DATE du jour."},
             "start_time": {"type": "string", "description": "Heure de début (HH:MM)."},
             "end_time": {"type": "string", "description": "Heure de fin (HH:MM). Peut passer minuit pour un événement ponctuel qui traverse la nuit (ex: 22:00 -> 06:00)."},
@@ -808,7 +810,7 @@ class CancelScheduledBlockTool(BaseTool):
     name = "cancel_scheduled_block"
     description = (
         "Annule/supprime un événement PONCTUEL déjà planifié à une date précise "
-        "(ex: 'annule mon rdv dentiste', 'enlève mon étude de demain', 'supprime "
+        "(ex: 'annule mon rdv optométriste','enlève mon étude de demain', 'supprime "
         "le prochain événement'). C'est l'outil pour un one-off créé par "
         "schedule_task_at. NE l'utilise PAS pour un bloc RÉCURRENT: pour sauter UN "
         "jour d'une série -> skip_block_occurrence; pour supprimer toute la série -> "

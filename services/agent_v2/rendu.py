@@ -862,6 +862,11 @@ class _Narrateur:
                 f"({_liste(noms)}), dis-moi lequel.".replace("  ", " "))
             return
 
+        # Round 10 (P2): un create_block retenu parce que le jour nomme n'a
+        # pas de mot de recurrence se tait quand l'evenement unique a suivi.
+        if d.get("evenement_unique") and _titre_place_plus_loin(self.registre.actions, index, p):
+            return
+
         # Echec sans donnee exploitable: on ne recopie JAMAIS le message (il
         # peut porter une exception brute ou un ordre au modele). Si la meme
         # intention a reussi plus loin dans le tour, l'echec etait une
@@ -1081,6 +1086,14 @@ def _identite(action) -> tuple:
 def _reussie_plus_loin(actions, index: int, action) -> bool:
     ident = _identite(action)
     return any(b.succes and _identite(b) == ident for b in actions[index + 1:])
+
+
+def _titre_place_plus_loin(actions, index: int, parametres: dict) -> bool:
+    titre = _txt((parametres or {}).get("title")).casefold()
+    return bool(titre) and any(
+        b.succes and b.outil == "schedule_task_at"
+        and _txt((b.parametres or {}).get("title")).casefold() == titre
+        for b in actions[index + 1:])
 
 
 def _phrase_ecart(genre: str, donnees: dict, auj: date) -> str:
@@ -1399,7 +1412,7 @@ def _lecture_semaine(d: dict, auj: date) -> str:
     return _rendre_jours(jours_data, ("Ta semaine", "cette semaine"), dire_vides=True)
 
 
-def _lecture_horaire(d: dict, auj: date) -> str:
+def _lecture_horaire(d: dict, auj: date, montrer: frozenset = frozenset()) -> str:
     par_jour: dict[int, list[dict]] = {}
     for b in _dicts(d.get("blocks")):
         dow = _dow(b.get("day_of_week"))
@@ -1407,9 +1420,13 @@ def _lecture_horaire(d: dict, auj: date) -> str:
             dow = _dow(b.get("day_name"))
         if dow is None:
             continue
+        # Round 10 (P3, banc r9 s05-1): un sommeil que la question du code
+        # nomme s'affiche dans la liste, sinon la liste en montre 2 et la
+        # question en demande 3.
         par_jour.setdefault(dow, []).append({
             "titre": _txt(b.get("title")), "debut": b.get("start_time"), "fin": b.get("end_time"),
-            "sommeil": _ressemble_sommeil(_txt(b.get("title")), b.get("block_type"))})
+            "sommeil": (_ressemble_sommeil(_txt(b.get("title")), b.get("block_type"))
+                        and _plat(_txt(b.get("title"))) not in montrer)})
     if not par_jour:
         return "Rien à ton horaire pour l'instant." if "blocks" in d else ""
     jours_data = [(dow, par_jour[dow]) for dow in sorted(par_jour)]
@@ -1422,7 +1439,7 @@ def _libre(creneaux) -> str:
     return ", ".join(morceaux)
 
 
-def _lecture_journee(d: dict, auj: date) -> str:
+def _lecture_journee(d: dict, auj: date, montrer: frozenset = frozenset()) -> str:
     dj = _date(d.get("date"))
     dow = dj.weekday() if dj else _dow(d.get("day_name"))
     if dow is not None:
@@ -1437,7 +1454,7 @@ def _lecture_journee(d: dict, auj: date) -> str:
     items = []
     for b in _dicts(d.get("blocks")):
         titre = _txt(b.get("title"))
-        if _ressemble_sommeil(titre, b.get("block_type")):
+        if _ressemble_sommeil(titre, b.get("block_type")) and _plat(titre) not in montrer:
             continue
         items.append({"titre": titre, "debut": b.get("start_time"), "fin": b.get("end_time")})
     corps = "\n".join(_ligne_item(i) for i in sorted(items, key=_ordre)) or "Rien de prévu."
@@ -1480,11 +1497,13 @@ _LECTEURS = {
 }
 
 
-def rendre_lecture(registre: Registre, aujourdhui: date | None = None) -> str:
+def rendre_lecture(registre: Registre, aujourdhui: date | None = None,
+                   titres_vises=None) -> str:
     """Ce que l'agent a VU, sur un tour qui n'a rien change.
 
     La derniere lecture reussie fait foi: si l'agent a relu, c'est la vue la
-    plus recente qui compte.
+    plus recente qui compte. `titres_vises`: les elements que la question du
+    code nomme; ils restent visibles dans la liste, sommeil compris.
     """
     if any(a.succes and a.est_mutation for a in registre.actions):
         return ""
@@ -1492,8 +1511,13 @@ def rendre_lecture(registre: Registre, aujourdhui: date | None = None) -> str:
     if not lectures:
         return ""
     auj = _aujourdhui(aujourdhui)
+    montrer = frozenset(_plat(_txt(t)) for t in (titres_vises or []) if _txt(t))
     for action in reversed(lectures):
-        texte = _LECTEURS[action.outil](action.donnees or {}, auj)
+        lecteur = _LECTEURS[action.outil]
+        if action.outil in ("list_blocks", "get_today_schedule"):
+            texte = lecteur(action.donnees or {}, auj, montrer)
+        else:
+            texte = lecteur(action.donnees or {}, auj)
         if texte:
             return texte
     return ""
@@ -1570,6 +1594,11 @@ def _objet_destructif(demande, auj) -> str:
         return f"supprimer la tâche {titre}" if titre else "supprimer cette tâche"
     if outil == "cancel_scheduled_block":
         quand = _quand(cible.get("date"), auj)
+        ids = cible.get("ids")
+        if isinstance(ids, list) and len(ids) > 1 and titre:
+            # Round 10 (P3, banc r9 k2-1): deux Lecture le meme samedi, la
+            # question disait « annuler Lecture » sans dire qu'il y en a deux.
+            return f"annuler les {len(ids)} créneaux de {titre}{' ' + quand if quand else ''}"
         return f"annuler {titre or 'cet événement'}{' ' + quand if quand else ''}"
     if outil == "update_block":
         return f"arrêter {titre}" if titre else "arrêter ce créneau"

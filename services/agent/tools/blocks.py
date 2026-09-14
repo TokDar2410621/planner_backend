@@ -132,13 +132,13 @@ class ListBlocksTool(BaseTool):
 
 class CreateBlockTool(BaseTool):
     name = "create_block"
-    description = "Crée un ou plusieurs blocs récurrents HEBDOMADAIRES (une habitude qui revient chaque semaine: cours, travail, sport, sommeil...). Jours = liste (ex: [0,1,2,3,4] = lundi à vendredi); un bloc séparé par jour. Appelle-le quand l'utilisateur décrit un horaire habituel complet (jours, début, fin). Activité souple sans heure (sport, étude): choisis un créneau libre. Pour un rendez-vous, un cours, un quart, une réunion ou une leçon fixé par quelqu'un d'autre sans heure de début ou de fin: n'appelle pas cet outil, demande-lui (present_form ou present_choices). N'utilise JAMAIS create_block pour un événement unique daté ('ce samedi', une date précise) -> schedule_task_at. Gère un quart de nuit récurrent qui traverse minuit (ex: travail 22:00-06:00 chaque lundi): mets start_time/end_time tels quels, le passage de minuit est détecté automatiquement. Les conflits sont détectés et renvoyés automatiquement."
+    description = "Crée un ou plusieurs blocs récurrents HEBDOMADAIRES (une habitude qui revient chaque semaine: cours, travail, sport, sommeil...). Jours = liste (ex: [0,1,2,3,4] = lundi à vendredi); un bloc séparé par jour. Appelle-le quand l'utilisateur décrit un horaire qui revient (mot de récurrence dit, ou un cours, un quart) avec ses jours, son début et sa fin. Un jour nommé sans mot de récurrence (« chaque », « tous les », « les lundis ») désigne un seul jour: c'est un événement unique -> schedule_task_at. Activité souple sans heure (sport, étude): choisis un créneau libre. Pour un rendez-vous, un cours, un quart, une réunion ou une leçon fixé par quelqu'un d'autre sans heure de début ou de fin: n'appelle pas cet outil, demande-lui (present_form ou present_choices). N'utilise JAMAIS create_block pour un événement unique daté ('ce samedi', une date précise) -> schedule_task_at. Gère un quart de nuit récurrent qui traverse minuit (ex: travail 22:00-06:00 chaque lundi): mets start_time/end_time tels quels, le passage de minuit est détecté automatiquement. Les conflits sont détectés et renvoyés automatiquement."
     parameters = {
         "type": "object",
         "properties": {
             "title": {
                 "type": "string",
-                "description": "Nom du bloc (ex: 'Travail', 'Cours de maths')",
+                "description": "Nom du bloc (ex: 'Travail', 'Cours de biologie')",
             },
             "block_type": {
                 "type": "string",
@@ -344,7 +344,7 @@ class CreateBlockTool(BaseTool):
 
 class UpdateBlockTool(BaseTool):
     name = "update_block"
-    description = "Modifie un bloc récurrent existant (titre, horaires, JOUR, lieu, flexibilité). Résous le bloc par son nom/jour/heure via list_blocks; ne demande JAMAIS un identifiant à l'utilisateur. Pour DÉPLACER un bloc vers un autre jour (ex: 'déplace mon cours du lundi au mardi'), passe day_of_week (0=Lundi..6=Dimanche): c'est un déplacement PROPRE en place. N'utilise JAMAIS delete_block+create_block pour déplacer (ça crée des doublons). flexibility='fixed' verrouille/protège le bloc; flexibility='flexible' le rend déplaçable. Pour annuler/ignorer UN SEUL jour, n'utilise PAS update_block -> skip_block_occurrence."
+    description = "Modifie un bloc récurrent existant (titre, horaires, JOUR, lieu, flexibilité). Résous le bloc par son nom/jour/heure via list_blocks; ne demande JAMAIS un identifiant à l'utilisateur. Pour DÉPLACER un bloc vers un autre jour (ex: 'déplace mon atelier du lundi au mardi'), passe day_of_week (0=Lundi..6=Dimanche): c'est un déplacement PROPRE en place. N'utilise JAMAIS delete_block+create_block pour déplacer (ça crée des doublons). flexibility='fixed' verrouille/protège le bloc; flexibility='flexible' le rend déplaçable. Pour annuler/ignorer UN SEUL jour, n'utilise PAS update_block -> skip_block_occurrence."
     parameters = {
         "type": "object",
         "properties": {

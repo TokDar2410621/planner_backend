@@ -583,7 +583,10 @@ class PlannerAgentV2:
         sans_lecture = bool(gagnant) and (
             gagnant.get("source") == "formulaire" or gagnant.get("motif") == "choix_modele"
         ) and not any(a.succes and a.est_mutation for a in registre.actions)
-        faits = bloc_factuel(registre, cles_posees=cles_posees, sans_lecture=sans_lecture)
+        titres_vises = [((d or {}).get("cible") or {}).get("titre")
+                        for d in (gagnant.get("demandes") or [])] if par_demande else []
+        faits = bloc_factuel(registre, cles_posees=cles_posees, sans_lecture=sans_lecture,
+                             titres_vises=[t for t in titres_vises if t])
         # La section RESTE: demande contre place, une soustraction rendue par
         # du code. Elle rejoint les faits AVANT la redaction et le flux: le
         # manque se nomme au meme instant que le succes qu'il tempere.
