@@ -87,6 +87,10 @@ _REGLES = (
     # « je vais deplacer », « je vais le deplacer », « je vais en creer »
     ("futur", re.compile(
         rf"\bje\s+vais\s+{_ADV}(?:{_CLIT})*(?:(?:{'|'.join(_RACINES)})er\b|{_LOCUTIONS})")),
+    # Futur simple: « je m'occuperai de te trouver les creneaux », « je le
+    # placerai » (banc du round 3, s06-1).
+    ("futur_simple", re.compile(
+        rf"\bje\s+(?:{_CLIT})*(?:(?:{'|'.join(_RACINES)})erai|occuperai|trouverai|mettrai|remettrai)\b")),
     # « je supprime le doublon et j'ajoute le nouveau »
     ("present", re.compile(
         rf"\bj(?:e\s+|\s*'\s*)(?:{_CLIT})*{_VERBE}")),
@@ -112,7 +116,7 @@ _NOMINALE = re.compile(
 # subordonnee en « que je » (« veux-tu que je m'occupe de... »). Le passe et
 # le resultat restent actifs partout: une question n'excuse pas une
 # affirmation d'action deja faite.
-_REGLES_D_INTENTION = {"futur", "present", "prise_en_charge", "passe_recent"}
+_REGLES_D_INTENTION = {"futur", "futur_simple", "present", "prise_en_charge", "passe_recent"}
 _MARQUE_OFFRE = re.compile(
     r"\b(?:veux|voudrais|souhaites?|aimerais|peux|pourrais|dois|devrais)\s*-?\s*(?:tu|je|on)\b"
     r"|\bque\s+j(?:e\b|\s*')")
@@ -213,6 +217,11 @@ def _fuites_d_une_phrase(phrase: str) -> list[str]:
             fuites.append(nom)
     if _NOMINALE.match(sans_marque.strip()):
         fuites.append("nominale")
+    # Revue de verite du round 3: le participe NU d'une mutation n'etait
+    # cherche que dans les questions. « Gym retire pour jeudi. » passait en
+    # ouverture pendant que le code demandait s'il fallait le retirer.
+    if "resultat" not in fuites and _resultat_sans_marque(phrase):
+        fuites.append("resultat")
     return fuites
 
 
@@ -475,6 +484,30 @@ def epurer_reponse(reponse: ReponseDire) -> tuple[ReponseDire, int]:
     if not supprimees:
         return reponse, 0
     return reponse.model_copy(update=champs), supprimees
+
+
+def questions_et_offres(texte) -> str:
+    """Ce qui, d'un brouillon d'AGIR, peut entrer au brief de DIRE.
+
+    Seulement les phrases qui DEMANDENT: une vraie question (finit par « ? »)
+    ou une offre (« Veux-tu que je... », « Dis-moi l'heure et je le place »),
+    et seulement si fuite_question n'y trouve rien. Toute phrase declarative
+    tombe: c'est la que le modele raconte ses actions, y compris celles
+    qu'une garde a retenues (revue de verite du round 3).
+    """
+    if not texte or not isinstance(texte, str):
+        return ""
+    gardees: list[str] = []
+    for phrase in _phrases(texte):
+        nette = phrase.strip()
+        plat = _normaliser(nette).replace("?", " ").strip()
+        if not plat:
+            continue
+        demande = (_finit_par_question(nette) or bool(_OFFRE_EN_TETE.match(plat))
+                   or bool(_CONDITIONNELLE.match(plat)))
+        if demande and not fuite_question(nette):
+            gardees.append(nette)
+    return " ".join(gardees)
 
 
 def fuites_reponse(reponse: ReponseDire) -> list[str]:
