@@ -286,7 +286,7 @@ def _bloc_de_demande(demande: dict):
 
 # Les champs d'etat compares. « date » n'en est pas: elle vient du message.
 _CHAMPS_CIBLE = ("titre", "jour", "debut", "fin", "block_type", "complete", "echeance",
-                 "ids", "nombre")
+                 "ids", "nombre", "evenements")
 
 MESSAGE_CIBLE_CHANGEE = (
     "La cible a change depuis la question: le code n'a rien execute et laisse la "
@@ -318,6 +318,12 @@ def _cible_evenements(blocs: list, jour: date) -> dict:
         "debut": premier.start_time.strftime("%H:%M"),
         "fin": premier.end_time.strftime("%H:%M"),
         "ids": sorted(b.id for b in blocs),
+        # Round 9 (revue Codex): une photo par evenement. Une deuxieme rangee
+        # deplacee le meme jour garde les memes ids et la premiere rangee.
+        "evenements": [
+            {"id": b.id, "titre": b.task.title if b.task_id else "",
+             "debut": b.start_time.strftime("%H:%M"), "fin": b.end_time.strftime("%H:%M")}
+            for b in sorted(blocs, key=lambda x: x.id)],
     }
 
 
@@ -983,8 +989,14 @@ def _heure_dite_ignoree(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparati
     # deplace-le a 9 h »). Seule, elle dit ou il va (« deplace mon gym a 7 h »
     # sur un gym de 19 h): son autre lecture reste ferme. Retirer toute la
     # position laissait passer n'importe quelle heure.
-    nommees_msg = {ou for v, ou, _tol in toutes if v == actuel}
-    autre_heure = bool({ou for _v, ou, _tol in toutes} - nommees_msg)
+    #
+    # Revue du round 9: l'autre heure doit viser le MEME bloc. Une heure d'un
+    # autre element (« et mon yoga a 9 h », « j'ai un rendez-vous a 10 h »)
+    # ne compte pas; seule compte une heure liee au titre dans sa proposition,
+    # ou celle d'une proposition sans element propre (« deplace-le a 9 h »).
+    heures_sans_element = {
+        ou for s2, e2 in _propositions_rattachees(plat) if _proposition_sans_element(plat, s2, e2)
+        for _v, ou, _tol in _heures_fermes(plat, positions, s2, e2)}
     for s, e in _propositions_rattachees(plat):
         morceau = plat[s:e]
         spans = [(s + m.start(), s + m.end()) for m in re.finditer(r"[a-z0-9]+", morceau)
@@ -992,10 +1004,12 @@ def _heure_dite_ignoree(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparati
                      else m.group()) in mots]
         if not spans:
             continue
-        dites = _heures_fermes(plat, positions, s, e)
+        dites = [(v, ou, tol) for v, ou, tol in _heures_fermes(plat, positions, s, e)
+                 if _heure_liee_au_titre(plat, ou, spans)]
+        nommees = {ou for v, ou, _tol in dites if v == actuel}
+        autre_heure = bool(({ou for _v, ou, _tol in dites} | heures_sans_element) - nommees)
         fermes = [(v, tol, ou) for v, ou, tol in dites
-                  if v != actuel and not (ou in nommees_msg and autre_heure)
-                  and _heure_liee_au_titre(plat, ou, spans)]
+                  if v != actuel and not (ou in nommees and autre_heure)]
         if not fermes:
             continue
         jour_cible = _jour_cible(dem._dates_nommees(morceau, aujourdhui) or dates_message)
@@ -1005,6 +1019,21 @@ def _heure_dite_ignoree(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparati
         return _heure_dite_contredite(ctx, nom, kwargs, prep, titre, recurrent, debut,
                                       jour_cible, fermes)
     return None
+
+
+_VERBE_DE_PLACEMENT = re.compile(
+    r"(?:deplac|boug|met|mis|plac|decal|avanc|recul|pass|pouss|chang|remet|fix|cal)\w*")
+_PRONOMS_DE_RAPPEL = {"le", "la", "les", "l", "y", "lui", "ca", "moi", "plutot", "donc"}
+
+
+def _proposition_sans_element(plat: str, s: int, e: int) -> bool:
+    """La proposition ne nomme aucun element: seulement une heure, des liants,
+    un verbe de placement et un pronom (« deplace-le a 9 h »)."""
+    if not dem._RE_HEURE.search(plat[s:e]):
+        return False
+    mots = re.findall(r"[a-z]+", dem._RE_HEURE.sub(" ", plat[s:e]))
+    return all(w in _LIANTS_TITRE_HEURE or w in _PRONOMS_DE_RAPPEL
+               or _VERBE_DE_PLACEMENT.fullmatch(w) for w in mots)
 
 
 # Une proposition faite seulement d'une heure (« Gym jeudi. A 15 h. ») se
@@ -1070,6 +1099,43 @@ _MOMENT_SOIR = re.compile(
     r"\b(?:soir(?:s|ee|ees)?|soupers?|apres[- ]midi|aprem|pm|p\.m\.)(?!\w)")
 
 
+# Revue du round 9: le mot doit QUALIFIER l'heure. Complement d'un autre nom
+# (« avant le souper », « mon quart du soir », « ma soiree »), il ne choisit
+# rien et les deux lectures restent valides. Dans le doute, rien n'est choisi.
+_AVANT_COMPLEMENT = {"du", "de", "d", "au", "aux", "pour", "avant", "apres", "pendant",
+                     "durant", "depuis", "jusqu", "sans", "par", "sur", "dans", "pas",
+                     "sauf", "ni", "que", "quart", "shift", "cours"}
+_DETERMINANTS = {"le", "la", "les", "l", "un", "une", "des", "mon", "ma", "mes", "ton",
+                 "ta", "tes", "son", "sa", "ses", "notre", "votre", "nos", "vos", "leur",
+                 "leurs"}
+_POSSESSIFS = {"mon", "ma", "mes", "ton", "ta", "tes", "son", "sa", "ses", "notre", "votre",
+               "nos", "vos", "leur", "leurs"}
+
+
+def _moment_qualifie_l_heure(plat: str, s: int, mot, heure: tuple[int, int]) -> bool:
+    # 1. Seuls des liants entre le mot et l'heure.
+    if mot.end() <= heure[0]:
+        entre = plat[mot.end():heure[0]]
+    else:
+        entre = plat[heure[1]:mot.start()]
+    if not all(w in _LIANTS_TITRE_HEURE for w in re.findall(r"[a-z]+", entre)):
+        return False
+    # 2. Pas complement d'un autre nom. « apres-midi »/« avant-midi » portent
+    # leur propre preposition: on regarde avant le mot entier.
+    avant = re.findall(r"[a-z]+", plat[s:mot.start()])
+    if not avant:
+        return True
+    precedent = avant[-1]
+    if precedent in _AVANT_COMPLEMENT:
+        return False
+    if precedent in _DETERMINANTS:
+        if precedent in _POSSESSIFS and not mot.group().startswith("souper"):
+            return False  # « ma soiree », « mon matin »: un nom
+        if len(avant) >= 2 and avant[-2] in _AVANT_COMPLEMENT:
+            return False  # « avant le souper », « pas le soir »
+    return True
+
+
 def _moment_de_la_journee(plat: str, ou: int) -> str | None:
     """« matin » ou « soir » quand un mot de moment de la journee de la
     proposition de l'heure a la position `ou` s'y rattache: parmi les heures
@@ -1091,7 +1157,7 @@ def _moment_de_la_journee(plat: str, ou: int) -> str | None:
         for mot in motif.finditer(plat, s, e):
             span = (mot.start(), mot.end())
             proche = min(heures, key=lambda h: _distance(h, span))
-            if proche[0] != ou:
+            if proche[0] != ou or not _moment_qualifie_l_heure(plat, s, mot, proche):
                 continue
             d = _distance(proche, span)
             if meilleur is None or d < meilleur[0]:
