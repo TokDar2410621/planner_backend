@@ -73,7 +73,7 @@ def bloc_lecture(registre: Registre, aujourdhui=None) -> str:
 
 
 def bloc_factuel(registre: Registre, aujourdhui=None, cles_posees=None,
-                 sans_lecture: bool = False) -> str:
+                 sans_lecture: bool = False, titres_vises=None) -> str:
     """Le compte rendu deterministe du tour: les faits, sinon la lecture.
 
     `cles_posees` dit quelles actions retenues sont couvertes par la question
@@ -87,10 +87,17 @@ def bloc_factuel(registre: Registre, aujourdhui=None, cles_posees=None,
         # Revue du round 6: la ligne d'abandon (D2) remplacait la lecture que
         # le message demandait (« c'est quoi mon horaire demain ? »). Elle la
         # precede maintenant.
-        lecture = r.rendre_lecture(registre, aujourdhui)
+        lecture = _lecture(r, registre, aujourdhui, titres_vises)
         return f"{faits}\n\n{lecture}" if lecture else faits
     if faits or sans_lecture:
         return faits or ""
+    return _lecture(r, registre, aujourdhui, titres_vises)
+
+
+def _lecture(r, registre: Registre, aujourdhui, titres_vises) -> str:
+    """La lecture rendue; les titres vises ne passent que s'il y en a."""
+    if titres_vises:
+        return r.rendre_lecture(registre, aujourdhui, titres_vises)
     return r.rendre_lecture(registre, aujourdhui)
 
 
@@ -132,6 +139,8 @@ _COMPTE_NU = re.compile(
     r"(?:blocs?|cr[ée]neaux?|t[âa]ches?)\b",
     re.IGNORECASE)
 OPTIONS_MAX = 4
+# Les questions du code apres lesquelles la prose de DIRE ne s'affiche pas.
+MOTIFS_CODE_SEUL = frozenset({"destructif", "portee_jour"})
 
 
 @dataclass
@@ -398,6 +407,13 @@ def composer(brut: ReponseDire | None, registre: Registre, faits: str,
     prose = " ".join(p for p in (ouverture, suite) if p).strip()
 
     if question_code:
+        if question_code.get("motif") in MOTIFS_CODE_SEUL:
+            # Round 10 (P3, banc r9): sous une question destructive du code,
+            # DIRE n'avait rien a ajouter et ecrivait l'attente ou la maniere
+            # de repondre (« Je comprends, attends ta confirmation. »,
+            # « Parfait. Réponds seulement ce jeudi ou tous les jeudis »). La
+            # question nomme deja les cibles: le code parle seul.
+            prose = ""
         return Composition(
             faits=faits,
             prose=prose,

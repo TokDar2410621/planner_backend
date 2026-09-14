@@ -1360,6 +1360,146 @@ def _jour_a_choisir(ctx: _Contexte, nom: str, kwargs: dict):
     return ToolResult(success=False, data={"demande": demande}, message=MESSAGE_RETENUE)
 
 
+# ------------------------------------------- jour nomme sans mot de recurrence
+
+# Round 10 (P2, banc r9 k4-1): « souper jeudi soir a 6 h » est devenu une
+# serie hebdomadaire. Le raisonnement citait la regle « horaires habituels
+# AVEC jours et heures -> create_block » et l'absence de « ce » devant jeudi.
+# Un jour nomme sans l'un de ces mots designe UN jour: evenement date.
+_RECURRENCE = re.compile(
+    r"\b(?:chaque|tous\s+les|toutes\s+les|par\s+semaine|fois\s+par|hebdo\w*|habitud\w*"
+    r"|toujours|normalement|regulier\w*|a\s+partir\s+d\w*|jusqu'?\s*(?:a|au)\b|horaire\w*"
+    r"|semaine\s+type|session"
+    r"|(?:les|le)\s+(?:" + _JOURS_RE + r")s?\b(?!\s*\d)"
+    r"|(?:" + _JOURS_RE + r")s)\b")
+_JOUR_UNIQUE = re.compile(r"\b(?:" + _JOURS_RE + r"|demain|apres-demain|aujourd'?hui)\b")
+_REPONSE_FORMULAIRE = re.compile(r"^\s*voici mes r[ée]ponses", re.IGNORECASE)
+# Un cours, un quart ou le sommeil reviennent chaque semaine par defaut (K6).
+_TYPES_QUI_REVIENNENT = frozenset({"course", "work", "sleep"})
+
+
+def jour_sans_recurrence(texte) -> bool:
+    """Le message nomme-t-il un jour sans dire que ca revient ?"""
+    if not isinstance(texte, str) or not texte.strip() or _REPONSE_FORMULAIRE.match(texte):
+        return False
+    plat = dem.sans_accents(texte).lower()
+    return bool(_JOUR_UNIQUE.search(plat)) and not _RECURRENCE.search(plat)
+
+
+def _reponse_a_une_habitude(ctx: _Contexte) -> bool:
+    """Le message repond-il a une question posee sur une demande qui disait
+    deja la recurrence (« ajoute du yoga chaque semaine », puis « samedi a
+    10 h ») ?"""
+    from core.models import ConversationMessage
+
+    derniers = ConversationMessage.objects.filter(user=ctx.user).order_by("-pk")[:6]
+    for message in derniers:
+        if message.role != "assistant":
+            continue
+        meta = message.metadata or {}
+        if not meta.get("question_posee") and not meta.get("demandes") \
+                and not meta.get("interactive_inputs"):
+            return False
+        origine = ConversationMessage.objects.filter(
+            user=ctx.user, pk=meta.get("en_reponse_a"), role="user").first()
+        return bool(origine and _RECURRENCE.search(dem.sans_accents(origine.content or "").lower()))
+    return False
+
+
+def _evenement_unique(ctx: _Contexte, nom: str, kwargs: dict):
+    """create_block d'une activite lance sur un jour nomme sans recurrence:
+    le code le retient et dit d'appeler schedule_task_at a la bonne date."""
+    from services.agent.tools.blocks import normaliser_jours
+
+    if nom != "create_block" or str(kwargs.get("block_type") or "") in _TYPES_QUI_REVIENNENT:
+        return None
+    if not jour_sans_recurrence(ctx.texte) or _reponse_a_une_habitude(ctx):
+        return None
+    aujourdhui = timezone.localdate()
+    nommes = {d.weekday() for d in dem._dates_nommees(ctx.texte, aujourdhui)}
+    dows = {dow for dow in (_entier(j) for j in normaliser_jours(kwargs.get("days")))
+            if dow is not None and 0 <= dow <= 6}
+    # Le jour nomme doit etre celui de CET appel: « efface le quart de jeudi,
+    # ajoute mes etudes » ne dit rien des jours des etudes.
+    if not dows or not dows <= nommes:
+        return None
+    dates = [dem.prochaine_occurrence(dow, aujourdhui) for dow in dows]
+    isos = sorted({d.isoformat() for d in dates})
+    return ToolResult(
+        success=False, data={"evenement_unique": isos},
+        message=("Retenu par le code: l'utilisateur a nomme un jour sans mot de recurrence "
+                 "(chaque, tous les, les lundis). C'est un seul jour, pas une habitude: "
+                 "n'appelle pas create_block. Appelle schedule_task_at avec le meme titre et "
+                 "les memes heures, date=" + " puis date=".join(isos)
+                 + ". S'il voulait chaque semaine, il le dira."))
+
+
+# ------------------------------------ formulaire: l'heure avec les jours (P4)
+
+# Round 10 (P4, banc r9 s06-1): le formulaire demandait les jours et la duree
+# de la gym, pas l'heure; au tour suivant AGIR a choisi 16 h seul. Un
+# formulaire qui demande les jours d'une activite demande aussi sa plage
+# horaire, sans defaut invente. Un volume total (« 4 h d'etude en tout ») se
+# repartit et n'a pas d'heure; le sommeil garde son defaut produit.
+_NOMS_JOURS_FORM = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
+_TOTAL_FORM = re.compile(
+    r"\b(?:total\w*|en tout|heures d|heures de|temps d|temps de|nombre d'?heures|volume)\b")
+_PAR_SEANCE_FORM = re.compile(r"\b(?:seances?|par fois|chaque fois|une fois)\b")
+_SOMMEIL_FORM = re.compile(r"\b(?:sommeil|dormir|dors|coucher|couches|reveil\w*|nuit|dodo)\b")
+
+
+def _plat_form(champ: dict) -> str:
+    return dem.sans_accents(" ".join(str(champ.get(k) or "") for k in ("id", "label", "question"))).lower()
+
+
+def _champ_de_jours(champ: dict) -> bool:
+    if champ.get("type") != "checkbox" or not isinstance(champ.get("options"), list):
+        return False
+    vus = set()
+    for option in champ["options"]:
+        if not isinstance(option, dict):
+            continue
+        libelle = dem.sans_accents(str(option.get("label") or "")).lower().strip().rstrip(".")
+        for rang, nom in enumerate(_NOMS_JOURS_FORM):
+            if libelle == nom or libelle == nom[:3]:
+                vus.add(rang)
+    return len(vus) >= 5
+
+
+def formulaire_avec_heure(texte: str, kwargs: dict) -> dict:
+    """Les arguments de present_form, completes d'une plage horaire sans
+    defaut quand le formulaire demande des jours sans demander l'heure."""
+    inputs = kwargs.get("inputs")
+    if not isinstance(inputs, list):
+        return kwargs
+    champs = [c for c in inputs if isinstance(c, dict)]
+    if not any(_champ_de_jours(c) for c in champs):
+        return kwargs
+    if any(c.get("type") in ("duration", "number") and _TOTAL_FORM.search(_plat_form(c))
+           and not _PAR_SEANCE_FORM.search(_plat_form(c)) for c in champs):
+        return kwargs
+    dites = dem.heures_dites(texte or "")
+    heure_demandee = False
+    nouveaux = []
+    for champ in inputs:
+        if isinstance(champ, dict) and champ.get("type") in ("time_range", "time"):
+            heure_demandee = True
+            defaut = champ.get("default")
+            debut = defaut.get("start") if isinstance(defaut, dict) else defaut
+            if "default" in champ and not _SOMMEIL_FORM.search(_plat_form(champ)) \
+                    and _heure_normale(debut) not in dites:
+                champ = {k: v for k, v in champ.items() if k != "default"}
+        nouveaux.append(champ)
+    if not heure_demandee and not dites:
+        ids = {c.get("id") for c in champs}
+        ident = "plage_horaire"
+        while ident in ids:
+            ident += "_2"
+        nouveaux.append({"id": ident, "type": "time_range", "label": "Plage horaire",
+                         "question": "De quelle heure à quelle heure ?"})
+    return {**kwargs, "inputs": nouveaux}
+
+
 # ------------------------------------------------------- creations en masse
 
 def _crees_ce_tour(registre: Registre) -> tuple[int, list[str]]:
@@ -1635,7 +1775,11 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
             if issue is None:
                 issue = _jour_a_choisir(ctx, nom, kwargs)
             if issue is None:
+                issue = _evenement_unique(ctx, nom, kwargs)
+            if issue is None:
                 issue = _garde_creations(ctx, nom, kwargs)
+            if nom == "present_form":
+                kwargs = formulaire_avec_heure(ctx.texte, kwargs)
         except Exception:  # noqa: BLE001
             logger.error("Garde du code en panne sur %s", nom, exc_info=True)
             issue = (ToolResult(success=False, data={"needs_confirmation": True},

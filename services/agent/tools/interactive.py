@@ -555,7 +555,7 @@ class PresentChoicesTool(BaseTool):
         "properties": {
             "question": {
                 "type": "string",
-                "description": "La question, courte (140 caractères max), qui finit par « ? ». Ex: 'Lequel de tes cours de chimie ?'",
+                "description": "La question, courte (140 caractères max), qui finit par « ? ». Ex: 'Laquelle de tes séances de poterie ?'",
             },
             "options": {
                 "type": "array",
@@ -563,7 +563,7 @@ class PresentChoicesTool(BaseTool):
                 "items": {
                     "type": "object",
                     "properties": {
-                        "label": {"type": "string", "description": "Texte du bouton, ex: '13 h à 14 h' ou 'Chimie générale'"},
+                        "label": {"type": "string", "description": "Texte du bouton, ex: '13 h à 14 h' ou 'Poterie débutant'"},
                         "value": {"type": "string", "description": "Message envoyé au tap, ex: 'Va pour 13 h à 14 h jeudi.'"},
                     },
                     "required": ["label", "value"],

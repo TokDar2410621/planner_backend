@@ -43,7 +43,7 @@ def faux_rendu(journal: dict) -> SimpleNamespace:
         journal.setdefault("cles_posees", []).append(cles_posees)
         return "FAITS" if any(a.succes and a.est_mutation for a in registre.actions) else ""
 
-    def rendre_lecture(registre, aujourdhui=None):
+    def rendre_lecture(registre, aujourdhui=None, titres_vises=None):
         return ""
 
     def rendre_demandes(demandes, aujourdhui=None):
