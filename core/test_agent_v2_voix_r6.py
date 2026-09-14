@@ -294,15 +294,19 @@ class D7AbsenceTests(SimpleTestCase):
                 self.assertEqual(self._prose(phrase), phrase)
 
 
+# Round 8 (F3): seule la mecanique de l'interface tombe. Les tournures du banc
+# du round 5 (« Choisis tes trois jours », « dans la liste », « l'étendue »)
+# retiraient aussi des conseils ordinaires: elles restent maintenant.
 MECANIQUE_R5 = (
+    "Touche un des boutons ci-dessous.",
+    "Appuie sur la puce qui te convient.",
+    "Réponds « Tous les jeudis ».",
+)
+ORDINAIRES = (
     "Précise tes heures et tes jours dans tes réponses.",
     "Choisis tes trois jours et l'heure.",
     "Ton mardi est déjà affiché.",
-    "Je n'ai pas tenu compte de ton sommeil dans la liste, mais il commence à 23 h.",
     "Indique l'étendue pour que je puisse tout retirer d'un coup.",
-    "Le Stage prend 10 h à 12 h, donc choisis parmi les moments libres proposés.",
-)
-ORDINAIRES = (
     "Ta journée est bien remplie.",
     "Si tu choisis le matin, tu seras plus frais.",
     "La liste de tes cours est longue cette session.",

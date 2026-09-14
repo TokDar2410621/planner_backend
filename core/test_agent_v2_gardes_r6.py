@@ -83,7 +83,9 @@ class D1PuceExacteTests(SimpleTestCase):
             'Oui, supprime ces trois blocs.', 'oui pour jeudi seulement', 'supprime-le',
             'oui, supprime la série', 'tous', 'chaque jeudi', 'jeudi seulement',
         )
-        for demande in (PORTEE, DESTR, MASSE, PLAN):
+        # Round 8 (F4): un oui clair confirme une creation en masse, qui ne
+        # detruit rien; test_agent_v2_final_r8 couvre ce cote.
+        for demande in (PORTEE, DESTR, PLAN):
             for brut in libres:
                 with self.subTest(motif=demande['motif'], brut=brut):
                     self.assertNotIn(dem.option_choisie(brut, demande),

@@ -174,9 +174,9 @@ class MecaniqueEtSecondeQuestionTests(NarrateurBase):
 
     def test_la_mecanique_tombe_meme_sans_question_du_code(self):
         _, done = self.tour(dire=ReponseDire(
-            ouverture="Ajuste les jours ou la durée si besoin.",
+            ouverture="Coche les jours voulus.",
             suite="Touche un des boutons ci-dessous."))
-        self.assertNotIn("Ajuste", done["response"])
+        self.assertNotIn("Coche", done["response"])
         self.assertNotIn("boutons", done["response"])
 
 

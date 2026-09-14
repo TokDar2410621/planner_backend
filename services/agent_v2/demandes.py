@@ -163,6 +163,23 @@ def demandes_en_attente(user, maintenant=None) -> list[dict]:
 #    aucune option: le code repose la question une fois, puis l'abandonne.
 
 MOTIFS_LECTURE_LIBRE = {"destructif", "creation_en_masse", "optimisation", "portee_jour"}
+# Round 8 (F4): un oui clair confirme ce qui ne detruit rien. Seule la creation
+# en masse en fait partie. « heure_refusee » n'a pas d'option « confirmer »:
+# un oui ne dit pas QUEL creneau, et en choisir un changerait l'heure a la
+# place de l'utilisateur (I3). Suppressions, vidage, annulations, arrets et
+# plan de la semaine restent a la puce exacte (I1).
+MOTIFS_OUI_LIBRE = {"creation_en_masse"}
+_OUI = {"oui", "ok", "okay", "ouais", "yes", "go", "continue", "vas-y", "d'accord", "daccord"}
+_POLITESSE = {"merci", "stp", "svp", "s'il", "te", "vous", "plait"}
+
+
+def oui_clair(message_brut) -> bool:
+    """Le message n'est-il qu'un oui, avec au plus de la politesse autour ?"""
+    if not isinstance(message_brut, str) or "?" in message_brut:
+        return False
+    mots = [m for m in (x.strip("'-") for x in re.findall(r"[a-z0-9'-]+", _plat(message_brut))) if m]
+    return (any(m in _OUI for m in mots)
+            and all(m in _OUI or m in _POLITESSE for m in mots))
 
 
 def _ids_options(demande: dict) -> set:
@@ -246,6 +263,22 @@ def _verbe_nie(plat: str, m) -> bool:
     return bool(_NEGATIONS_DU_VERBE.intersection(avant + apres))
 
 
+_VERBE_DE_GARDE = re.compile(r"(?:gard|laiss|conserv|arret)")
+# Avant un verbe de garde, « rien » est l'objet du verbe precedent (« n'efface
+# rien, garde-le »): il ne nie pas la garde.
+_NEGATIONS_AVANT_GARDE = {"ne", "pas", "plus", "pu", "jamais"}
+_NEGATIONS_APRES_GARDE = {"pas", "rien", "plus", "pu", "jamais", "aucun", "aucune"}
+
+
+def _garde_nie(plat: str, m) -> bool:
+    if plat[:m.start()].endswith("n'"):
+        return True
+    avant = [x.strip("'") for x in _mots(plat[:m.start()])][-2:]
+    apres = [x.strip("'") for x in _mots(plat[m.end():])][:2]
+    return bool(_NEGATIONS_AVANT_GARDE.intersection(avant)
+                or _NEGATIONS_APRES_GARDE.intersection(apres))
+
+
 def _jetons(texte: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", sans_accents(texte))
 
@@ -295,6 +328,10 @@ def annulation_libre(message_brut, demande: dict) -> bool:
     for m in _MARQUE_GARDE.finditer(plat):
         if annuler_est_l_action and m.group(0).startswith("annul"):
             return False
+        # Round 8: « ne le garde pas », « garde rien », « laisse pas »,
+        # « n'arrete pas » disent l'inverse: la demande se repose.
+        if _VERBE_DE_GARDE.match(m.group(0)) and _garde_nie(plat, m):
+            return False
         garde = True
     if not garde:
         return False
@@ -323,6 +360,9 @@ def option_choisie(message_brut: str, demande: dict) -> str | None:
     if not ids:
         return None
     choix = puce_touchee(message_brut, demande)
+    if (choix is None and "confirmer" in ids
+            and demande.get("motif") in MOTIFS_OUI_LIBRE and oui_clair(message_brut)):
+        choix = "confirmer"
     if (choix is None and "annuler" in ids
             and demande.get("motif") in MOTIFS_LECTURE_LIBRE
             and annulation_libre(message_brut, demande)):
@@ -354,6 +394,13 @@ _NOUVELLE_REQUETE = re.compile(
     r"\b(?:ajout\w*|cree\w*|creer|mets|met|place\w*|planifi\w*|deplac\w*|bouge\w*|"
     r"montre\w*|affiche\w*|horaire|planning|agenda|quoi|quel\w*|quand|combien|"
     r"merci|bonne|bonjour|salut|allo)\b")
+# Round 8 (F6): « efface tout », « vide tout », « supprime tous mes blocs »,
+# « supprime tout ce jeudi » ouvrent une nouvelle demande destructive. AGIR la
+# sert, sous ses propres gardes; rien ne s'execute par cette lecture. « tous
+# les jeudis » reste une portee, donc une reponse floue.
+_NOUVELLE_DESTRUCTION = re.compile(
+    r"\b(?:supprim\w*|effac\w*|enlev\w*|retir\w*|vide[rz]?)\s+"
+    r"(?:tout\b|(?:tous|toutes)\s+(?!les\s+(?:" + "|".join(_JOURS) + r")s?\b))")
 
 
 def _nomme_rien_d_autre(plat: str, demande: dict | None) -> bool:
@@ -382,7 +429,7 @@ def reponse_plausible(message_brut, demande: dict) -> bool:
     question reposee ou abandonnee, jamais une action.
     """
     plat = _plat(message_brut)
-    if not plat or _NOUVELLE_REQUETE.search(plat):
+    if not plat or _NOUVELLE_REQUETE.search(plat) or _NOUVELLE_DESTRUCTION.search(plat):
         return False
     # Revue du round 6: un oui ou un non en tete ne suffit plus. « non,
     # supprime plutot mon gym » est une correction qui porte une nouvelle

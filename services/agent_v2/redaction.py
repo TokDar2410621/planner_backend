@@ -234,28 +234,21 @@ def contient_question(texte: str) -> bool:
 
 
 # La mecanique de l'interface decrite a l'utilisateur (banc du round 3):
-# « Remplis ce qui te convient », « le tout est pré-rempli », « Réponds « Tous
-# les jeudis » », « ajuste les jours si besoin », « touche un des boutons ».
-# Revue de lisibilite du round 4: « Ta journée est bien remplie » et « au
-# champ de tir » tombaient. Seuls l'imperatif « remplis » et le champ d'une
-# saisie (« le champ », « ces champs ») restent de la mecanique.
+# « le tout est pré-rempli », « Réponds « Tous les jeudis » », « touche un des
+# boutons ». Round 8: seule la mecanique de l'interface tombe (bouton, puce,
+# formulaire, champ, coche, clique, appuie). Les tournures du banc du round 5
+# (« Choisis tes trois jours », « dans la liste », « l'étendue », « heures
+# proposées », « ajuste si besoin », « réponds par ») retiraient aussi des
+# conseils ordinaires (« Choisis une matière à la fois. »): elles sont
+# retirees. Une phrase de mecanique qui passe coute une phrase de trop, comme
+# sur main; un conseil retire coutait une reponse.
 _MECANIQUE = re.compile(
-    r"\brempli(?:s|r)\b|\bpr[ée][- ]?rempli\w*"
-    r"|\br[ée]ponds?\s*(?:[«\"“]|par\b|avec\b)"
-    r"|\bboutons?\b|\bcoch(?:e|es|er|ez|ée|ées)\b|\bclique\w*|\bappuie\w*\s+sur\b"
-    r"|\bci-(?:dessous|dessus)\b|\bajuste\w*\b[^.?!]*\bsi\s+besoin\b"
-    r"|\bs[ée]lectionne\w*|\b(?:le|les|ce|ces|chaque|un|des)\s+champs?\b"
-    # Banc du round 5, cinq tours: « dans tes réponses » (s02-1), « Choisis
-    # tes trois jours » (s06-1), « déjà affiché » et « dans la liste »
-    # (s08-1), « l'étendue » (p2-1), « choisis parmi les moments libres
-    # proposés » (p3-1). « choisis » ne compte qu'a l'imperatif: « si tu
-    # choisis le matin » reste.
-    r"|\bdans\s+(?:tes|ta|les|ces|mes)\s+r[ée]ponses?\b"
-    r"|(?<!tu\s)\bchoisis\b"
-    r"|\bd[ée]j[àa]\s+affich\w*|\b(?:est|sont)\s+affich[ée]\w*"
-    r"|\bdans\s+(?:la|cette|ta|les|ces)\s+listes?\b"
-    r"|\bl['’]\s*[ée]tendue\b"
-    r"|\b(?:moments?|cr[ée]neaux|options|choix|heures|jours|plages?)\s+(?:\w+\s+)?propos[ée]e?s?\b",
+    r"\brempli(?:s|r)\s+(?:le|les|ce|ces)\s+(?:formulaires?|champs?)\b"
+    r"|\bpr[ée][- ]?rempli\w*"
+    r"|\br[ée]ponds?\s*[«\"“]"
+    r"|\bboutons?\b|\bpuces?\b|\bcoch(?:e|es|er|ez|ée|ées)\b|\bclique\w*|\bappuie\w*\s+sur\b"
+    r"|\bci-(?:dessous|dessus)\b"
+    r"|\b(?:le|les|ce|ces|chaque|un|des)\s+champs?\b",
     re.IGNORECASE)
 # Une absence affirmee alors que le code affiche la liste lue (banc du round
 # 4, s03-1). Round 6 (D7): la phrase ne tombe que si elle nomme un TITRE que

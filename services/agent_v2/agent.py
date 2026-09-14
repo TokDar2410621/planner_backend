@@ -548,7 +548,9 @@ class PlannerAgentV2:
         # brouillon a ete jete. Quand le message ne fait que repondre (ou ne
         # pas repondre) a une demande en attente, le tour se construit depuis
         # la decision du code: ni AGIR, ni DIRE.
-        par_le_code = self._tour_decide(registre, message)
+        # Round 8: une piece jointe est toujours une demande pour AGIR, meme
+        # quand le texte tape ne fait que repondre.
+        par_le_code = attachment is None and self._tour_decide(registre, message)
         raisonnement, panne = "", None
         if par_le_code:
             self._file_pensees = None

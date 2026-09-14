@@ -861,8 +861,11 @@ def _heure_dite_ignoree(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparati
                      else m.group()) in mots]
         if not spans:
             continue
-        fermes = [(v, tol) for v, ou, tol in _heures_fermes(plat, positions, s, e)
-                  if v != actuel and _heure_liee_au_titre(plat, ou, spans)]
+        dites = _heures_fermes(plat, positions, s, e)
+        # Une heure nue dont une lecture est l'heure actuelle nomme le bloc.
+        nommees = {ou for v, ou, _tol in dites if v == actuel}
+        fermes = [(v, tol, ou) for v, ou, tol in dites
+                  if ou not in nommees and _heure_liee_au_titre(plat, ou, spans)]
         if not fermes:
             continue
         jour_cible = _jour_cible(dem._dates_nommees(morceau, aujourdhui) or dates_message)
@@ -925,9 +928,35 @@ def _heure_liee_au_titre(plat: str, ou: int, spans: list[tuple[int, int]]) -> bo
     return all(w in _LIANTS_TITRE_HEURE for w in mots)
 
 
+_MARQUE_MATIN = re.compile(r"[ \t]*(?:du matin\b|am\b|a\.m\.)")
+_MARQUE_APRES_MIDI = re.compile(
+    r"[ \t]*(?:du soir\b|pm\b|p\.m\.|de l'?[ \t]*apres[- ]midi\b|de l'?[ \t]*aprem\b)")
+
+
+def _lectures_d_heure(plat: str, ou: int, valeur: str) -> list[str]:
+    """Les lectures d'une heure dite. Round 8: au Quebec, une heure nue de 1 a
+    11 (« souper jeudi a 6 h ») vaut aussi H+12. « du matin », « am » gardent
+    H; « du soir », « pm », « de l'apres-midi » donnent H+12. Midi (12 h) et une
+    heure ecrite avec un zero (« 07:00 ») restent telles quelles."""
+    m = dem._RE_HEURE.match(plat, ou)
+    if m is None or m.group(5):
+        return [valeur]
+    ecrite = m.group(1) if m.group(1) is not None else m.group(3)
+    h = int(valeur[:2])
+    if not 1 <= h <= 12 or ecrite.startswith("0"):
+        return [valeur]
+    suite = plat[m.end():]
+    if _MARQUE_APRES_MIDI.match(suite):
+        return [valeur if h == 12 else f"{h + 12:02d}{valeur[2:]}"]
+    if h == 12 or _MARQUE_MATIN.match(suite):
+        return [valeur]
+    return [valeur, f"{h + 12:02d}{valeur[2:]}"]
+
+
 def _heures_fermes(plat: str, positions, s: int, e: int) -> list[tuple[str, int, int]]:
     """(valeur, position, tolerance) des heures fermes entre s et e: une
-    borne (« avant 10 h ») n'en est pas une, une approximation a sa marge."""
+    borne (« avant 10 h ») n'en est pas une, une approximation a sa marge.
+    Une heure nue donne une entree par lecture, a la meme position."""
     fermes = []
     for valeur, ou in positions:
         if not (s <= ou < e):
@@ -936,7 +965,8 @@ def _heures_fermes(plat: str, positions, s: int, e: int) -> list[tuple[str, int,
         if _HEURE_SOUPLE_AVANT.search(avant):
             continue
         tolerance = TOLERANCE_APPROX if _HEURE_APPROX_AVANT.search(avant) else 0
-        fermes.append((valeur, ou, tolerance))
+        for lecture in _lectures_d_heure(plat, ou, valeur):
+            fermes.append((lecture, ou, tolerance))
     return fermes
 
 
@@ -945,26 +975,38 @@ def _heure_dite_contredite(ctx: _Contexte, nom: str, kwargs: dict, prep: _Prepar
     """Refus quand l'appel ne pose aucune des heures fermes dites, sinon None."""
     from services.scheduling.placement import open_intervals
 
-    if any(abs(_minutes(debut) - _minutes(v)) <= tol for v, tol in fermes):
+    if any(abs(_minutes(debut) - _minutes(v)) <= tol for v, tol, _ou in fermes):
         return None
-    dite = fermes[0][0]
+    # Les lectures de la premiere heure dite: une heure nue en a deux, et le
+    # code n'en impose jamais une seule (round 8).
+    lectures = [v for v, _tol, ou in fermes if ou == fermes[0][2]]
+    dite = lectures[0]
     fin_appel = _heure_normale(kwargs.get("end_time")) or (prep.bloc_update or {}).get("fin")
     duree = ((_minutes(fin_appel) - _minutes(debut)) % (24 * 60)) if fin_appel else 60
     duree = duree or 60
     fin_dite = _fmt((_minutes(dite) + duree) % (24 * 60))
-    debut_min = _minutes(dite)
-    fin_min = debut_min + duree
-    libre = fin_min <= 24 * 60 and any(
-        a <= debut_min and fin_min <= b for a, b in open_intervals(ctx.user, jour_cible, 0, 24 * 60))
-    if libre:
+    ouverts = open_intervals(ctx.user, jour_cible, 0, 24 * 60)
+
+    def _libre(heure):
+        debut_min = _minutes(heure)
+        fin_min = debut_min + duree
+        return fin_min <= 24 * 60 and any(a <= debut_min and fin_min <= b for a, b in ouverts)
+
+    if any(_libre(v) for v in lectures):
+        if len(lectures) > 1:
+            consigne = (f"l'utilisateur a dit {' ou '.join(lectures)} pour {_ascii(titre)} "
+                        "(heure sans matin ni soir, les deux lectures valent). Refais l'appel avec "
+                        + " ou ".join(f"start_time={v}" for v in lectures)
+                        + " selon le contexte. Si aucune ne convient")
+        else:
+            consigne = (f"l'utilisateur a dit {dite} pour {_ascii(titre)}. "
+                        f"Refais l'appel avec start_time={dite}. Si cette heure ne convient pas")
         return ToolResult(
             success=False, data={"heure_dite": dite},
-            message=(f"Retenu par le code: l'utilisateur a dit {dite} pour {_ascii(titre)}. "
-                     f"Refais l'appel avec start_time={dite}. Si cette heure ne convient pas, "
-                     "pose la question au lieu de changer l'heure."))
+            message=f"Retenu par le code: {consigne}, pose la question au lieu de changer l'heure.")
     demande = _demande_heure_refusee(ctx, nom, kwargs, titre, jour_cible, dite, fin_dite,
                                      None, recurrent=recurrent)
-    heures = [v for v, _tol in fermes]
+    heures = [v for v, _tol, _ou in fermes]
     if recurrent:
         _armer(ctx, demande, heures, jour=jour_cible.weekday())
     else:
