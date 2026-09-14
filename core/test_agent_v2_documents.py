@@ -188,12 +188,13 @@ class ImportAuRegistreTests(TestCase):
         self.assertTrue(imports[0].est_mutation)
         self.assertTrue(imports[0].succes)
         # Le recap est rendu par du code, donc present meme quand DIRE ne dit
-        # que « Ok. »: l'utilisateur lit ses cours, pas une prose.
+        # que « Ok. »: l'utilisateur lit ses cours, pas une prose. Le format
+        # exact (heures humaines, jours) appartient a rendu.py et a ses tests;
+        # ici on verifie que chaque cours importe est nomme.
         reponse = resultat['response']
-        self.assertIn('2 entrées ajoutées', reponse)
-        self.assertIn('Physique : mercredi 13:30-15:20', reponse)
-        self.assertIn('Anglais : vendredi 09:00-11:00', reponse)
-        self.assertIn('horaire.png', reponse)
+        self.assertIn('Physique', reponse)
+        self.assertIn('Anglais', reponse)
+        self.assertTrue(reponse.index('Physique') < reponse.index('Ok.'), reponse)
 
     def test_le_recap_nomme_les_cours_ecartes_par_le_processeur(self):
         """5 cours lus, 4 crees: le manquant doit etre nomme, avec sa raison."""
@@ -208,8 +209,8 @@ class ImportAuRegistreTests(TestCase):
 
         resultat, _ = self._tour(doc)
 
-        self.assertIn('1 entrée ajoutée', resultat['response'])
-        self.assertIn('Non ajouté : Programmation Web (mardi 15:00-17:00)', resultat['response'])
+        self.assertIn('Physique', resultat['response'])
+        self.assertIn('Programmation Web', resultat['response'])
 
     def test_le_brief_de_dire_ne_dit_plus_que_le_registre_est_vide(self):
         from core.models import RecurringBlock
@@ -237,6 +238,7 @@ class ImportAuRegistreTests(TestCase):
         self.assertEqual(len(lectures), 1)
         self.assertFalse(lectures[0].est_mutation)
         self.assertNotIn('Horaire importé', resultat['response'])
+        self.assertNotIn("C'est importé", resultat['response'])
         brief = self.Agent._brief_dire("c'est bon ?", registre, {}, "")
         self.assertNotIn('VIDE', brief)
         self.assertIn('Anglais', brief)

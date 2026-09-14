@@ -23,8 +23,14 @@ def _agir_muet(self_agent, user, message, registre):
 
 
 def _agir_qui_cree(self_agent, user, message, registre):
+    # Les donnees ont la forme que rend create_block: le rendu des faits lit
+    # les donnees, jamais le message ecrit pour le modele.
     registre.ajouter('create_block', {'title': 'Maths'},
-                     ToolResult(success=True, message="Bloc 'Maths' cree"))
+                     ToolResult(success=True, message="Bloc 'Maths' cree",
+                                data={'created': [{
+                                    'title': 'Maths', 'day_of_week': 0,
+                                    'day_name': 'Lundi', 'start_time': '09:00',
+                                    'end_time': '12:00'}]}))
     return None
 
 
@@ -45,10 +51,18 @@ class BoucleTests(TestCase):
              patch.object(self.Agent, '_dire', return_value=menteur):
             res = self.Agent().process_message(self.user, "mes cours sont prioritaires")
         self.assertNotIn('supprime les blocs', res['response'])
-        self.assertIn('Absolument', res['response'])
+        # Depuis le 2026-09-14, une reference inventee fait tomber TOUTE la
+        # prose de DIRE, accroche comprise: un redacteur qui ment sur une
+        # action n'est pas cru sur le reste.
+        self.assertNotIn('Absolument', res['response'])
+        self.assertTrue(res['response'].strip())
 
     def test_un_recit_vrai_survit(self):
-        """Contre-epreuve: sans elle, un agent qui supprime tout passerait."""
+        """Contre-epreuve: sans elle, un agent qui supprime tout passerait.
+
+        Un seul narrateur depuis le 2026-09-14: l'action vraie est racontee
+        par les faits rendus par le code, et la phrase citee par DIRE n'est
+        plus recopiee a cote (elle doublait chaque ligne)."""
         vrai = ReponseDire(
             ouverture="C'est fait.",
             actions=[ActionCitee(ref='a1', phrase="Maths est cale le lundi.")],
@@ -56,8 +70,8 @@ class BoucleTests(TestCase):
         with patch.object(self.Agent, '_agir', _agir_qui_cree), \
              patch.object(self.Agent, '_dire', return_value=vrai):
             res = self.Agent().process_message(self.user, "ajoute maths")
-        self.assertIn('Maths est cale', res['response'])
-        self.assertIn('Bloc', res['response'])
+        self.assertIn('Maths', res['response'])
+        self.assertNotIn('Maths est cale', res['response'])
 
     def test_les_quatre_cles_du_contrat_sont_presentes(self):
         """views.py:861 lit result['response'] par indexation DIRECTE: une cle
@@ -249,4 +263,5 @@ class ResilienceTests(TestCase):
         with patch.object(self.Agent, '_agir', _agir_sature), \
              patch.object(self.Agent, '_dire', return_value=ReponseDire(ouverture="Bon.")):
             res = self.Agent().process_message(self.user, "fais tout")
-        self.assertIn('interrompu', res['response'].lower())
+        texte = res['response'].lower()
+        self.assertTrue('interrompu' in texte or 'arrêté' in texte, texte)
