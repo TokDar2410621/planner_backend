@@ -522,11 +522,16 @@ _RE_HEURE = re.compile(
     # [ \t]* et non \s*: « 2026-09-17\nHeure du rendez-vous » se lisait 17:00.
     r"(?<![\d:-])([01]?\d|2[0-3])[ \t]*(?:heures?|h)(?![a-z])[ \t]*([0-5]\d)?(?!\d)"
     r"|(?<![\d:])([01]?\d|2[0-3]):([0-5]\d)(?!\d)"
-    r"|(?<![-\w])(midi|minuit)\b"
+    # « apres midi » et « avant midi » sans trait d'union ne sont pas 12 h.
+    r"|(?<![-\w])(?<!apres )(?<!avant )(midi|minuit)\b"
 )
 # « pour » n'en fait pas partie: « Va pour 11 h 50 » est la valeur d'une puce.
 _AVANT_DUREE = re.compile(r"(pendant|durant|dure|duree de)\s*$")
-_APRES_DUREE = re.compile(r"^\s*(de\s|d'|par (jour|semaine|soir|seance)\b)")
+# Round 9: « 2 h de l'apres-midi », « 2 h de la nuit » donnent une heure, pas
+# une duree. La lecture stricte (H+12) est choisie par outils._lectures_d_heure.
+_APRES_DUREE = re.compile(
+    r"^\s*(de\s(?!l'?\s*(?:apres[- ]midi|aprem)\b|la\s+(?:nuit|soiree|matinee)\b)"
+    r"|d'(?!\s*(?:apres[- ]midi|aprem)\b)|par (jour|semaine|soir|seance)\b)")
 # Une reponse de formulaire « Durée: 1 h » ou « Temps d'étude total: 4 h »
 # donne une DUREE. Lue comme 01:00 ou 04:00, elle faisait retenir les ajouts
 # du formulaire d'etude (banc du 2026-09-14, s02-2). Le libelle se lit sur la

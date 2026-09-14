@@ -276,6 +276,139 @@ def _bloc_de_demande(demande: dict):
     return None
 
 
+# ------------------------------------------------ cible relue avant l'effet
+#
+# Round 9 (K1, trouve par Codex): l'effet stocke ne verifiait que sa cle et
+# ses parametres. Un bloc modifie, desactive ou remplace entre la question et
+# la puce (autre appareil, MCP, application web) etait supprime dans son
+# NOUVEL etat. Avant tout effet destructif, la cible est relue et comparee a
+# demande.cible; a la moindre difference, rien ne s'execute.
+
+# Les champs d'etat compares. « date » n'en est pas: elle vient du message.
+_CHAMPS_CIBLE = ("titre", "jour", "debut", "fin", "block_type", "complete", "echeance",
+                 "ids", "nombre")
+
+MESSAGE_CIBLE_CHANGEE = (
+    "La cible a change depuis la question: le code n'a rien execute et laisse la "
+    "demande de cote. N'agis pas sur ce point sans nouvelle demande explicite.")
+
+
+def _cible_tache(task) -> dict:
+    return {
+        "titre": task.title,
+        "complete": bool(task.completed),
+        "echeance": task.deadline.isoformat() if task.deadline else None,
+    }
+
+
+def _evenements(user, jour, titre: str) -> list:
+    from core.models import ScheduledBlock
+
+    qs = ScheduledBlock.objects.filter(user=user, date=jour).select_related("task")
+    if titre:
+        qs = qs.filter(task__title__icontains=titre)
+    return list(qs.order_by("start_time", "id"))
+
+
+def _cible_evenements(blocs: list, jour: date) -> dict:
+    premier = blocs[0]
+    return {
+        "titre": premier.task.title if premier.task_id else "",
+        "date": jour.isoformat(),
+        "debut": premier.start_time.strftime("%H:%M"),
+        "fin": premier.end_time.strftime("%H:%M"),
+        "ids": sorted(b.id for b in blocs),
+    }
+
+
+def _cible_planning(user) -> dict:
+    from core.models import RecurringBlock
+
+    ids = sorted(RecurringBlock.objects.filter(user=user, active=True).values_list("id", flat=True))
+    return {"nombre": len(ids), "ids": ids}
+
+
+def _cible_actuelle(user, demande: dict):
+    """L'etat COURANT de la cible d'une demande destructive, dans la forme de
+    demande.cible, ou None quand elle n'existe plus (ou plus active)."""
+    from core.models import RecurringBlock, Task
+
+    outil = demande.get("outil")
+    parametres = demande.get("parametres") or {}
+    if demande.get("motif") == "portee_jour" or outil in ("delete_block", "update_block",
+                                                          "skip_block_occurrence"):
+        bid = _bloc_de_demande(demande)
+        block = (RecurringBlock.objects.filter(id=bid, user=user, active=True).first()
+                 if bid is not None else None)
+        return _cible_bloc(block) if block is not None else None
+    if outil == "delete_task":
+        tid = _entier(parametres.get("task_id"))
+        task = Task.objects.filter(id=tid, user=user).first() if tid is not None else None
+        return _cible_tache(task) if task is not None else None
+    if outil == "cancel_scheduled_block":
+        jour = _date_iso(parametres.get("date"))
+        if jour is None:
+            return None
+        titre = str(parametres.get("title") or "").strip()
+        blocs = _evenements(user, jour, titre)
+        if not blocs or (not titre and len({b.task.title if b.task_id else "" for b in blocs}) > 1):
+            return None
+        return _cible_evenements(blocs, jour)
+    if outil == "clear_all_blocks":
+        return _cible_planning(user)
+    return None
+
+
+def _cible_changee(user, demande: dict) -> bool:
+    """Vrai quand la cible d'une demande destructive n'est plus celle de la
+    question. Seuls les champs presents dans demande.cible sont compares: une
+    demande d'avant le round 9 (sans « ids ») garde les autres."""
+    if demande.get("motif") not in ("portee_jour", "destructif"):
+        return False
+    stockee = demande.get("cible") or {}
+    actuelle = _cible_actuelle(user, demande)
+    if actuelle is None:
+        return True
+    return any(actuelle.get(k) != stockee[k] for k in _CHAMPS_CIBLE if k in stockee)
+
+
+def _ligne_cible_changee(demande: dict) -> str:
+    """La ligne du code, en francais du Quebec, pour une cible changee."""
+    outil = demande.get("outil")
+    titre = str((demande.get("cible") or {}).get("titre") or "").strip()
+    if titre:
+        titre = titre[0].upper() + titre[1:]
+    if outil == "clear_all_blocks":
+        sujet, verbe = "Ton planning", "supprimé"
+    elif outil == "delete_task":
+        sujet, verbe = (f"La tâche {titre}" if titre else "Cette tâche"), "supprimé"
+    elif outil == "cancel_scheduled_block":
+        sujet, verbe = (titre or "Cet événement"), "annulé"
+    elif outil == "update_block":
+        sujet, verbe = (titre or "Ce créneau"), "changé"
+    else:
+        sujet, verbe = (titre or "Ce créneau"), "supprimé"
+    return (f"{sujet} a changé depuis ma question, je n'ai rien {verbe}. "
+            "Redis-le si tu veux toujours.")
+
+
+def _abandon_cible_changee(ctx, demande: dict):
+    """Consigne l'abandon d'une demande dont la cible a change, et la retire
+    du tour: ni la puce ni le modele ne peuvent plus l'executer."""
+    cle = demande.get("cle")
+    ctx.etat.attente.setdefault("abandonnees", set()).add(cle)
+    ctx.etat.attente.setdefault("cibles_changees", set()).add(cle)
+    logger.warning("Cible changee depuis la question, rien d'execute cle=%s", cle)
+    resultat = ToolResult(
+        success=False,
+        data={"demande": {k: v for k, v in demande.items() if k != "chips"},
+              "abandonnee_par_le_code": True, "cible_changee": True,
+              "decision_code": DECISION_ABANDONNEE,
+              "ligne_cible_changee": _ligne_cible_changee(demande)},
+        message=MESSAGE_CIBLE_CHANGEE)
+    return _consigner_decision(ctx, demande, resultat)
+
+
 # -------------------------------------------------------------------- gardes
 
 @dataclass
@@ -335,7 +468,7 @@ def _saut_suspect(texte: str) -> bool:
 def _analyser(ctx: _Contexte, nom: str, kwargs: dict):
     """La garde destructive d'un appel, ou None. Une garde inactive sert
     seulement a reconnaitre ce que le code a deja fait ce tour."""
-    from core.models import RecurringBlock, ScheduledBlock, Task
+    from core.models import RecurringBlock, Task
 
     user, texte = ctx.user, ctx.texte
     if nom == "delete_block":
@@ -384,8 +517,8 @@ def _analyser(ctx: _Contexte, nom: str, kwargs: dict):
                       actif=_saut_suspect(texte) or en_attente, type="choix")
 
     if nom == "clear_all_blocks":
-        nombre = RecurringBlock.objects.filter(user=user, active=True).count()
-        cible = {"nombre": nombre}
+        # K1: l'ensemble exact des blocs, relu avant d'executer la puce.
+        cible = _cible_planning(user)
         return _Garde("destructif", "clear_all_blocks", {"clear_all_blocks"}, nom,
                       {"confirm": True}, cible,
                       _options_confirmer(nom, {"confirm": True}, cible))
@@ -398,7 +531,7 @@ def _analyser(ctx: _Contexte, nom: str, kwargs: dict):
         task = Task.objects.filter(id=tid, user=user).first()
         if task is None:
             return _Garde("destructif", cle, {cle}, nom, actif=False)
-        cible = {"titre": task.title}
+        cible = _cible_tache(task)
         return _Garde("destructif", cle, {cle}, nom, {"task_id": tid}, cible,
                       _options_confirmer(nom, {"task_id": tid, "confirm": True}, cible))
 
@@ -408,21 +541,12 @@ def _analyser(ctx: _Contexte, nom: str, kwargs: dict):
             return None
         titre = str(kwargs.get("title") or "").strip()
         cle = _cle_destructive(nom, kwargs)
-        qs = ScheduledBlock.objects.filter(user=user, date=jour).select_related("task")
-        if titre:
-            qs = qs.filter(task__title__icontains=titre)
-        blocs = list(qs.order_by("start_time"))
+        blocs = _evenements(user, jour, titre)
         distincts = {b.task.title if b.task_id else "" for b in blocs}
         if not blocs or (len(distincts) > 1 and not titre):
             # Rien a supprimer, ou l'outil va demander lequel: rien a retenir.
             return _Garde("destructif", cle, {cle}, nom, actif=False)
-        premier = blocs[0]
-        cible = {
-            "titre": premier.task.title if premier.task_id else "",
-            "date": jour.isoformat(),
-            "debut": premier.start_time.strftime("%H:%M"),
-            "fin": premier.end_time.strftime("%H:%M"),
-        }
+        cible = _cible_evenements(blocs, jour)
         parametres = {"date": jour.isoformat(), "title": titre} if titre else {"date": jour.isoformat()}
         return _Garde("destructif", cle, {cle}, nom, parametres, cible,
                       _options_confirmer(nom, parametres, cible))
@@ -849,11 +973,18 @@ def _heure_dite_ignoree(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparati
     # jamais refusee. « Gym jeudi a 15 h, en fait non, a 17 h » posait 15 h;
     # « Mon gym de 15 h, deplace-le a 17 h » ne se deplacait plus. La garde ne
     # retient que l'heure que l'utilisateur n'a dite nulle part.
-    if any(abs(_minutes(debut) - _minutes(v)) <= tol
-           for v, _ou, tol in _heures_fermes(plat, positions, 0, len(plat))):
+    toutes = _heures_fermes(plat, positions, 0, len(plat))
+    if any(abs(_minutes(debut) - _minutes(v)) <= tol for v, _ou, tol in toutes):
         return None
     # L'heure actuelle d'un bloc deplace le NOMME, elle ne dit pas ou il va.
     actuel = _heure_normale((prep.bloc_update or {}).get("debut")) if nom == "update_block" else None
+    # Round 9 (K3): une heure nue dont UNE lecture est l'heure actuelle ne
+    # nomme le bloc que si le message donne une autre heure (« mon gym de 7 h,
+    # deplace-le a 9 h »). Seule, elle dit ou il va (« deplace mon gym a 7 h »
+    # sur un gym de 19 h): son autre lecture reste ferme. Retirer toute la
+    # position laissait passer n'importe quelle heure.
+    nommees_msg = {ou for v, ou, _tol in toutes if v == actuel}
+    autre_heure = bool({ou for _v, ou, _tol in toutes} - nommees_msg)
     for s, e in _propositions_rattachees(plat):
         morceau = plat[s:e]
         spans = [(s + m.start(), s + m.end()) for m in re.finditer(r"[a-z0-9]+", morceau)
@@ -862,10 +993,9 @@ def _heure_dite_ignoree(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparati
         if not spans:
             continue
         dites = _heures_fermes(plat, positions, s, e)
-        # Une heure nue dont une lecture est l'heure actuelle nomme le bloc.
-        nommees = {ou for v, ou, _tol in dites if v == actuel}
         fermes = [(v, tol, ou) for v, ou, tol in dites
-                  if ou not in nommees and _heure_liee_au_titre(plat, ou, spans)]
+                  if v != actuel and not (ou in nommees_msg and autre_heure)
+                  and _heure_liee_au_titre(plat, ou, spans)]
         if not fermes:
             continue
         jour_cible = _jour_cible(dem._dates_nommees(morceau, aujourdhui) or dates_message)
@@ -903,6 +1033,7 @@ _LIANTS_TITRE_HEURE = {
     "a", "au", "aux", "vers", "environ", "autour", "de", "du", "des", "d", "genre", "pile",
     "le", "la", "les", "l", "ce", "cette", "prochain", "prochaine", "pour", "et", "chaque",
     "tous", "toutes", "semaine", "demain", "aujourd", "hui", "soir", "matin", "midi", "er",
+    "soirs", "matins", "soiree", "matinee", "aprem", "cet",
     "janvier", "fevrier", "mars", "avril", "mai", "juin", "juillet", "aout", "septembre",
     "sept", "octobre", "oct", "novembre", "nov", "decembre", "dec",
     "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche",
@@ -923,7 +1054,7 @@ def _heure_liee_au_titre(plat: str, ou: int, spans: list[tuple[int, int]]) -> bo
         if not apres:
             return False
         segment = plat[fin_heure:apres[0][0]]
-    segment = re.sub(r"apres-(?:demain|midi)", " demain ", segment)
+    segment = re.sub(r"(?:apres|avant)[- ](?:demain|midi)", " demain ", segment)
     mots = re.findall(r"[a-z]+", dem._RE_HEURE.sub(" ", segment))
     return all(w in _LIANTS_TITRE_HEURE for w in mots)
 
@@ -931,13 +1062,49 @@ def _heure_liee_au_titre(plat: str, ou: int, spans: list[tuple[int, int]]) -> bo
 _MARQUE_MATIN = re.compile(r"[ \t]*(?:du matin\b|am\b|a\.m\.)")
 _MARQUE_APRES_MIDI = re.compile(
     r"[ \t]*(?:du soir\b|pm\b|p\.m\.|de l'?[ \t]*apres[- ]midi\b|de l'?[ \t]*aprem\b)")
+# Round 9 (K4): un moment de la journee dit dans la meme proposition, avant
+# ou apres l'heure (« jeudi soir a 6 h », « a 6 h le soir », « tous les
+# matins a 7 h »), choisit la lecture stricte. « souper » est un soir.
+_MOMENT_MATIN = re.compile(r"\b(?:matin(?:s|ee|ees)?|avant[- ]midi|am|a\.m\.)(?!\w)")
+_MOMENT_SOIR = re.compile(
+    r"\b(?:soir(?:s|ee|ees)?|soupers?|apres[- ]midi|aprem|pm|p\.m\.)(?!\w)")
+
+
+def _moment_de_la_journee(plat: str, ou: int) -> str | None:
+    """« matin » ou « soir » quand un mot de moment de la journee de la
+    proposition de l'heure a la position `ou` s'y rattache: parmi les heures
+    de la proposition, c'est elle la plus proche du mot. Le mot le plus
+    proche l'emporte."""
+    borne = next(((s, e) for s, e in _propositions(plat) if s <= ou < e), None)
+    if borne is None:
+        return None
+    s, e = borne
+    heures = [(s + h.start(), s + h.end()) for h in dem._RE_HEURE.finditer(plat[s:e])]
+    if not heures:
+        return None
+
+    def _distance(a, b):
+        return max(0, b[0] - a[1], a[0] - b[1])
+
+    meilleur = None
+    for genre, motif in (("matin", _MOMENT_MATIN), ("soir", _MOMENT_SOIR)):
+        for mot in motif.finditer(plat, s, e):
+            span = (mot.start(), mot.end())
+            proche = min(heures, key=lambda h: _distance(h, span))
+            if proche[0] != ou:
+                continue
+            d = _distance(proche, span)
+            if meilleur is None or d < meilleur[0]:
+                meilleur = (d, genre)
+    return meilleur[1] if meilleur else None
 
 
 def _lectures_d_heure(plat: str, ou: int, valeur: str) -> list[str]:
     """Les lectures d'une heure dite. Round 8: au Quebec, une heure nue de 1 a
     11 (« souper jeudi a 6 h ») vaut aussi H+12. « du matin », « am » gardent
     H; « du soir », « pm », « de l'apres-midi » donnent H+12. Midi (12 h) et une
-    heure ecrite avec un zero (« 07:00 ») restent telles quelles."""
+    heure ecrite avec un zero (« 07:00 ») restent telles quelles. Round 9: un
+    moment de la journee dit dans la proposition choisit aussi la lecture."""
     m = dem._RE_HEURE.match(plat, ou)
     if m is None or m.group(5):
         return [valeur]
@@ -946,11 +1113,17 @@ def _lectures_d_heure(plat: str, ou: int, valeur: str) -> list[str]:
     if not 1 <= h <= 12 or ecrite.startswith("0"):
         return [valeur]
     suite = plat[m.end():]
+    apres_midi = f"{h + 12:02d}{valeur[2:]}" if h != 12 else valeur
     if _MARQUE_APRES_MIDI.match(suite):
-        return [valeur if h == 12 else f"{h + 12:02d}{valeur[2:]}"]
+        return [apres_midi]
     if h == 12 or _MARQUE_MATIN.match(suite):
         return [valeur]
-    return [valeur, f"{h + 12:02d}{valeur[2:]}"]
+    moment = _moment_de_la_journee(plat, ou)
+    if moment == "soir":
+        return [apres_midi]
+    if moment == "matin":
+        return [valeur]
+    return [valeur, apres_midi]
 
 
 def _heures_fermes(plat: str, positions, s: int, e: int) -> list[tuple[str, int, int]]:
@@ -1367,9 +1540,16 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
             if garde is not None and garde.actif:
                 if garde.motif == "optimisation":
                     issue = _garde_optimisation(ctx, outil, kwargs, garde)
+                elif garde.cles & (etat.attente.get("cibles_changees") or set()):
+                    # K1: la puce de ce tour visait une cible qui a change.
+                    # Ni execution ni nouvelle question: la ligne du code le dit.
+                    issue = MESSAGE_CIBLE_CHANGEE
                 else:
                     autorise, repondue, en_suspens = _reponse(ctx, garde.cles, nom)
-                    if autorise:
+                    if autorise and _cible_changee(ctx.user, repondue):
+                        _abandon_cible_changee(ctx, repondue)
+                        issue = MESSAGE_CIBLE_CHANGEE
+                    elif autorise:
                         if nom in ("delete_task", "clear_all_blocks"):
                             kwargs["confirm"] = True
                     elif repondue is not None:
@@ -1705,6 +1885,17 @@ def _appliquer(ctx: _Contexte) -> list[dict]:
             decisions[cle] = None
             sorties.append({"cle": cle, "motif": motif, "option": option, "action_id": None,
                             "resume": f"SANS REPONSE CLAIRE: {_sujet(demande)}, n'agis pas"})
+            continue
+
+        if _cible_changee(ctx.user, demande):
+            # K1: la cible a change depuis la question. Rien ne s'execute,
+            # la demande tombe et la voix le dit en une ligne.
+            abandon = _abandon_cible_changee(ctx, demande)
+            decisions[cle] = codes[cle] = DECISION_ABANDONNEE
+            sorties.append({"cle": cle, "motif": motif, "option": option, "action_id": None,
+                            "resume": (f"CIBLE CHANGEE ({abandon.id}): {_sujet(demande)} a change "
+                                       "depuis la question, le code n'a rien execute; n'agis pas "
+                                       "sur ce point sans nouvelle demande explicite")})
             continue
 
         outil = TOOL_MAP[effet["outil"]]

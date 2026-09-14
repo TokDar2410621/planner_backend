@@ -55,7 +55,9 @@ class F1HeureNueTests(HarnaisGardes, TransactionTestCase):
 
     def test_une_heure_nue_accepte_les_deux_lectures(self):
         cas = (('souper jeudi à 6 h', 'Souper', '18:00'),
-               ('souper jeudi à 6 h', 'Souper', '06:00'),
+               # Round 9 (K4): « souper » est un soir; « souper jeudi a 6 h »
+               # ne vaut plus 06:00 (core/test_agent_v2_gardes_r9.py).
+               ('lecture jeudi à 6 h', 'Lecture', '06:00'),
                # Le harnais a un quart le jeudi de 19 h a 24 h: les heures
                # restent avant, pour que seul le code de l'heure dite parle.
                ('gym jeudi à 5 h', 'Gym', '17:00'),
