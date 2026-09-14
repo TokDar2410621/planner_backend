@@ -338,11 +338,16 @@ class V1BrouillonTests(SimpleTestCase):
 class L1AbsenceEtLectureTests(NarrateurBase):
 
     def test_une_absence_contredite_par_la_liste_tombe(self):
+        # Remplace au round 6 (D7): la phrase ne tombe que si elle nomme un
+        # titre de la liste affichee. Le cas « cours de maths » au-dessus de
+        # « Calcul différentiel » survit desormais (voir
+        # core.test_agent_v2_voix_r6.D7AbsenceTests); ce qui reste protege est
+        # l'absence du MEME titre.
         registre = Registre()
         registre.ajouter('list_blocks', {}, ToolResult(success=True, message='ok',
                                                       data={'blocks': []}))
-        faits = 'Lundi\n- Calcul différentiel, 9 h à 12 h'
-        compo = composer(ReponseDire(ouverture="Il n'y a pas de cours de maths dans ton horaire.",
+        faits = 'Lundi\n- 9 h à 12 h · Calcul différentiel'
+        compo = composer(ReponseDire(ouverture="Il n'y a pas de Calcul différentiel dans ton horaire.",
                                      suite='Tu peux ajouter une révision.'),
                          registre, faits, None)
         self.assertNotIn("n'y a pas", compo.prose)

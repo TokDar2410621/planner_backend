@@ -30,7 +30,6 @@ from typing import Optional
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import close_old_connections
-from django.utils import timezone
 from pydantic_ai import Agent, ModelRetry
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (ModelRequest, ModelResponse, PartDeltaEvent,
@@ -72,6 +71,7 @@ REPLI_PROSE_LECTURE = "Dis-moi si tu veux autre chose."
 REPLI_QUESTION = "Je n'ai pas compris. Tu veux ajouter, déplacer ou voir quelque chose ?"
 PROSE_FORMULAIRE = "Il me manque quelques précisions."
 PROSE_REPRISE = "Il me faut juste cette précision avant de toucher à ton horaire."
+PROSE_ANNULEE = "D'accord, je ne change rien."
 
 # POOL DE THREADS REUTILISES, et le mot « reutilises » porte tout le poids.
 #
@@ -111,21 +111,25 @@ def _charger_appliquer_choix():
     return appliquer_choix_en_attente
 
 
-def _charger_demandes_en_attente():
-    """demandes.demandes_en_attente, charge par une fonction pour les tests."""
-    from services.agent_v2.demandes import demandes_en_attente
-    return demandes_en_attente
+def _charger_tour_decide():
+    """outils.tour_entierement_decide_par_le_code, ou None s'il n'existe pas.
+
+    Contrat du round 6 avec les gardes: vrai quand le message ne fait que
+    repondre (ou echouer a repondre) a une demande en attente, sans nouvelle
+    requete. Absente, la fonction ne decide rien et AGIR tourne comme avant.
+    """
+    from services.agent_v2 import outils
+    return getattr(outils, "tour_entierement_decide_par_le_code", None)
 
 
-# Les resumes de appliquer_choix_en_attente qui laissent une demande gardee
-# ouverte: la reponse n'a tranche aucune option.
-SANS_REPONSE_CLAIRE = "SANS REPONSE CLAIRE"
+def _abandonnee(action) -> bool:
+    return bool((action.donnees or {}).get("abandonnee_par_le_code"))
 
 
 def _garde_a_retenu(registre: Registre) -> bool:
     """Une garde du code a-t-elle retenu une action ce tour ?"""
     for a in registre.actions:
-        if a.succes:
+        if a.succes or _abandonnee(a):
             continue
         d = a.donnees or {}
         if (isinstance(d.get("demande"), dict) or d.get("needs_confirmation")
@@ -142,8 +146,11 @@ def _brouillon_interdit(registre: Registre) -> bool:
     ratee (« Je l'ai mis jeudi a 9 h, veux-tu... ? »). Toute action en echec
     ce tour, retenue ou non, ecarte le brouillon entier.
     """
+    # Une demande laissee tombee par le code (D2) n'est pas un echec du tour:
+    # son brouillon peut encore porter la question d'une nouvelle requete.
     return _garde_a_retenu(registre) or any(
-        not a.succes and a.outil != "import_recent" for a in registre.actions)
+        not a.succes and a.outil != "import_recent" and not _abandonnee(a)
+        for a in registre.actions)
 
 
 def _cout(resultat, duree: float) -> dict:
@@ -459,6 +466,8 @@ class PlannerAgentV2:
         arrivent dans l'ordre final (faits, prose, question) et done.response
         en est exactement la concatenation."""
         self.user = user
+        depart_tour = time.perf_counter()
+        self._cout_agir, self._cout_dire = {}, {}
         # Le message TAPE, avant tout enrichissement: c'est lui que lisent la
         # garde et les boutons forces.
         self._message_brut = message
@@ -522,65 +531,30 @@ class PlannerAgentV2:
         yield from self._vider_file()
         choix = [c for c in choix if isinstance(c, dict)]
         choix_code = sum(1 for c in choix if c.get("action_id"))
-        # Une reponse floue a une question gardee (« Oui, supprime ces trois
-        # blocs. » a « seulement ce jeudi ou tous les jeudis ? ») ne doit pas
-        # perdre la demande: le CODE la repose, avec ses boutons, et la
-        # persiste pour que la reponse claire du tour suivant la tranche
-        # (banc du round 3, s05-2 et s05-3).
-        reemises = self._demandes_a_reemettre(user, choix)
+        # Une reponse floue a une question gardee ne perd pas la demande: les
+        # gardes la reposent UNE fois et l'inscrivent au registre avec
+        # reposee_par_le_code (contrat du round 6). La voix ne relit plus
+        # l'attente elle-meme: une seule source decide de reposer.
+        reemises = [a.donnees["demande"] for a in registre.actions
+                    if (a.donnees or {}).get("reposee_par_le_code")
+                    and isinstance(a.donnees.get("demande"), dict)]
         resumes = [str(c["resume"]) for c in choix if c.get("resume")]
         if resumes:
             message_enrichi = (f"{message_enrichi}\n\nSUITE AU CHOIX DE L'UTILISATEUR:\n- "
                                + "\n- ".join(resumes))
 
-        yield {"type": "status", "text": "Réflexion..."}
-
-        # AGIR tourne dans un THREAD pour qu'on puisse emettre pendant qu'il
-        # travaille. Mesure du 2026-08-28: sur une demande multi-etapes il
-        # occupe 15 s des 25 s du tour, et l'utilisateur n'avait rien a lire
-        # pendant ce temps. Le raisonnement etait bien capte, mais emis apres
-        # coup: il decrivait une reflexion deja terminee.
+        # CHEMIN RAPIDE (D6). Banc du round 5, s05-2: le code avait repose la
+        # demande a 0,06 s, puis AGIR a raisonne 105,6 s sans outil et son
+        # brouillon a ete jete. Quand le message ne fait que repondre (ou ne
+        # pas repondre) a une demande en attente, le tour se construit depuis
+        # la decision du code: ni AGIR, ni DIRE.
+        par_le_code = self._tour_decide(registre, message)
         raisonnement, panne = "", None
-        file_agir = self._file_pensees
-
-        def travailler():
-            nonlocal raisonnement, panne
-            # Ce thread vit hors du cycle de requete Django, qui ferme les
-            # connexions: on s'en charge des deux cotes.
-            close_old_connections()
-            try:
-                raisonnement = self._agir(user, message_enrichi, registre) or ""
-            except Exception as e:  # noqa: BLE001
-                panne = e
-            finally:
-                close_old_connections()
-                file_agir.put(None)  # sentinelle de fin
-
-        futur = _POOL_AGIR.submit(travailler)
-        fragments = 0
-        while True:
-            try:
-                element = file_agir.get(timeout=ATTENTE_PENSEE)
-            except queue.Empty:
-                # Filet: si le thread s'est termine sans poser sa sentinelle
-                # (arret brutal du worker), on sort au lieu d'attendre pour
-                # toujours et de geler la connexion SSE.
-                if futur.done():
-                    break
-                continue
-            if element is None:
-                break
-            fragments += 1
-            yield self._evenement_de_file(element)
-        futur.result()  # remonte une panne du pool lui-meme, pas d'AGIR
-        self._file_pensees = None
-
-        # Repli pour les fournisseurs qui ne streament pas leurs deltas: sans
-        # lui, leur raisonnement n'atteindrait le client que dans la charge
-        # utile finale, et le volet resterait vide tout le tour. On perd le
-        # gain de latence, jamais l'information.
-        if raisonnement and not fragments:
-            yield {"type": "thinking", "text": raisonnement}
+        if par_le_code:
+            self._file_pensees = None
+        else:
+            yield {"type": "status", "text": "Réflexion..."}
+            raisonnement, panne = yield from self._agir_en_fond(user, message_enrichi, registre)
 
         if panne is not None:
             # Une panne d'AGIR ne doit pas effacer ce que les outils ont deja
@@ -598,7 +572,7 @@ class PlannerAgentV2:
         # autres recoivent leur ligne « pas encore ».
         gagnant = self._choisir_question(
             user, message, attachment, registre, attachment_traite_ce_tour,
-            reemises=reemises)
+            reemises=reemises, sans_forcee=par_le_code)
         par_demande = bool(gagnant) and gagnant.get("source") == "demande"
         cles_posees = set(gagnant.get("cles_posees") or []) if par_demande else set()
 
@@ -630,33 +604,44 @@ class PlannerAgentV2:
         supprimees = 0
         fuites: list[str] = []
         panne_dire = False
-        try:
-            brut = self._dire(user, message, registre, etat, faits,
-                              brouillon="" if reemises else self._brouillon_agir,
-                              question_code=question_deja,
-                              historique_court=self._deux_derniers_echanges(user))
-            # Fuites APRES la seconde chance du validateur: ce compteur dit
-            # ce que le modele persiste a affirmer, pas ce qui part.
-            fuites = fuites_reponse(brut)
-            brut, supprimees = epurer_reponse(brut)
-            compo = composer(brut, registre, faits, gagnant)
-        except Exception as e:  # noqa: BLE001
-            logger.error("DIRE a echoue: %s", e, exc_info=True)
-            panne_dire = True
+        if par_le_code:
             compo = composer(None, registre, faits, gagnant)
+        else:
+            try:
+                brut = self._dire(user, message, registre, etat, faits,
+                                  brouillon="" if reemises else self._brouillon_agir,
+                                  question_code=question_deja,
+                                  historique_court=self._deux_derniers_echanges(user))
+                # Fuites APRES la seconde chance du validateur: ce compteur dit
+                # ce que le modele persiste a affirmer, pas ce qui part.
+                fuites = fuites_reponse(brut)
+                brut, supprimees = epurer_reponse(brut)
+                compo = composer(brut, registre, faits, gagnant)
+            except Exception as e:  # noqa: BLE001
+                logger.error("DIRE a echoue: %s", e, exc_info=True)
+                panne_dire = True
+                compo = composer(None, registre, faits, gagnant)
 
         # Zero tiret long dans ce que lit l'utilisateur, quelle que soit la
         # source (banc du round 3, s06-1).
         prose, question = sans_tiret_long(compo.prose), sans_tiret_long(compo.question)
         motif, chips = compo.motif, compo.chips
+        mutation_reussie = any(a.succes and a.est_mutation for a in registre.actions)
         if reemises and par_demande and cles_posees & {d.get("cle") for d in reemises}:
             # Revue de lisibilite du round 4: DIRE lisait une reponse de garde
             # et ecrivait « D'accord, je garde ta chimie. » juste avant la
             # question de suppression reposee. Sur ce tour, le code parle seul.
-            prose = PROSE_REPRISE
+            # Round 6 (D5): « avant de toucher a ton horaire » serait faux
+            # apres une mutation reussie; les faits parlent, puis la question.
+            prose = "" if mutation_reussie else PROSE_REPRISE
+        annulee = (any(c.get("decision_code") == "annulee" for c in choix)
+                   or any((a.donnees or {}).get("decision_code") == "annulee"
+                          for a in registre.actions))
+        if par_le_code and annulee and not faits and not prose and not question:
+            # Une garde fermee par « laisse faire »: une ligne, pas un silence.
+            prose = PROSE_ANNULEE
         formulaire = gagnant.get("interactive_inputs") if gagnant and \
             gagnant.get("source") == "formulaire" else None
-        mutation_reussie = any(a.succes and a.est_mutation for a in registre.actions)
         if panne_dire and faits and not prose:
             # DIRE est tombe. Se taire laisserait croire que rien n'a eu lieu.
             prose = REPLI_PROSE if mutation_reussie else REPLI_PROSE_LECTURE
@@ -701,7 +686,7 @@ class PlannerAgentV2:
             "agent_v2 tour actions=%d rejetees=%d fuites=%d supprimees=%d ecarts=%d%s"
             " agir=%.1fs/%dep/%d->%dj/r%d/c%d dire=%.1fs/%dep/%d->%dj/r%d"
             " asked=%d form=%d choices=%d read_without_list=%d raw_marker_count=%d"
-            " motif=%s choix_code=%d",
+            " motif=%s choix_code=%d chemin=%s tour=%.2fs",
             len(registre.actions),
             rejetees,
             len(fuites),
@@ -729,6 +714,9 @@ class PlannerAgentV2:
             len(marqueurs),
             motif or "-",
             choix_code,
+            # Latence du chemin rapide (D6) contre la boucle complete.
+            "code" if par_le_code else "agir",
+            time.perf_counter() - depart_tour,
         )
 
         question_affichee = "" if motif == "formulaire" else question
@@ -803,52 +791,85 @@ class PlannerAgentV2:
             if element is not None:
                 yield self._evenement_de_file(element)
 
-    @staticmethod
-    def _demandes_a_reemettre(user: User, choix: list) -> list[dict]:
-        """Les demandes gardees restees SANS REPONSE CLAIRE, pretes a reposer.
+    def _agir_en_fond(self, user: User, message_enrichi: str, registre: Registre):
+        """AGIR dans le pool, ses pensees streamees. Rend (raisonnement, panne).
 
-        Relues depuis le message precedent (la seule source que la garde
-        accepte), jamais reconstruites: la question reposee est celle que
-        l'utilisateur a deja vue. emise_le reste celle d'origine pour que la
-        fenetre d'attente expire (revue du round 4), et le compte de
-        reemissions monte: le code ne repose qu'une fois.
+        AGIR tourne dans un THREAD pour qu'on puisse emettre pendant qu'il
+        travaille. Mesure du 2026-08-28: sur une demande multi-etapes il
+        occupe 15 s des 25 s du tour, et l'utilisateur n'avait rien a lire
+        pendant ce temps. Le raisonnement etait bien capte, mais emis apres
+        coup: il decrivait une reflexion deja terminee.
         """
-        cles = {c.get("cle") for c in choix
-                if c.get("cle") and c.get("option") is None
-                and str(c.get("resume") or "").startswith(SANS_REPONSE_CLAIRE)}
-        if not cles:
-            return []
+        raisonnement, panne = "", None
+        file_agir = self._file_pensees
+
+        def travailler():
+            nonlocal raisonnement, panne
+            # Ce thread vit hors du cycle de requete Django, qui ferme les
+            # connexions: on s'en charge des deux cotes.
+            close_old_connections()
+            try:
+                raisonnement = self._agir(user, message_enrichi, registre) or ""
+            except Exception as e:  # noqa: BLE001
+                panne = e
+            finally:
+                close_old_connections()
+                file_agir.put(None)  # sentinelle de fin
+
+        futur = _POOL_AGIR.submit(travailler)
+        fragments = 0
+        while True:
+            try:
+                element = file_agir.get(timeout=ATTENTE_PENSEE)
+            except queue.Empty:
+                # Filet: si le thread s'est termine sans poser sa sentinelle
+                # (arret brutal du worker), on sort au lieu d'attendre pour
+                # toujours et de geler la connexion SSE.
+                if futur.done():
+                    break
+                continue
+            if element is None:
+                break
+            fragments += 1
+            yield self._evenement_de_file(element)
+        futur.result()  # remonte une panne du pool lui-meme, pas d'AGIR
+        self._file_pensees = None
+
+        # Repli pour les fournisseurs qui ne streament pas leurs deltas: sans
+        # lui, leur raisonnement n'atteindrait le client que dans la charge
+        # utile finale, et le volet resterait vide tout le tour. On perd le
+        # gain de latence, jamais l'information.
+        if raisonnement and not fragments:
+            yield {"type": "thinking", "text": raisonnement}
+        return raisonnement, panne
+
+    @staticmethod
+    def _tour_decide(registre: Registre, message: str) -> bool:
+        """Le code a-t-il tout decide ce tour (D6) ? Faux au moindre doute."""
         try:
-            attente = list(_charger_demandes_en_attente()(user) or [])
-        except Exception:  # noqa: BLE001 - sans attente lisible, AGIR redemandera
-            logger.error("Demandes a reposer illisibles", exc_info=True)
-            return []
-        sortie: list[dict] = []
-        vues: set = set()
-        for d in attente:
-            cle = d.get("cle") if isinstance(d, dict) else None
-            if cle in cles and cle not in vues:
-                vues.add(cle)
-                copie = {k: v for k, v in d.items() if k != "chips"}
-                copie["reemissions"] = int(d.get("reemissions") or 0) + 1
-                if not copie.get("emise_le"):
-                    copie["emise_le"] = timezone.now().isoformat()
-                sortie.append(copie)
-        return sortie
+            decide = _charger_tour_decide()
+            return bool(decide(registre, message)) if callable(decide) else False
+        except Exception:  # noqa: BLE001 - dans le doute, AGIR tourne
+            logger.error("Decision du code illisible", exc_info=True)
+            return False
 
     def _choisir_question(self, user: User, message: str, attachment,
                           registre: Registre, attachment_traite_ce_tour: bool,
-                          reemises=()):
+                          reemises=(), sans_forcee: bool = False):
         """La question UNIQUE du tour, selon PRIORITE, ou None.
 
         Rend {"source", "motif", "question", "chips", "demandes",
         "cles_posees", "interactive_inputs"}. Les demandes viennent du
         registre (gardes du code, present_choices), dans l'ordre des actions,
         puis des demandes reemises apres une reponse floue (une cle deja au
-        registre n'est pas doublee).
+        registre n'est pas doublee). Une demande abandonnee par le code (D2)
+        n'est jamais reposee: elle a sa ligne dans les faits. `sans_forcee`:
+        sur le chemin rapide, aucune question forcee ne s'ajoute a la
+        decision du code.
         """
         demandes = [a.donnees["demande"] for a in registre.actions
-                    if isinstance((a.donnees or {}).get("demande"), dict)]
+                    if isinstance((a.donnees or {}).get("demande"), dict)
+                    and not _abandonnee(a)]
         deja = {d.get("cle") for d in demandes}
         demandes += [d for d in reemises or [] if d.get("cle") not in deja]
         formulaire = self._dernier_formulaire(registre)
@@ -866,6 +887,8 @@ class PlannerAgentV2:
                     "chips": [], "demandes": [], "cles_posees": [],
                     "interactive_inputs": formulaire}
 
+        if sans_forcee:
+            return None
         try:
             forcee = _charger_question_forcee()(
                 user, message, attachment, registre, attachment_traite_ce_tour)

@@ -509,10 +509,12 @@ _AFFIRMATION_DE_BROUILLON = re.compile(
 
 def _demande_structurelle(phrase: str) -> bool:
     """Revue de verite du round 4: le filtre lexical laissait passer « Je l'ai
-    mis jeudi a 9 h, veux-tu que je change ? ». Une phrase ne passe que si
-    chaque proposition sauf la derniere, et la premiere toujours, est une
-    tete de question, d'offre ou de conditionnelle: une proposition
-    declarative devant le « ? » emporte la phrase entiere."""
+    mis jeudi a 9 h, veux-tu que je change ? ». Round 6 (D4): la derniere
+    proposition n'est plus exemptee. « Tu veux un rappel, ton gym est jeudi
+    a 9 h ? » affirmait un etat derriere une tete de question. Une phrase ne
+    passe que si CHAQUE proposition est une tete de question, d'offre ou de
+    conditionnelle. Une vraie question ecartee ici ne coute rien: DIRE peut
+    poser la sienne, et le code pose les questions gardees."""
     clauses = [" ".join(_normaliser(c).replace("?", " ").split()) for c in _CLAUSE.split(phrase)]
     clauses = [c for c in clauses if c]
     if not clauses:
@@ -521,9 +523,7 @@ def _demande_structurelle(phrase: str) -> bool:
     def _tete(c):
         return bool(_TETE_DEMANDE.match(c) or _OFFRE_EN_TETE.match(c) or _CONDITIONNELLE.match(c))
 
-    if len(clauses) == 1:
-        return _tete(clauses[0])
-    return all(_tete(c) for c in clauses[:-1])
+    return all(_tete(c) for c in clauses)
 
 
 def questions_et_offres(texte) -> str:

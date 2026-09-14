@@ -15,6 +15,7 @@ par tour, choisie par agent.py selon PRIORITE).
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 from pydantic import BaseModel, Field
@@ -223,11 +224,25 @@ _MECANIQUE = re.compile(
     r"|\br[ée]ponds?\s*(?:[«\"“]|par\b|avec\b)"
     r"|\bboutons?\b|\bcoch(?:e|es|er|ez|ée|ées)\b|\bclique\w*|\bappuie\w*\s+sur\b"
     r"|\bci-(?:dessous|dessus)\b|\bajuste\w*\b[^.?!]*\bsi\s+besoin\b"
-    r"|\bs[ée]lectionne\w*|\b(?:le|les|ce|ces|chaque|un|des)\s+champs?\b",
+    r"|\bs[ée]lectionne\w*|\b(?:le|les|ce|ces|chaque|un|des)\s+champs?\b"
+    # Banc du round 5, cinq tours: « dans tes réponses » (s02-1), « Choisis
+    # tes trois jours » (s06-1), « déjà affiché » et « dans la liste »
+    # (s08-1), « l'étendue » (p2-1), « choisis parmi les moments libres
+    # proposés » (p3-1). « choisis » ne compte qu'a l'imperatif: « si tu
+    # choisis le matin » reste.
+    r"|\bdans\s+(?:tes|ta|les|ces|mes)\s+r[ée]ponses?\b"
+    r"|(?<!tu\s)\bchoisis\b"
+    r"|\bd[ée]j[àa]\s+affich\w*|\b(?:est|sont)\s+affich[ée]\w*"
+    r"|\bdans\s+(?:la|cette|ta|les|ces)\s+listes?\b"
+    r"|\bl['’]\s*[ée]tendue\b"
+    r"|\b(?:moments?|cr[ée]neaux|options|choix|heures|jours|plages?)\s+(?:\w+\s+)?propos[ée]e?s?\b",
     re.IGNORECASE)
 # Une absence affirmee alors que le code affiche la liste lue (banc du round
-# 4, s03-1: « Il n'y a pas de cours de maths » au-dessus de Calcul
-# différentiel). La liste fait foi; la phrase tombe.
+# 4, s03-1). Round 6 (D7): la phrase ne tombe que si elle nomme un TITRE que
+# la liste affiche. « Tu n'as pas d'examen lundi. » est une vraie reponse et
+# doit survivre; « Il n'y a pas de cours de maths » au-dessus de « Calcul
+# différentiel » survit aussi, faute de meme titre (ecart accepte: le code
+# ne devine pas qu'un cours de maths est ce calcul).
 _ABSENCE = re.compile(
     r"\bil\s+n['’]?\s*y\s+a\s+(?:pas|aucun\w*|rien)\b|\btu\s+n['’]?\s*as\s+(?:pas|aucun\w*)\b"
     r"|\bn['’]?\s*(?:appara[iî]\w*|figure\w*)\s+pas\b|\baucun\w*\s+\w+\s+(?:dans|à|a)\s+ton\b",
@@ -237,6 +252,51 @@ _ABSENCE = re.compile(
 _DEMANDE_EN_PROSE = re.compile(
     r"^(?:et\s+|alors\s+|sinon\s+)?(?:dis|donne|indique|pr[ée]cise|confirme)[- ]moi\b",
     re.IGNORECASE)
+
+
+_BLOC_TEXTE = re.compile(r"^(.*\S)\s\(\d{1,2}:\d{2}-\d{1,2}:\d{2}\)$")
+
+
+def _plat(texte: str) -> str:
+    """Minuscules, sans accents ni ponctuation, espaces simples."""
+    sans_accents = unicodedata.normalize("NFKD", texte or "").encode("ascii", "ignore").decode("ascii")
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", sans_accents.lower()).split())
+
+
+def _collecter_titres(valeur, sortie: set) -> None:
+    if isinstance(valeur, dict):
+        for cle, v in valeur.items():
+            if cle in ("title", "titre") and isinstance(v, str):
+                sortie.add(v)
+            else:
+                _collecter_titres(v, sortie)
+    elif isinstance(valeur, (list, tuple)):
+        for v in valeur:
+            _collecter_titres(v, sortie)
+    elif isinstance(valeur, str):
+        m = _BLOC_TEXTE.match(valeur.strip())
+        if m:
+            sortie.add(m.group(1))
+
+
+def _titres_affiches(registre: Registre, faits: str) -> set[str]:
+    """Les titres (aplatis) lus ce tour ET visibles dans la liste affichee."""
+    candidats: set = set()
+    for a in registre.actions:
+        if a.succes and a.outil in LECTURES_RENDUES:
+            _collecter_titres(a.donnees, candidats)
+    for ligne in (faits or "").splitlines():
+        if "·" in ligne:
+            candidats.add(ligne.rsplit("·", 1)[1])
+    affiche = f" {_plat(faits)} "
+    return {t for t in map(_plat, candidats) if len(t) >= 3 and f" {t} " in affiche}
+
+
+def _absence_contredite(phrase: str, titres: set[str]) -> bool:
+    if not titres or not _ABSENCE.search(phrase or ""):
+        return False
+    plate = f" {_plat(phrase)} "
+    return any(f" {t} " in plate for t in titres)
 
 
 def _references_rejetees(brut, registre: Registre) -> int:
@@ -289,9 +349,10 @@ def composer(brut: ReponseDire | None, registre: Registre, faits: str,
         suite, n2 = _sans_annonce_vide(suite)
         lecture_sans_liste = bool(n1 or n2)
     elif any(a.succes and a.outil in LECTURES_RENDUES for a in registre.actions):
-        ouverture = " ".join(p for p in _phrases(ouverture) if not _ABSENCE.search(p))
-        suite = " ".join(p for p in _phrases(suite) if not _ABSENCE.search(p))
-        if _ABSENCE.search(question):
+        titres = _titres_affiches(registre, faits)
+        ouverture = " ".join(p for p in _phrases(ouverture) if not _absence_contredite(p, titres))
+        suite = " ".join(p for p in _phrases(suite) if not _absence_contredite(p, titres))
+        if _absence_contredite(question, titres):
             question, options = "", []
 
     # Une question par reponse, et dans son champ (lot 3d, banc du round 3).

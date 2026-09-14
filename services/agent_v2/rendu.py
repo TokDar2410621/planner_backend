@@ -962,6 +962,26 @@ def _occupant(donnees: dict, debut) -> tuple[str, bool]:
     return "", False
 
 
+def _objet_abandonne(demande: dict) -> str:
+    """Ce que le code laisse tomber, au nom: « la suppression de Gym »."""
+    motif = demande.get("motif")
+    outil = _txt(demande.get("outil"))
+    titre = _titre_demande(demande) if demande else ""
+    if motif == "optimisation" or outil == "optimize_week":
+        return "le nouveau plan de ta semaine"
+    if motif == "creation_en_masse":
+        return "le reste des ajouts"
+    if outil == "clear_all_blocks":
+        return "le vidage de ton planning"
+    if outil == "delete_task":
+        return f"la suppression de la tâche {titre}" if titre else "la suppression de cette tâche"
+    if outil == "cancel_scheduled_block":
+        return f"l'annulation de {titre}" if titre else "l'annulation de cet événement"
+    if outil == "update_block":
+        return f"l'arrêt de {titre}" if titre else "l'arrêt de ce créneau"
+    return f"la suppression de {titre}" if titre else "la suppression de ce créneau"
+
+
 def _objet_retenu(outil: str, titre: str) -> str:
     if outil == "clear_all_blocks":
         return "vidé ton planning"
@@ -1171,6 +1191,14 @@ def rendre_faits(registre: Registre, aujourdhui: date | None = None,
 
     for index, a in enumerate(registre.actions):
         if a.outil in _IGNORES or _deja_fait(a):
+            continue
+        # Round 6 (D2): une demande laissee tombee par le code se dit en UNE
+        # ligne, meme si la question du tour porte la meme cle et quel que
+        # soit l'outil sous lequel les gardes l'ont consignee.
+        if (a.donnees or {}).get("abandonnee_par_le_code"):
+            demande = _dict((a.donnees or {}).get("demande"))
+            n.ajouter_refus(f"Je laisse tomber {_objet_abandonne(demande)}. "
+                            "Redis-le si tu veux toujours.")
             continue
         if not a.est_mutation:
             continue
