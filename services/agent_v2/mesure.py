@@ -132,8 +132,13 @@ _CONDITIONNELLE = re.compile(
 # Revue de verite du round 4: « Je l'ai mis jeudi », « je te les ai
 # inscrits » et « C'est noté pour jeudi » passaient (clitiques et
 # participes hors des racines).
+_JE_VIENS_DE = (
+    r"je\s+(?:(?:l|t|m|s)'\s*|(?:le|la|les|lui|leur|te|en|y|me)\s+)*viens\s+(?:\w+\s+){0,2}d(?:e\b|')")
 _PREMIERE_PERSONNE = re.compile(
-    r"(?<![a-z])(?:j'ai|je\s+t'ai|que\s+j'ai|je\s+viens\s+de|j'ai\s+deja|c'est\s+fait|voila\s+qui\s+est"
+    # Revue de verite du round 6: « que je viens d'ajouter » et « je viens
+    # tout juste de placer » passaient (elision et mots intercales).
+    r"(?<![a-z])(?:j'ai|je\s+t'ai|que\s+j'ai|j'ai\s+deja|c'est\s+fait|voila\s+qui\s+est"
+    r"|" + _JE_VIENS_DE +
     r"|je\s+(?:(?:l|t|m|s)'\s*|(?:le|la|les|lui|leur|te|vous|nous|en|y|me)\s+)+ai"
     r"|c'est\s+(?:note|confirme|inscrit|enregistre|reserve))\b")
 # « j'ai besoin de », « j'ai une question »: aucune action, on les neutralise
@@ -503,6 +508,7 @@ _TETE_DEMANDE = re.compile(
 # Ce qu'un brouillon ne peut JAMAIS porter, meme sous une tete de question.
 _AFFIRMATION_DE_BROUILLON = re.compile(
     r"(?<![a-z])(?:j'ai|je\s+(?:(?:l|t|m|s)'\s*|(?:le|la|les|lui|leur|te|vous|nous|en|y|me)\s+)+ai"
+    r"|" + _JE_VIENS_DE +
     r"|c'est\s+(?:note|bon|confirme|inscrit|reserve|enregistre|regle)"
     r"|maintenant|desormais|ne\s+figure\s+plus|plus\s+de)\b")
 

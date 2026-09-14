@@ -332,12 +332,6 @@ def option_choisie(message_brut: str, demande: dict) -> str | None:
 
 # -- reposer ou abandonner (D2): cette lecture n'autorise JAMAIS rien
 
-_TETE_OUI = re.compile(
-    r"^(je confirme|c'est bon|c est bon|d'accord|d accord|daccord|vas-y|vas y|"
-    r"oui|okay|ok|confirme|go|applique)(?![\w'-])"
-)
-_TETE_NON = re.compile(r"^(non|annul\w*|laisse\w*|arret\w*|pas)(?![\w'-])")
-
 # Les mots qu'une reponse floue peut porter sans nommer autre chose que sa
 # cible: portee, politesse, hesitation, pronoms.
 _VOCABULAIRE_DE_REPONSE = _VOCABULAIRE_DE_GARDE | {
@@ -347,6 +341,10 @@ _VOCABULAIRE_DE_REPONSE = _VOCABULAIRE_DE_GARDE | {
     "certain", "certaine", "sure", "donc", "plutot", "seulement", "juste", "cette", "fois",
     "celui", "celle", "cet", "mais", "ou", "et", "bof", "sais", "completement", "prochain",
     "prochaine", "occurrence",
+    # Noms generiques et petits nombres: « Oui, supprime ces trois blocs. »
+    # ne nomme aucun AUTRE element; le oui en tete ne suffit plus (round 6).
+    "bloc", "blocs", "creneau", "creneaux", "element", "elements", "evenement",
+    "evenements", "ceux", "celles", "ci", "un", "une", "deux", "trois", "quatre", "cinq",
 }
 
 # Une reponse qui ouvre une AUTRE demande n'est pas une reponse floue a la
@@ -386,8 +384,10 @@ def reponse_plausible(message_brut, demande: dict) -> bool:
     plat = _plat(message_brut)
     if not plat or _NOUVELLE_REQUETE.search(plat):
         return False
-    if _TETE_OUI.match(plat) or _TETE_NON.match(plat):
-        return True
+    # Revue du round 6: un oui ou un non en tete ne suffit plus. « non,
+    # supprime plutot mon gym » est une correction qui porte une nouvelle
+    # requete; lue comme reponse, elle faisait sauter AGIR (D6). Le message
+    # entier ne doit nommer que la cible.
     return _nomme_rien_d_autre(plat, demande)
 
 

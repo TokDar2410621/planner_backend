@@ -83,9 +83,29 @@ def bloc_factuel(registre: Registre, aujourdhui=None, cles_posees=None,
     """
     r = _charger_rendu()
     faits = r.rendre_faits(registre, aujourdhui, cles_posees)
+    if faits and not sans_lecture and _abandons_seuls(registre):
+        # Revue du round 6: la ligne d'abandon (D2) remplacait la lecture que
+        # le message demandait (« c'est quoi mon horaire demain ? »). Elle la
+        # precede maintenant.
+        lecture = r.rendre_lecture(registre, aujourdhui)
+        return f"{faits}\n\n{lecture}" if lecture else faits
     if faits or sans_lecture:
         return faits or ""
     return r.rendre_lecture(registre, aujourdhui)
+
+
+def _abandons_seuls(registre: Registre) -> bool:
+    """Les seuls faits du tour sont des demandes laissees tombees par le code:
+    aucune autre mutation (reussie ou retenue), aucun ecart, aucun arret."""
+    abandons = {id(a) for a in registre.actions
+                if (a.donnees or {}).get("abandonnee_par_le_code")}
+    if not abandons:
+        return False
+    if any(a.est_mutation for a in registre.actions if id(a) not in abandons):
+        return False
+    if any(getattr(e, "genre", None) for e in registre.ecarts):
+        return False
+    return not (registre.budget_epuise or getattr(registre, "boucle_interrompue", False))
 
 
 def question_code(demandes: list[dict], aujourdhui=None) -> tuple[str, list[dict], list[str]]:

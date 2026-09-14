@@ -982,6 +982,20 @@ def _objet_abandonne(demande: dict) -> str:
     return f"la suppression de {titre}" if titre else "la suppression de ce créneau"
 
 
+_SUPPRESSION_DE = "la suppression de "
+
+
+def _objets_abandonnes(objets: list[str]) -> str:
+    """« la suppression de A et de B », ou « X, Y et Z » quand les motifs
+    different."""
+    if len(objets) == 1:
+        return objets[0]
+    if all(o.startswith(_SUPPRESSION_DE) for o in objets):
+        noms = [o[len(_SUPPRESSION_DE):] for o in objets]
+        return _SUPPRESSION_DE + ", de ".join(noms[:-1]) + " et de " + noms[-1]
+    return ", ".join(objets[:-1]) + " et " + objets[-1]
+
+
 def _objet_retenu(outil: str, titre: str) -> str:
     if outil == "clear_all_blocks":
         return "vidé ton planning"
@@ -1188,17 +1202,19 @@ def rendre_faits(registre: Registre, aujourdhui: date | None = None,
     """
     auj = _aujourdhui(aujourdhui)
     n = _Narrateur(registre, auj, cles_posees)
+    abandonnes: list[str] = []
 
     for index, a in enumerate(registre.actions):
         if a.outil in _IGNORES or _deja_fait(a):
             continue
         # Round 6 (D2): une demande laissee tombee par le code se dit en UNE
         # ligne, meme si la question du tour porte la meme cle et quel que
-        # soit l'outil sous lequel les gardes l'ont consignee.
+        # soit l'outil sous lequel les gardes l'ont consignee. Plusieurs
+        # demandes abandonnees partagent cette ligne unique.
         if (a.donnees or {}).get("abandonnee_par_le_code"):
-            demande = _dict((a.donnees or {}).get("demande"))
-            n.ajouter_refus(f"Je laisse tomber {_objet_abandonne(demande)}. "
-                            "Redis-le si tu veux toujours.")
+            objet = _objet_abandonne(_dict((a.donnees or {}).get("demande")))
+            if objet not in abandonnes:
+                abandonnes.append(objet)
             continue
         if not a.est_mutation:
             continue
@@ -1209,6 +1225,10 @@ def rendre_faits(registre: Registre, aujourdhui: date | None = None,
                 n.heure_refusee(a, demande)
         else:
             n.refus_de(a, index)
+
+    if abandonnes:
+        n.ajouter_refus(f"Je laisse tomber {_objets_abandonnes(abandonnes)}. "
+                        "Redis-le si tu veux toujours.")
 
     for e in registre.ecarts:
         if not e.genre:

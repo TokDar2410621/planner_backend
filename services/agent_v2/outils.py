@@ -844,13 +844,25 @@ def _heure_dite_ignoree(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparati
     # La regle du prompt d'AGIR le couvre. Production main n'a aucune garde
     # d'heure dite: c'est strictement mieux. La garde armee (R1), elle, tient
     # toujours le meme element apres un refus.
+    #
+    # Revue du round 6: une heure DITE n'importe ou dans le message n'est
+    # jamais refusee. « Gym jeudi a 15 h, en fait non, a 17 h » posait 15 h;
+    # « Mon gym de 15 h, deplace-le a 17 h » ne se deplacait plus. La garde ne
+    # retient que l'heure que l'utilisateur n'a dite nulle part.
+    if any(abs(_minutes(debut) - _minutes(v)) <= tol
+           for v, _ou, tol in _heures_fermes(plat, positions, 0, len(plat))):
+        return None
+    # L'heure actuelle d'un bloc deplace le NOMME, elle ne dit pas ou il va.
+    actuel = _heure_normale((prep.bloc_update or {}).get("debut")) if nom == "update_block" else None
     for s, e in _propositions_rattachees(plat):
         morceau = plat[s:e]
-        mots_morceau = {m[:-1] if m.endswith("s") and len(m) > 4 else m
-                        for m in re.findall(r"[a-z0-9]+", morceau)}
-        if not mots & mots_morceau:
+        spans = [(s + m.start(), s + m.end()) for m in re.finditer(r"[a-z0-9]+", morceau)
+                 if (m.group()[:-1] if m.group().endswith("s") and len(m.group()) > 4
+                     else m.group()) in mots]
+        if not spans:
             continue
-        fermes = [(v, tol) for v, _ou, tol in _heures_fermes(plat, positions, s, e)]
+        fermes = [(v, tol) for v, ou, tol in _heures_fermes(plat, positions, s, e)
+                  if v != actuel and _heure_liee_au_titre(plat, ou, spans)]
         if not fermes:
             continue
         jour_cible = _jour_cible(dem._dates_nommees(morceau, aujourdhui) or dates_message)
@@ -878,6 +890,39 @@ def _propositions_rattachees(plat: str) -> list[tuple[int, int]]:
             continue
         sortie.append((s, e))
     return sortie
+
+
+# Ce qui peut separer un titre de SON heure: jour, date, preposition. Tout
+# autre mot (« apres mon cours a 15 h », « avant le souper a 18 h ») rattache
+# l'heure a un autre element: la garde se tait, comme sur main. Une liste
+# incomplete ne coute qu'une garde absente, jamais une heure imposee.
+_LIANTS_TITRE_HEURE = {
+    "a", "au", "aux", "vers", "environ", "autour", "de", "du", "des", "d", "genre", "pile",
+    "le", "la", "les", "l", "ce", "cette", "prochain", "prochaine", "pour", "et", "chaque",
+    "tous", "toutes", "semaine", "demain", "aujourd", "hui", "soir", "matin", "midi", "er",
+    "janvier", "fevrier", "mars", "avril", "mai", "juin", "juillet", "aout", "septembre",
+    "sept", "octobre", "oct", "novembre", "nov", "decembre", "dec",
+    "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche",
+    "lundis", "mardis", "mercredis", "jeudis", "vendredis", "samedis", "dimanches",
+}
+
+
+def _heure_liee_au_titre(plat: str, ou: int, spans: list[tuple[int, int]]) -> bool:
+    """L'heure a la position `ou` suit (ou precede) directement un mot du
+    titre, separee seulement par des liants."""
+    m = dem._RE_HEURE.match(plat, ou)
+    fin_heure = m.end() if m else ou
+    avant = [sp for sp in spans if sp[1] <= ou]
+    if avant:
+        segment = plat[avant[-1][1]:ou]
+    else:
+        apres = [sp for sp in spans if sp[0] >= fin_heure]
+        if not apres:
+            return False
+        segment = plat[fin_heure:apres[0][0]]
+    segment = re.sub(r"apres-(?:demain|midi)", " demain ", segment)
+    mots = re.findall(r"[a-z]+", dem._RE_HEURE.sub(" ", segment))
+    return all(w in _LIANTS_TITRE_HEURE for w in mots)
 
 
 def _heures_fermes(plat: str, positions, s: int, e: int) -> list[tuple[str, int, int]]:
