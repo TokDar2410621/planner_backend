@@ -107,7 +107,9 @@ class ChoixExecutesTests(HarnaisGardes, TransactionTestCase):
         registre, sorties = self.appliquer('oui')
         self.assertIsNone(sorties[0]['option'])
         self.assertIn('SANS REPONSE CLAIRE', sorties[0]['resume'])
-        self.assertEqual(registre.actions, [])
+        # Rien ne s'execute; le code repose la meme demande (banc r3, s05-3).
+        self.assertFalse(any(a.succes for a in registre.actions))
+        self.assertEqual([a.donnees['demande']['cle'] for a in registre.actions], [demande['cle']])
         self.assertActif(self.q)
 
     def test_confirmer_destructif_execute_la_tache_retenue(self):

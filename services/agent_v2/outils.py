@@ -687,10 +687,20 @@ def _refus_heure_armee(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparatio
     dates, jours, recurrent, debut = cibles
     if debut is None:
         return None
+    # Revue du 2026-09-14 (round 3): la garde armee retenait TOUT ajout du
+    # jour, meme un autre element, sous la cle de la premiere question. Rendu
+    # masquait cette retenue et la seconde demande disparaissait sans un mot.
+    # Elle ne vise plus que l'element dont l'heure a ete refusee; un element
+    # renomme reste couvert par la garde d'heure dite, qui suit.
+    titre = str(kwargs.get("title") or (prep.bloc_update or {}).get("titre") or "")
     for arme in ctx.etat.armes:
-        if _arme_touche(arme, dates, jours, recurrent) and debut not in arme["heures"]:
-            return ToolResult(success=False, data={"demande": arme["demande"]},
-                              message=MESSAGE_RETENUE)
+        if not _arme_touche(arme, dates, jours, recurrent) or debut in arme["heures"]:
+            continue
+        titre_arme = str(((arme.get("demande") or {}).get("cible") or {}).get("titre") or "")
+        if not _meme_element(titre, titre_arme):
+            continue
+        return ToolResult(success=False, data={"demande": arme["demande"]},
+                          message=MESSAGE_RETENUE)
     return None
 
 
@@ -709,16 +719,41 @@ _HEURE_SOUPLE_AVANT = re.compile(
 _HEURE_APPROX_AVANT = re.compile(r"\b(?:vers|environ|autour de|genre)\s*$")
 TOLERANCE_APPROX = 30
 _MOTS_VIDES_TITRE = {"avec", "pour", "dans", "chez", "cours", "bloc", "rendez", "vous",
-                     "rendez-vous", "tache", "evenement", "seance"}
+                     "tache", "evenement", "seance", "le", "la", "les", "de", "du", "des",
+                     "un", "une", "au", "aux", "en", "et", "ma", "mon", "mes", "ton", "ta",
+                     "tes", "sa", "son", "ses", "sur", "par"}
 
 
 def _mots_du_titre(titre: str) -> set:
+    """Mots porteurs d'un titre. Deux lettres suffisent: « Gym » ou « Bac »
+    donnaient un ensemble vide et la garde d'heure sautait (revue r3)."""
     mots = set()
     for mot in re.findall(r"[a-z0-9]+", dem.sans_accents(titre or "")):
-        if len(mot) < 4 or mot in _MOTS_VIDES_TITRE:
+        if len(mot) < 2 or mot in _MOTS_VIDES_TITRE:
             continue
         mots.add(mot[:-1] if mot.endswith("s") and len(mot) > 4 else mot)
     return mots
+
+
+def _meme_element(titre_a: str, titre_b: str) -> bool:
+    """Deux titres designent-ils le meme element ? « Stats » et
+    « Statistiques », « RDV dentiste » et « Dentiste » oui; « Lecture » et
+    « Dentiste » non. Sans mot porteur, seule l'egalite compte."""
+    mots_a, mots_b = _mots_du_titre(titre_a), _mots_du_titre(titre_b)
+    if not mots_a or not mots_b:
+        return dem.normaliser(titre_a) == dem.normaliser(titre_b)
+    for a in mots_a:
+        for b in mots_b:
+            if a == b:
+                return True
+            commun = 0
+            for x, y in zip(a, b):
+                if x != y:
+                    break
+                commun += 1
+            if commun >= 4:
+                return True
+    return False
 
 
 def _propositions(plat: str) -> list[tuple[int, int]]:
@@ -733,8 +768,6 @@ def _propositions(plat: str) -> list[tuple[int, int]]:
 def _heure_dite_ignoree(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparation):
     """ToolResult de refus quand l'appel pose une AUTRE heure que celle que
     l'utilisateur a donnee pour ce titre et ce jour, sinon None."""
-    from services.scheduling.placement import open_intervals
-
     if nom not in ("schedule_task_at", "create_block", "update_block"):
         return None
     if nom == "update_block" and kwargs.get("start_time") in (None, ""):
@@ -747,8 +780,6 @@ def _heure_dite_ignoree(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparati
         return None
     titre = str(kwargs.get("title") or (prep.bloc_update or {}).get("titre") or "").strip()
     mots = _mots_du_titre(titre)
-    if not mots:
-        return None
     plat = dem.sans_accents(ctx.texte)
     positions = dem.heures_dites_positions(ctx.texte)
     if not positions:
@@ -756,61 +787,111 @@ def _heure_dite_ignoree(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparati
     aujourdhui = timezone.localdate()
     dates_message = dem._dates_nommees(ctx.texte, aujourdhui)
 
-    for s, e in _propositions(plat):
-        morceau = plat[s:e]
-        mots_morceau = {m[:-1] if m.endswith("s") and len(m) > 4 else m
-                        for m in re.findall(r"[a-z0-9]+", morceau)}
-        if not mots & mots_morceau:
-            continue
-        fermes = []
-        for valeur, ou in positions:
-            if not (s <= ou < e):
-                continue
-            avant = plat[:ou]
-            if _HEURE_SOUPLE_AVANT.search(avant):
-                continue
-            tolerance = TOLERANCE_APPROX if _HEURE_APPROX_AVANT.search(avant) else 0
-            fermes.append((valeur, tolerance))
-        if not fermes:
-            continue
-        dates_visees = dem._dates_nommees(morceau, aujourdhui) or dates_message
+    def _jour_cible(dates_visees):
         if dates_visees:
             if recurrent:
                 communs = [d for d in dates_visees if d.weekday() in jours]
             else:
                 communs = [d for d in dates_visees if d in dates]
             if not communs:
-                continue
-            jour_cible = communs[0] if not recurrent else dem.prochaine_occurrence(communs[0].weekday())
-        else:
-            jour_cible = next(iter(dates)) if dates else dem.prochaine_occurrence(min(jours))
-        if any(abs(_minutes(debut) - _minutes(v)) <= tol for v, tol in fermes):
-            return None
+                return None
+            return communs[0] if not recurrent else dem.prochaine_occurrence(communs[0].weekday())
+        return next(iter(dates)) if dates else dem.prochaine_occurrence(min(jours))
 
-        dite = fermes[0][0]
-        fin_appel = _heure_normale(kwargs.get("end_time")) or (prep.bloc_update or {}).get("fin")
-        duree = ((_minutes(fin_appel) - _minutes(debut)) % (24 * 60)) if fin_appel else 60
-        duree = duree or 60
-        fin_dite = _fmt((_minutes(dite) + duree) % (24 * 60))
-        debut_min = _minutes(dite)
-        fin_min = debut_min + duree
-        libre = fin_min <= 24 * 60 and any(
-            a <= debut_min and fin_min <= b for a, b in open_intervals(ctx.user, jour_cible, 0, 24 * 60))
-        if libre:
-            return ToolResult(
-                success=False, data={"heure_dite": dite},
-                message=(f"Retenu par le code: l'utilisateur a dit {dite} pour {_ascii(titre)}. "
-                         f"Refais l'appel avec start_time={dite}. Si cette heure ne convient pas, "
-                         "pose la question au lieu de changer l'heure."))
-        demande = _demande_heure_refusee(ctx, nom, kwargs, titre, jour_cible, dite, fin_dite,
-                                         None, recurrent=recurrent)
-        heures = [v for v, _tol in fermes]
-        if recurrent:
-            _armer(ctx, demande, heures, jour=jour_cible.weekday())
-        else:
-            _armer(ctx, demande, heures, date_armee=jour_cible)
-        return ToolResult(success=False, data={"demande": demande}, message=MESSAGE_RETENUE)
-    return None
+    titre_situe = False
+    for s, e in _propositions(plat):
+        morceau = plat[s:e]
+        mots_morceau = {m[:-1] if m.endswith("s") and len(m) > 4 else m
+                        for m in re.findall(r"[a-z0-9]+", morceau)}
+        if not mots & mots_morceau:
+            continue
+        titre_situe = True
+        fermes = [(v, tol) for v, _ou, tol in _heures_fermes(plat, positions, s, e)]
+        if not fermes:
+            continue
+        jour_cible = _jour_cible(dem._dates_nommees(morceau, aujourdhui) or dates_message)
+        if jour_cible is None:
+            continue
+        return _heure_dite_contredite(ctx, nom, kwargs, prep, titre, recurrent, debut,
+                                      jour_cible, fermes)
+    if titre_situe:
+        return None
+
+    # Revue du 2026-09-14 (round 3): un titre court ou vide de sens (« Gym »,
+    # « cours ») ou renomme par le modele (« Entraînement » pour « gym ») ne se
+    # retrouve dans aucune proposition. Si le message ne donne qu'UNE heure
+    # ferme, elle vaut pour tout ajout du jour qu'il nomme (ou sans jour nomme).
+    fermes = _sans_fins_de_plage(plat, _heures_fermes(plat, positions, 0, len(plat)))
+    if len({v for v, _ou, _tol in fermes}) != 1:
+        return None
+    jour_cible = _jour_cible(dates_message)
+    if jour_cible is None:
+        return None
+    return _heure_dite_contredite(ctx, nom, kwargs, prep, titre, recurrent, debut, jour_cible,
+                                  [(v, tol) for v, _ou, tol in fermes])
+
+
+def _heures_fermes(plat: str, positions, s: int, e: int) -> list[tuple[str, int, int]]:
+    """(valeur, position, tolerance) des heures fermes entre s et e: une
+    borne (« avant 10 h ») n'en est pas une, une approximation a sa marge."""
+    fermes = []
+    for valeur, ou in positions:
+        if not (s <= ou < e):
+            continue
+        avant = plat[:ou]
+        if _HEURE_SOUPLE_AVANT.search(avant):
+            continue
+        tolerance = TOLERANCE_APPROX if _HEURE_APPROX_AVANT.search(avant) else 0
+        fermes.append((valeur, ou, tolerance))
+    return fermes
+
+
+_ENTRE_PLAGE = re.compile(r"\s*(?:a|au|-)\s*$")
+
+
+def _sans_fins_de_plage(plat: str, fermes):
+    """« de 14 h a 15 h » ou « 10:30 - 11:30 » donnent UNE heure de debut."""
+    fins = {m.start(): m.end() for m in dem._RE_HEURE.finditer(plat)}
+    gardees, fin_precedente = [], None
+    for valeur, ou, tolerance in sorted(fermes, key=lambda f: f[1]):
+        if fin_precedente is not None and _ENTRE_PLAGE.match(plat[fin_precedente:ou]):
+            fin_precedente = None
+            continue
+        gardees.append((valeur, ou, tolerance))
+        fin_precedente = fins.get(ou)
+    return gardees
+
+
+def _heure_dite_contredite(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparation,
+                           titre: str, recurrent: bool, debut: str, jour_cible: date, fermes):
+    """Refus quand l'appel ne pose aucune des heures fermes dites, sinon None."""
+    from services.scheduling.placement import open_intervals
+
+    if any(abs(_minutes(debut) - _minutes(v)) <= tol for v, tol in fermes):
+        return None
+    dite = fermes[0][0]
+    fin_appel = _heure_normale(kwargs.get("end_time")) or (prep.bloc_update or {}).get("fin")
+    duree = ((_minutes(fin_appel) - _minutes(debut)) % (24 * 60)) if fin_appel else 60
+    duree = duree or 60
+    fin_dite = _fmt((_minutes(dite) + duree) % (24 * 60))
+    debut_min = _minutes(dite)
+    fin_min = debut_min + duree
+    libre = fin_min <= 24 * 60 and any(
+        a <= debut_min and fin_min <= b for a, b in open_intervals(ctx.user, jour_cible, 0, 24 * 60))
+    if libre:
+        return ToolResult(
+            success=False, data={"heure_dite": dite},
+            message=(f"Retenu par le code: l'utilisateur a dit {dite} pour {_ascii(titre)}. "
+                     f"Refais l'appel avec start_time={dite}. Si cette heure ne convient pas, "
+                     "pose la question au lieu de changer l'heure."))
+    demande = _demande_heure_refusee(ctx, nom, kwargs, titre, jour_cible, dite, fin_dite,
+                                     None, recurrent=recurrent)
+    heures = [v for v, _tol in fermes]
+    if recurrent:
+        _armer(ctx, demande, heures, jour=jour_cible.weekday())
+    else:
+        _armer(ctx, demande, heures, date_armee=jour_cible)
+    return ToolResult(success=False, data={"demande": demande}, message=MESSAGE_RETENUE)
 
 
 def _date_passee(nom: str, kwargs: dict):
@@ -1424,8 +1505,21 @@ def _appliquer(ctx: _Contexte) -> list[dict]:
         option = dem.option_choisie(ctx.texte, demande)
         if option is None:
             if motif in MOTIFS_GARDES:
+                # Banc du 2026-09-14 (s05-3): apres un oui vague, la demande
+                # se perdait et « Tous les jeudis » au tour suivant ne trouvait
+                # plus rien a trancher. Le CODE repose la meme demande: elle
+                # entre au registre, la question du tour la rend avec ses
+                # puces et la persiste, et une reponse claire la tranchera.
+                reposee = ToolResult(
+                    success=False,
+                    data={"demande": _reposer(demande), "reposee_par_le_code": True,
+                          **({"needs_confirmation": True} if motif != "creation_en_masse" else {})},
+                    message=MESSAGE_RETENUE)
+                action = _consigner(ctx, str(demande.get("outil") or ""),
+                                    dict(demande.get("parametres") or {}), reposee)
                 sorties.append({"cle": cle, "motif": motif, "option": None, "action_id": None,
-                                "resume": f"SANS REPONSE CLAIRE: {_sujet(demande)}, n'agis pas"})
+                                "resume": (f"SANS REPONSE CLAIRE: {_sujet(demande)}, n'agis pas "
+                                           f"({action.id}: le code repose la question)")})
             continue
         choisie = next((o for o in demande.get("options") or []
                         if isinstance(o, dict) and o.get("id") == option), None) or {}

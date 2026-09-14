@@ -223,9 +223,48 @@ def _r2(plat: str):
     return None
 
 
+# Revue du 2026-09-14 (round 3): « garde tous les jeudis » repondu a « Seulement
+# ce jeudi ou tous les jeudis ? » supprimait la SERIE, parce que « tous les »
+# etait lu avant l'intention de garder. Garder ou annuler gagne toujours: ces
+# verbes ne menent jamais a la serie ni a l'occurrence.
+_GARDER = re.compile(
+    r"\b(gard\w*|laiss\w*|conserv\w*|annul\w*|non|finalement|"
+    r"ne (?:touche|change|supprime|efface|enleve|retire)\w*|n'y touche\w*|"
+    r"touche pas|change pas)\b"
+)
+_VERBE_SUPPRESSION = re.compile(r"\b(supprim\w*|effac\w*|enlev\w*|retir\w*|vide[rz]?|debarrasse\w*)\b")
+# « toujours » et « definitivement » ne disent la serie qu'avec un verbe de
+# suppression (« efface-le definitivement »).
+_SER_FAIBLE = {"toujours", "definitivement"}
+_MOTS_REPONSE_NUE = _RESTE_POLI | set(_JOURS) | {j + "s" for j in _JOURS} | {
+    "semaine", "semaines", "donc", "alors", "plutot", "de", "des", "ces",
+}
+
+
+def _reponse_nue(plat: str, series) -> bool:
+    """La reponse n'est que la portee (« tous les jeudis », « la serie »),
+    avec au plus de la politesse autour."""
+    if any(m.group(1) in _SER_FAIBLE for m in series):
+        return False
+    reste, debut = [], 0
+    for m in series:
+        reste.append(plat[debut:m.start()])
+        debut = m.end()
+    reste.append(plat[debut:])
+    mots = [m.strip("-'") for m in " ".join(reste).split()]
+    return all(m in _MOTS_REPONSE_NUE for m in mots if m)
+
+
 def _r3(plat: str):
     occ = _OCC.search(plat)
     series = list(_SER.finditer(plat))
+    suppression = bool(_VERBE_SUPPRESSION.search(plat))
+    if _GARDER.search(plat):
+        # Garder, laisser, annuler: jamais la serie, jamais l'occurrence.
+        # Sans portee ni verbe de suppression, c'est un refus; sinon on repose.
+        if not series and not occ and not suppression:
+            return "annuler"
+        return None
     niee = False
     for m in series:
         avant = plat[:m.start()].split()[-3:]
@@ -236,7 +275,9 @@ def _r3(plat: str):
         # celui-la »): on repose la question plutot que de trancher.
         return None
     if series:
-        return None if niee else "serie"
+        if niee:
+            return None
+        return "serie" if suppression or _reponse_nue(plat, series) else None
     if occ:
         return "occurrence"
     if _ANNULER_PORTEE.match(plat):
