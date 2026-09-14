@@ -42,20 +42,25 @@ class G1LectureDePorteeTests(SimpleTestCase):
             with self.subTest(brut=brut):
                 self.assertIn(dem.option_choisie(brut, PORTEE), (None, 'annuler'))
 
-    def test_la_serie_reste_lisible(self):
-        cas = {'tous les jeudis': 'serie', 'Tous les jeudis': 'serie',
-               'la série': 'serie', 'oui, tous les jeudis': 'serie',
-               'supprime tous les jeudis': 'serie', 'efface-le définitivement': 'serie',
-               'enlève-le chaque semaine': 'serie',
-               'Tous les jeudis (supprimer la série).': 'serie',
-               # Sans verbe de suppression ni reponse nue: on repose.
+    def test_la_serie_ne_se_lit_que_sur_la_puce(self):
+        # Round 6 (D1): remplace « la serie reste lisible ». La lecture libre
+        # de la portee est retiree; la puce exacte seule donne la serie.
+        cas = {'tous les jeudis': None, 'Tous les jeudis': None,
+               'la série': None, 'oui, tous les jeudis': None,
+               'supprime tous les jeudis': None, 'efface-le définitivement': None,
+               'enlève-le chaque semaine': None,
+               'Tous les jeudis (supprimer la série).': None,
                'toujours': None, 'définitivement': None,
                "j'aimerais que tous les jeudis soient libres": None,
                'Non, ne change rien.': 'annuler', 'non': 'annuler',
-               'juste celui-là': 'occurrence'}
+               'juste celui-là': None}
         for brut, attendu in cas.items():
             with self.subTest(brut=brut):
                 self.assertEqual(dem.option_choisie(brut, PORTEE), attendu)
+        avec_puces = puces(dict(PORTEE, cible={'jour': 3, 'date': '2026-09-17'}))
+        for brut in ('tous les jeudis', 'Tous les jeudis', 'Tous les jeudis (supprimer la série).'):
+            with self.subTest(brut=brut, puces=True):
+                self.assertEqual(dem.option_choisie(brut, avec_puces), 'serie')
 
 
 class G1GarderNeSupprimeRienTests(HarnaisGardes, TransactionTestCase):
@@ -67,12 +72,14 @@ class G1GarderNeSupprimeRienTests(HarnaisGardes, TransactionTestCase):
                 self.attendre([demande], brut)
                 registre = Registre()
                 outils_v2.appliquer_choix_en_attente(self.user, registre, brut, f'g:{i}')
-                self.assertFalse(any(a.succes for a in registre.actions))
+                # Round 6: la decision « annulee » est consignee (succes, pas
+                # une mutation); aucune mutation ne doit reussir.
+                self.assertFalse(any(a.succes and a.est_mutation for a in registre.actions))
                 self.assertActif(self.q)
                 # Le modele qui tenterait la suppression est retenu aussi.
                 _, tools = self.outils(brut, registre=registre, tache=f'g:{i}')
                 self.appeler(tools, 'delete_block', block_id=self.q.id)
-                self.assertFalse(any(a.succes for a in registre.actions))
+                self.assertFalse(any(a.succes and a.est_mutation for a in registre.actions))
                 self.assertActif(self.q)
         # Temoin: la reponse nue passe, la lecture de l'attente fonctionne.
         self.attendre([demande], 'Tous les jeudis')
@@ -93,7 +100,9 @@ class G2HeureDiteTitreCourtTests(HarnaisGardes, TransactionTestCase):
         for i, (brut, titre) in enumerate((('ajoute gym jeudi à 15 h', 'Gym'),
                                            ('mets Bac jeudi à 15 h', 'Bac'),
                                            ('ajoute mon cours jeudi à 15 h', 'Cours'),
-                                           ('ajoute gym jeudi à 15 h', 'Entraînement'),
+                                           # Round 6 (D3): « Entraînement » pour « gym »
+                                           # est l'ecart accepte, verrouille dans
+                                           # test_agent_v2_gardes_r6.D3HeureDiteTests.
                                            ('mon rendez-vous jeudi à 15 h', 'Rendez-vous'))):
             with self.subTest(brut=brut, titre=titre):
                 self.message_courant(brut)

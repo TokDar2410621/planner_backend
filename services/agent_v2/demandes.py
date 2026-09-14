@@ -16,6 +16,8 @@ Deux regles de fond, verifiees par les tests de core/test_agent_v2_gardes.py:
 2. La reponse se lit PAR DEMANDE, jamais sur une liste. Une puce « Tous les
    jeudis » repond a la question de portee, pas a la confirmation d'un
    planning vide pose au meme tour.
+3. Round 6: une suppression ne se tranche que sur la puce EXACTE. Une reponse
+   libre ne peut que fermer la demande (garder, annuler).
 
 Tout est pur sauf demandes_en_attente, qui lit la conversation.
 """
@@ -147,25 +149,20 @@ def demandes_en_attente(user, maintenant=None) -> list[dict]:
 
 
 # ------------------------------------------------------------ lecture reponse
+#
+# Round 6 (D1). Les rounds 1 a 5 lisaient la reponse libre: oui en tete, portee
+# nommee (« tous les jeudis », « juste celui-la »), reponse nue, verbe de garde.
+# Chaque revue trouvait une tournure mal lue qui supprimait, et chaque
+# rafistolage ouvrait un trou neuf. La surface est retiree:
+#
+# 1. Une option destructive (serie, occurrence, confirmer) ne sort QUE d'une
+#    puce exacte de la demande: egalite normalisee (casse, accents, espaces,
+#    ponctuation) avec sa valeur ou son libelle.
+# 2. Une reponse libre ne peut produire que « annuler », et seulement quand
+#    elle ne dit rien d'autre que garder ou annuler. Tout le reste ne donne
+#    aucune option: le code repose la question une fois, puis l'abandonne.
 
-_TETE_OUI = re.compile(
-    r"^(je confirme|c'est bon|c est bon|d'accord|d accord|daccord|vas-y|vas y|"
-    r"oui|okay|ok|confirme|go|applique)(?![\w'-])"
-)
-_TETE_NON = re.compile(r"^(non|annul\w*|laisse\w*|arret\w*|pas)(?![\w'-])")
-_RESTE_INTERDIT = re.compile(
-    r"supprim|effac|enlev|retir|annul|vid|ajout|cre[eé]|mets?\b|place|deplac|"
-    r"change|modifi|bouge|aussi|mais|sauf"
-)
-_OCC = re.compile(
-    r"\b(seulement|juste|cette fois|celui-la|celle-la|"
-    r"ce (lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche))\b"
-)
-_SER = re.compile(r"\b(tous les|toutes les|chaque|la serie|toujours|definitivement)\b")
-_NEGATIONS = {"pas", "non", "jamais"}
-_ANNULER_PORTEE = re.compile(r"^(non|laisse|garde tout|ne change rien)\b")
-
-_MOTIFS_OUI_NON = {"destructif", "creation_en_masse", "optimisation"}
+MOTIFS_LECTURE_LIBRE = {"destructif", "creation_en_masse", "optimisation", "portee_jour"}
 
 
 def _ids_options(demande: dict) -> set:
@@ -175,9 +172,17 @@ def _ids_options(demande: dict) -> set:
     }
 
 
-def _r1(message_brut: str, demande: dict, ids: set):
+def puce_touchee(message_brut, demande: dict):
+    """L'option dont le message est la puce EXACTE, ou None.
+
+    « Tous les jeudis ? » n'est pas la puce « Tous les jeudis »: normaliser
+    effacerait le « ? » d'un utilisateur encore hesitant (revue du round 4).
+    """
+    if not isinstance(demande, dict) or not isinstance(message_brut, str):
+        return None
+    ids = _ids_options(demande)
     cible = normaliser(message_brut)
-    if not cible:
+    if not ids or not cible:
         return None
     interrogatif = "?" in message_brut
     for puce in demande.get("chips") or []:
@@ -188,8 +193,6 @@ def _r1(message_brut: str, demande: dict, ids: set):
             continue
         for champ in ("value", "label"):
             texte = puce.get(champ)
-            # « Tous les jeudis ? » n'est pas la puce « Tous les jeudis »:
-            # normaliser efface le « ? » d'un utilisateur encore hesitant.
             if interrogatif and "?" not in str(texte or ""):
                 continue
             if normaliser(texte) == cible:
@@ -197,84 +200,38 @@ def _r1(message_brut: str, demande: dict, ids: set):
     return None
 
 
-# Revue du 2026-09-14: « oui pour jeudi seulement » confirmait la SERIE, parce
-# que le reste ne contenait aucun verbe interdit. Le reste d'un oui ne peut
-# plus porter que de la politesse: toute portee, tout jour, toute date ou tout
-# autre mot fait reposer la question.
-_RESTE_POLI = {
-    "oui", "ok", "okay", "ouais", "yes", "je", "confirme", "confirmer", "vas-y", "vas", "y",
-    "go", "c'est", "c", "est", "bon", "d'accord", "d", "accord", "daccord", "merci", "stp",
-    "svp", "s'il", "te", "plait", "parfait", "super", "bien", "sur", "vraiment", "absolument",
-    "tout", "a", "fait", "exactement", "allez", "fais-le", "fais", "le", "applique", "continue",
-    "les", "ajouts", "plan", "la", "certain", "certaine", "sure",
+# -- garder ou annuler, en texte libre
+
+_MARQUE_GARDE = re.compile(r"\b(?:gard\w*|laiss\w*|conserv\w*|annul\w*|non|nan|finalement|arret\w*)\b")
+_VERBE_SUPPRESSION = re.compile(r"\b(?:supprim\w*|effac\w*|enlev\w*|retir\w*|vide[rz]?|debarrass\w*)\b")
+# Ces verbes ne gardent que nies (« ne touche pas », « change rien »).
+_VERBE_A_NIER = re.compile(r"\b(?:touch\w*|chang\w*|boug\w*)\b")
+_CHANGE_D_AVIS = re.compile(r"\bchang\w*\s+d'?\s*avis\b")
+_NEGATIONS_DU_VERBE = {"pas", "rien", "aucun", "aucune", "jamais", "pu", "plus", "ne"}
+# « non pas tous les jeudis », « pas juste celui-la »: la portee elle-meme est
+# niee, l'utilisateur en veut peut-etre une autre.
+_PORTEE_NIEE = re.compile(
+    r"\b(?:pas|jamais|non)\s+(?:tous|toutes|tout|chaque|la serie|juste|seulement|"
+    r"ce|cet|cette|celui|celle)\b")
+# Une portee d'une fois (« laisse ce jeudi », « garde celui-la ») laisse
+# entendre qu'une autre occurrence part: on ne ferme pas la demande.
+_OCCURRENCE = re.compile(
+    r"\b(?:seulement|juste|cette fois|celui-la|celle-la|"
+    r"ce (?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche))\b")
+# « laisse tomber le cours » peut vouloir dire « supprime le cours ».
+_TOMBER_AVEC_OBJET = re.compile(
+    r"\blaiss\w*[\s-]+tomber\s+(?:le|la|les|l'|ce|cet|cette|ces|mon|ma|mes|ton|ta|tes|"
+    r"son|sa|ses|un|une)\b")
+_VOCABULAIRE_DE_GARDE = {
+    "non", "nan", "ne", "n", "pas", "rien", "plus", "pu", "jamais", "tomber",
+    "le", "la", "les", "l", "lui", "leur", "y", "en", "ce", "ca", "c", "ces",
+    "mon", "ma", "mes", "ton", "ta", "tes", "son", "sa", "ses", "moi",
+    "tous", "toutes", "tout", "toute", "chaque", "semaine", "semaines", "serie",
+    "toujours", "definitivement", "reste", "restent", "rester", "comme", "est",
+    "je", "j", "ai", "veux", "voudrais", "prefere", "te", "dis", "a", "au", "aux",
+    "de", "des", "du", "d", "avis", "alors", "bon", "ben", "euh", "hmm", "tant", "pis",
+    "merci", "stp", "svp", "s", "il", "plait", "finalement", "encore",
 }
-
-
-def _reste_poli(reste: str) -> bool:
-    mots = [m.strip("-'") for m in reste.split()]
-    return all(m in _RESTE_POLI for m in mots if m)
-
-
-def _r2(plat: str):
-    if not plat or len(plat.split()) > 8:
-        return None
-    oui = _TETE_OUI.match(plat)
-    if oui:
-        reste = plat[oui.end():]
-        if _RESTE_INTERDIT.search(reste) or not _reste_poli(reste):
-            return None
-        return "confirmer"
-    if _TETE_NON.match(plat):
-        return "annuler"
-    return None
-
-
-# Revue du 2026-09-14 (round 3): « garde tous les jeudis » repondu a « Seulement
-# ce jeudi ou tous les jeudis ? » supprimait la SERIE, parce que « tous les »
-# etait lu avant l'intention de garder. Garder ou annuler gagne toujours: ces
-# verbes ne menent jamais a la serie ni a l'occurrence.
-_GARDER = re.compile(
-    r"\b(gard\w*|laiss\w*|conserv\w*|annul\w*|non|finalement|"
-    r"ne (?:touche|change|supprime|efface|enleve|retire)\w*|n'y touche\w*|"
-    r"touche pas|change pas)\b"
-)
-_VERBE_SUPPRESSION = re.compile(r"\b(supprim\w*|effac\w*|enlev\w*|retir\w*|vide[rz]?|debarrasse\w*)\b")
-# « toujours » et « definitivement » ne disent la serie qu'avec un verbe de
-# suppression (« efface-le definitivement »).
-_SER_FAIBLE = {"toujours", "definitivement"}
-_MOTS_REPONSE_NUE = _RESTE_POLI | set(_JOURS) | {j + "s" for j in _JOURS} | {
-    "semaine", "semaines", "donc", "alors", "plutot", "de", "des", "ces",
-}
-
-
-def _jours_permis(jour) -> set:
-    """Les noms de jour qu'une reponse nue peut porter: celui de la cible
-    seulement. « tous les lundis » ne repond pas a une question sur jeudi."""
-    if isinstance(jour, int) and 0 <= jour <= 6:
-        return {_JOURS[jour], _JOURS[jour] + "s"}
-    return set(_JOURS) | {j + "s" for j in _JOURS}
-
-
-def _reponse_nue(plat: str, series, jour=None) -> bool:
-    """La reponse n'est que la portee (« tous les jeudis », « la serie »),
-    avec au plus de la politesse autour."""
-    if any(m.group(1) in _SER_FAIBLE for m in series):
-        return False
-    reste, debut = [], 0
-    for m in series:
-        reste.append(plat[debut:m.start()])
-        debut = m.end()
-    reste.append(plat[debut:])
-    permis = (_MOTS_REPONSE_NUE - set(_JOURS) - {j + "s" for j in _JOURS}) | _jours_permis(jour)
-    mots = [m.strip("-'") for m in " ".join(reste).split()]
-    return all(m in permis for m in mots if m)
-
-
-# Revue du round 4 (regressions): « n'efface rien, tous les jeudis restent »
-# supprimait la serie, parce que le verbe de suppression etait lu sans sa
-# negation. Un verbe nie (n' colle, ou une negation a deux mots au plus)
-# compte comme une garde.
-_NEGATIONS_DU_VERBE = {"pas", "rien", "aucun", "aucune", "jamais", "pu", "plus"}
 
 
 def _mots(texte: str) -> list[str]:
@@ -289,17 +246,6 @@ def _verbe_nie(plat: str, m) -> bool:
     return bool(_NEGATIONS_DU_VERBE.intersection(avant + apres))
 
 
-# Les mots qu'une reponse a la question de portee peut porter sans nommer
-# autre chose que sa cible: portee, politesse, hesitation, pronoms.
-_VOCABULAIRE_DE_REPONSE = (_MOTS_REPONSE_NUE - set(_JOURS) - {j + "s" for j in _JOURS}) | {
-    "tous", "toutes", "tout", "toute", "chaque", "serie", "toujours", "definitivement",
-    "seulement", "juste", "cette", "fois", "celui", "celle", "l", "le", "la", "les", "ce",
-    "cet", "ces", "mon", "ma", "mes", "ton", "ta", "tes", "lui", "leur", "en", "y", "moi",
-    "non", "pas", "ne", "n", "rien", "mais", "ou", "et", "hmm", "euh", "ben", "bof", "sais",
-    "completement", "vraiment", "finalement", "prochain", "prochaine", "occurrence",
-}
-
-
 def _jetons(texte: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", sans_accents(texte))
 
@@ -310,13 +256,115 @@ def _meme_mot(a: str, b: str) -> bool:
     return len(a) >= 4 and len(b) >= 4 and a[:4] == b[:4]
 
 
+def _jours_permis(jour) -> set:
+    """Les noms de jour qu'une reponse peut porter: celui de la cible
+    seulement. « garde-le vendredi » ne repond pas a une question sur jeudi."""
+    if isinstance(jour, int) and 0 <= jour <= 6:
+        return {_JOURS[jour], _JOURS[jour] + "s"}
+    return set()
+
+
+def annulation_libre(message_brut, demande: dict) -> bool:
+    """Le message ne dit-il QUE garder ou annuler, sans rien nommer d'autre ?
+
+    Vrai ferme la demande sur « annuler »: rien ne s'execute. Tout doute rend
+    Faux, donc aucune option.
+    """
+    if not isinstance(message_brut, str) or "?" in message_brut or not isinstance(demande, dict):
+        return False
+    plat = _plat(message_brut)
+    if not plat or _PORTEE_NIEE.search(plat) or _OCCURRENCE.search(plat):
+        return False
+    if _TOMBER_AVEC_OBJET.search(plat):
+        return False
+    # « J'annule le dentiste ? » « annule »: la c'est un oui. Ni l'un ni
+    # l'autre ne se lit en texte libre.
+    annuler_est_l_action = demande.get("outil") == "cancel_scheduled_block"
+    garde = False
+    for m in _VERBE_SUPPRESSION.finditer(plat):
+        if not _verbe_nie(plat, m):
+            return False
+        garde = True
+    for m in _VERBE_A_NIER.finditer(plat):
+        if _CHANGE_D_AVIS.match(plat, m.start()):
+            garde = True
+            continue
+        if not _verbe_nie(plat, m):
+            return False
+        garde = True
+    for m in _MARQUE_GARDE.finditer(plat):
+        if annuler_est_l_action and m.group(0).startswith("annul"):
+            return False
+        garde = True
+    if not garde:
+        return False
+    cible = demande.get("cible") or {}
+    titre = [m for m in _jetons(cible.get("titre") or "") if len(m) >= 3]
+    jours = _jours_permis(cible.get("jour"))
+    for mot in _jetons(plat):
+        if (mot in _VOCABULAIRE_DE_GARDE or mot in jours
+                or _MARQUE_GARDE.fullmatch(mot) or _VERBE_SUPPRESSION.fullmatch(mot)
+                or _VERBE_A_NIER.fullmatch(mot) or any(_meme_mot(mot, t) for t in titre)):
+            continue
+        return False
+    return True
+
+
+def option_choisie(message_brut: str, demande: dict) -> str | None:
+    """L'option que CE message choisit pour CETTE demande, ou None.
+
+    Jamais evaluee sur une liste: chaque demande ne connait que ses propres
+    puces. Seule la puce exacte donne une option destructive; une reponse
+    libre ne donne au mieux que « annuler ».
+    """
+    if not isinstance(demande, dict) or not isinstance(message_brut, str):
+        return None
+    ids = _ids_options(demande)
+    if not ids:
+        return None
+    choix = puce_touchee(message_brut, demande)
+    if (choix is None and "annuler" in ids
+            and demande.get("motif") in MOTIFS_LECTURE_LIBRE
+            and annulation_libre(message_brut, demande)):
+        choix = "annuler"
+    return choix if choix in ids else None
+
+
+# -- reposer ou abandonner (D2): cette lecture n'autorise JAMAIS rien
+
+_TETE_OUI = re.compile(
+    r"^(je confirme|c'est bon|c est bon|d'accord|d accord|daccord|vas-y|vas y|"
+    r"oui|okay|ok|confirme|go|applique)(?![\w'-])"
+)
+_TETE_NON = re.compile(r"^(non|annul\w*|laisse\w*|arret\w*|pas)(?![\w'-])")
+
+# Les mots qu'une reponse floue peut porter sans nommer autre chose que sa
+# cible: portee, politesse, hesitation, pronoms.
+_VOCABULAIRE_DE_REPONSE = _VOCABULAIRE_DE_GARDE | {
+    "oui", "ok", "okay", "ouais", "yes", "confirme", "confirmer", "vas", "go", "est", "bon",
+    "accord", "daccord", "parfait", "super", "bien", "sur", "vraiment", "absolument",
+    "fait", "exactement", "allez", "fais", "applique", "continue", "ajouts", "plan",
+    "certain", "certaine", "sure", "donc", "plutot", "seulement", "juste", "cette", "fois",
+    "celui", "celle", "cet", "mais", "ou", "et", "bof", "sais", "completement", "prochain",
+    "prochaine", "occurrence",
+}
+
+# Une reponse qui ouvre une AUTRE demande n'est pas une reponse floue a la
+# question en attente (revue du round 4: « c'est quoi mon horaire demain ? »,
+# « merci, bonne nuit »).
+_NOUVELLE_REQUETE = re.compile(
+    r"\b(?:ajout\w*|cree\w*|creer|mets|met|place\w*|planifi\w*|deplac\w*|bouge\w*|"
+    r"montre\w*|affiche\w*|horaire|planning|agenda|quoi|quel\w*|quand|combien|"
+    r"merci|bonne|bonjour|salut|allo)\b")
+
+
 def _nomme_rien_d_autre(plat: str, demande: dict | None) -> bool:
     """La reponse ne nomme que sa cible: aucun titre ni jour d'un autre
-    element (revue du round 4: « supprime mon gym tous les jeudis » repondu
-    a la question sur le quart supprimait le quart)."""
+    element (« supprime mon gym tous les jeudis » repondu a la question sur
+    le quart est une nouvelle requete)."""
     cible = (demande or {}).get("cible") or {}
     titre = [m for m in _jetons(cible.get("titre") or "") if len(m) >= 3]
-    permis_jours = _jours_permis(cible.get("jour"))
+    permis_jours = _jours_permis(cible.get("jour")) or (set(_JOURS) | {j + "s" for j in _JOURS})
     for mot in _jetons(plat):
         if mot in _VOCABULAIRE_DE_REPONSE or mot in permis_jours:
             continue
@@ -328,104 +376,19 @@ def _nomme_rien_d_autre(plat: str, demande: dict | None) -> bool:
     return True
 
 
-_LAISSE_TOMBER = re.compile(r"\blaiss\w*[\s-]+tomber\b")
-_OCC_NIEE = re.compile(r"\bpas\s+(?:juste|seulement)\b")
-_TOUS_NU = re.compile(r"\b(?:tous|toutes)\b(?!\s+les\b)")
-
-
-def _serie_niee_par_la_garde(plat: str, series) -> bool:
-    """« non pas tous les jeudis », « ne touche pas a tous les jeudis »: la
-    portee elle-meme est niee. « Non, garde tous les jeudis » ne l'est pas:
-    le « non » y porte sur la suppression."""
-    for m in series:
-        avant = _mots(plat[:m.start()])
-        if {"pas", "jamais"}.intersection(avant[-3:]) or (avant and avant[-1] == "non"):
-            return True
-    return False
-
-
-def _r3(plat: str, demande: dict | None = None):
-    cible = (demande or {}).get("cible") or {}
-    occ = _OCC.search(plat)
-    series = list(_SER.finditer(plat))
-    verbes = list(_VERBE_SUPPRESSION.finditer(plat))
-    actifs = [m for m in verbes if not _verbe_nie(plat, m)]
-    if _LAISSE_TOMBER.search(plat):
-        # « laisse tomber ce cours, tous les jeudis »: garder ou jeter ? On repose.
-        return None
-    if _GARDER.search(plat) or len(actifs) < len(verbes):
-        # Garder, laisser, annuler, ou un verbe de suppression nie: jamais la
-        # serie, jamais l'occurrence. Revue de lisibilite du round 4: garder
-        # en nommant la portee (« Non, garde tous les jeudis. ») est un refus
-        # clair; le reposer faisait boucler la question sans fin.
-        if actifs or occ or _serie_niee_par_la_garde(plat, series):
-            return None
-        return "annuler"
-    if occ and (_OCC_NIEE.search(plat)
-                or _NEGATIONS.intersection(_mots(plat[:occ.start()])[-3:])):
-        # « pas seulement ce jeudi »: la portee d'une fois est refusee.
-        return None
-    if occ and (series or _TOUS_NU.search(plat)):
-        # Les deux portees sont nommees (« pas tous les jeudis, juste
-        # celui-la », « ce jeudi, tous »): on repose la question.
-        return None
-    if series:
-        for m in series:
-            if _NEGATIONS.intersection(_mots(plat[:m.start()])[-3:]):
-                return None
-        if actifs:
-            return "serie" if _nomme_rien_d_autre(plat, demande) else None
-        return "serie" if _reponse_nue(plat, series, cible.get("jour")) else None
-    if occ:
-        return "occurrence"
-    if _ANNULER_PORTEE.match(plat):
-        return "annuler"
-    return None
-
-
-# Une reponse qui ouvre une AUTRE demande n'est pas une reponse floue a la
-# question en attente: on ne la repose pas (revue du round 4, reemission
-# collante sur « c'est quoi mon horaire demain ? » et « merci, bonne nuit »).
-_NOUVELLE_REQUETE = re.compile(
-    r"\b(?:ajout\w*|cree\w*|creer|mets|met|place\w*|planifi\w*|deplac\w*|bouge\w*|"
-    r"montre\w*|affiche\w*|horaire|planning|agenda|quoi|quel\w*|quand|combien|"
-    r"merci|bonne|bonjour|salut|allo)\b")
-
-
 def reponse_plausible(message_brut, demande: dict) -> bool:
-    """Le message peut-il etre une reponse (meme floue) a CETTE demande ?"""
+    """Le message peut-il etre une reponse, meme floue, a CETTE demande ?
+
+    Ne sert qu'a choisir entre reposer la question et l'abandonner (D2), et a
+    dire si le tour peut se passer d'AGIR (D6). Une erreur ici coute une
+    question reposee ou abandonnee, jamais une action.
+    """
     plat = _plat(message_brut)
     if not plat or _NOUVELLE_REQUETE.search(plat):
         return False
     if _TETE_OUI.match(plat) or _TETE_NON.match(plat):
         return True
     return _nomme_rien_d_autre(plat, demande)
-
-
-def option_choisie(message_brut: str, demande: dict) -> str | None:
-    """L'option que CE message choisit pour CETTE demande, ou None.
-
-    Jamais evaluee sur une liste: chaque demande ne connait que ses propres
-    puces et ses propres options. Tout doute rend None, donc une question
-    reposee, jamais une action.
-    """
-    if not isinstance(demande, dict) or not isinstance(message_brut, str):
-        return None
-    ids = _ids_options(demande)
-    if not ids:
-        return None
-    choix = _r1(message_brut, demande, ids)
-    if choix is None and "?" not in message_brut:
-        # Revue du round 4: _plat retirait le point d'interrogation, et
-        # « Tous les jeudis ? » ou « oui ? » d'un utilisateur encore hesitant
-        # supprimaient. Seule la puce exacte (R1) tranche une question.
-        motif = demande.get("motif")
-        plat = _plat(message_brut)
-        if motif in _MOTIFS_OUI_NON:
-            choix = _r2(plat)
-        elif motif == "portee_jour":
-            choix = _r3(plat, demande)
-    return choix if choix in ids else None
 
 
 # ------------------------------------------------------------- jours, heures
