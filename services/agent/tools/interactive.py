@@ -634,6 +634,18 @@ class PresentChoicesTool(BaseTool):
         ancrees = ancrees[:MAX_OPTIONS_CHOIX]
         if len(ancrees) < MIN_OPTIONS_CHOIX:
             detail = f" Options écartées : {', '.join(rejetees)}." if rejetees else ""
+            seul = self._seul_element_reel(user, source, brutes)
+            if seul is not None:
+                # Banc r8, s03-2: un seul cours proche plus « Un autre cours »
+                # inventé. « Pose plutôt une question courte » faisait
+                # redemander au lieu de créer un cours dont l'utilisateur
+                # venait de donner les jours et les heures.
+                return self._refus(
+                    f"Choix non présenté : un seul élément réel correspond (« {seul} »), "
+                    "il n'y a donc rien à choisir. Si l'utilisateur ajoute un cours ou une "
+                    "activité avec ses jours et ses heures, crée-le (create_block) sans "
+                    "demander lequel. Sinon, vise cet élément." + detail,
+                    options_ecartees=rejetees)
             return self._refus(
                 "Choix non présenté : il faut au moins 2 options réelles (créneaux libres, "
                 "blocs, tâches ou jours existants). Pose plutôt une question courte." + detail,
@@ -712,6 +724,27 @@ class PresentChoicesTool(BaseTool):
                 "date": jour.isoformat(), "debut": _hhmm(debut),
                 "fin": _hhmm(fin % (24 * 60))}})
         return gardees
+
+    def _seul_element_reel(self, user, source: str, brutes) -> str | None:
+        """Le titre du SEUL bloc ou tache reel que nomment les options, sinon None.
+
+        Lit les libelles bruts: une option reelle ecartee parce que sa valeur
+        raconte une action compte encore comme element reel.
+        """
+        if source not in ("blocs", "taches") or not isinstance(brutes, list):
+            return None
+        titres = self._titres(user, source)
+        reels = set()
+        for option in brutes:
+            if not isinstance(option, dict):
+                continue
+            label = _texte_court(option.get("label"), MAX_LIBELLE_CHOIX)
+            if label is None:
+                continue
+            titre = _titre_contenu(_plat(label), titres)
+            if titre is not None:
+                reels.add(titre)
+        return reels.pop() if len(reels) == 1 else None
 
     @staticmethod
     def _titres(user, source: str) -> dict:
