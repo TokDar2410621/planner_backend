@@ -110,6 +110,12 @@ def detecter_ecarts(registre: Registre) -> None:
             obtenue_brute = _lire(action.donnees, chemin)
             fin = _lire(action.donnees, chemin[:-1] + ("end_time",)) if len(chemin) > 1 \
                 else action.donnees.get("end_time")
+            # Ce que rendu.py affiche a l'utilisateur, lu aux memes endroits
+            # que la date: la description ci-dessous reste pour le modele.
+            debut = _lire(action.donnees, chemin[:-1] + ("start_time",)) if len(chemin) > 1 \
+                else action.donnees.get("start_time")
+            titre = _lire(action.donnees, chemin[:-1] + ("title",)) if len(chemin) > 1 \
+                else action.donnees.get("title")
             if obtenue_brute and _est_passe(obtenue_brute, fin):
                 # Formulation deliberement explicite sur le fait que la chose
                 # EXISTE. Une premiere version disait « place dans le passe,
@@ -121,19 +127,37 @@ def detecter_ecarts(registre: Registre) -> None:
                     action.id,
                     f"CREE mais dans le passe ({obtenue_brute} {fin or ''}"
                     .rstrip() + "): il existe et n'a PAS ete annule, il est "
-                    "seulement inutilisable tel quel et doit etre replace")
+                    "seulement inutilisable tel quel et doit etre replace",
+                    genre="passe",
+                    donnees={"date": str(obtenue_brute)[:10], "debut": debut,
+                             "fin": fin, "titre": titre})
             demandee = action.parametres.get("date") or action.parametres.get("start_date")
             obtenue = _lire(action.donnees, chemin)
             if demandee and obtenue and str(demandee) != str(obtenue):
                 registre.ajouter_ecart(
-                    action.id, f"date demandee {demandee}, date obtenue {obtenue}")
+                    action.id, f"date demandee {demandee}, date obtenue {obtenue}",
+                    genre="date_differente",
+                    donnees={"demandee": str(demandee), "obtenue": str(obtenue),
+                             "titre": titre})
 
         # Succes SANS mutation reelle: verifie dans le code v1, quatre cas.
         if action.outil == "create_task" and "non dupliquee" in action.message.lower():
-            registre.ajouter_ecart(action.id, "tache deja presente, rien n'a ete cree")
+            tache = action.donnees.get("task") or {}
+            registre.ajouter_ecart(
+                action.id, "tache deja presente, rien n'a ete cree",
+                genre="tache_existante",
+                donnees={"titre": tache.get("title") if isinstance(tache, dict) else None})
         if action.outil in ("optimize_week", "organize_day") and action.donnees.get("applied") is False:
-            registre.ajouter_ecart(action.id, "plan seulement propose, rien n'a ete applique")
+            registre.ajouter_ecart(
+                action.id, "plan seulement propose, rien n'a ete applique",
+                genre="plan_propose",
+                donnees={"date": action.donnees.get("date") or action.donnees.get("start_date")})
         if action.outil == "update_preferences" and not action.donnees.get("updated_fields"):
-            registre.ajouter_ecart(action.id, "aucune preference n'a change")
+            registre.ajouter_ecart(action.id, "aucune preference n'a change",
+                                   genre="preferences_inchangees")
         if action.outil == "restore_block_occurrence" and action.donnees.get("restored") is False:
-            registre.ajouter_ecart(action.id, "aucune occurrence sautee a restaurer")
+            registre.ajouter_ecart(
+                action.id, "aucune occurrence sautee a restaurer",
+                genre="rien_a_restaurer",
+                donnees={"date": action.donnees.get("date"),
+                         "titre": action.donnees.get("title")})

@@ -57,6 +57,17 @@ class RegistreTests(SimpleTestCase):
         self.assertEqual(e.action_id, a.id)
         self.assertIs(r.par_id(e.id), e)
 
+    def test_un_ecart_porte_un_genre_et_des_donnees(self):
+        r = Registre()
+        a = r.ajouter('schedule_task_at', {}, ToolResult(success=True))
+        sans = r.ajouter_ecart(a.id, 'ancien appel')
+        self.assertEqual((sans.genre, sans.donnees), ('', {}))
+        avec = r.ajouter_ecart(a.id, 'CREE mais dans le passe', genre='passe',
+                               donnees={'date': '2026-09-13'})
+        self.assertEqual(avec.genre, 'passe')
+        self.assertEqual(avec.donnees, {'date': '2026-09-13'})
+        self.assertEqual(avec.description, 'CREE mais dans le passe')
+
     def test_un_identifiant_inconnu_ne_resout_rien(self):
         r = Registre()
         r.ajouter('create_block', {}, ToolResult(success=True))
