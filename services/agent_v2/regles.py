@@ -136,13 +136,15 @@ def appliquer_formulaire_cours(ldt: Optional[LectureDuTour], registre, *, attach
     # Un message en plusieurs parties garde main (relecture Codex: « mets mon
     # cours de maths et montre-moi mon horaire demain » perdait la lecture de
     # l'horaire sous le formulaire): un seul element lu, aucune reponse a une
-    # question, et aucune consultation au registre autre que la semaine type.
+    # question, et aucune consultation au registre autre que list_blocks, la
+    # verification silencieuse d'AGIR. get_week_schedule affiche la semaine
+    # demandee: le formulaire la cacherait si la lecture ratait cette partie.
     if len(ldt.lecture.elements) != 1 or ldt.lecture.reponses:
         return ""
     from services.agent_v2.rendu import LECTURES_RENDUES
 
-    if any(a.succes and a.outil in LECTURES_RENDUES
-           and a.outil not in ("list_blocks", "get_week_schedule") for a in registre.actions):
+    if any(a.succes and a.outil in LECTURES_RENDUES and a.outil != "list_blocks"
+           for a in registre.actions):
         return ""
     resultat = _formulaire(nom)
     if not resultat.success:

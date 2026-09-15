@@ -194,8 +194,9 @@ class FormulaireCoursTests(SimpleTestCase):
                    "operation": "consulter"}
         prose, ajoutees = self._appliquer(COURS_MATHS, horaire)
         self.assertEqual((prose, ajoutees), ("", []))
-        prose, ajoutees = self._appliquer(COURS_MATHS, registre=_registre("get_today_schedule"))
-        self.assertEqual((prose, ajoutees), ("", []))
+        for lecture_affichee in ("get_today_schedule", "get_week_schedule", "find_free_slots"):
+            prose, ajoutees = self._appliquer(COURS_MATHS, registre=_registre(lecture_affichee))
+            self.assertEqual((prose, ajoutees), ("", []), lecture_affichee)
         prose, ajoutees = self._appliquer(COURS_MATHS, registre=_registre("list_blocks"))
         self.assertTrue(prose)
 
