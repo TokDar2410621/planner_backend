@@ -63,7 +63,7 @@ LIGNE_TOUR = re.compile(
     r"^agent_v2 lire statut=[a-z_]+ fournisseur=[a-z0-9.\-]+ ms=\d+ accords="
     r"heures:(ok|diff|na),dates:(ok|diff|na),jour_vise:(ok|diff|na),date_visee:(ok|diff|na),"
     r"suppression:(ok|diff|na),evenement_unique:(ok|diff|na),cette_semaine:(ok|diff|na),"
-    r"puces_date:(ok|diff|na) attente=\d+ rejets=\d+ erreur=[A-Za-z0-9:_|\-]+$")
+    r"puces_date:(ok|diff|na) attente=\d+ rejets=\d+ erreur=[A-Za-z0-9:_|\-]+ regle=[a-z_\-]+$")
 
 
 # ------------------------------------------------------------------ fabriques
@@ -899,9 +899,11 @@ class TourCompletTests(TransactionTestCase):
 
         message, appel, dire = self.SCENARIOS[scenario]
         # Tous les reglages LIRE sont fixes ici: une variable du poste (LIRE_MODELES)
-        # ne doit pas decider du fournisseur simule que le tour interroge.
+        # ne doit pas decider du fournisseur simule que le tour interroge. Ces
+        # tours prouvent le mode OMBRE: aucune regle ne decide (LIRE_REGLES vide).
+        # Les regles ont leurs tests dans core/test_agent_v2_lire_regles.py.
         reglages = {"LIRE_OMBRE": "1" if lire_actif else "0", "LIRE_ATTENTE_S": "5",
-                    "LIRE_MODELES": "deepseek-flash,gemini-2.5-flash"}
+                    "LIRE_MODELES": "deepseek-flash,gemini-2.5-flash", "LIRE_REGLES": ""}
         lecteur = _lecteur(self._lecture_valide(scenario), appels=appels_lecteur)
         with override_settings(**reglages), \
                 patch.object(module_agent, "modele_agir", side_effect=lambda: _agir_scripte(appel)), \

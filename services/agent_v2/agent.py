@@ -38,7 +38,7 @@ from pydantic_ai.messages import (ModelRequest, ModelResponse, PartDeltaEvent,
 from pydantic_ai.usage import UsageLimits
 
 from core.models import ConversationMessage, UploadedDocument
-from services.agent_v2 import lecture
+from services.agent_v2 import lecture, regles
 from services.agent_v2.mesure import epurer_reponse, fuites_reponse, questions_et_offres
 from services.agent_v2.modeles import REGLAGES_DIRE, modele_agir, modele_dire
 from services.agent_v2.outils import outils_pour
@@ -104,6 +104,12 @@ def _charger_question_forcee():
     """boutons.question_forcee, charge par une fonction pour que les tests la simulent."""
     from services.agent_v2.boutons import question_forcee
     return question_forcee
+
+
+def _charger_creneaux_types():
+    """boutons.creneaux_types (regle creneaux), charge par une fonction pour les tests."""
+    from services.agent_v2.boutons import creneaux_types
+    return creneaux_types
 
 
 def _charger_appliquer_choix():
@@ -577,12 +583,34 @@ class PlannerAgentV2:
             etat = reconcilier(user, registre)
             detecter_ecarts(registre)
 
+        # LIRE decide (regles.py, LIRE_REGLES). La lecture se recueille UNE
+        # fois, ici, avec l'attente bornee: le meme resultat sert aux regles
+        # puis aux metadonnees et a la ligne du tour. Sans lecture utilisable,
+        # LIRE coupe ou regle coupee, rien de ce qui suit ne change.
+        resultat_lire = lecture.recueillir(suivi_lire)
+        lecture_typee = None if par_le_code else regles.lecture_du_tour(suivi_lire, resultat_lire)
+        actives = lecture.regles_actives() if lecture_typee is not None else frozenset()
+        regle, prose_regle = "-", ""
+        if regles.FORMULAIRE_COURS in actives:
+            try:
+                prose_regle = regles.appliquer_formulaire_cours(
+                    lecture_typee, registre, attachment=attachment, reemises=reemises)
+            except Exception as e:  # noqa: BLE001 - une regle ne casse pas un tour
+                logger.warning("agent_v2 regle=%s illisible erreur=%s",
+                               regles.FORMULAIRE_COURS, type(e).__name__)
+                prose_regle = ""
+            if prose_regle:
+                regle = regles.FORMULAIRE_COURS
+
         # La question du tour est choisie AVANT les faits: les actions
         # retenues que cette question couvre n'ont pas a etre redites, les
         # autres recoivent leur ligne « pas encore ».
         gagnant = self._choisir_question(
             user, message, attachment, registre, attachment_traite_ce_tour,
-            reemises=reemises, sans_forcee=par_le_code)
+            reemises=reemises, sans_forcee=par_le_code,
+            lecture_typee=lecture_typee if regles.CRENEAUX in actives else None)
+        if gagnant and gagnant.get("regle"):
+            regle = gagnant["regle"]
         par_demande = bool(gagnant) and gagnant.get("source") == "demande"
         cles_posees = set(gagnant.get("cles_posees") or []) if par_demande else set()
 
@@ -617,7 +645,9 @@ class PlannerAgentV2:
         supprimees = 0
         fuites: list[str] = []
         panne_dire = False
-        if par_le_code:
+        # Regle formulaire_cours: DIRE n'est pas appele. L'absence fausse et
+        # les puces inventees ne peuvent plus s'ecrire; le code parle seul.
+        if par_le_code or prose_regle:
             compo = composer(None, registre, faits, gagnant)
         else:
             try:
@@ -639,6 +669,8 @@ class PlannerAgentV2:
         # source (banc du round 3, s06-1).
         prose, question = sans_tiret_long(compo.prose), sans_tiret_long(compo.question)
         motif, chips = compo.motif, compo.chips
+        if prose_regle:
+            prose = sans_tiret_long(prose_regle)
         mutation_reussie = any(a.succes and a.est_mutation for a in registre.actions)
         if reemises and par_demande and cles_posees & {d.get("cle") for d in reemises}:
             # Revue de lisibilite du round 4: DIRE lisait une reponse de garde
@@ -686,9 +718,9 @@ class PlannerAgentV2:
             marqueurs = []
         rejetees = compo.rejetees
 
-        # Tout ce que voit l'utilisateur est fixe: LIRE ne peut plus rien
-        # changer. Attente bornee par LIRE_ATTENTE_S, hors de tout verrou.
-        metadonnees_lire = lecture.finir(suivi_lire)
+        # La lecture a deja ete recueillie avant la question: ici, rien ne
+        # s'attend, la ligne du tour nomme la regle qui a decide.
+        metadonnees_lire = lecture.clore(suivi_lire, resultat_lire, regle)
 
         # Une seule ligne par tour, mais pas toujours au meme niveau: une
         # reference rejetee est un mensonge que la garantie structurelle vient
@@ -873,7 +905,7 @@ class PlannerAgentV2:
 
     def _choisir_question(self, user: User, message: str, attachment,
                           registre: Registre, attachment_traite_ce_tour: bool,
-                          reemises=(), sans_forcee: bool = False):
+                          reemises=(), sans_forcee: bool = False, lecture_typee=None):
         """La question UNIQUE du tour, selon PRIORITE, ou None.
 
         Rend {"source", "motif", "question", "chips", "demandes",
@@ -907,6 +939,22 @@ class PlannerAgentV2:
 
         if sans_forcee:
             return None
+        if lecture_typee is not None:
+            # Regle creneaux: la jambe typee passe d'abord; si elle ne rend
+            # rien, question_forcee tourne exactement comme sur main.
+            try:
+                typee = _charger_creneaux_types()(user, message, attachment, registre, lecture_typee)
+            except Exception as e:  # noqa: BLE001 - un bouton ne fait jamais tomber un tour
+                logger.warning("agent_v2 regle=creneaux illisible erreur=%s", type(e).__name__)
+                typee = None
+            if isinstance(typee, dict):
+                chips = _chips_propres(typee.get("chips"), garder_option=False)
+                texte = (typee.get("question") or "").strip()
+                if texte or chips:
+                    return {"source": "forcee", "motif": typee.get("motif") or "creneaux",
+                            "question": texte, "chips": chips, "demandes": [],
+                            "cles_posees": [], "interactive_inputs": None,
+                            "regle": "creneaux"}
         try:
             forcee = _charger_question_forcee()(
                 user, message, attachment, registre, attachment_traite_ce_tour)

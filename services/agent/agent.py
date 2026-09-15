@@ -216,10 +216,18 @@ def _chips_from_message(user, message: str):
         return None
     title_m = re.search(r"[«\"]\s*([^»\"]{2,60})\s*[»\"]", message)
     title = title_m.group(1).strip() if title_m else None
+    return _chips_pour_fenetre(user, title or "cet événement", target, s_min, e_min)
+
+
+def _chips_pour_fenetre(user, title: str, target, s_min: int, e_min: int):
+    """Chips de créneaux libres quand la fenêtre [s_min, e_min] du jour
+    `target` est OCCUPÉE, None si elle est libre. Extrait tel quel de
+    _chips_from_message: v2 y passe aussi une fenêtre lue par LIRE
+    (services/agent_v2/boutons.creneaux_types), pour les mêmes chips."""
     fake_call = {
         "tool": "schedule_task_at",
         "args": {
-            "title": title or "cet événement",
+            "title": title,
             "date": target.isoformat(),
             "start_time": f"{s_min // 60:02d}:{s_min % 60:02d}",
             "end_time": f"{e_min // 60:02d}:{e_min % 60:02d}",

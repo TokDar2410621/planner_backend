@@ -283,6 +283,9 @@ _EN_TEST = (len(sys.argv) > 1 and sys.argv[1] == 'test') or 'pytest' in sys.modu
 LIRE_OMBRE = os.getenv('LIRE_OMBRE', '0' if _EN_TEST else '1')
 LIRE_MODELES = os.getenv('LIRE_MODELES', 'deepseek-flash,gemini-2.5-flash')
 LIRE_ATTENTE_S = os.getenv('LIRE_ATTENTE_S', '1.5')
+# Les regles ou la lecture DECIDE (services/agent_v2/regles.py), une par nom.
+# "" garde le mode ombre seul; retirer un nom coupe sa regle sans deploiement.
+LIRE_REGLES = os.getenv('LIRE_REGLES', 'formulaire_cours,creneaux')
 
 # Hugging Face API (fallback for Gemini vision)
 HF_API_KEY = os.getenv('HF_API_KEY', '')

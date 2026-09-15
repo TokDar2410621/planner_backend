@@ -115,7 +115,8 @@ def en_file() -> int:
         return _en_file
 
 LIGNE = ("agent_v2 lire statut=%s fournisseur=%s ms=%d accords=%s"
-         " attente=%d rejets=%d erreur=%s")
+         " attente=%d rejets=%d erreur=%s regle=%s")
+REGLES_DEFAUT = ("formulaire_cours", "creneaux")
 
 
 # ------------------------------------------------------------------ reglages
@@ -151,6 +152,15 @@ def modeles_lire() -> tuple[str, ...]:
     return tuple(n.strip() for n in noms if isinstance(n, str) and n.strip())
 
 
+def regles_actives() -> frozenset:
+    """Les regles qui decident (regles.py). Absent: les deux; "": aucune."""
+    valeur = getattr(settings, "LIRE_REGLES", None)
+    if valeur is None:
+        return frozenset(REGLES_DEFAUT)
+    noms = valeur.split(",") if isinstance(valeur, str) else list(valeur or [])
+    return frozenset(n.strip() for n in noms if isinstance(n, str) and n.strip())
+
+
 # ------------------------------------------------------------------- donnees
 
 @dataclass(frozen=True)
@@ -161,6 +171,7 @@ class Preparation:
     contexte: str
     refs: dict
     modeles: tuple
+    origine: str = "tape"
 
 
 @dataclass(frozen=True)
@@ -260,7 +271,7 @@ def preparer(user, message_brut: str) -> Preparation:
     texte, refs = schema.contexte_lire(aujourdhui, maintenant.strftime("%H:%M"), origine,
                                        semaine, taches, attente, formulaire, question)
     return Preparation(message=message, aujourdhui=aujourdhui, contexte=texte,
-                       refs=refs, modeles=modeles_lire())
+                       refs=refs, modeles=modeles_lire(), origine=origine)
 
 
 def sautee() -> Suivi:
@@ -456,7 +467,7 @@ def _tardive(futur, prep: Preparation) -> None:
         logger.warning("agent_v2 lire tardive illisible erreur=%s", type(e).__name__)
 
 
-def journaliser(suivi: Suivi, resultat: Resultat) -> None:
+def journaliser(suivi: Suivi, resultat: Resultat, regle: str = "-") -> None:
     """LA ligne du tour. Valeurs categorielles seulement."""
     prep = suivi.preparation
     if prep is None or resultat.lecture is None:
@@ -465,20 +476,34 @@ def journaliser(suivi: Suivi, resultat: Resultat) -> None:
         acc = accords(resultat.lecture, prep.message, prep.aujourdhui, prep.refs)
     logger.info(LIGNE, resultat.statut, resultat.fournisseur or "-", resultat.ms,
                 formater_accords(acc), resultat.attente_ms, resultat.rejets,
-                resultat.erreur or "-")
+                resultat.erreur or "-", regle or "-")
 
 
-def finir(suivi: Suivi) -> dict:
-    """Attend (borne), journalise, rend les metadonnees du message. Ne leve jamais."""
+def recueillir(suivi: Suivi) -> Resultat:
+    """Attend la lecture UNE fois par tour, bornee par LIRE_ATTENTE_S. Le meme
+    resultat sert aux regles puis a clore(): jamais deux attentes. Ne leve jamais."""
     try:
         debut = time.perf_counter()
         resultat = conclure(suivi)
-        resultat = replace(resultat, attente_ms=int((time.perf_counter() - debut) * 1000))
-        journaliser(suivi, resultat)
+        return replace(resultat, attente_ms=int((time.perf_counter() - debut) * 1000))
+    except Exception as e:  # noqa: BLE001 - une mesure ne casse pas un tour
+        logger.warning("agent_v2 lire conclusion illisible erreur=%s", type(e).__name__)
+        return Resultat(ERREUR, erreur=type(e).__name__)
+
+
+def clore(suivi: Suivi, resultat: Resultat, regle: str = "-") -> dict:
+    """Journalise la ligne du tour et rend les metadonnees. N'attend rien."""
+    try:
+        journaliser(suivi, resultat, regle)
         return resultat.metadonnees()
     except Exception as e:  # noqa: BLE001 - une mesure ne casse pas un tour
         logger.warning("agent_v2 lire conclusion illisible erreur=%s", type(e).__name__)
         return Resultat(ERREUR, erreur=type(e).__name__).metadonnees()
+
+
+def finir(suivi: Suivi) -> dict:
+    """recueillir puis clore, sans regle. Ne leve jamais."""
+    return clore(suivi, recueillir(suivi))
 
 
 # ------------------------------------------ accords avec les lecteurs geles

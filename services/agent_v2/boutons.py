@@ -242,7 +242,11 @@ def _calcul_force(user, message: str, attachment, registre: Registre,
 
     from services.agent.agent import _ambiguous_scheduling_chips
 
-    ambigu = _ambiguous_scheduling_chips(user, appels_outils(registre), message)
+    return _calcul_creneaux(user, _ambiguous_scheduling_chips(user, appels_outils(registre), message))
+
+
+def _calcul_creneaux(user, ambigu) -> dict | None:
+    """La question de creneaux d'un calcul v1 (phrase, chips), ou None."""
     if not ambigu:
         return None
     phrase, chips_v1 = ambigu
@@ -254,6 +258,46 @@ def _calcul_force(user, message: str, attachment, registre: Registre,
         "chips": [_chip_humaine(chip) for chip in chips_v1],
         "chips_v1": chips_v1,
         "phrase_v1": phrase,
+    }
+
+
+# Un placement tente, des creneaux consultes, un choix ou un formulaire ce
+# tour: les jambes de v1 ou la question en place decident, pas la lecture.
+_OUTILS_QUI_DECIDENT = frozenset({"schedule_task_at", "find_free_slots",
+                                  "present_choices", "present_form"})
+
+
+def creneaux_types(user, message: str, attachment, registre: Registre,
+                   lecture_du_tour) -> dict | None:
+    """Regle creneaux (LIRE_REGLES): la jambe typee des creneaux forces.
+
+    La fenetre vient de la lecture (regles.appel_bloque_type) et passe par le
+    meme calcul que la troisieme jambe de v1 (_chips_pour_fenetre puis
+    _calcul_creneaux): memes puces et meme question quand elle est occupee,
+    rien quand elle est libre. Rend la forme de question_forcee, ou None; None
+    laisse question_forcee tourner exactement comme sur main."""
+    if lecture_du_tour is None or attachment is not None:
+        return None
+    if not _creneaux_envisageables(message, registre):
+        return None
+    for action in registre.actions:
+        if (action.outil in _OUTILS_QUI_DECIDENT or (action.succes and action.est_mutation)
+                or isinstance((action.donnees or {}).get("demande"), dict)):
+            return None
+    from services.agent.agent import _chips_pour_fenetre
+    from services.agent_v2.regles import appel_bloque_type
+
+    appel = appel_bloque_type(lecture_du_tour)
+    if appel is None:
+        return None
+    calcul = _calcul_creneaux(user, _chips_pour_fenetre(
+        user, appel["titre"], appel["date"], appel["debut_min"], appel["fin_min"]))
+    if calcul is None:
+        return None
+    return {
+        "question": calcul["question"],
+        "chips": [dict(chip) for chip in calcul["chips"]],
+        "motif": calcul["motif"],
     }
 
 
