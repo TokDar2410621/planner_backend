@@ -1606,8 +1606,11 @@ def _titre_du_formulaire(ctx: _Contexte, nom: str, kwargs: dict):
     plat, plat_donne = dem.normaliser(titre), dem.normaliser(nom_donne)
     # Le nom de l'utilisateur porte deja ce titre (« mon cours de chimie
     # generale » contre « Chimie generale »): c'est bien ce cours-la qu'il
-    # nomme, une seance de plus ne se discute pas (relecture Codex).
-    if not nom_donne or plat == plat_donne or plat in plat_donne:
+    # nomme, une seance de plus ne se discute pas. En MOTS ENTIERS et a partir
+    # de trois lettres: « Art » se cachait dans « mon cours de cartographie »
+    # et laissait passer un titre sans rapport (relecture Codex).
+    porte_le_titre = len(plat) >= 3 and f" {plat} " in f" {plat_donne} "
+    if not nom_donne or plat == plat_donne or porte_le_titre:
         return None
     existants = RecurringBlock.objects.filter(user=ctx.user, active=True).values_list("title", flat=True)
     if dem.normaliser(titre) not in {dem.normaliser(t) for t in existants}:

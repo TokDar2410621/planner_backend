@@ -63,11 +63,23 @@ class TitreDuFormulaireTests(HarnaisGardes, TransactionTestCase):
         self.assertEqual(self.vendredis(), ["Chimie générale (labo)"])
 
     def test_le_titre_nomme_par_l_utilisateur_passe(self):
-        self.bloc("Chimie générale", 0, "13:00", "15:50")
-        self.formulaire_pose("mon cours de chimie générale")
+        for titre, nom_donne in (("Chimie générale", "mon cours de chimie générale"),
+                                 ("Gym", "mon cours de gym")):
+            with self.subTest(titre=titre):
+                self.bloc(titre, 0, "13:00", "15:50")
+                self.formulaire_pose(nom_donne)
+                registre, tools = self.tour()
+                self.appeler(tools, "create_block", title=titre, **VENDREDI)
+                self.assertIn(titre, self.vendredis())
+                RecurringBlock.objects.filter(user=self.user, day_of_week=4).delete()
+
+    def test_un_titre_court_cache_dans_le_nom_ne_passe_pas(self):
+        self.bloc("Art", 0, "13:00", "15:50")
+        self.formulaire_pose("mon cours de cartographie")
         registre, tools = self.tour()
-        self.appeler(tools, "create_block", title="Chimie générale", **VENDREDI)
-        self.assertEqual(self.vendredis(), ["Chimie générale"])
+        sortie = self.appeler(tools, "create_block", title="Art", **VENDREDI)
+        self.assertIn("« mon cours de cartographie »", sortie)
+        self.assertEqual(self.vendredis(), [])
 
     def test_le_nom_de_l_utilisateur_passe(self):
         self.formulaire_pose()
