@@ -1461,7 +1461,14 @@ def _lecture_journee(d: dict, auj: date, montrer: frozenset = frozenset()) -> st
     texte = f"{tete}\n{corps}"
     if "free_slots" in d:
         libre = _libre(d.get("free_slots"))
-        texte += f"\n\nLibre : {libre}" if libre else "\n\nAucun moment libre dans la journée."
+        if libre:
+            texte += f"\n\nLibre : {libre}"
+        elif dj == auj:
+            # La lecture d'aujourd'hui part de l'heure courante (schedule.py):
+            # « aucun moment libre » nierait le temps libre deja passe.
+            texte += "\n\nPlus de temps libre aujourd'hui."
+        else:
+            texte += "\n\nAucun moment libre dans la journée."
     return texte
 
 

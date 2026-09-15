@@ -62,6 +62,13 @@ class TitreDuFormulaireTests(HarnaisGardes, TransactionTestCase):
         self.appeler(tools, "create_block", title="Chimie générale (labo)", **VENDREDI)
         self.assertEqual(self.vendredis(), ["Chimie générale (labo)"])
 
+    def test_le_titre_nomme_par_l_utilisateur_passe(self):
+        self.bloc("Chimie générale", 0, "13:00", "15:50")
+        self.formulaire_pose("mon cours de chimie générale")
+        registre, tools = self.tour()
+        self.appeler(tools, "create_block", title="Chimie générale", **VENDREDI)
+        self.assertEqual(self.vendredis(), ["Chimie générale"])
+
     def test_le_nom_de_l_utilisateur_passe(self):
         self.formulaire_pose()
         registre, tools = self.tour()
@@ -82,3 +89,26 @@ class TitreDuFormulaireTests(HarnaisGardes, TransactionTestCase):
         registre, tools = self.outils("ancien message", tache=f"{self.user.pk}:{ancien.pk}")
         self.appeler(tools, "create_block", title="Chimie générale (labo)", **VENDREDI)
         self.assertEqual(self.vendredis(), ["Chimie générale (labo)"])
+
+
+class LibreDuJourRenduTests(TransactionTestCase):
+    """La journee rognee ne doit pas nier le temps libre deja passe."""
+
+    def rendre(self, date_iso):
+        from core.test_agent_v2_gardes import AUJOURDHUI
+        from services.agent.tools.base import ToolResult
+        from services.agent_v2 import rendu
+        from services.agent_v2.registre import Registre
+
+        registre = Registre()
+        registre.ajouter("get_today_schedule", {"date": date_iso},
+                         ToolResult(success=True, message="ok", data={
+                             "date": date_iso, "day_name": "lundi",
+                             "blocks": [], "free_slots": []}))
+        return rendu.rendre_lecture(registre, AUJOURDHUI)
+
+    def test_aujourd_hui_dit_qu_il_ne_reste_plus_de_temps(self):
+        self.assertIn("Plus de temps libre aujourd'hui.", self.rendre("2026-09-14"))
+
+    def test_un_autre_jour_garde_la_phrase_d_origine(self):
+        self.assertIn("Aucun moment libre dans la journée.", self.rendre("2026-09-15"))

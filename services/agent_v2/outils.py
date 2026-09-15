@@ -1603,7 +1603,11 @@ def _titre_du_formulaire(ctx: _Contexte, nom: str, kwargs: dict):
         return None
     meta = deux[1].metadata if isinstance(deux[1].metadata, dict) else {}
     nom_donne = str(meta.get("formulaire_nom") or "").strip()
-    if not nom_donne or dem.normaliser(titre) == dem.normaliser(nom_donne):
+    plat, plat_donne = dem.normaliser(titre), dem.normaliser(nom_donne)
+    # Le nom de l'utilisateur porte deja ce titre (« mon cours de chimie
+    # generale » contre « Chimie generale »): c'est bien ce cours-la qu'il
+    # nomme, une seance de plus ne se discute pas (relecture Codex).
+    if not nom_donne or plat == plat_donne or plat in plat_donne:
         return None
     existants = RecurringBlock.objects.filter(user=ctx.user, active=True).values_list("title", flat=True)
     if dem.normaliser(titre) not in {dem.normaliser(t) for t in existants}:
