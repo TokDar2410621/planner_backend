@@ -587,9 +587,13 @@ class PlannerAgentV2:
         # fois, ici, avec l'attente bornee: le meme resultat sert aux regles
         # puis aux metadonnees et a la ligne du tour. Sans lecture utilisable,
         # LIRE coupe ou regle coupee, rien de ce qui suit ne change.
-        resultat_lire = lecture.recueillir(suivi_lire)
-        lecture_typee = None if par_le_code else regles.lecture_du_tour(suivi_lire, resultat_lire)
-        actives = lecture.regles_actives() if lecture_typee is not None else frozenset()
+        # Sans regle configuree, l'attente reste en fin de tour comme en mode
+        # ombre seul (relecture Codex): rien ne retarde la question ni le flux.
+        configurees = frozenset() if par_le_code else lecture.regles_actives()
+        resultat_lire = lecture.recueillir(suivi_lire) if configurees else None
+        lecture_typee = (regles.lecture_du_tour(suivi_lire, resultat_lire)
+                         if resultat_lire is not None else None)
+        actives = configurees if lecture_typee is not None else frozenset()
         regle, prose_regle = "-", ""
         if regles.FORMULAIRE_COURS in actives:
             try:
@@ -718,8 +722,11 @@ class PlannerAgentV2:
             marqueurs = []
         rejetees = compo.rejetees
 
-        # La lecture a deja ete recueillie avant la question: ici, rien ne
-        # s'attend, la ligne du tour nomme la regle qui a decide.
+        # Recueillie avant la question quand une regle est configuree; sinon
+        # ici seulement, une fois la reponse figee. La ligne du tour nomme la
+        # regle qui a decide.
+        if resultat_lire is None:
+            resultat_lire = lecture.recueillir(suivi_lire)
         metadonnees_lire = lecture.clore(suivi_lire, resultat_lire, regle)
 
         # Une seule ligne par tour, mais pas toujours au meme niveau: une

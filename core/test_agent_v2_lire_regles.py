@@ -189,6 +189,16 @@ class FormulaireCoursTests(SimpleTestCase):
         self.assertEqual(regles.appliquer_formulaire_cours(None, registre, attachment=None, reemises=()), "")
         self.assertEqual(registre.actions, [])
 
+    def test_un_message_en_plusieurs_parties_ou_une_consultation_garde_main(self):
+        horaire = {**COURS_MATHS, "mention": "mon horaire", "polarite": "question",
+                   "operation": "consulter"}
+        prose, ajoutees = self._appliquer(COURS_MATHS, horaire)
+        self.assertEqual((prose, ajoutees), ("", []))
+        prose, ajoutees = self._appliquer(COURS_MATHS, registre=_registre("get_today_schedule"))
+        self.assertEqual((prose, ajoutees), ("", []))
+        prose, ajoutees = self._appliquer(COURS_MATHS, registre=_registre("list_blocks"))
+        self.assertTrue(prose)
+
 
 # ---------------------------------------------------- regle 2: creneaux types
 
@@ -248,6 +258,24 @@ class CreneauxTypesTests(TestCase):
     def test_une_fenetre_libre_ne_force_rien(self):
         self.assertIsNone(self._main("planifie « revision » demain de 14h a 16h", libre=LIBRE))
         self.assertIsNone(self._types(_revision(DEMIN), libre=LIBRE))
+
+    def test_une_fenetre_hors_de_la_journee_ne_force_rien(self):
+        tard = _revision(DEMIN, _heure("23h", "23:00"), _heure("23h30", "23:30", role="fin"))
+        self.assertIsNone(self._types(tard))
+
+    def test_les_lecteurs_geles_gardent_le_plancher(self):
+        lu = _ldt(_revision(DEMIN))
+
+        def types(message):
+            with patch("services.scheduling.placement.open_intervals", return_value=OCCUPE):
+                return boutons.creneaux_types(self.user, message, None, Registre(), lu)
+
+        # Main lit « aujourd'hui », la lecture « demain »: la jambe typee se tait.
+        self.assertIsNone(types("planifie « revision » aujourd'hui de 14h a 16h"))
+        # Main lit 15 h, la lecture 14 h: idem.
+        self.assertIsNone(types("planifie « revision » demin de 15h a 16h"))
+        # Main ne lit aucune date (faute) et les memes heures: la lecture decide.
+        self.assertIsNotNone(types("planifie « revision » demin de 14h a 16h"))
 
     def test_ce_que_la_regle_laisse_a_main(self):
         demin = _revision(DEMIN)

@@ -267,6 +267,26 @@ _OUTILS_QUI_DECIDENT = frozenset({"schedule_task_at", "find_free_slots",
                                   "present_choices", "present_form"})
 
 
+def _plancher_gele(message: str, appel: dict, aujourdhui) -> bool:
+    """Les lecteurs regex geles gardent le plancher: quand ils lisent une date
+    ou des heures dans le message, la fenetre typee doit s'y retrouver, sinon
+    la jambe typee se tait et main decide. Relecture Codex: un « demain » lu
+    « aujourd'hui » par le modele aurait force des puces du mauvais jour, la ou
+    main visait la bonne date."""
+    from services.agent_v2 import demandes as dem
+
+    dates = dem._dates_nommees(message or "", aujourdhui)
+    if dates and appel["date"] not in dates:
+        return False
+    heures = dem.heures_dites(message or "")
+    if heures:
+        debut = f"{appel['debut_min'] // 60:02d}:{appel['debut_min'] % 60:02d}"
+        fin = f"{appel['fin_min'] // 60:02d}:{appel['fin_min'] % 60:02d}"
+        if debut not in heures or fin not in heures:
+            return False
+    return True
+
+
 def creneaux_types(user, message: str, attachment, registre: Registre,
                    lecture_du_tour) -> dict | None:
     """Regle creneaux (LIRE_REGLES): la jambe typee des creneaux forces.
@@ -288,7 +308,7 @@ def creneaux_types(user, message: str, attachment, registre: Registre,
     from services.agent_v2.regles import appel_bloque_type
 
     appel = appel_bloque_type(lecture_du_tour)
-    if appel is None:
+    if appel is None or not _plancher_gele(message, appel, lecture_du_tour.aujourdhui):
         return None
     calcul = _calcul_creneaux(user, _chips_pour_fenetre(
         user, appel["titre"], appel["date"], appel["debut_min"], appel["fin_min"]))

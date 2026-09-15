@@ -133,6 +133,17 @@ def appliquer_formulaire_cours(ldt: Optional[LectureDuTour], registre, *, attach
     nom = _nom(element)
     if not nom or not _tour_sans_suite(registre, reemises):
         return ""
+    # Un message en plusieurs parties garde main (relecture Codex: « mets mon
+    # cours de maths et montre-moi mon horaire demain » perdait la lecture de
+    # l'horaire sous le formulaire): un seul element lu, aucune reponse a une
+    # question, et aucune consultation au registre autre que la semaine type.
+    if len(ldt.lecture.elements) != 1 or ldt.lecture.reponses:
+        return ""
+    from services.agent_v2.rendu import LECTURES_RENDUES
+
+    if any(a.succes and a.outil in LECTURES_RENDUES
+           and a.outil not in ("list_blocks", "get_week_schedule") for a in registre.actions):
+        return ""
     resultat = _formulaire(nom)
     if not resultat.success:
         return ""
@@ -178,6 +189,12 @@ def appel_bloque_type(ldt: Optional[LectureDuTour]) -> Optional[dict]:
         return None
     debut, fin = _heure_ferme(element, "debut"), _heure_ferme(element, "fin")
     if debut is None or fin is None or len(element.heures) != 2 or fin <= debut:
+        return None
+    from services.agent.tools.schedule import DAY_END_MIN, DAY_START_MIN
+
+    # Hors de la journee ou cherchent les creneaux libres (7 h a 23 h), une
+    # fenetre libre passerait pour occupee (relecture Codex, 23 h a 23 h 30).
+    if debut < DAY_START_MIN or fin > DAY_END_MIN:
         return None
     return {"titre": _nom(element) or "cet événement", "date": resolution.dates[0],
             "debut_min": debut, "fin_min": fin}
