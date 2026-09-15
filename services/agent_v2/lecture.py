@@ -20,7 +20,9 @@ Ce que ce module garantit (core/test_agent_v2_lire_ombre.py le verifie):
    2026-08-28, voir agent.py).
 4. Le tour attend au plus LIRE_ATTENTE_S, a sa fin, hors de tout outil et de
    tout verrou. Au-dela: hors_budget; une lecture encore en file est annulee,
-   une lecture en cours n'est que journalisee a son arrivee.
+   une lecture en cours abandonne son repli et n'est que journalisee a son
+   arrivee. La file est bornee (FILE_MAX): au-dela, erreur file_pleine, sans
+   meme lire la base.
 5. Rien de l'utilisateur dans les journaux: statuts, noms de fournisseur,
    classes d'erreur et accords categoriels. Jamais str(e) ni exc_info: une
    erreur de validation pydantic recopie les valeurs lues, donc ses mots.
@@ -35,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import threading
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
@@ -79,10 +82,37 @@ CLES_METADONNEES = ("lecture", "lecture_statut", "lecture_fournisseur", "lecture
 # Quatre travailleurs: un appel dure 1 a 2 s et le trafic reste modeste. Sous
 # une rafale, les lectures attendent en file et celles d'un tour deja conclu
 # sont annulees avant de partir.
-_POOL_LIRE = ThreadPoolExecutor(
-    max_workers=getattr(settings, "AGENT_V2_THREADS_LIRE", 4),
-    thread_name_prefix="lire",
-)
+_TRAVAILLEURS = getattr(settings, "AGENT_V2_THREADS_LIRE", 4)
+_POOL_LIRE = ThreadPoolExecutor(max_workers=_TRAVAILLEURS, thread_name_prefix="lire")
+
+# La file du ThreadPoolExecutor n'a pas de borne. Pendant une panne DeepSeek,
+# chaque lecture tient un travailleur jusqu'a son delai, et les tours suivants
+# s'empilaient sans limite avec leur contexte. _en_file compte les lectures
+# soumises et pas encore terminees, en cours ou en attente.
+FILE_MAX = 2 * _TRAVAILLEURS
+_FILE_VERROU = threading.Lock()
+_en_file = 0
+
+
+def _reserver() -> bool:
+    global _en_file
+    with _FILE_VERROU:
+        if _en_file >= FILE_MAX:
+            return False
+        _en_file += 1
+        return True
+
+
+def _liberer(_futur=None) -> None:
+    global _en_file
+    with _FILE_VERROU:
+        _en_file = max(0, _en_file - 1)
+
+
+def en_file() -> int:
+    """Lectures soumises et pas encore terminees."""
+    with _FILE_VERROU:
+        return _en_file
 
 LIGNE = ("agent_v2 lire statut=%s fournisseur=%s ms=%d accords=%s"
          " attente=%d rejets=%d erreur=%s")
@@ -158,6 +188,7 @@ class Suivi:
     futur: object = None
     depart: float = 0.0
     fixe: Optional[Resultat] = None
+    abandon: Optional[threading.Event] = None
 
 
 def _ms(depart: float) -> int:
@@ -240,17 +271,26 @@ def demarrer(user, message_brut: str) -> Suivi:
     """Prepare et soumet la lecture. Ne leve jamais, n'attend jamais."""
     if not ombre_active():
         return Suivi(fixe=Resultat(DESACTIVEE))
+    # Avant preparer(): une file pleine ne coute aucune requete en base.
+    if not _reserver():
+        return Suivi(fixe=Resultat(ERREUR, erreur="file_pleine"))
     depart = time.perf_counter()
     try:
         prep = preparer(user, message_brut)
     except Exception as e:  # noqa: BLE001 - une mesure ne casse pas un tour
+        _liberer()
         logger.warning("agent_v2 lire contexte illisible erreur=%s", type(e).__name__)
         return Suivi(fixe=Resultat(ERREUR, ms=_ms(depart), erreur=type(e).__name__))
+    abandon = threading.Event()
     try:
-        futur = _POOL_LIRE.submit(lire, prep, depart)
+        futur = _POOL_LIRE.submit(lire, prep, depart, abandon)
     except Exception as e:  # noqa: BLE001 - pool ferme a l'arret du processus
+        _liberer()
         return Suivi(preparation=prep, fixe=Resultat(ERREUR, ms=_ms(depart), erreur=type(e).__name__))
-    return Suivi(preparation=prep, futur=futur, depart=depart)
+    # Rappel appele une seule fois, a la fin comme a l'annulation (Future.cancel
+    # invoque les rappels): la place se libere dans tous les cas.
+    futur.add_done_callback(_liberer)
+    return Suivi(preparation=prep, futur=futur, depart=depart, abandon=abandon)
 
 
 # ------------------------------------------------------ pool LIRE (sans ORM)
@@ -336,7 +376,8 @@ def _evaluer(prep: Preparation, nom: str, sortie, depart: float) -> Resultat:
                     ms=_ms(depart), rejets=len(rejets))
 
 
-def lire(prep: Preparation, depart: float = 0.0) -> Resultat:
+def lire(prep: Preparation, depart: float = 0.0,
+         abandon: Optional[threading.Event] = None) -> Resultat:
     """Dans le pool LIRE. AUCUN ORM: tout ce qui vient de la base est dans prep.
 
     Repli sur panne du fournisseur seulement (HTTP, delai, reseau). Une sortie
@@ -346,14 +387,20 @@ def lire(prep: Preparation, depart: float = 0.0) -> Resultat:
     Une boucle asyncio PAR lecture (asyncio.run), jamais celle du thread: les
     clients des fournisseurs y naissent et y meurent (voir _modele)."""
     try:
-        return asyncio.run(_lire(prep, depart))
+        return asyncio.run(_lire(prep, depart, abandon))
     except Exception as e:  # noqa: BLE001 - le pool ne remonte jamais d'exception
         return Resultat(ERREUR, ms=_ms(depart), erreur=type(e).__name__)
 
 
-async def _lire(prep: Preparation, depart: float) -> Resultat:
+async def _lire(prep: Preparation, depart: float,
+                abandon: Optional[threading.Event] = None) -> Resultat:
     erreurs: list[str] = []
     for nom in prep.modeles:
+        # Tour deja conclu en hors_budget: plus personne n'attend ni cette
+        # lecture ni son repli. Sous une panne DeepSeek, le repli Gemini tenait
+        # le travailleur environ 16 s pour un resultat seulement journalise.
+        if abandon is not None and abandon.is_set():
+            return Resultat(ERREUR, ms=_ms(depart), erreur="|".join(erreurs + ["abandon"]))
         try:
             async with _modele(nom) as modele:
                 if modele is None:
@@ -388,6 +435,8 @@ def conclure(suivi: Suivi) -> Resultat:
         pass
     except Exception as e:  # noqa: BLE001 - lire() ne leve pas; filet
         return Resultat(ERREUR, ms=_ms(suivi.depart), erreur=type(e).__name__)
+    if suivi.abandon is not None:
+        suivi.abandon.set()
     if not suivi.futur.cancel():
         prep = suivi.preparation
         suivi.futur.add_done_callback(lambda futur: _tardive(futur, prep))

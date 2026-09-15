@@ -686,6 +686,9 @@ class ConcurrenceTests(SimpleTestCase):
                 suivi.futur.result(timeout=10)
             except CancelledError:
                 pass
+        # Future.result() reveille l'attente AVANT les rappels: sans ce vidage,
+        # la manche suivante trouverait des places encore comptees.
+        _attendre_file_vide(self)
         return tours, duree
 
     @override_settings(LIRE_OMBRE="1", LIRE_ATTENTE_S="1.0")
@@ -708,6 +711,113 @@ class ConcurrenceTests(SimpleTestCase):
         self.assertTrue(noms_lire)
         self.assertTrue(all(n.startswith("lire") for n in noms_lire), noms_lire)
         self.assertEqual(lecture._POOL_LIRE._max_workers, 4)
+
+
+def _attendre_file_vide(test, limite=10.0):
+    fin = time.perf_counter() + limite
+    while lecture.en_file() and time.perf_counter() < fin:
+        time.sleep(0.01)
+    test.assertEqual(lecture.en_file(), 0)
+
+
+@override_settings(LIRE_OMBRE="1")
+class FileEtAbandonTests(SimpleTestCase):
+    """Revue Codex du 2026-09-15: sous une panne DeepSeek, une lecture deja
+    conclue en hors_budget tentait encore le repli Gemini (environ 16 s par
+    travailleur), et la file du pool grossissait sans borne."""
+
+    MESSAGE = "ajoute gym jeudi a 18h"
+
+    def setUp(self):
+        _attendre_file_vide(self)
+
+    def test_une_lecture_abandonnee_n_appelle_jamais_le_repli(self):
+        appels_gemini: list = []
+        lent_puis_en_panne = _lecteur(attente=0.3, erreur=ModelHTTPError(503, "deepseek-flash"))
+        with patch.object(lecture, "preparer", side_effect=lambda user, m: _prep(m)), \
+                _fournisseurs({"deepseek-flash": lent_puis_en_panne,
+                               "gemini-2.5-flash": _lecteur(GYM_JEUDI, appels=appels_gemini)}), \
+                override_settings(LIRE_ATTENTE_S="0.05"):
+            suivi = lecture.demarrer(None, self.MESSAGE)
+            self.assertEqual(lecture.conclure(suivi).statut, "hors_budget")
+            self.assertTrue(suivi.abandon.is_set())
+            tardif = suivi.futur.result(timeout=10)
+        self.assertEqual(appels_gemini, [])
+        self.assertEqual((tardif.statut, tardif.erreur), ("erreur", "deepseek:ModelHTTPError:503|abandon"))
+        _attendre_file_vide(self)
+
+    def test_un_abandon_deja_pose_ne_tente_aucun_fournisseur(self):
+        appels: list = []
+        abandon = threading.Event()
+        abandon.set()
+        with _fournisseurs({"deepseek-flash": _lecteur(GYM_JEUDI, appels=appels)}):
+            r = lecture.lire(_prep(self.MESSAGE), 0.0, abandon)
+        self.assertEqual((r.statut, r.erreur), ("erreur", "abandon"))
+        self.assertEqual(appels, [])
+
+    def test_la_file_revient_a_zero_apres_succes_erreur_et_annulation(self):
+        with patch.object(lecture, "preparer", side_effect=lambda user, m: _prep(m)), \
+                override_settings(LIRE_ATTENTE_S="5"):
+            with _fournisseurs({"deepseek-flash": _lecteur(GYM_JEUDI)}):
+                suivi = lecture.demarrer(None, self.MESSAGE)
+                self.assertEqual(lecture.conclure(suivi).statut, "ok")
+                self.assertFalse(suivi.abandon.is_set())
+            _attendre_file_vide(self)
+            with _fournisseurs({"deepseek-flash": _lecteur(erreur=ModelHTTPError(503, "deepseek-flash"))}):
+                self.assertEqual(lecture.conclure(lecture.demarrer(None, self.MESSAGE)).statut, "erreur")
+            _attendre_file_vide(self)
+
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lire_test")
+        verrou = threading.Event()
+        try:
+            pool.submit(verrou.wait, 5)
+            with patch.object(lecture, "_POOL_LIRE", pool), \
+                    patch.object(lecture, "preparer", side_effect=lambda user, m: _prep(m)), \
+                    override_settings(LIRE_ATTENTE_S="0.05"):
+                suivi = lecture.demarrer(None, self.MESSAGE)
+                self.assertEqual(lecture.en_file(), 1)
+                self.assertEqual(lecture.conclure(suivi).statut, "hors_budget")
+                self.assertTrue(suivi.futur.cancelled())
+                self.assertEqual(lecture.en_file(), 0)
+        finally:
+            verrou.set()
+            pool.shutdown(wait=True)
+
+    def test_file_pleine_sans_contexte_puis_reprise_apres_vidage(self):
+        self.assertEqual(lecture.FILE_MAX, 2 * lecture._POOL_LIRE._max_workers)
+        preparations: list = []
+
+        def preparer(user, message):
+            preparations.append(message)
+            return _prep(message)
+
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lire_test")
+        verrou = threading.Event()
+        try:
+            pool.submit(verrou.wait, 10)
+            with patch.object(lecture, "_POOL_LIRE", pool), \
+                    patch.object(lecture, "preparer", side_effect=preparer), \
+                    _fournisseurs({"deepseek-flash": _lecteur(GYM_JEUDI)}), \
+                    override_settings(LIRE_ATTENTE_S="5"):
+                suivis = [lecture.demarrer(None, self.MESSAGE) for _ in range(lecture.FILE_MAX)]
+                self.assertTrue(all(s.futur is not None for s in suivis))
+                self.assertEqual(lecture.en_file(), lecture.FILE_MAX)
+
+                with self.assertLogs(JOURNAL, "INFO") as journal:
+                    meta = lecture.finir(lecture.demarrer(None, self.MESSAGE))
+                self.assertEqual((meta["lecture_statut"], meta["lecture"]), ("erreur", None))
+                self.assertIn("erreur=file_pleine", journal.records[-1].getMessage())
+                self.assertRegex(journal.records[-1].getMessage(), LIGNE_TOUR)
+                self.assertEqual(len(preparations), lecture.FILE_MAX, "file pleine: aucun contexte lu")
+
+                verrou.set()
+                self.assertEqual([lecture.conclure(s).statut for s in suivis], ["ok"] * lecture.FILE_MAX)
+                _attendre_file_vide(self)
+                self.assertEqual(lecture.conclure(lecture.demarrer(None, self.MESSAGE)).statut, "ok")
+        finally:
+            verrou.set()
+            pool.shutdown(wait=True)
+        _attendre_file_vide(self)
 
 
 # ------------------------------------------------------------- tours complets
