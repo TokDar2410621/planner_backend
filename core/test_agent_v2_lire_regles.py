@@ -134,9 +134,16 @@ class FormulaireCoursTests(SimpleTestCase):
         self.assertEqual(heures["type"], "time_range")
         self.assertNotIn("default", heures)
         self.assertNotIn("presets", heures)
+        self.assertIn("« mon cours de maths »", jours["label"])
+        self.assertIn("« mon cours de maths »", heures["question"])
         for champ in (jours, heures):
-            self.assertIn("« mon cours de maths »", champ["label"])
             self.assertIsNone(MOTS_D_INTERFACE.search(f"{champ['label']} {champ['question']}"))
+        # La reponse exacte du frontend garde les deux heures pour les lecteurs
+        # geles: « Heures de ... » passait pour une duree et la garde imposait
+        # 17:50 au lieu de 16:00 (banc reel du 2026-09-15).
+        from services.agent_v2 import demandes as dem
+        reponse = f"Voici mes réponses :\n{jours['label']}: Mardi, Jeudi\n{heures['label']}: 16:00 - 17:50"
+        self.assertEqual(dem.heures_dites(reponse), ["16:00", "17:50"])
 
     def test_sans_candidat_de_la_semaine_type_une_seule_ligne(self):
         prose, _ = self._appliquer(_element(mention="mon cours de maths", genre="course", candidats=["t1"]))

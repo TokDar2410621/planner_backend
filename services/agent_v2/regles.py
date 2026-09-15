@@ -111,7 +111,11 @@ def _formulaire(nom: str) -> ToolResult:
         {"id": "jours", "type": "checkbox", "label": f"Jours de « {nom} »",
          "question": f"Quels jours as-tu « {nom} » ?",
          "options": [{"value": str(i), "label": jour} for i, jour in enumerate(JOURS)]},
-        {"id": "heures", "type": "time_range", "label": f"Heures de « {nom} »",
+        # « Plage horaire », pas « Heures de ... »: la reponse du frontend
+        # (« <libelle>: 16:00 - 17:50 ») passerait sinon pour une duree aux
+        # lecteurs geles (_LIBELLE_DUREE), qui ne gardaient que 17:50, et la
+        # garde des heures dites imposait ce mauvais debut (banc du 2026-09-15).
+        {"id": "heures", "type": "time_range", "label": "Plage horaire",
          "question": f"À quelle heure commence et finit « {nom} » ?"},
     ])
 
