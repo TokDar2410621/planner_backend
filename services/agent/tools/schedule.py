@@ -133,9 +133,15 @@ class GetTodayScheduleTool(BaseTool):
         # Créneaux libres 7h-23h via la logique unique overnight-aware (compte
         # correctement un quart de nuit du jour ET le débordement de la veille,
         # + les blocs déjà planifiés). Corrige le faux "libre 7h-23h".
-        free_slots = _free_slots_from_intervals(
-            open_intervals(user, target_date, DAY_START_MIN, DAY_END_MIN), 30
-        )
+        intervals = open_intervals(user, target_date, DAY_START_MIN, DAY_END_MIN)
+        # AUJOURD'HUI, le passé n'est pas libre, comme dans find_free_slots.
+        # Vécu (banc du 2026-09-15, 16:31): la ligne « Libre : 15 h 50 à 18 h »
+        # de cette lecture est devenue un bouton « 15 h 50 à 18 h ».
+        now_local = timezone.localtime()
+        if target_date == now_local.date():
+            now_min = ((now_local.hour * 60 + now_local.minute + 4) // 5) * 5
+            intervals = [(max(s, now_min), e) for s, e in intervals if e > now_min]
+        free_slots = _free_slots_from_intervals(intervals, 30)
 
         return ToolResult(
             success=True,

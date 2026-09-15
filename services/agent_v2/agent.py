@@ -794,6 +794,12 @@ class PlannerAgentV2:
             "faits_rendus": faits,
             "raw_markers": marqueurs,
             "lecture_sans_liste": lecture_sans_liste,
+            # Le nom que l'utilisateur a donne au cours du formulaire du code:
+            # au tour de la reponse, create_block le garde (outils.py).
+            "formulaire_nom": next((str((a.donnees or {}).get("nom") or "")
+                                    for a in registre.actions
+                                    if a.outil == "present_form" and a.succes
+                                    and (a.donnees or {}).get("par_le_code")), ""),
             "actions": [
                 {"id": a.id, "outil": a.outil, "succes": bool(a.succes),
                  "par_le_code": bool((a.donnees or {}).get("par_le_code"))}

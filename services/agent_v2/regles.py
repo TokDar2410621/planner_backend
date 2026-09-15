@@ -158,7 +158,7 @@ def appliquer_formulaire_cours(ldt: Optional[LectureDuTour], registre, *, attach
     if titres:
         lignes.append(f"Déjà à ton horaire : {', '.join(titres)}")
     lignes.append(f"Quels jours et à quelles heures as-tu « {nom} » ?")
-    donnees = {**(resultat.data or {}), "par_le_code": True, "regle": FORMULAIRE_COURS}
+    donnees = {**(resultat.data or {}), "par_le_code": True, "regle": FORMULAIRE_COURS, "nom": nom}
     registre.ajouter("present_form", {"regle": FORMULAIRE_COURS},
                      ToolResult(success=True, data=donnees, message=resultat.message))
     return "\n".join(lignes)

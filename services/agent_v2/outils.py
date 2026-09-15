@@ -1580,6 +1580,42 @@ def _crees_ce_tour(registre: Registre) -> tuple[int, list[str]]:
     return len(vus), titres
 
 
+def _titre_du_formulaire(ctx: _Contexte, nom: str, kwargs: dict):
+    """Au tour de la reponse au formulaire du code (regle formulaire_cours),
+    un create_block sous le titre d'un cours DEJA a l'horaire est renvoye UNE
+    fois au modele avec le nom que l'utilisateur a donne.
+
+    Banc reel du 2026-09-15: « mon labo de chimie » est devenu une seconde
+    serie « Chimie generale (labo) ». La decision se lit sur des donnees
+    structurees (le nom garde dans les metadonnees du formulaire, les titres en
+    base), jamais sur les mots du message. Un second appel au meme titre passe:
+    l'utilisateur voulait peut-etre vraiment une seance de plus de ce cours."""
+    from core.models import ConversationMessage, RecurringBlock
+
+    if nom != "create_block" or ctx.etat.attente.get("titre_formulaire_renvoye"):
+        return None
+    titre = str(kwargs.get("title") or "").strip()
+    _, _, courant = str(ctx.tache or "").rpartition(":")
+    if not titre or not courant.isdigit():
+        return None
+    deux = list(ConversationMessage.objects.filter(user=ctx.user).order_by("-pk")[:2])
+    if len(deux) < 2 or deux[0].pk != int(courant) or deux[1].role != "assistant":
+        return None
+    meta = deux[1].metadata if isinstance(deux[1].metadata, dict) else {}
+    nom_donne = str(meta.get("formulaire_nom") or "").strip()
+    if not nom_donne or dem.normaliser(titre) == dem.normaliser(nom_donne):
+        return None
+    existants = RecurringBlock.objects.filter(user=ctx.user, active=True).values_list("title", flat=True)
+    if dem.normaliser(titre) not in {dem.normaliser(t) for t in existants}:
+        return None
+    ctx.etat.attente["titre_formulaire_renvoye"] = True
+    return (f"L'utilisateur vient de donner les jours et les heures de « {nom_donne} », un cours "
+            f"qu'il AJOUTE. « {titre} » est le titre d'un cours deja a son horaire: cree ce "
+            f"nouveau cours sous le nom de l'utilisateur, sans le determinant (mon, ma, mes), "
+            f"par exemple « {nom_donne} » mis en forme de titre. Seulement s'il voulait vraiment "
+            f"une seance de plus de « {titre} », rappelle create_block avec ce titre.")
+
+
 def _garde_creations(ctx: _Contexte, nom: str, kwargs: dict):
     from services.agent.tools.blocks import normaliser_jours
 
@@ -1825,6 +1861,8 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
                 issue = _evenement_unique(ctx, nom, kwargs)
             if issue is None:
                 issue = _garde_creations(ctx, nom, kwargs)
+            if issue is None:
+                issue = _titre_du_formulaire(ctx, nom, kwargs)
             if nom == "present_form":
                 kwargs = formulaire_avec_heure(ctx.texte, kwargs)
         except Exception:  # noqa: BLE001
