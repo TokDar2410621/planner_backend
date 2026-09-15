@@ -38,6 +38,7 @@ from pydantic_ai.messages import (ModelRequest, ModelResponse, PartDeltaEvent,
 from pydantic_ai.usage import UsageLimits
 
 from core.models import ConversationMessage, UploadedDocument
+from services.agent_v2 import lecture
 from services.agent_v2.mesure import epurer_reponse, fuites_reponse, questions_et_offres
 from services.agent_v2.modeles import REGLAGES_DIRE, modele_agir, modele_dire
 from services.agent_v2.outils import outils_pour
@@ -552,10 +553,17 @@ class PlannerAgentV2:
         # quand le texte tape ne fait que repondre.
         par_le_code = attachment is None and self._tour_decide(registre, message)
         raisonnement, panne = "", None
+        suivi_lire = lecture.sautee()
         if par_le_code:
             self._file_pensees = None
         else:
             yield {"type": "status", "text": "Réflexion..."}
+            # LIRE en mode ombre (lecture.py): soumise ici et pas plus tot, pour
+            # que le chemin rapide n'en paie ni le contexte ni l'appel. Apres
+            # inscrire_import (un document importe est deja en base) et apres
+            # les choix du code, soit l'etat que voit AGIR. Rien ne l'attend
+            # avant la fin du tour.
+            suivi_lire = lecture.demarrer(user, message)
             raisonnement, panne = yield from self._agir_en_fond(user, message_enrichi, registre)
 
         if panne is not None:
@@ -678,6 +686,10 @@ class PlannerAgentV2:
             marqueurs = []
         rejetees = compo.rejetees
 
+        # Tout ce que voit l'utilisateur est fixe: LIRE ne peut plus rien
+        # changer. Attente bornee par LIRE_ATTENTE_S, hors de tout verrou.
+        metadonnees_lire = lecture.finir(suivi_lire)
+
         # Une seule ligne par tour, mais pas toujours au meme niveau: une
         # reference rejetee est un mensonge que la garantie structurelle vient
         # d'attraper, et une fuite est une affirmation d'action dans le canal
@@ -749,6 +761,7 @@ class PlannerAgentV2:
                 for a in registre.actions
             ],
         }
+        metadonnees.update(metadonnees_lire)
         ConversationMessage.objects.create(
             user=user, role="assistant", content=response,
             metadata=_json_sur(metadonnees))

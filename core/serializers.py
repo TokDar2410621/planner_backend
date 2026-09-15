@@ -558,10 +558,21 @@ class ScheduledBlockSerializer(serializers.ModelSerializer):
 class ConversationMessageSerializer(serializers.ModelSerializer):
     """Serializer for ConversationMessage model."""
 
+    # Mesure interne du mode ombre LIRE (services/agent_v2/lecture.py,
+    # CLES_METADONNEES): elle reste cote serveur, le client n'en a pas l'usage.
+    METADONNEES_INTERNES = ('lecture', 'lecture_statut', 'lecture_fournisseur', 'lecture_ms')
+
     class Meta:
         model = ConversationMessage
         fields = ['id', 'role', 'content', 'attachment', 'metadata', 'created_at']
         read_only_fields = ['id', 'role', 'created_at']
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        meta = data.get('metadata')
+        if isinstance(meta, dict) and any(cle in meta for cle in self.METADONNEES_INTERNES):
+            data['metadata'] = {k: v for k, v in meta.items() if k not in self.METADONNEES_INTERNES}
+        return data
 
 
 class ChatInputSerializer(serializers.Serializer):
