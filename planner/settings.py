@@ -275,10 +275,11 @@ DEEPSEEK_MAX_TOKENS = int(os.getenv('DEEPSEEK_MAX_TOKENS', '8192'))
 # LIRE en mode ombre (services/agent_v2/lecture.py): une lecture typee du
 # message tape, journalisee a cote des lecteurs regex geles, qui ne decide rien.
 # Active quand la variable est absente; "0" ou "false" la coupe. Coupee par
-# defaut sous `manage.py test`: chaque tour de test partirait sinon vers le
-# fournisseur avec les cles du poste. Les valeurs restent des chaines, lues
-# par lecture.py: une valeur mal formee ne doit pas empecher le demarrage.
-_EN_TEST = len(sys.argv) > 1 and sys.argv[1] == 'test'
+# defaut sous `manage.py test` et sous pytest (pytest.ini existe): chaque tour
+# de test partirait sinon vers le fournisseur avec les cles du poste. Les
+# valeurs restent des chaines, lues par lecture.py: une valeur mal formee ne
+# doit pas empecher le demarrage.
+_EN_TEST = (len(sys.argv) > 1 and sys.argv[1] == 'test') or 'pytest' in sys.modules
 LIRE_OMBRE = os.getenv('LIRE_OMBRE', '0' if _EN_TEST else '1')
 LIRE_MODELES = os.getenv('LIRE_MODELES', 'deepseek-flash,gemini-2.5-flash')
 LIRE_ATTENTE_S = os.getenv('LIRE_ATTENTE_S', '1.5')

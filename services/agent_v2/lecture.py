@@ -32,11 +32,13 @@ repondu), sautee (chemin rapide du code: LIRE n'est pas soumise).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from concurrent.futures import TimeoutError as _DelaiDepasse
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
@@ -59,8 +61,14 @@ ERREUR = "erreur"
 SAUTEE = "sautee"
 
 # Delai client par appel, sans relance: la sonde 2 mesure un p95 de 1,70 s et
-# aucun appel au-dela de 5 s. Le repli Gemini a le meme delai.
+# aucun appel au-dela de 5 s.
 DELAI_LIRE = 6.0
+# Gemini refuse toute echeance sous 10 s: HTTP 400 « Minimum allowed deadline
+# is 10s » a chaque appel (smoke test du 2026-09-15). L'attente du tour reste
+# bornee par LIRE_ATTENTE_S; seul le travailleur du pool attend plus longtemps.
+DELAI_GEMINI = 10.0
+BASE_DEEPSEEK = "https://api.deepseek.com"
+BASE_GEMINI = None  # None: l'adresse par defaut de google-genai
 ATTENTE_DEFAUT = 1.5
 ATTENTE_MAX = 10.0
 MODELES_DEFAUT = ("deepseek-flash", "gemini-2.5-flash")
@@ -247,40 +255,59 @@ def demarrer(user, message_brut: str) -> Suivi:
 
 # ------------------------------------------------------ pool LIRE (sans ORM)
 
-def _modele(nom: str):
-    """Le modele d'un identifiant de LIRE_MODELES, ou None (cle absente, inconnu)."""
+@asynccontextmanager
+async def _modele(nom: str):
+    """Le modele d'un identifiant de LIRE_MODELES, ou None (cle absente, inconnu).
+
+    Clients NEUFS, ouverts et fermes dans la boucle de CETTE lecture. Smoke test
+    du 2026-09-15: GoogleProvider(api_key=...) seul reprend le client httpx mis
+    en cache pour tout le processus, et un appel depuis la boucle d'un autre
+    thread bloquait 30 s; un AsyncOpenAI jamais ferme levait « Event loop is
+    closed » a la sortie du processus. Aucun client ne survit a sa lecture."""
     if nom.startswith("deepseek"):
         cle = getattr(settings, "DEEPSEEK_API_KEY", "")
         if not cle:
-            return None
+            yield None
+            return
         from openai import AsyncOpenAI
         from pydantic_ai.models.openai import OpenAIChatModel
         from pydantic_ai.providers.deepseek import DeepSeekProvider
 
-        return OpenAIChatModel(nom, provider=DeepSeekProvider(openai_client=AsyncOpenAI(
-            api_key=cle, base_url="https://api.deepseek.com",
-            timeout=DELAI_LIRE, max_retries=0)))
+        async with AsyncOpenAI(api_key=cle, base_url=BASE_DEEPSEEK,
+                               timeout=DELAI_LIRE, max_retries=0) as client:
+            yield OpenAIChatModel(nom, provider=DeepSeekProvider(openai_client=client))
+        return
     if nom.startswith("gemini"):
         cle = getattr(settings, "GEMINI_API_KEY", "")
         if not cle:
-            return None
+            yield None
+            return
+        import httpx
         from pydantic_ai.models.google import GoogleModel
         from pydantic_ai.providers.google import GoogleProvider
 
-        return GoogleModel(nom, provider=GoogleProvider(api_key=cle))
-    return None
+        async with httpx.AsyncClient(timeout=DELAI_GEMINI) as client:
+            yield GoogleModel(nom, provider=GoogleProvider(api_key=cle, http_client=client,
+                                                           base_url=BASE_GEMINI))
+        return
+    yield None
 
 
-def _appeler(nom: str, modele, prep: Preparation):
+def delai(nom: str) -> float:
+    return DELAI_GEMINI if nom.startswith("gemini") else DELAI_LIRE
+
+
+async def _appeler(nom: str, modele, prep: Preparation):
     from pydantic_ai import Agent, ToolOutput
 
+    # output_retries=0: une sortie invalide rend absente, sans second appel paye.
     agent = Agent(modele, output_type=ToolOutput(schema.LectureTour, name=schema.NOM_OUTIL),
-                  output_retries=1)
+                  output_retries=0)
     # Jamais d'historique: le message tape seul, le contexte en instructions
     # apres le prompt fixe (prefixe mis en cache chez le fournisseur).
-    resultat = agent.run_sync(prep.message,
-                              instructions=f"{schema.PROMPT_LIRE}\n\n{prep.contexte}",
-                              model_settings=schema.reglages_lire(nom, DELAI_LIRE))
+    resultat = await agent.run(prep.message,
+                               instructions=f"{schema.PROMPT_LIRE}\n\n{prep.contexte}",
+                               model_settings=schema.reglages_lire(nom, delai(nom)))
     return resultat.output
 
 
@@ -314,30 +341,39 @@ def lire(prep: Preparation, depart: float = 0.0) -> Resultat:
 
     Repli sur panne du fournisseur seulement (HTTP, delai, reseau). Une sortie
     invalide rend absente sans repli: la mesure porte sur le lecteur, et un
-    second appel doublerait cout et latence."""
+    second appel doublerait cout et latence.
+
+    Une boucle asyncio PAR lecture (asyncio.run), jamais celle du thread: les
+    clients des fournisseurs y naissent et y meurent (voir _modele)."""
     try:
-        premiere = ""
-        for nom in prep.modeles:
-            modele = _modele(nom)
-            if modele is None:
-                continue
-            try:
-                sortie = _appeler(nom, modele, prep)
-            except Exception as e:  # noqa: BLE001
-                if _sortie_invalide(e):
-                    return Resultat(ABSENTE, fournisseur=nom, ms=_ms(depart), erreur=_classe(e))
-                code = getattr(e, "status_code", None)
-                if nom.startswith("deepseek") and code in (401, 402):
-                    # Un credit mort ne se voit nulle part ailleurs: le repli
-                    # repond et le tour continue sans bruit.
-                    logger.warning("agent_v2 lire fournisseur=%s http=%d cle refusee ou credit "
-                                   "epuise, repli sur le suivant", nom, code)
-                premiere = premiere or _classe(e)
-                continue
-            return _evaluer(prep, nom, sortie, depart)
-        return Resultat(ERREUR, ms=_ms(depart), erreur=premiere or "AucunFournisseur")
+        return asyncio.run(_lire(prep, depart))
     except Exception as e:  # noqa: BLE001 - le pool ne remonte jamais d'exception
         return Resultat(ERREUR, ms=_ms(depart), erreur=type(e).__name__)
+
+
+async def _lire(prep: Preparation, depart: float) -> Resultat:
+    erreurs: list[str] = []
+    for nom in prep.modeles:
+        try:
+            async with _modele(nom) as modele:
+                if modele is None:
+                    continue
+                sortie = await _appeler(nom, modele, prep)
+        except Exception as e:  # noqa: BLE001
+            if _sortie_invalide(e):
+                return Resultat(ABSENTE, fournisseur=nom, ms=_ms(depart), erreur=_classe(e))
+            code = getattr(e, "status_code", None)
+            if nom.startswith("deepseek") and code in (401, 402):
+                # Un credit mort ne se voit nulle part ailleurs: le repli
+                # repond et le tour continue sans bruit.
+                logger.warning("agent_v2 lire fournisseur=%s http=%d cle refusee ou credit "
+                               "epuise, repli sur le suivant", nom, code)
+            # Chaque fournisseur tente laisse sa classe: la panne du repli ne se
+            # cache pas derriere celle du premier.
+            erreurs.append(f"{nom.split('-', 1)[0]}:{_classe(e)}")
+            continue
+        return _evaluer(prep, nom, sortie, depart)
+    return Resultat(ERREUR, ms=_ms(depart), erreur="|".join(erreurs) or "AucunFournisseur")
 
 
 # --------------------------------------------------- fin du tour (requete)
@@ -505,9 +541,13 @@ def accord_suppression(lecture, message: str) -> str:
 
 
 def accord_evenement_unique(lecture, message: str) -> str:
-    """outils.jour_sans_recurrence, le lecteur de _evenement_unique."""
+    """outils.jour_sans_recurrence, le lecteur de _evenement_unique. Une lecture
+    qui ne dit rien de la recurrence (non_dit partout) ne tranche pas: na, et
+    non diff contre une regex qui lit un jour sans mot de recurrence."""
     from services.agent_v2.outils import jour_sans_recurrence
 
+    if all(e.recurrence == "non_dit" for e in lecture.elements):
+        return NA
     return _booleens(bool(jour_sans_recurrence(message)),
                      any(e.recurrence == "unique" for e in lecture.elements))
 

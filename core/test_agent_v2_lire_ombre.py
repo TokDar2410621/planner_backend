@@ -6,7 +6,7 @@ Pourquoi ces tests. Les gardes de v2 lisent le francais brut par des regex, et
 une faute (« aujourdui ») saute une garantie sans bruit. Avant qu'une regle ne
 s'appuie sur la lecture typee, elle tourne en production pour compter ses
 desaccords avec les lecteurs regex geles. Ce mode n'est acceptable que s'il
-tient cinq promesses, verrouillees ici:
+tient ces promesses, verrouillees ici:
 
 1. Le tour est identique octet pour octet, LIRE actif ou coupe.
 2. Chaque statut sort tel que prevu, et un credit DeepSeek mort se voit.
@@ -14,20 +14,29 @@ tient cinq promesses, verrouillees ici:
 4. Aucune donnee de l'utilisateur dans les journaux.
 5. Les comparaisons avec les lecteurs geles sont des fonctions pures, et les
    dates typees y passent par le resolveur du code (une date, ou une question).
+6. Les vrais clients HTTP des fournisseurs ne passent jamais d'une boucle a
+   l'autre et sont fermes a chaque lecture (smoke test du 2026-09-15: repli
+   Gemini bloque 30 s dans un second thread, echeance de 6 s refusee).
 
-Aucun appel reseau: les fournisseurs sont des FunctionModel de pydantic-ai,
-qui passent par la vraie validation de sortie.
+Aucun appel reseau: les fournisseurs sont des FunctionModel de pydantic-ai, ou
+un faux serveur HTTP local (127.0.0.1) pour les vrais clients.
 """
 import asyncio
 import json
+import os
 import re
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import CancelledError, ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import date, time as heure, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import httpx
 from django.contrib.auth.models import User
 from django.db import connections
 from django.db.backends.utils import CursorWrapper
@@ -37,6 +46,7 @@ from pydantic import ValidationError
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.models import cached_async_http_client
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
 from core.models import ConversationMessage, RecurringBlock
@@ -48,11 +58,12 @@ from services.agent_v2 import lecture_schema as schema
 LUNDI = date(2026, 9, 14)
 JOURNAL = "services.agent_v2.lecture"
 TIRET_LONG, DEMI_CADRATIN = chr(0x2014), chr(0x2013)
+RACINE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIGNE_TOUR = re.compile(
     r"^agent_v2 lire statut=[a-z_]+ fournisseur=[a-z0-9.\-]+ ms=\d+ accords="
     r"heures:(ok|diff|na),dates:(ok|diff|na),jour_vise:(ok|diff|na),date_visee:(ok|diff|na),"
     r"suppression:(ok|diff|na),evenement_unique:(ok|diff|na),cette_semaine:(ok|diff|na),"
-    r"puces_date:(ok|diff|na) attente=\d+ rejets=\d+ erreur=[A-Za-z0-9:_\-]+$")
+    r"puces_date:(ok|diff|na) attente=\d+ rejets=\d+ erreur=[A-Za-z0-9:_|\-]+$")
 
 
 # ------------------------------------------------------------------ fabriques
@@ -98,8 +109,14 @@ def _lecteur(args=None, *, attente=0.0, erreur=None, appels=None):
     return FunctionModel(repondre)
 
 
+@asynccontextmanager
+async def _tel_quel(modele):
+    yield modele
+
+
 def _fournisseurs(modeles: dict):
-    return patch.object(lecture, "_modele", side_effect=lambda nom: modeles.get(nom))
+    """_modele est un gestionnaire de contexte asynchrone: on le remplace a l'identique."""
+    return patch.object(lecture, "_modele", side_effect=lambda nom: _tel_quel(modeles.get(nom)))
 
 
 GYM_JEUDI = {"elements": [_element(
@@ -181,21 +198,61 @@ class ReglagesTests(SimpleTestCase):
         with override_settings(LIRE_MODELES=" deepseek-flash , gemini-2.5-flash,"):
             self.assertEqual(lecture.modeles_lire(), ("deepseek-flash", "gemini-2.5-flash"))
 
-    def test_gemini_porte_son_delai_dans_les_reglages_et_deepseek_coupe_la_reflexion(self):
-        """Sonde 2: google-genai ignore le delai du client httpx; DeepSeek rend
-        HTTP 400 sur la sortie outil forcee quand la reflexion est active."""
-        self.assertEqual(schema.reglages_lire("gemini-2.5-flash", 6.0)["timeout"], 6.0)
-        self.assertEqual(
-            schema.reglages_lire("gemini-2.5-flash", 6.0)["google_thinking_config"]["thinking_budget"], 0)
+    def test_gemini_porte_une_echeance_d_au_moins_10_s_et_deepseek_coupe_la_reflexion(self):
+        """Gemini rend HTTP 400 sous 10 s (smoke test du 2026-09-15); google-genai
+        ignore le delai du client httpx (sonde 2); DeepSeek rend HTTP 400 sur la
+        sortie outil forcee quand la reflexion est active."""
+        self.assertGreaterEqual(lecture.delai("gemini-2.5-flash"), 10.0)
+        self.assertEqual(lecture.delai("deepseek-flash"), lecture.DELAI_LIRE)
+        reglages = schema.reglages_lire("gemini-2.5-flash", lecture.delai("gemini-2.5-flash"))
+        self.assertGreaterEqual(reglages["timeout"], 10.0)
+        self.assertEqual(reglages["google_thinking_config"]["thinking_budget"], 0)
         self.assertEqual(
             schema.reglages_lire("deepseek-flash", 6.0)["extra_body"]["thinking"]["type"], "disabled")
 
     @override_settings(DEEPSEEK_API_KEY="x", GEMINI_API_KEY="y")
-    def test_le_client_deepseek_est_borne_et_sans_relance(self):
-        client = lecture._modele("deepseek-flash")._provider.client
-        self.assertEqual(client.max_retries, 0)
-        self.assertLessEqual(float(getattr(client.timeout, "read", client.timeout)), lecture.DELAI_LIRE)
-        self.assertIsNone(lecture._modele("inconnu"))
+    def test_les_clients_sont_propres_a_la_lecture_et_fermes_a_sa_sortie(self):
+        vus: dict = {}
+
+        async def ouvrir():
+            async with lecture._modele("deepseek-flash") as deepseek:
+                client = deepseek._provider.client
+                vus["deepseek"] = client
+                vus["deepseek_reglages"] = (client.max_retries,
+                                            float(getattr(client.timeout, "read", client.timeout)),
+                                            client.is_closed())
+            async with lecture._modele("gemini-2.5-flash") as gemini:
+                vus["gemini"] = gemini._provider.client._api_client._async_httpx_client
+                vus["gemini_ouvert"] = not vus["gemini"].is_closed
+            async with lecture._modele("inconnu") as rien:
+                vus["inconnu"] = rien
+
+        asyncio.run(ouvrir())
+        self.assertEqual(vus["deepseek_reglages"], (0, lecture.DELAI_LIRE, False))
+        self.assertTrue(vus["deepseek"].is_closed())
+        self.assertTrue(vus["gemini_ouvert"])
+        self.assertTrue(vus["gemini"].is_closed)
+        self.assertIsNot(vus["gemini"], cached_async_http_client(provider="google-gla"))
+        self.assertIsNone(vus["inconnu"])
+
+    def test_l_interrupteur_de_test_couvre_manage_py_et_pytest(self):
+        """pytest.ini existe: sous pytest, LIRE partirait vers le fournisseur avec
+        les cles du poste. Les settings sont relus dans un processus neuf."""
+        code = ("import os, sys, types; {avant}sys.argv = {argv!r}; "
+                "from planner import settings; print('LIRE_OMBRE=' + settings.LIRE_OMBRE)")
+        env = {k: v for k, v in os.environ.items() if k != "LIRE_OMBRE"}
+        # Sans DEBUG ni SECRET_KEY, les settings refusent de charger.
+        env.setdefault("DEBUG", "True")
+        for avant, argv, attendu in (
+                ("sys.modules['pytest'] = types.ModuleType('pytest'); ", ["pytest"], "0"),
+                ("", ["manage.py", "test"], "0"),
+                ("", ["gunicorn"], "1")):
+            with self.subTest(argv=argv):
+                sortie = subprocess.run([sys.executable, "-c", code.format(avant=avant, argv=argv)],
+                                        capture_output=True, text=True, timeout=120, env=env, cwd=RACINE)
+                self.assertEqual(sortie.returncode, 0, "settings illisibles dans le processus neuf")
+                lignes = [l for l in sortie.stdout.splitlines() if l.startswith("LIRE_OMBRE=")]
+                self.assertEqual(lignes, [f"LIRE_OMBRE={attendu}"])
 
 
 # ---------------------------------------------------------------- les statuts
@@ -220,14 +277,16 @@ class StatutsTests(SimpleTestCase):
         self.assertEqual((r.statut, r.rejets), ("partielle", 1))
         self.assertEqual(r.lecture.elements[0].dates, [])
 
-    def test_l_enveloppe_est_absente_sans_repli(self):
+    def test_l_enveloppe_est_absente_sans_second_appel_ni_repli(self):
+        appels_deepseek: list = []
         appels_gemini: list = []
-        with _fournisseurs({"deepseek-flash": _lecteur({"arguments": GYM_JEUDI}),
+        with _fournisseurs({"deepseek-flash": _lecteur({"arguments": GYM_JEUDI}, appels=appels_deepseek),
                             "gemini-2.5-flash": _lecteur(GYM_JEUDI, appels=appels_gemini)}):
             r = lecture.lire(_prep("ajoute gym jeudi a 18h"))
         self.assertEqual((r.statut, r.fournisseur), ("absente", "deepseek-flash"))
         self.assertTrue(r.erreur.startswith("UnexpectedModelBehavior"), r.erreur)
         self.assertIsNone(r.metadonnees()["lecture"])
+        self.assertEqual(len(appels_deepseek), 1, "une sortie invalide ne paie pas un second appel")
         self.assertEqual(appels_gemini, [])
 
     def test_une_lecture_vide_sur_un_message_qui_dit_quelque_chose_est_absente(self):
@@ -246,19 +305,20 @@ class StatutsTests(SimpleTestCase):
         self.assertEqual((r.statut, r.fournisseur), ("ok", "gemini-2.5-flash"))
         self.assertTrue(any("http=402" in l and "deepseek-flash" in l for l in journal.output))
 
-    def test_tous_en_panne_rend_erreur_avec_la_classe(self):
+    def test_tous_en_panne_chaque_fournisseur_laisse_sa_classe(self):
         with _fournisseurs({"deepseek-flash": _lecteur(erreur=ModelHTTPError(401, "deepseek-flash")),
                             "gemini-2.5-flash": _lecteur(erreur=ModelHTTPError(503, "gemini-2.5-flash"))}), \
                 self.assertLogs(JOURNAL, "WARNING") as journal:
             r = lecture.lire(_prep("ajoute gym jeudi a 18h"))
-        self.assertEqual((r.statut, r.erreur, r.fournisseur), ("erreur", "ModelHTTPError:401", ""))
+        self.assertEqual((r.statut, r.fournisseur), ("erreur", ""))
+        self.assertEqual(r.erreur, "deepseek:ModelHTTPError:401|gemini:ModelHTTPError:503")
         self.assertTrue(any("http=401" in l for l in journal.output))
 
     def test_une_panne_hors_credit_n_alerte_pas(self):
         with _fournisseurs({"deepseek-flash": _lecteur(erreur=ModelHTTPError(503, "deepseek-flash"))}), \
                 self.assertNoLogs(JOURNAL, "WARNING"):
             r = lecture.lire(_prep("ajoute gym jeudi a 18h"))
-        self.assertEqual((r.statut, r.erreur), ("erreur", "ModelHTTPError:503"))
+        self.assertEqual((r.statut, r.erreur), ("erreur", "deepseek:ModelHTTPError:503"))
 
     @override_settings(DEEPSEEK_API_KEY="", GEMINI_API_KEY="")
     def test_sans_cle_aucun_fournisseur(self):
@@ -317,6 +377,112 @@ class StatutsTests(SimpleTestCase):
                 self.assertLogs(JOURNAL, "WARNING"):
             meta = lecture.finir(lecture.sautee())
         self.assertEqual(meta["lecture_statut"], "erreur")
+
+
+# ------------------------------------------- vrais clients, faux serveur local
+
+class _FauxFournisseur(BaseHTTPRequestHandler):
+    """Gemini (generateContent) et DeepSeek (chat/completions) en HTTP/1.1
+    keep-alive: c'est la connexion reutilisee d'une boucle a l'autre qui
+    bloquait le repli Gemini."""
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        gemini = ":generateContent" in self.path
+        self.server.recues.append({"gemini": gemini, "echeance": self.headers.get("X-Server-Timeout"),
+                                   "thread": threading.current_thread().name})
+        code = self.server.code
+        if code != 200:
+            reponse = {"error": {"code": code, "message": "refus simule", "status": "INVALID_ARGUMENT"}}
+        elif gemini:
+            reponse = {"candidates": [{"content": {"role": "model", "parts": [
+                {"functionCall": {"name": schema.NOM_OUTIL, "args": GYM_JEUDI}}]},
+                "finishReason": "STOP", "index": 0}],
+                "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 1, "totalTokenCount": 4},
+                "modelVersion": "gemini-2.5-flash", "responseId": "r1"}
+        else:
+            reponse = {"id": "c1", "object": "chat.completion", "created": 1757900000,
+                       "model": "deepseek-flash",
+                       "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                           "role": "assistant", "content": None, "tool_calls": [{
+                               "id": "t1", "type": "function",
+                               "function": {"name": schema.NOM_OUTIL, "arguments": json.dumps(GYM_JEUDI)}}]}}],
+                       "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}}
+        brut = json.dumps(reponse).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(brut)))
+        self.end_headers()
+        self.wfile.write(brut)
+
+    def log_message(self, *args):
+        pass
+
+
+@override_settings(DEEPSEEK_API_KEY="factice", GEMINI_API_KEY="factice")
+class VraisClientsTests(SimpleTestCase):
+    def setUp(self):
+        self.serveur = ThreadingHTTPServer(("127.0.0.1", 0), _FauxFournisseur)
+        self.serveur.daemon_threads = True
+        self.serveur.recues = []
+        self.serveur.code = 200
+        threading.Thread(target=self.serveur.serve_forever, daemon=True).start()
+        self.addCleanup(self.serveur.server_close)
+        self.addCleanup(self.serveur.shutdown)
+        adresse = f"http://127.0.0.1:{self.serveur.server_address[1]}"
+        for nom, valeur in (("BASE_DEEPSEEK", adresse), ("BASE_GEMINI", adresse)):
+            correctif = patch.object(lecture, nom, valeur)
+            correctif.start()
+            self.addCleanup(correctif.stop)
+
+    def test_gemini_recoit_une_echeance_d_au_moins_10_s(self):
+        r = lecture.lire(_prep("ajoute gym jeudi a 18h", modeles=("gemini-2.5-flash",)))
+        self.assertEqual((r.statut, r.fournisseur), ("ok", "gemini-2.5-flash"))
+        echeances = [int(q["echeance"]) for q in self.serveur.recues if q["gemini"]]
+        self.assertEqual(len(echeances), 1)
+        self.assertGreaterEqual(echeances[0], 10)
+
+    def test_des_lectures_de_threads_differents_a_la_suite_aboutissent(self):
+        """Smoke test du 2026-09-15: pool A1 ok, A2 ok, thread dedie B1 bloque 30 s."""
+        for nom in ("gemini-2.5-flash", "deepseek-flash"):
+            with self.subTest(fournisseur=nom):
+                prep = _prep("ajoute gym jeudi a 18h", modeles=(nom,))
+                statuts = [lecture._POOL_LIRE.submit(lecture.lire, prep).result(timeout=15).statut
+                           for _ in range(2)]
+                sortie: dict = {}
+                fil = threading.Thread(target=lambda: sortie.update(r=lecture.lire(prep)),
+                                       name="autre-thread", daemon=True)
+                fil.start()
+                fil.join(timeout=15)
+                self.assertFalse(fil.is_alive(), "une lecture s'est figee dans un second thread")
+                statuts.append(sortie["r"].statut)
+                statuts.append(lecture._POOL_LIRE.submit(lecture.lire, prep).result(timeout=15).statut)
+                self.assertEqual(statuts, ["ok"] * 4)
+
+    def test_chaque_lecture_ferme_ses_clients(self):
+        """Tout client httpx asynchrone ouvert par une lecture est ferme a sa
+        sortie: un AsyncOpenAI jamais ferme levait « Event loop is closed »."""
+        crees: list = []
+        original = httpx.AsyncClient.__init__
+
+        def espion(client, *args, **kwargs):
+            crees.append(client)
+            original(client, *args, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "__init__", espion):
+            statuts = [lecture.lire(_prep("ajoute gym jeudi a 18h", modeles=(nom,))).statut
+                       for nom in ("deepseek-flash", "gemini-2.5-flash")]
+        self.assertEqual(statuts, ["ok", "ok"])
+        self.assertGreaterEqual(len(crees), 2)
+        self.assertEqual([c for c in crees if not c.is_closed], [])
+
+    def test_les_deux_fournisseurs_en_panne_laissent_chacun_leur_classe(self):
+        self.serveur.code = 400
+        r = lecture.lire(_prep("ajoute gym jeudi a 18h"))
+        self.assertEqual((r.statut, r.fournisseur), ("erreur", ""))
+        self.assertEqual(r.erreur, "deepseek:ModelHTTPError:400|gemini:ModelHTTPError:400")
+        self.assertEqual([q["gemini"] for q in self.serveur.recues], [False, True])
 
 
 # ------------------------------------------------ accords avec les lecteurs geles
@@ -402,11 +568,27 @@ class AccordsTests(SimpleTestCase):
         self.assertEqual(lecture.accord_date_visee(sans_cible, "efface mon gym", LUNDI, refs), "na")
 
     def test_evenement_unique(self):
+        from services.agent_v2.outils import jour_sans_recurrence
+
         unique = _lecture(_element(recurrence="unique"))
         self.assertEqual(lecture.accord_evenement_unique(unique, "souper jeudi soir a 6h"), "ok")
         hebdo = _lecture(_element(recurrence="hebdomadaire"))
         self.assertEqual(lecture.accord_evenement_unique(hebdo, "souper chak jeudi a 18h"), "diff")
         self.assertEqual(lecture.accord_evenement_unique(_lecture(_element()), "ajoute gym"), "na")
+
+    def test_une_lecture_muette_sur_la_recurrence_ne_compte_pas_en_desaccord(self):
+        """Smoke test du 2026-09-15 (l3, l5-1): la regex lit un jour sans mot de
+        recurrence, la lecture typee dit non_dit. Ce n'est pas un desaccord."""
+        from services.agent_v2.outils import jour_sans_recurrence
+
+        message = "souper jeudi a 6h"
+        self.assertTrue(jour_sans_recurrence(message))
+        muette = _lecture(_element(mention="souper", recurrence="non_dit"),
+                          _element(mention="gym", recurrence="non_dit"))
+        self.assertEqual(lecture.accord_evenement_unique(muette, message), "na")
+        tranchee = _lecture(_element(mention="souper", recurrence="non_dit"),
+                            _element(mention="gym", recurrence="hebdomadaire"))
+        self.assertEqual(lecture.accord_evenement_unique(tranchee, message), "diff")
 
     def test_cette_semaine(self):
         bornee = _lecture(_element(recurrence="cette_semaine_seulement"))
@@ -457,8 +639,9 @@ class AccordsTests(SimpleTestCase):
                                heures=[_heure("18h", "18:00")]))
         suivi = lecture.Suivi(preparation=prep)
         with self.assertLogs(JOURNAL, "INFO") as journal:
-            lecture.journaliser(suivi, lecture.Resultat("absente", lecture=lu, fournisseur="deepseek-flash",
-                                                        ms=12, attente_ms=3, erreur="lecture_vide"))
+            lecture.journaliser(suivi, lecture.Resultat(
+                "erreur", lecture=lu, fournisseur="", ms=12, attente_ms=3,
+                erreur="deepseek:ModelHTTPError:400|gemini:ModelHTTPError:400"))
         self.assertEqual(len(journal.records), 1)
         ligne = journal.records[0].getMessage()
         self.assertRegex(ligne, LIGNE_TOUR)
