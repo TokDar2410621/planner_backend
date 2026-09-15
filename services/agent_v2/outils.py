@@ -229,6 +229,8 @@ def _cible_bloc(block) -> dict:
         "debut": block.start_time.strftime("%H:%M"),
         "fin": block.end_time.strftime("%H:%M"),
         "block_type": block.block_type,
+        "debut_serie": block.start_date.isoformat() if block.start_date else None,
+        "fin_serie": block.end_date.isoformat() if block.end_date else None,
     }
 
 
@@ -236,6 +238,17 @@ def _cible_bloc(block) -> dict:
 
 def _cle_portee(block_id, jour_iso: str) -> str:
     return dem.cle_demande("portee_jour", {"block_id": int(block_id), "date": jour_iso})
+
+
+def _cle_bornes(block_id, params: dict) -> str:
+    """Cle d'une fin ou d'un depart de serie: les dates en font partie, pour
+    qu'une puce confirmant le 15 octobre n'autorise pas le 1er decembre."""
+    def _iso(cle):
+        jour = _date_iso(params.get(cle)) if str(params.get(cle) or "").strip() else None
+        return jour.isoformat() if jour else ""
+    return dem.cle_demande("update_block:fin", {"block_id": int(block_id),
+                                                "end_date": _iso("end_date"),
+                                                "start_date": _iso("start_date")})
 
 
 def _cle_destructive(nom: str, params: dict):
@@ -246,7 +259,7 @@ def _cle_destructive(nom: str, params: dict):
         return None if bid is None else dem.cle_demande("delete_block", {"block_id": bid})
     if nom == "update_block":
         bid = _entier(params.get("block_id"))
-        return None if bid is None else dem.cle_demande("update_block:fin", {"block_id": bid})
+        return None if bid is None else _cle_bornes(bid, params)
     if nom == "delete_task":
         tid = _entier(params.get("task_id"))
         return None if tid is None else dem.cle_demande("delete_task", {"task_id": tid})
@@ -286,7 +299,7 @@ def _bloc_de_demande(demande: dict):
 
 # Les champs d'etat compares. « date » n'en est pas: elle vient du message.
 _CHAMPS_CIBLE = ("titre", "jour", "debut", "fin", "block_type", "complete", "echeance",
-                 "ids", "nombre", "evenements")
+                 "ids", "nombre", "evenements", "debut_serie", "fin_serie")
 
 MESSAGE_CIBLE_CHANGEE = (
     "La cible a change depuis la question: le code n'a rien execute et laisse la "
@@ -558,30 +571,33 @@ def _analyser(ctx: _Contexte, nom: str, kwargs: dict):
                       _options_confirmer(nom, parametres, cible))
 
     if nom == "update_block":
-        # Revue du 2026-09-14: « supprime mon cours de chimie » + end_date=demain
-        # terminait la serie sans question. Une fin (ou un depart repousse)
-        # est destructive quand le message parle de supprimer, ou quand la
-        # fin tombe dans les 7 prochains jours. « mon quart finit le 15
-        # octobre » (fin lointaine, aucun verbe de suppression) passe.
-        aujourdhui = timezone.localdate()
-        suppression = dem.suppression_demandee(texte)
+        # Une fin avancee ou un depart repousse enleve des seances. La garde se
+        # decide sur les dates et l'etat du bloc, jamais sur les mots du
+        # message: « arrete mon quart a partir de decembre » passait sans
+        # question faute d'un verbe de suppression reconnu (enquete du
+        # 2026-09-14). Prolonger une serie ou avancer son depart n'enleve rien.
         fin = _date_iso(kwargs.get("end_date")) if str(kwargs.get("end_date") or "").strip() else None
         depart = _date_iso(kwargs.get("start_date")) if str(kwargs.get("start_date") or "").strip() else None
-        fin_destructive = fin is not None and (suppression or fin <= aujourdhui + timedelta(days=7))
-        depart_destructif = depart is not None and suppression and depart > aujourdhui
-        if not (fin_destructive or depart_destructif):
+        if fin is None and depart is None:
             return None
-        if fin is None:
-            fin = depart
         bid = _entier(kwargs.get("block_id"))
         if bid is None:
             return None
-        cle = dem.cle_demande("update_block:fin", {"block_id": bid})
+        cle = _cle_bornes(bid, kwargs)
         block = RecurringBlock.objects.filter(id=bid, user=user, active=True).first()
         if block is None:
             return _Garde("destructif", cle, {cle}, nom, actif=False)
+        aujourdhui = timezone.localdate()
+        fin_destructive = fin is not None and (block.end_date is None or fin < block.end_date)
+        depart_destructif = (depart is not None and depart > aujourdhui
+                             and (block.start_date is None or depart > block.start_date))
+        if fin_destructive and not depart_destructif \
+                and _fin_de_recurrence_repondue(user, block, fin, aujourdhui, ctx.tache):
+            fin_destructive = False
+        if not (fin_destructive or depart_destructif):
+            return None
         cible = _cible_bloc(block)
-        cible["date"] = fin.isoformat()
+        cible["date"] = (fin if fin_destructive else depart).isoformat()
         parametres = dict(kwargs)
         parametres["block_id"] = bid
         return _Garde("destructif", cle, {cle}, nom, parametres, cible,
@@ -591,6 +607,37 @@ def _analyser(ctx: _Contexte, nom: str, kwargs: dict):
         cle = "optimize_week:apply"
         return _Garde("optimisation", cle, {cle}, nom, dict(kwargs))
     return None
+
+
+def _fin_de_recurrence_repondue(user, block, fin, aujourdhui, tache: str = "") -> bool:
+    """La reponse IMMEDIATE a la question de fin de recurrence posee apres le
+    dernier import: le message juste avant le message courant est cette
+    question, le bloc vient du dernier document envoye et n'a pas encore de
+    fin, et la fin tombe au-dela des 7 prochains jours. Le message de
+    l'utilisateur ne porte pas sa piece jointe en v2: le document se lit par
+    l'ordre des envois."""
+    from core.models import ConversationMessage, UploadedDocument
+    from services.agent_v2.boutons import MOTIF_FIN_RECURRENCE
+
+    if block.source_document_id is None or block.end_date is not None:
+        return False
+    if fin <= aujourdhui + timedelta(days=7):
+        return False
+    dernier_doc = UploadedDocument.objects.filter(user=user).order_by("-pk").values_list(
+        "pk", flat=True).first()
+    if dernier_doc != block.source_document_id:
+        return False
+    # La tache vaut « user:message courant » (agent.py). Sans ce message, un
+    # tour plus ancien du meme utilisateur profiterait de la reponse d'un autre.
+    _, _, courant = str(tache or "").rpartition(":")
+    if not courant.isdigit():
+        return False
+    deux = list(ConversationMessage.objects.filter(user=user).order_by("-pk")[:2])
+    if (len(deux) < 2 or deux[0].pk != int(courant) or deux[0].role != "user"
+            or deux[1].role != "assistant"):
+        return False
+    meta = deux[1].metadata if isinstance(deux[1].metadata, dict) else {}
+    return meta.get("question_motif") == MOTIF_FIN_RECURRENCE
 
 
 def _garde_critique(nom: str, kwargs: dict) -> bool:

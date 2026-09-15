@@ -1601,7 +1601,23 @@ def _objet_destructif(demande, auj) -> str:
             return f"annuler les {len(ids)} créneaux de {titre}{' ' + quand if quand else ''}"
         return f"annuler {titre or 'cet événement'}{' ' + quand if quand else ''}"
     if outil == "update_block":
-        return f"arrêter {titre}" if titre else "arrêter ce créneau"
+        # La date dans la question: « arrêter Quart au dépanneur » laissait
+        # croire a un arret immediat quand la fin tombe dans un mois.
+        nomme = titre or "ce créneau"
+        parametres = _dict(demande.get("parametres"))
+        borne = _txt(cible.get("date"))
+        quand = _quand(borne, auj)
+        fin_dite = _txt(parametres.get("end_date"))[:10]
+        debut_dit = _txt(parametres.get("start_date"))[:10]
+        if _quand(fin_dite, auj) and _quand(debut_dit, auj):
+            return (f"changer les dates de {nomme} (début {_quand(debut_dit, auj)}, "
+                    f"fin {_quand(fin_dite, auj)})")
+        if quand and fin_dite == borne:
+            return f"terminer {nomme} {quand}"
+        if quand and _txt(parametres.get("start_date"))[:10] == borne:
+            au = f"au {quand[3:]}" if quand.startswith("le ") else f"à {quand}"
+            return f"reporter le début de {nomme} {au}"
+        return f"arrêter {nomme}"
     detail = ""
     dow = _dow_cible(cible)
     if dow is not None and _hm(cible.get("debut")) and _hm(cible.get("fin")):

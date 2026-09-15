@@ -444,16 +444,20 @@ class GardesDestructivesTests(HarnaisGardes, TransactionTestCase):
         self.assertFalse(action.succes)
         demande = action.donnees['demande']
         self.assertEqual(demande['motif'], 'destructif')
-        self.assertEqual(demande['cle'], dem.cle_demande('update_block:fin', {'block_id': self.q.id}))
+        self.assertEqual(demande['cle'], outils_v2._cle_destructive(
+            'update_block', {'block_id': self.q.id, 'end_date': '2026-09-14'}))
         self.q.refresh_from_db()
         self.assertIsNone(self.q.end_date)
 
-    def test_une_fin_future_ne_demande_rien(self):
+    def test_une_fin_future_demande_aussi_confirmation(self):
+        # Decision de Darius (2026-09-14): une fin lointaine ecrite librement
+        # demande un tap. Detail dans core/test_agent_v2_fin_de_serie.py.
         action = self.premier_tour('mon quart finit le 15 octobre', 'update_block',
                                    block_id=self.q.id, end_date='2026-10-15')
-        self.assertTrue(action.succes)
+        self.assertFalse(action.succes)
+        self.assertEqual(action.donnees['demande']['motif'], 'destructif')
         self.q.refresh_from_db()
-        self.assertEqual(self.q.end_date, date(2026, 10, 15))
+        self.assertIsNone(self.q.end_date)
 
     def test_annulation_d_evenement_demande_confirmation(self):
         tache = Task.objects.create(user=self.user, title='Dentiste')
