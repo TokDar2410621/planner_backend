@@ -347,18 +347,29 @@ def annulation_libre(message_brut, demande: dict) -> bool:
     return True
 
 
-def option_choisie(message_brut: str, demande: dict) -> str | None:
+def option_choisie(message_brut: str, demande: dict,
+                   tap: dict | None = None) -> str | None:
     """L'option que CE message choisit pour CETTE demande, ou None.
 
     Jamais evaluee sur une liste: chaque demande ne connait que ses propres
     puces. Seule la puce exacte donne une option destructive; une reponse
     libre ne donne au mieux que « annuler ».
+
+    `tap` est le postback structure du front ({"demande": cle, "option": id})
+    envoye quand l'utilisateur touche une puce: l'egalite d'identifiants
+    remplace la comparaison de texte. Il n'ouvre aucune surface nouvelle
+    (equivalent byte-exact de taper la puce) et ne vaut que pour la demande
+    dont il porte la cle.
     """
     if not isinstance(demande, dict) or not isinstance(message_brut, str):
         return None
     ids = _ids_options(demande)
     if not ids:
         return None
+    if (isinstance(tap, dict) and tap.get("demande")
+            and tap.get("demande") == demande.get("cle")
+            and tap.get("option") in ids):
+        return tap["option"]
     choix = puce_touchee(message_brut, demande)
     if (choix is None and "confirmer" in ids
             and demande.get("motif") in MOTIFS_OUI_LIBRE and oui_clair(message_brut)):

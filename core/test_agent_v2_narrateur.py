@@ -449,8 +449,12 @@ class PrioriteTests(NarrateurBase):
                                              options=["Oui", "Non"]))
         self.assertEqual(done["question"], QUESTION_PORTEE)
         self.assertEqual(done["question_motif"], "portee_jour")
+        # Les puces d'une demande rendue portent le postback structure: au
+        # tap, le front renvoie {demande, option} et l'egalite d'identifiants
+        # remplace la comparaison de texte.
         self.assertEqual(done["quick_replies"],
-                         [{"label": c["label"], "value": c["value"]} for c in CHIPS_PORTEE])
+                         [{"label": c["label"], "value": c["value"],
+                           "demande": "p1", "option": c["option"]} for c in CHIPS_PORTEE])
         self.assertNotIn("Autre chose", done["response"])
         self.assertTrue(done["response"].endswith(QUESTION_PORTEE))
         meta = self.metadonnees()
@@ -492,8 +496,10 @@ class PrioriteTests(NarrateurBase):
         self.assertEqual(done["question_motif"], "choix_modele")
         self.assertEqual(done["question"], "Lequel de tes cours ?")
         self.assertEqual(done["quick_replies"], [
-            {"label": "Calcul différentiel", "value": "Le cours de Calcul différentiel"},
-            {"label": "Physique mécanique", "value": "Le cours de Physique mécanique"}])
+            {"label": "Calcul différentiel", "value": "Le cours de Calcul différentiel",
+             "demande": "choix:abc", "option": "o1"},
+            {"label": "Physique mécanique", "value": "Le cours de Physique mécanique",
+             "demande": "choix:abc", "option": "o2"}])
 
     def test_formulaire_et_garde(self):
         with self.subTest("garde + formulaire"):

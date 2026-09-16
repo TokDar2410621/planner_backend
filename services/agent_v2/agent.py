@@ -222,6 +222,33 @@ def _chips_propres(chips, garder_option: bool) -> list[dict]:
     return propres[:CHIPS_MAX]
 
 
+def _chips_reponse(chips, demandes) -> list[dict]:
+    """Les quick replies envoyees au front, avec le postback des demandes.
+
+    Une puce qui appartient a une demande RENDUE porte `demande` (la cle) et
+    `option` (l'id): au tap, le front les renvoie tels quels et l'egalite
+    d'identifiants remplace la comparaison de texte. Champs additifs: v1,
+    le MCP et un front ancien les ignorent sans rien casser.
+    """
+    propres = _chips_propres(chips, garder_option=False)
+    par_texte: dict[tuple, tuple] = {}
+    for d in demandes or []:
+        cle = (d or {}).get("cle") if isinstance(d, dict) else None
+        if not cle:
+            continue
+        for chip in d.get("chips") or []:
+            if not isinstance(chip, dict) or chip.get("option") is None:
+                continue
+            ref = (sans_tiret_long(str(chip.get("label") or "")),
+                   sans_tiret_long(str(chip.get("value") or "")))
+            par_texte.setdefault(ref, (cle, chip["option"]))
+    for propre in propres:
+        info = par_texte.get((propre["label"], propre["value"]))
+        if info:
+            propre["demande"], propre["option"] = info
+    return propres
+
+
 def _rang(motif) -> int:
     # Un motif inconnu est traite comme informatif, au rang du chevauchement.
     return PRIORITE.index(motif) if motif in PRIORITE else PRIORITE.index("chevauchement")
@@ -229,6 +256,10 @@ def _rang(motif) -> int:
 
 class PlannerAgentV2:
     """Le nom est fixe par benchmarks/harness.py, qui l'importe tel quel."""
+
+    # La vue chat ne passe `tap` (postback structure d'une puce) qu'aux
+    # agents qui l'annoncent: v1 ne le connait pas et ne doit pas le recevoir.
+    accepte_tap = True
 
     def __init__(self, user: Optional[User] = None):
         self.user = user
@@ -239,6 +270,7 @@ class PlannerAgentV2:
         self._exclu: Optional[int] = None
         self._file_pensees: Optional[queue.Queue] = None
         self._message_brut: Optional[str] = None
+        self._tap: Optional[dict] = None
         self._brouillon_agir: str = ""
 
     def pousser_pensee(self, texte: str) -> None:
@@ -307,7 +339,7 @@ class PlannerAgentV2:
         brut = self._message_brut if self._message_brut is not None else message
         outils = outils_pour(user, registre, message_du_tour=message,
                              tache=self._tache, signaler=self.signaler_outil,
-                             message_brut=brut)
+                             message_brut=brut, tap=self._tap)
         # instructions= et non system_prompt=: pydantic-ai n'ajoute les system
         # prompts QUE si l'historique est vide. Sur tout tour de suivi, AGIR
         # tournait sans date, sans table de decision ni semaine type, et a
@@ -468,16 +500,23 @@ class PlannerAgentV2:
         *,
         use_streaming: bool = True,
         generate_quick_replies: bool = False,
+        tap: Optional[dict] = None,
     ):
         """Contrat SSE additif: status, thinking, tool, delta, done. Les deltas
         arrivent dans l'ordre final (faits, prose, question) et done.response
-        en est exactement la concatenation."""
+        en est exactement la concatenation.
+
+        `tap` est le postback structure d'une puce touchee:
+        {"demande": cle, "option": id}. Il ne vaut que contre la demande en
+        attente qui porte cette cle (memes gardes, meme fenetre); tout le
+        reste du tour lit le message comme avant."""
         self.user = user
         depart_tour = time.perf_counter()
         self._cout_agir, self._cout_dire = {}, {}
         # Le message TAPE, avant tout enrichissement: c'est lui que lisent la
         # garde et les boutons forces.
         self._message_brut = message
+        self._tap = tap if isinstance(tap, dict) and tap.get("demande") and tap.get("option") else None
         self._brouillon_agir = ""
         self._journaliser_reponse_formulaire(user, message)
 
@@ -486,7 +525,8 @@ class PlannerAgentV2:
         # rajoute, donc duplique a chaque requete); ici la duplication est
         # structurellement impossible.
         courant = ConversationMessage.objects.create(
-            user=user, role="user", content=message)
+            user=user, role="user", content=message,
+            metadata={"tap": self._tap} if self._tap else {})
         self._exclu = courant.pk
         # Identifie CE tour pour les cles d'idempotence: deux tours
         # distincts peuvent legitimement refaire la meme action, un meme
@@ -529,9 +569,12 @@ class PlannerAgentV2:
         self._file_pensees = queue.Queue()
         choix: list = []
         try:
+            # `tap` seulement s'il existe: les simulations de tests et tout
+            # remplacant sans ce parametre restent valides.
+            extra_tap = {"tap": self._tap} if self._tap else {}
             choix = list(_charger_appliquer_choix()(
                 user, registre, message, tache=self._tache,
-                signaler=self.signaler_outil) or [])
+                signaler=self.signaler_outil, **extra_tap) or [])
         except Exception:  # noqa: BLE001 - un choix non applique se redemande
             logger.error("Choix en attente non appliques", exc_info=True)
             choix = []
@@ -709,7 +752,7 @@ class PlannerAgentV2:
             yield {"type": "delta", "text": morceau}
         response = "".join(emis)
 
-        quick_replies = _chips_propres(chips, garder_option=False)
+        quick_replies = _chips_reponse(chips, compo.demandes if par_demande else [])
         # Une question restee dans la prose compte aussi: sinon des puces
         # differees viennent contredire la question (banc du round 3, s05-2).
         question_posee = bool(gagnant) or bool(question) or contient_question(prose)
@@ -1055,6 +1098,7 @@ class PlannerAgentV2:
         message: str,
         attachment: Optional[UploadedDocument] = None,
         generate_quick_replies: bool = True,
+        tap: Optional[dict] = None,
     ) -> dict:
         """Enveloppe non streamee: draine le flux, seule source de verite."""
         done: dict = {}
@@ -1062,6 +1106,7 @@ class PlannerAgentV2:
             user, message, attachment,
             use_streaming=False,
             generate_quick_replies=generate_quick_replies,
+            tap=tap,
         ):
             if event.get("type") == "done":
                 done = {k: v for k, v in event.items() if k != "type"}

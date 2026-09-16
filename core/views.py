@@ -88,6 +88,22 @@ def _agent_pour(user):
     return PlannerAgent()
 
 
+def _tap_de(request):
+    """Le postback structure d'une puce touchee, ou None.
+
+    Le front envoie `tap_demande` (cle de la demande en attente) et
+    `tap_option` (id de l'option) quand l'utilisateur TOUCHE une puce qui
+    les porte. Seul v2 les lit (accepte_tap); ils n'autorisent rien par
+    eux-memes: demandes.option_choisie ne les accepte que contre la demande
+    en attente qui porte exactement cette cle.
+    """
+    demande = str(request.data.get('tap_demande') or '').strip()
+    option = str(request.data.get('tap_option') or '').strip()
+    if not demande or not option:
+        return None
+    return {'demande': demande, 'option': option}
+
+
 def _as_bool(value):
     """Coerce a request value (bool, int, or string) to a boolean.
 
@@ -1023,11 +1039,14 @@ class ChatView(APIView):
         # Generate chat response via PlannerAgent
         try:
             agent = _agent_pour(request.user)
+            tap = _tap_de(request)
+            extra = {'tap': tap} if tap and getattr(agent, 'accepte_tap', False) else {}
             result = agent.process_message(
                 request.user,
                 message or "J'ai uploadé un document.",
                 attachment,
                 generate_quick_replies=not defer_quick_replies,
+                **extra,
             )
             logger.info(f"Agent response generated: {result.get('response', '')[:100]}...")
         except Exception as e:
@@ -1145,13 +1164,17 @@ class ChatStreamView(APIView):
 
         user = request.user
         final_message = message or "J'ai uploadé un document."
+        # Lu ICI, dans le thread de la requete: le drain tourne detache et ne
+        # doit plus toucher request.data.
+        tap = _tap_de(request)
 
         def evenements():
             # Execute dans le thread du drain, pas dans la requete: une panne
             # ici (agent introuvable, crash du flux) devient la trame
             # d'erreur habituelle, posee par lancer_flux.
             agent = _agent_pour(user)
-            yield from agent.process_message_stream(user, final_message, attachment)
+            extra = {'tap': tap} if tap and getattr(agent, 'accepte_tap', False) else {}
+            yield from agent.process_message_stream(user, final_message, attachment, **extra)
 
         # ITERATEUR ASYNCHRONE, et ce n'est pas un detail de style.
         #

@@ -158,6 +158,7 @@ class _Contexte:
     tache: str
     texte: str
     signaler: object = None
+    tap: dict | None = None
 
     @property
     def etat(self) -> _EtatTour:
@@ -679,7 +680,7 @@ def _reponse(ctx: _Contexte, cles: set, nom: str):
             # Abandonnee par le code ce tour (D2): une nouvelle suppression de
             # la meme cible pose une question NEUVE, jamais la perimee.
             continue
-        option = dem.option_choisie(ctx.texte, demande)
+        option = dem.option_choisie(ctx.texte, demande, tap=ctx.tap)
         if _autorise(demande.get("motif"), nom, option):
             return True, demande, None
         if option is not None:
@@ -1635,7 +1636,7 @@ def _garde_creations(ctx: _Contexte, nom: str, kwargs: dict):
     for demande in _attente(ctx):
         if demande.get("motif") != "creation_en_masse":
             continue
-        option = dem.option_choisie(ctx.texte, demande)
+        option = dem.option_choisie(ctx.texte, demande, tap=ctx.tap)
         if option == "confirmer":
             return None
         if option is not None:
@@ -1952,7 +1953,7 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
 
 def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
                tache: str, cache: dict | None = None, signaler=None,
-               message_brut: str | None = None):
+               message_brut: str | None = None, tap: dict | None = None):
     """Rend la coroutine que PydanticAI appellera avec les arguments du modele.
 
     `cache` n'est plus lu: l'idempotence vit dans l'etat du tour, partage
@@ -1961,7 +1962,7 @@ def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
     """
     ctx = _Contexte(user=user, registre=registre, tache=tache,
                     texte=message_brut if message_brut is not None else (message_du_tour or ""),
-                    signaler=signaler)
+                    signaler=signaler, tap=tap)
 
     def _appel_ferme(kwargs):
         """L'ORM tourne dans un thread du pool d'asgiref, hors du cycle de
@@ -1989,7 +1990,8 @@ def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
 
 
 def outils_pour(user: User, registre: Registre, message_du_tour: str = "",
-                tache: str = "", signaler=None, message_brut: str | None = None) -> list[Tool]:
+                tache: str = "", signaler=None, message_brut: str | None = None,
+                tap: dict | None = None) -> list[Tool]:
     """Les outils de v1, prets pour PydanticAI, branches sur ce registre.
 
     `tache` identifie le tour: il entre dans la cle d'idempotence pour que
@@ -2003,7 +2005,7 @@ def outils_pour(user: User, registre: Registre, message_du_tour: str = "",
     return [
         Tool.from_schema(
             _fabriquer(outil, user, registre, message_du_tour, tache, None,
-                       signaler, message_brut),
+                       signaler, message_brut, tap),
             outil.name,
             outil.description,
             outil.parameters,
@@ -2114,7 +2116,7 @@ def _appliquer(ctx: _Contexte) -> list[dict]:
     attente = _attente(ctx)
     etat = ctx.etat
     abandonnees = etat.attente.setdefault("abandonnees", set())
-    options = {id(d): dem.option_choisie(ctx.texte, d) for d in attente}
+    options = {id(d): dem.option_choisie(ctx.texte, d, tap=ctx.tap) for d in attente}
     # D2: un message qui ne repond a aucune demande (ni puce, ni garde, ni
     # reponse meme floue) porte une nouvelle requete. Cette lecture choisit
     # seulement entre reposer et abandonner; elle n'autorise jamais rien.
@@ -2252,7 +2254,7 @@ def tour_entierement_decide_par_le_code(registre: Registre, message) -> bool:
 
 
 def appliquer_choix_en_attente(user, registre: Registre, message_brut: str, tache: str,
-                               signaler=None) -> list[dict]:
+                               signaler=None, tap: dict | None = None) -> list[dict]:
     """Execute par le code l'option que l'utilisateur vient de choisir.
 
     Appele avant AGIR: une puce touchee (« Tous les jeudis ») supprime la
@@ -2262,7 +2264,7 @@ def appliquer_choix_en_attente(user, registre: Registre, message_brut: str, tach
     toute mutation. Rend un resume par demande en attente, destine au modele.
     """
     ctx = _Contexte(user=user, registre=registre, tache=tache,
-                    texte=message_brut or "", signaler=signaler)
+                    texte=message_brut or "", signaler=signaler, tap=tap)
 
     def _ferme():
         close_old_connections()
