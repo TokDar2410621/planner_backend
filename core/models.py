@@ -96,6 +96,11 @@ class UserProfile(models.Model):
     # Le retour arriere par compte reste un UPDATE, sans deploiement, pour
     # ramener un compte sur v1 en quelques secondes si v2 derape.
     agent_v2 = models.BooleanField(default=True)
+    # Une seule tete (Darius, 2026-09-17): AGIR ecrit lui-meme la reponse et
+    # DIRE saute (une phase LLM de moins par tour). Sa prose passe par le
+    # MEME contrat que DIRE: epuration (aucune action affirmee, les faits du
+    # registre parlent) et composer. Bascule par compte, retour = UPDATE.
+    voix_agir = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

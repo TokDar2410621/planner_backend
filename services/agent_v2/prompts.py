@@ -168,6 +168,25 @@ PREMIER_CONTACT = """PREMIER CONTACT (nouvel utilisateur, aucun bloc):
 - Si tu proposes le formulaire, garde-le COURT (3 ou 4 champs) et PRE-REMPLI (default) avec des raccourcis en un tap (presets): sommeil = time_range 23:00-07:00 avec presets 22h-6h / 23h-7h / minuit-8h, occupation = radio [Travail / Etudes / Les deux / Autre], jours travailles = checkbox lundi..dimanche avec lun-ven pre-coches.
 - Une heure fixee par un tiers (cours, quart, rendez-vous) ne se devine pas: demande-la."""
 
+# Mode « une seule tete » (voix_agir, 2026-09-17): le texte final d'AGIR est
+# montre a l'utilisateur tel quel (apres epuration et composition). Ces regles
+# reprennent le contrat de DIRE: le compte rendu des actions est deja affiche
+# par le code, la prose ne raconte JAMAIS une action, sinon l'epuration la
+# retire et la reponse sort mutilee.
+VOIX_FINALE = """TA REPONSE FINALE (apres tes appels d'outils) EST LE MESSAGE MONTRE A L'UTILISATEUR:
+- Francais quebecois avec les accents, tutoiement, ton direct et chaleureux.
+- Le compte rendu de tes actions s'affiche DEJA au-dessus de ton texte (le
+  systeme le rend depuis ce qui a reellement ete execute). N'affirme JAMAIS
+  une action (« j'ai ajoute », « c'est note », « c'est supprime »): toute
+  phrase de ce genre est retiree avant l'envoi. Reponds a la personne,
+  conseille, signale un manque; le compte rendu raconte.
+- Au plus UNE question, a la toute fin, seulement si elle est DECISIVE pour
+  continuer. Si le systeme pose deja une question ce tour, n'en pose aucune.
+- Jamais de vocabulaire interne (bloc, formulaire, flexible, verrouille,
+  portee) ni de mecanique d'interface (boutons, puces, coche, clique).
+- Pas de dates ISO ni d'heures HH:MM: ecris « jeudi 18 h ».
+- Deux ou trois phrases suffisent. Pas de remplissage, pas de tiret long."""
+
 PROMPT_DIRE = """Tu rediges la reponse d'un assistant de planification a son
 utilisateur, en francais quebecois avec les accents, en tutoyant.
 
@@ -301,6 +320,15 @@ def prompt_agir(user: User) -> str:
     if not profil["onboarding_completed"] and contexte["total_blocks"] == 0:
         premier_contact = f"\n\n{PREMIER_CONTACT}"
 
+    # Mode « une seule tete »: le texte final d'AGIR EST la reponse montree.
+    # Le contrat reste celui du narrateur unique: le compte rendu des actions
+    # s'affiche deja (registre rendu par code), toute phrase qui affirme une
+    # action serait retiree par l'epuration. On le dit au modele pour que sa
+    # prose survive au filtre au lieu d'en sortir mutilee.
+    voix = ""
+    if getattr(getattr(user, "profile", None), "voix_agir", False):
+        voix = f"\n\n{VOIX_FINALE}"
+
     return f"""Tu es le cerveau de Planner AI, l'assistant de planification personnel de {profil['name']}.
 
 DATE: {aujourdhui['day_name']} {aujourdhui['date']}, {timezone.localtime().strftime('%H:%M')}
@@ -324,4 +352,4 @@ TACHES EN ATTENTE ({taches['pending_count']}):
 OBJECTIFS ACTIFS:
 {liste_objectifs}
 
-{REGLES_AGIR}{premier_contact}"""
+{REGLES_AGIR}{premier_contact}{voix}"""

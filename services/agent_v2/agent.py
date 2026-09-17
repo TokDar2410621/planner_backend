@@ -696,6 +696,18 @@ class PlannerAgentV2:
         # les puces inventees ne peuvent plus s'ecrire; le code parle seul.
         if par_le_code or prose_regle:
             compo = composer(None, registre, faits, gagnant)
+        elif getattr(getattr(user, "profile", None), "voix_agir", False):
+            # Une seule tete (2026-09-17): celui qui a reflechi parle. Le
+            # texte final d'AGIR devient la reponse, DIRE saute (une phase
+            # LLM de moins). MEME contrat que DIRE, rien de moins: fuites
+            # comptees, phrases d'action epurees (les faits du registre
+            # parlent), questions et filtres par composer. Le raisonnement
+            # streame et la reponse sortent donc de la meme tete.
+            brut = ReponseDire(
+                ouverture="" if reemises else (self._brouillon_agir or ""))
+            fuites = fuites_reponse(brut)
+            brut, supprimees = epurer_reponse(brut)
+            compo = composer(brut, registre, faits, gagnant)
         else:
             try:
                 brut = self._dire(user, message, registre, etat, faits,
