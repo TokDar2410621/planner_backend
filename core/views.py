@@ -1281,7 +1281,15 @@ class RecurringBlockViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         # Default manager hides 'pending' blocks, so the normal list/detail
         # endpoints only ever expose confirmed blocks.
-        return RecurringBlock.objects.filter(user=self.request.user)
+        qs = RecurringBlock.objects.filter(user=self.request.user)
+        # Un bloc archive (soft delete: active=False, chemin delete_block du
+        # chat et clear_all_blocks) n'est plus un bloc du planning: la LISTE
+        # ne le montre pas. Le detail reste adressable par id: le contrat
+        # PATCH active en depend (desactiver = metadonnee, reactiver = valide
+        # contre l'horaire, voir test_qa_supervision_fixes).
+        if self.action == 'list':
+            qs = qs.filter(active=True)
+        return qs
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
