@@ -1533,7 +1533,9 @@ class TaskViewSet(viewsets.ModelViewSet):
     serializer_class = TaskSerializer
 
     def get_queryset(self):
-        queryset = Task.objects.filter(user=self.request.user)
+        # select_related: is_blocked lit la dependance; sans lui, une liste
+        # de N taches chainees ferait N requetes de plus.
+        queryset = Task.objects.filter(user=self.request.user).select_related('depends_on')
 
         # Filter by completed status
         completed = self.request.query_params.get('completed')

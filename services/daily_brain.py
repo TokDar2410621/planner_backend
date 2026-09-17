@@ -88,7 +88,7 @@ def build_daily_brief(user, target_date=None) -> dict:
         items.append({
             "type": "goal",
             "text": (f"Objectif « {g.title} » à échéance le {g.deadline.strftime('%d/%m')} "
-                     f"(progression {g.progress}%)."),
+                     f"(progression {g.progres_effectif()}%)."),
         })
 
     payload = {"date": today.isoformat(), "items": items[:MAX_ITEMS + 2]}

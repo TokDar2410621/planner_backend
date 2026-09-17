@@ -92,7 +92,7 @@ def build_context(user: User) -> dict:
     active_goals = Goal.objects.filter(user=user, status="active")[:5]
     goals_list = []
     for g in active_goals:
-        goals_list.append(f"  - {g.title} ({g.get_goal_type_display()}, {g.progress}%)")
+        goals_list.append(f"  - {g.title} ({g.get_goal_type_display()}, {g.progres_effectif()}%)")
 
     return {
         "profile": profile_data,

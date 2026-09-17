@@ -3,6 +3,7 @@ Serializers for Planner AI backend.
 """
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
+from django.db.models import Count, Q
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -386,15 +387,24 @@ class TaskSerializer(serializers.ModelSerializer):
     # Nested read-only venue so the frontend can show distance / departure for a
     # located task (ex: "Réunion 14h à l'UQAC"). `place` (write) sets the FK.
     place_detail = UserPlaceSerializer(source='place', read_only=True)
+    # La dependance n'est pas completee: la tache attend son tour.
+    is_blocked = serializers.BooleanField(read_only=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Scope `place` choices to the requesting user's own places (no IDOR).
+        # Meme cloture pour `goal` et `depends_on`: un id d'un autre compte
+        # doit etre invisible, pas seulement refuse.
         request = self.context.get('request')
-        if request is not None and 'place' in self.fields:
+        if request is not None:
             user = getattr(request, 'user', None)
             if user is not None and user.is_authenticated:
-                self.fields['place'].queryset = UserPlace.objects.filter(user=user)
+                if 'place' in self.fields:
+                    self.fields['place'].queryset = UserPlace.objects.filter(user=user)
+                if 'goal' in self.fields:
+                    self.fields['goal'].queryset = Goal.objects.filter(user=user)
+                if 'depends_on' in self.fields:
+                    self.fields['depends_on'].queryset = Task.objects.filter(user=user)
 
     class Meta:
         model = Task
@@ -402,6 +412,11 @@ class TaskSerializer(serializers.ModelSerializer):
             'id',
             'title',
             'description',
+            'deliverable',
+            'done_when',
+            'goal',
+            'depends_on',
+            'is_blocked',
             'deadline',
             'estimated_duration_minutes',
             'task_type',
@@ -414,7 +429,8 @@ class TaskSerializer(serializers.ModelSerializer):
             'completed_at',
             'created_at',
         ]
-        read_only_fields = ['id', 'completed_at', 'created_at', 'task_type_display', 'place_detail']
+        read_only_fields = ['id', 'completed_at', 'created_at', 'task_type_display',
+                            'place_detail', 'is_blocked']
 
     def validate_priority(self, value):
         if value < 1 or value > 10:
@@ -428,6 +444,40 @@ class TaskSerializer(serializers.ModelSerializer):
             user = getattr(request, 'user', None)
             if user is not None and user.is_authenticated and value.user_id != user.id:
                 raise serializers.ValidationError("Ce lieu ne vous appartient pas.")
+        return value
+
+    def _proprietaire(self):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None) if request is not None else None
+        return user if user is not None and user.is_authenticated else None
+
+    def validate_goal(self, value):
+        user = self._proprietaire()
+        if value is not None and user is not None and value.user_id != user.id:
+            raise serializers.ValidationError("Cet objectif ne vous appartient pas.")
+        return value
+
+    def validate_depends_on(self, value):
+        if value is None:
+            return value
+        user = self._proprietaire()
+        if user is not None and value.user_id != user.id:
+            raise serializers.ValidationError("Cette tâche ne vous appartient pas.")
+        if self.instance is not None and value.pk == self.instance.pk:
+            raise serializers.ValidationError(
+                "Une tâche ne peut pas dépendre d'elle-même.")
+        # Pas de cycle: on remonte la chaine depuis la dependance proposee;
+        # retomber sur la tache editee fermerait une boucle ou plus personne
+        # ne se debloque. Borne dure: une chaine legitime n'approche jamais
+        # 100 maillons, et la borne protege d'une boucle deja en base.
+        if self.instance is not None:
+            courant, pas = value, 0
+            while courant is not None and pas < 100:
+                if courant.pk == self.instance.pk:
+                    raise serializers.ValidationError(
+                        "Cette dépendance créerait un cycle.")
+                courant = courant.depends_on
+                pas += 1
         return value
 
 
@@ -484,6 +534,23 @@ class GoalSerializer(serializers.ModelSerializer):
         if value < 0 or value > 100:
             raise serializers.ValidationError("La progression doit être entre 0 et 100.")
         return value
+
+    def to_representation(self, instance):
+        # Un objectif qui a des taches liees montre le progres OBSERVABLE
+        # (taches completees / taches, regle « 1 tache = 1 livrable »); le
+        # curseur manuel reste la valeur des objectifs sans taches. Les
+        # comptes accompagnent pour que l'interface puisse dire « 4/9 ».
+        data = super().to_representation(instance)
+        agg = instance.tasks.aggregate(
+            total=Count('id'),
+            faites=Count('id', filter=Q(completed=True)),
+        )
+        total, faites = agg['total'] or 0, agg['faites'] or 0
+        data['tasks_total'] = total
+        data['tasks_done'] = faites
+        if total:
+            data['progress'] = round(100 * faites / total)
+        return data
 
     def validate(self, attrs):
         # 100% et « actif » sont contradictoires. L'agent applique déjà cette

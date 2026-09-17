@@ -452,9 +452,37 @@ class Task(models.Model):
     )
     priority = models.PositiveIntegerField(default=5)  # 1-10
     related_course = models.CharField(max_length=100, blank=True)
+    # Architecture « 1 tache = 1 livrable observable » (Darius, 2026-09-17):
+    # ce que la tache doit produire, et comment on sait qu'elle est finie.
+    deliverable = models.TextField(blank=True)
+    done_when = models.TextField(blank=True)
+    # La tache sert un objectif. Quand un objectif a des taches liees, son
+    # progres se CALCULE depuis elles (Goal.progres_effectif) au lieu du
+    # curseur manuel 0-100.
+    goal = models.ForeignKey(
+        'Goal',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='tasks',
+    )
+    # Chaine de travail: cette tache n'a de sens qu'apres celle-la. SET_NULL:
+    # une dependance supprimee LIBERE la tache, jamais d'orpheline bloquee.
+    depends_on = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='dependents',
+    )
     completed = models.BooleanField(default=False)
     completed_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    @property
+    def is_blocked(self) -> bool:
+        """La dependance existe et n'est pas completee."""
+        return self.depends_on_id is not None and not self.depends_on.completed
 
     def __str__(self):
         status = "✓" if self.completed else "○"
@@ -803,6 +831,23 @@ class Goal(models.Model):
         elif self.progress > 100:
             self.progress = 100
         super().save(*args, **kwargs)
+
+    def progres_effectif(self) -> int:
+        """Le progres montre partout: observable quand il peut l'etre.
+
+        Un objectif qui a des taches liees calcule son progres depuis elles
+        (taches completees / taches, regle « 1 tache = 1 livrable »); un
+        objectif sans taches garde son curseur manuel 0-100. Calcule a la
+        lecture: aucune valeur stockee a synchroniser, donc aucun drift.
+        """
+        agg = self.tasks.aggregate(
+            total=models.Count('id'),
+            faites=models.Count('id', filter=models.Q(completed=True)),
+        )
+        total = agg['total'] or 0
+        if not total:
+            return self.progress
+        return round(100 * (agg['faites'] or 0) / total)
 
     class Meta:
         verbose_name = "Objectif"

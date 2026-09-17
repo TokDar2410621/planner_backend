@@ -40,7 +40,8 @@ def _goal_to_dict(goal: Goal) -> dict:
             goal.deadline.isoformat() if hasattr(goal.deadline, "isoformat")
             else (goal.deadline or None)
         ),
-        "progress": goal.progress,
+        # Observable quand l'objectif a des taches liees, manuel sinon.
+        "progress": goal.progres_effectif(),
         "status": goal.status,
         "created_at": goal.created_at.isoformat(),
     }
@@ -192,5 +193,5 @@ class UpdateGoalTool(BaseTool):
         return ToolResult(
             success=True,
             data={"goal": _goal_to_dict(goal)},
-            message=f"Objectif '{goal.title}' mis à jour (progression: {goal.progress}%).",
+            message=f"Objectif '{goal.title}' mis à jour (progression: {goal.progres_effectif()}%).",
         )
