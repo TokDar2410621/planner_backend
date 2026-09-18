@@ -13,8 +13,28 @@ from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
+from django.test import SimpleTestCase
+
 from core.models import ConversationMessage
-from services.transcription import TranscriptionIndisponible
+from services.transcription import (_CONSIGNE, TranscriptionIndisponible,
+                                    _sans_echo_de_consigne)
+
+
+class SansEchoDeConsigneTests(SimpleTestCase):
+    """Sonde prod du 2026-09-17: sur un silence, le modele recitait la
+    consigne; ce texte partait dans le champ de l'utilisateur."""
+
+    def test_la_consigne_recitee_devient_une_chaine_vide(self):
+        self.assertEqual(_sans_echo_de_consigne(_CONSIGNE), "")
+        self.assertEqual(_sans_echo_de_consigne(_CONSIGNE[:40]), "")
+        self.assertEqual(_sans_echo_de_consigne(f"Voici. {_CONSIGNE} Fin."), "")
+
+    def test_une_vraie_transcription_passe_intacte(self):
+        self.assertEqual(_sans_echo_de_consigne("Ajoute mon gym jeudi à 18 h"),
+                         "Ajoute mon gym jeudi à 18 h")
+        # Un court fragment present dans la consigne reste une vraie dictee.
+        self.assertEqual(_sans_echo_de_consigne("en français"), "en français")
+        self.assertEqual(_sans_echo_de_consigne(""), "")
 
 
 def _audio(mime="audio/webm", octets=b"x" * 128, nom="dictee.webm"):
