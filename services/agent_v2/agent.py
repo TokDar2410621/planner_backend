@@ -343,6 +343,26 @@ class PlannerAgentV2:
             self._apercu_phrases += 1
             self._file_pensees.put(("delta", texte))
 
+    def reliquat_apercu(self) -> str:
+        """La DERNIERE phrase, publiee quand AGIR a fini d'ecrire.
+
+        Une phrase n'est publiable qu'une fois terminee, et « terminee » se
+        reconnait a l'espace qui suit son point: la derniere phrase d'un
+        texte n'en a pas et restait donc dans le tampon (sonde prod du
+        2026-09-18: apercu=1 sur une reponse de deux phrases). Quand AGIR
+        rend la main, il n'y a plus rien a attendre: on la publie.
+        """
+        reste, self._apercu_tampon = self._apercu_tampon, ""
+        if not self._apercu_actif:
+            return ""
+        publiable = self._phrase_publiable(reste)
+        if not publiable:
+            return ""
+        texte = f" {publiable}" if self._apercu_emis else publiable
+        self._apercu_emis = True
+        self._apercu_phrases += 1
+        return texte
+
     def signaler_outil(self, action) -> None:
         """Diffuse un appel d'outil vers le flux, s'il y a un flux.
 
@@ -695,7 +715,11 @@ class PlannerAgentV2:
             self._apercu_tampon, self._apercu_emis = "", False
             self._apercu_phrases = 0
             raisonnement, panne = yield from self._agir_en_fond(user, message_enrichi, registre)
+            # AGIR a rendu la main: sa derniere phrase n'attend plus rien.
+            reliquat = self.reliquat_apercu()
             self._apercu_actif = False
+            if reliquat:
+                yield {"type": "delta", "text": reliquat}
 
         if panne is not None:
             # Une panne d'AGIR ne doit pas effacer ce que les outils ont deja

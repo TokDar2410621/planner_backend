@@ -49,6 +49,18 @@ class ApercuBase(NarrateurBase):
 
 class ApercuStreameTests(ApercuBase):
 
+    def test_la_derniere_phrase_part_aussi_sans_espace_final(self):
+        # Sonde prod du 2026-09-18: une phrase n'est « terminee » qu'a
+        # l'espace qui suit son point, donc la DERNIERE restait au tampon
+        # (apercu=1 sur une reponse de deux phrases). AGIR qui rend la main
+        # la libere.
+        evts, done = self.tour_streame(
+            fragments=["Première phrase. ", "Deuxième et dernière phrase."])
+        self.assertEqual(self.deltas_de(evts),
+                         ["Première phrase.", " Deuxième et dernière phrase."])
+        self.assertEqual(done["response"],
+                         "Première phrase. Deuxième et dernière phrase.")
+
     def test_les_phrases_partent_au_fil_de_l_ecriture(self):
         evts, done = self.tour_streame(
             fragments=["Bonne ", "idée. ", "Le matin ", "te laisse ", "plus d'élan. "])
