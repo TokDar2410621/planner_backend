@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -33,8 +34,8 @@ from django.db import close_old_connections
 from pydantic_ai import Agent, ModelRetry
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (ModelRequest, ModelResponse, PartDeltaEvent,
-                                  PartStartEvent, TextPart, ThinkingPart,
-                                  ThinkingPartDelta, UserPromptPart)
+                                  PartStartEvent, TextPart, TextPartDelta,
+                                  ThinkingPart, ThinkingPartDelta, UserPromptPart)
 from pydantic_ai.usage import UsageLimits
 
 from core.models import ConversationMessage, UploadedDocument
@@ -55,6 +56,11 @@ logger = logging.getLogger(__name__)
 
 BUDGET_ETAPES = 10
 HISTORIQUE_MAX = 20
+
+# Une phrase TERMINEE dans un flux de texte: ponctuation finale, guillemets
+# fermants eventuels, puis une espace. Tant que l'espace n'est pas arrivee,
+# la phrase peut encore s'allonger (« 18 h. » contre « 18 h.30 »).
+_FIN_DE_PHRASE_STREAMEE = re.compile(r"[.!?…][\"'»)\]]*\s")
 
 # Une question par tour, la premiere presente dans cet ordre. Les gardes du
 # code passent avant tout: une suppression retenue sans sa question serait un
@@ -272,6 +278,14 @@ class PlannerAgentV2:
         self._message_brut: Optional[str] = None
         self._tap: Optional[dict] = None
         self._brouillon_agir: str = ""
+        # Apercu streame (mode voix_agir): la reponse s'ecrit pendant qu'AGIR
+        # la produit, phrase par phrase, chacune passee par le MEME filtre
+        # que la composition finale.
+        self._apercu_actif: bool = False
+        self._apercu_tampon: str = ""
+        self._apercu_emis: bool = False
+        self._apercu_phrases: int = 0
+        self._registre_courant: Optional[Registre] = None
 
     def pousser_pensee(self, texte: str) -> None:
         """Emet un fragment de raisonnement vers le flux, s'il y a un flux.
@@ -282,6 +296,52 @@ class PlannerAgentV2:
         """
         if self._file_pensees is not None and texte:
             self._file_pensees.put(("thinking", texte))
+
+    def _phrase_publiable(self, phrase: str) -> str:
+        """La phrase telle que la composition finale la garderait, ou « ».
+
+        On ne re-implemente RIEN: la phrase passe par epurer_reponse puis
+        composer, exactement le chemin de la reponse finale. Une phrase qui
+        affirme une action (que le registre ne couvre pas), qui parle
+        vocabulaire interne ou mecanique d'interface, ou qui POSE une
+        question (elle appartient a la fin du tour, ou au code) n'en
+        ressort pas. Un mensonge ne peut donc pas s'afficher, meme une
+        seconde.
+        """
+        registre = self._registre_courant
+        if registre is None or not phrase.strip():
+            return ""
+        # Une garde a pose une demande ce tour: la question du code gagnera
+        # et la prose d'AGIR sera taillee ou jetee. On n'affiche rien qu'il
+        # faudrait reprendre.
+        if any((a.donnees or {}).get("demande") for a in registre.actions):
+            return ""
+        try:
+            brut, _ = epurer_reponse(ReponseDire(ouverture=phrase))
+            compo = composer(brut, registre, "", None)
+        except Exception:  # noqa: BLE001 - un apercu ne casse jamais un tour
+            logger.debug("Apercu non publiable", exc_info=True)
+            return ""
+        return sans_tiret_long(compo.prose or "").strip()
+
+    def pousser_brouillon(self, fragment: str) -> None:
+        """Accumule le texte final d'AGIR et publie ses phrases completes."""
+        if not self._apercu_actif or not fragment or self._file_pensees is None:
+            return
+        self._apercu_tampon += fragment
+        while True:
+            fin = _FIN_DE_PHRASE_STREAMEE.search(self._apercu_tampon)
+            if fin is None:
+                return
+            phrase = self._apercu_tampon[:fin.end()]
+            self._apercu_tampon = self._apercu_tampon[fin.end():]
+            publiable = self._phrase_publiable(phrase)
+            if not publiable:
+                continue
+            texte = f" {publiable}" if self._apercu_emis else publiable
+            self._apercu_emis = True
+            self._apercu_phrases += 1
+            self._file_pensees.put(("delta", texte))
 
     def signaler_outil(self, action) -> None:
         """Diffuse un appel d'outil vers le flux, s'il y a un flux.
@@ -302,7 +362,7 @@ class PlannerAgentV2:
     # ------------------------------------------------------------------ AGIR
 
     async def _sur_evenements(self, _contexte, evenements) -> None:
-        """Capte le RAISONNEMENT au fil de sa production, et rien d'autre.
+        """Capte le RAISONNEMENT au fil de sa production, et le TEXTE final.
 
         run_sync execute le graphe en entier, donc tous les outils tournent;
         run_stream_sync s'arreterait a la premiere sortie « finale » et
@@ -314,14 +374,23 @@ class PlannerAgentV2:
         d'AGIR (TextPartDelta) se melaient au raisonnement anglais du volet;
         et elle ignorait PartStartEvent, qui porte le PREMIER fragment de
         chaque partie (d'ou « user wants » sans « The »).
+
+        Les deux canaux restent SEPARES: la pensee va au volet, le texte va
+        a l'apercu streame (mode voix_agir seulement, ou le texte final
+        d'AGIR est la reponse). Hors de ce mode, pousser_brouillon ne fait
+        rien et le comportement est celui d'avant.
         """
         async for evenement in evenements:
             if isinstance(evenement, PartStartEvent):
                 if isinstance(evenement.part, ThinkingPart):
                     self.pousser_pensee(evenement.part.content)
+                elif isinstance(evenement.part, TextPart):
+                    self.pousser_brouillon(evenement.part.content)
             elif isinstance(evenement, PartDeltaEvent):
                 if isinstance(evenement.delta, ThinkingPartDelta):
                     self.pousser_pensee(evenement.delta.content_delta)
+                elif isinstance(evenement.delta, TextPartDelta):
+                    self.pousser_brouillon(evenement.delta.content_delta)
 
     def _agir(self, user: User, message: str, registre: Registre) -> str:
         """Laisse le modele outiller. Rend son raisonnement, jamais persiste.
@@ -518,6 +587,8 @@ class PlannerAgentV2:
         self._message_brut = message
         self._tap = tap if isinstance(tap, dict) and tap.get("demande") and tap.get("option") else None
         self._brouillon_agir = ""
+        self._apercu_actif, self._apercu_tampon = False, ""
+        self._apercu_emis, self._apercu_phrases = False, 0
         self._journaliser_reponse_formulaire(user, message)
 
         # Persiste d'abord, puis exclut CETTE ligne de l'historique par son id.
@@ -534,6 +605,9 @@ class PlannerAgentV2:
         self._tache = f"{user.pk}:{courant.pk}"
 
         registre = Registre()
+        # L'apercu streame lit ce registre pour savoir ce qui est deja vrai
+        # (et s'il porte une demande) avant de publier une phrase.
+        self._registre_courant = registre
 
         # Le document et l'import recent DOIVENT entrer dans le message vu par
         # AGIR. Sans cela, un horaire envoye est perdu en silence et l'agent
@@ -601,6 +675,7 @@ class PlannerAgentV2:
         # Round 8: une piece jointe est toujours une demande pour AGIR, meme
         # quand le texte tape ne fait que repondre.
         par_le_code = attachment is None and self._tour_decide(registre, message)
+        voix_agir = bool(getattr(getattr(user, "profile", None), "voix_agir", False))
         raisonnement, panne = "", None
         suivi_lire = lecture.sautee()
         if par_le_code:
@@ -613,7 +688,14 @@ class PlannerAgentV2:
             # les choix du code, soit l'etat que voit AGIR. Rien ne l'attend
             # avant la fin du tour.
             suivi_lire = lecture.demarrer(user, message)
+            # Apercu streame: seulement quand AGIR est CELUI QUI PARLE
+            # (voix_agir), et pas sur un tour de reprise, ou le code parle
+            # a sa place. Ailleurs, rien ne change.
+            self._apercu_actif = voix_agir and not reemises
+            self._apercu_tampon, self._apercu_emis = "", False
+            self._apercu_phrases = 0
             raisonnement, panne = yield from self._agir_en_fond(user, message_enrichi, registre)
+            self._apercu_actif = False
 
         if panne is not None:
             # Une panne d'AGIR ne doit pas effacer ce que les outils ont deja
@@ -678,12 +760,18 @@ class PlannerAgentV2:
             faits = f"{faits}\n{reste}" if faits else reste
         faits = sans_tiret_long(faits or "")
 
+        # Un apercu a deja ecrit la prose chez le client. Re-emettre les
+        # sections la dupliquerait: `response` reste la verite canonique
+        # (faits, prose, question) et le client remplace la bulle par
+        # done.response, comme le contrat SSE le prevoit deja.
+        apercu = self._apercu_emis
         emis: list[str] = []
         if faits:
             # Les faits partent AVANT la redaction: ils sont deja vrais, et
             # l'utilisateur n'a pas a attendre l'enrobage pour les voir.
             emis.append(faits)
-            yield {"type": "delta", "text": faits}
+            if not apercu:
+                yield {"type": "delta", "text": faits}
 
         question_deja = ""
         if gagnant:
@@ -696,7 +784,7 @@ class PlannerAgentV2:
         # les puces inventees ne peuvent plus s'ecrire; le code parle seul.
         if par_le_code or prose_regle:
             compo = composer(None, registre, faits, gagnant)
-        elif getattr(getattr(user, "profile", None), "voix_agir", False):
+        elif voix_agir:
             # Une seule tete (2026-09-17): celui qui a reflechi parle. Le
             # texte final d'AGIR devient la reponse, DIRE saute (une phase
             # LLM de moins). MEME contrat que DIRE, rien de moins: fuites
@@ -757,11 +845,13 @@ class PlannerAgentV2:
         if prose:
             morceau = ("\n\n" if emis else "") + prose
             emis.append(morceau)
-            yield {"type": "delta", "text": morceau}
+            if not apercu:
+                yield {"type": "delta", "text": morceau}
         if question:
             morceau = ("\n\n" if emis else "") + question
             emis.append(morceau)
-            yield {"type": "delta", "text": morceau}
+            if not apercu:
+                yield {"type": "delta", "text": morceau}
         response = "".join(emis)
 
         quick_replies = _chips_reponse(chips, compo.demandes if par_demande else [])
@@ -797,7 +887,7 @@ class PlannerAgentV2:
             "agent_v2 tour actions=%d rejetees=%d fuites=%d supprimees=%d ecarts=%d%s"
             " agir=%.1fs/%dep/%d->%dj/r%d/c%d dire=%.1fs/%dep/%d->%dj/r%d"
             " asked=%d form=%d choices=%d read_without_list=%d raw_marker_count=%d"
-            " motif=%s choix_code=%d chemin=%s tour=%.2fs",
+            " motif=%s choix_code=%d chemin=%s apercu=%d tour=%.2fs",
             len(registre.actions),
             rejetees,
             len(fuites),
@@ -827,6 +917,9 @@ class PlannerAgentV2:
             choix_code,
             # Latence du chemin rapide (D6) contre la boucle complete.
             "code" if par_le_code else "agir",
+            # Phrases parties AVANT la fin du tour (apercu streame): 0 dit
+            # que la reponse est arrivee d'un bloc.
+            self._apercu_phrases,
             time.perf_counter() - depart_tour,
         )
 
