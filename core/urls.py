@@ -41,6 +41,7 @@ from .views import (
     ChatView,
     ChatQuickRepliesView,
     ChatStreamView,
+    ChatTranscriptionView,
     DailyBriefView,
     # ViewSets
     DocumentViewSet,
@@ -139,6 +140,7 @@ urlpatterns = [
     path('chat/', ChatView.as_view(), name='chat'),
     path('chat/quick-replies/', ChatQuickRepliesView.as_view(), name='chat-quick-replies'),
     path('chat/stream/', ChatStreamView.as_view(), name='chat-stream'),
+    path('chat/transcrire/', ChatTranscriptionView.as_view(), name='chat-transcrire'),
 
     # Schedule endpoints
     path('schedule/', ScheduleView.as_view(), name='schedule'),

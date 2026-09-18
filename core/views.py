@@ -1201,6 +1201,49 @@ class ChatStreamView(APIView):
         return response
 
 
+class ChatTranscriptionView(APIView):
+    """La dictée du bouton micro : audio vers texte, rien d'autre.
+
+    Le texte rendu atterrit dans le champ de saisie du client, où
+    l'utilisateur le relit avant d'envoyer. AUCUN tour d'agent ne part
+    d'ici : transcrire n'autorise rien, les gardes du chat gardent tout
+    leur sens. Consentement IA requis : l'audio part chez Gemini.
+    """
+
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        from services.transcription import (MIMES_ACCEPTES, TAILLE_MAX_OCTETS,
+                                            TranscriptionIndisponible,
+                                            transcrire_audio)
+        denied = ai_consent_denied(request.user)
+        if denied is not None:
+            return denied
+        fichier = request.FILES.get('audio')
+        if not fichier:
+            return Response({'error': "Fichier 'audio' requis."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        mime = (fichier.content_type or '').split(';')[0].strip().lower()
+        if mime not in MIMES_ACCEPTES:
+            return Response({'error': 'Format audio non pris en charge.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if fichier.size and fichier.size > TAILLE_MAX_OCTETS:
+            return Response({'error': 'Audio trop long (5 Mo maximum).'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        donnees = fichier.read()
+        if len(donnees) > TAILLE_MAX_OCTETS:
+            return Response({'error': 'Audio trop long (5 Mo maximum).'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        try:
+            texte = transcrire_audio(donnees, mime)
+        except TranscriptionIndisponible:
+            # Le detail (URL, cle) reste au serveur; le client recoit un
+            # message actionnable et le front garde le texte deja saisi.
+            return Response({'error': 'La transcription est indisponible pour le moment.'},
+                            status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return Response({'texte': texte})
+
+
 # ============== Document Views ==============
 
 class DocumentViewSet(viewsets.ModelViewSet):
