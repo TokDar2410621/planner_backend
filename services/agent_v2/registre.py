@@ -98,6 +98,7 @@ class Registre:
         self.actions: list[Action] = []
         self.ecarts: list[Ecart] = []
         self.budget_epuise: bool = False
+        self.delai_depasse: bool = False
         self.boucle_interrompue: bool = False
         self._index: dict = {}
 
