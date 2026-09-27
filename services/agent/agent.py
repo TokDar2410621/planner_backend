@@ -775,6 +775,9 @@ class PlannerAgent:
                         # etablit la verite quoi que raconte le modele.
                         attachment_processed_this_turn = True
                         break
+                    if attachment.processing_error:
+                        # Echec constate: on n'attend pas la borne pour rien.
+                        break
                     if tick and tick % 16 == 0:
                         yield {"type": "status", "text": "J'analyse ton document… (presque fini)"}
             history[-1]["content"] = f"{history[-1]['content']}\n\n{self._build_attachment_context(attachment)}"
@@ -1265,6 +1268,19 @@ class PlannerAgent:
         header = f"Document uploadé: {attachment.file_name} (type: {doc_type})"
 
         if not attachment.processed:
+            if attachment.processing_error:
+                # Echec constate (sortie anticipée de l'attente): ne PAS
+                # parler de "retard", ce serait un mensonge. Tutoiement
+                # explicite et AUCUNE promesse de resume automatique.
+                return (
+                    f"[{header}]\n"
+                    "[L'ANALYSE DU DOCUMENT A ÉCHOUÉ — aucun contenu n'a pu "
+                    "en être extrait. Dis-le honnêtement, en TUTOYANT (comme "
+                    "partout dans l'app): l'analyse n'a pas abouti, propose "
+                    "de renvoyer une photo plus nette ou un PDF avec du vrai "
+                    "texte. Ne promets JAMAIS d'envoyer un résumé de toi-même: "
+                    "tu n'en as pas le moyen.]"
+                )
             # Cas rare depuis l'attente synchrone: seulement si l'analyse
             # depasse la borne. Tutoiement explicite (le LLM vouvoyait sur ce
             # chemin) et AUCUNE promesse de resume automatique: rien ne la

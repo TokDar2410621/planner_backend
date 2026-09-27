@@ -34,6 +34,7 @@ opentelemetry-api<1.38
 huggingface-hub>=0.20,<1.0
 PyMuPDF>=1.24,<2.0
 Pillow>=11.0,<12.0
+pillow-heif>=1.0,<2.0
 pdfplumber>=0.11,<1.0
 
 # Web Push (VAPID)

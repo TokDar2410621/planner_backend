@@ -13,7 +13,17 @@ from rest_framework.exceptions import ValidationError
 MAX_UPLOAD_SIZE = 8 * 1024 * 1024
 
 # Allowed file extensions (lowercase, without the leading dot).
-ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg', 'webp'}
+# heic/heif: photos iPhone. Acceptees depuis le fix extraction-horaires:
+# avant, une photo iPhone etait rejetee en 400 alors que c'est le cas
+# d'usage principal de l'envoi d'horaires en photo.
+ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg', 'webp', 'heic', 'heif'}
+
+# Marques (brands) ISO BMFF reconnues comme HEIC/HEIF: les 4 octets a
+# l'offset 8 quand les octets 4-8 valent 'ftyp'.
+HEIC_BRANDS = (
+    b'heic', b'heix', b'hevc', b'hevx', b'heim', b'heis', b'hevm', b'hevs',
+    b'mif1', b'msf1',
+)
 
 # Magic byte signatures keyed by canonical type. Each entry is a list of
 # (offset, signature_bytes) tuples that must ALL match for the file to be
@@ -24,6 +34,10 @@ MAGIC_SIGNATURES = {
     'jpg': [(0, b'\xff\xd8\xff')],
     # WEBP is a RIFF container: "RIFF"...."WEBP".
     'webp': [(0, b'RIFF'), (8, b'WEBP')],
+    # HEIC/HEIF is an ISO BMFF container: "ftyp" at offset 4, brand at
+    # offset 8. La signature accepte une ALTERNATIVE (tuple): au moins une
+    # des marques doit correspondre.
+    'heic': [(4, b'ftyp'), (8, HEIC_BRANDS)],
 }
 
 # Map an extension to the magic signature group that validates it.
@@ -33,6 +47,8 @@ EXTENSION_TO_MAGIC = {
     'jpg': 'jpg',
     'jpeg': 'jpg',
     'webp': 'webp',
+    'heic': 'heic',
+    'heif': 'heic',
 }
 
 
@@ -64,9 +80,21 @@ def _read_header(file, size=16):
 
 def _matches_signature(header, signatures):
     for offset, sig in signatures:
-        if header[offset:offset + len(sig)] != sig:
+        if isinstance(sig, (tuple, list)):
+            # Alternative: au moins une des signatures candidates doit
+            # correspondre (utilise pour les marques HEIC/HEIF).
+            width = max(len(s) for s in sig)
+            chunk = header[offset:offset + width]
+            if not any(chunk[:len(s)] == s for s in sig):
+                return False
+        elif header[offset:offset + len(sig)] != sig:
             return False
     return True
+
+
+def is_heic_header(header: bytes) -> bool:
+    """True si l'en-tete correspond a un conteneur HEIC/HEIF."""
+    return _matches_signature(header, MAGIC_SIGNATURES['heic'])
 
 
 def sniff_kind(header: bytes) -> str:
@@ -84,7 +112,8 @@ def sniff_kind(header: bytes) -> str:
     if (header[:8] == b'\x89PNG\r\n\x1a\n'
             or header[:3] == b'\xff\xd8\xff'
             or (header[:4] == b'RIFF' and header[8:12] == b'WEBP')
-            or header[:6] in (b'GIF87a', b'GIF89a')):
+            or header[:6] in (b'GIF87a', b'GIF89a')
+            or is_heic_header(header)):
         return 'image'
     return 'pdf'
 
