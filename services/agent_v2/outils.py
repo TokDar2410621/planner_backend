@@ -800,6 +800,72 @@ def _plan_propose(outil, user, kwargs: dict):
     return proposition, empreinte, arrangements
 
 
+_PLAN_JOUR_TTL = 1800  # 30 min: meme logique que le plan semaine.
+
+
+def _cle_plan_jour(user_id: int, date_iso: str) -> str:
+    return f"agentv2:plan_jour:v1:{user_id}:{date_iso}"
+
+
+def _jour_organize(raw):
+    """Parse la date d'organize_day; None si absente ou invalide."""
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date() if raw else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _arrangement_jour_cache(user, jour):
+    """(arrangement, entrees): l'arrangement en cache si ses entrees sont
+    inchangees, sinon (None, entrees_fraiches).
+
+    Le solveur est deterministe: si ses entrees n'ont pas change depuis la
+    proposition, on reutilise l'arrangement en cache au lieu de re-resoudre
+    (~1-2 s mesures, plafond 2 s par jour).
+    """
+    from django.core.cache import cache
+    from services.scheduling.solve_day import empreinte_entrees_jour
+
+    cle = _cle_plan_jour(user.pk, jour.isoformat())
+    entrees = empreinte_entrees_jour(user, jour)
+    cached = cache.get(cle)
+    if cached and cached.get("entrees") == entrees:
+        logger.info("Plan jour %s: servi du cache (entrees inchangees)", jour.isoformat())
+        return cached["arrangement"], entrees
+    return None, entrees
+
+
+def _plan_propose_jour(outil, user, kwargs: dict):
+    """(proposition, entrees, arrangement) pour organize_day, avec cache.
+
+    Meme contrat que _plan_propose mais pour un seul jour: la proposition
+    (apply=False) alimente le cache; l'apply le lit via
+    _arrangement_jour_cache.
+    """
+    from django.core.cache import cache
+    from services.agent.tools import schedule as _sched
+
+    jour = _jour_organize(kwargs.get("date"))
+    if jour is None:
+        # Date invalide: l'outil echouera de lui-meme; pas de cache.
+        proposition = outil.execute(user, **kwargs)
+        return proposition, None, None
+
+    arrangement, entrees = _arrangement_jour_cache(user, jour)
+    if arrangement is None:
+        # Via le module (pas d'import direct): les tests peuvent espionner
+        # solve_placement, et le comportement reste identique.
+        arrangement = _sched.solve_placement(user, jour)
+        proposition = _sched._executer_organize_day(user, jour, apply=False, arrangement=arrangement)
+        cache.set(_cle_plan_jour(user.pk, jour.isoformat()),
+                  {"entrees": entrees, "data": proposition.data,
+                   "message": proposition.message, "arrangement": arrangement},
+                  _PLAN_JOUR_TTL)
+    else:
+        proposition = _sched._executer_organize_day(user, jour, apply=False, arrangement=arrangement)
+    return proposition, entrees, arrangement
+
+
 def _demande_optimisation(kwargs: dict, empreinte: str, proposition: ToolResult) -> dict:
     # Les kwargs prives (prefixe _) ne font jamais partie d'une demande
     # persistee: ce sont des hints d'execution, pas l'intention metier.
@@ -1958,6 +2024,20 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
         # polluer le registre).
         kwargs["_arrangements"] = arrangements
 
+    if nom == "organize_day" and kwargs.get("apply"):
+        # Niveau 3 (jour): l'apply reutilise l'arrangement valide quand les
+        # entrees sont inchangees, au lieu de re-resoudre (kwarg prive,
+        # retire apres l'execution pour ne pas polluer le registre).
+        # Pas de garde dediee pour organize_day: le chemin est direct.
+        try:
+            jour = _jour_organize(kwargs.get("date"))
+            if jour is not None:
+                arrangement, _ = _arrangement_jour_cache(ctx.user, jour)
+                if arrangement is not None:
+                    kwargs["_arrangement"] = arrangement
+        except Exception:  # noqa: BLE001
+            logger.error("Cache plan jour en panne", exc_info=True)
+
     # Meme marqueur que v1: le banc capte les appels d'outils par le
     # logger parent « services », et cette ligne est ce qu'il cherche.
     # Les kwargs prives (ex: _arrangements) sont exclus de l'affichage:
@@ -1971,6 +2051,12 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
             # re-resoudre si les entrees sont inchangees. Resultat identique
             # a l'execution directe (memes helpers de mise en forme).
             resultat, _, _ = _plan_propose(outil, ctx.user, kwargs)
+        elif nom == "organize_day" and not kwargs.get("apply"):
+            # La proposition passe par _plan_propose_jour pour ALIMENTER le
+            # cache inter-tours: a l'apply, l'arrangement est reutilise sans
+            # re-resoudre si les entrees sont inchangees. Resultat identique
+            # a l'execution directe (memes helpers de mise en forme).
+            resultat, _, _ = _plan_propose_jour(outil, ctx.user, kwargs)
         else:
             resultat = outil.execute(ctx.user, **kwargs)
     except Exception as e:  # noqa: BLE001
@@ -1979,8 +2065,9 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
         # aucune trace de la mutation tentee.
         logger.error("Tool %s a leve: %s", nom, e, exc_info=True)
         resultat = ToolResult(success=False, data={}, message=f"Erreur de l'outil: {e}")
-    # Kwarg prive du niveau 3: ne doit pas polluer le registre ni le rendu.
+    # Kwargs prives du niveau 3: ne doivent pas polluer le registre ni le rendu.
     kwargs.pop("_arrangements", None)
+    kwargs.pop("_arrangement", None)
 
     if choix is not None:
         resultat = ToolResult(

@@ -661,6 +661,60 @@ class CheckFeasibilityTool(BaseTool):
         )
 
 
+def _mettre_en_forme_jour(arrangement):
+    """Decoupe + listing d'un arrangement existant (sans solveur)."""
+    placed = [r for r in arrangement if not r["skipped"] and not r["overnight_kept"]]
+    overnight = [r for r in arrangement if r["overnight_kept"]]
+    skipped = [r for r in arrangement if r["skipped"] and not r.get("reporte_au_lendemain")]
+    listing = ", ".join(f"{r['title']} {r['start_time']}-{r['end_time']}" for r in placed) or "rien à replacer"
+    return placed, overnight, skipped, listing
+
+
+def _appliquer_jour(user, arrangement):
+    """Applique UN arrangement: ajuste les heures des blocs souples."""
+    moved = []
+    for r in arrangement:
+        if r["skipped"] or r["overnight_kept"]:
+            continue
+        block = RecurringBlock.objects.filter(id=r["block_id"], user=user).first()
+        if block is None:
+            continue
+        new_start = time(r["start_min"] // 60, r["start_min"] % 60)
+        new_end = time(r["end_min"] // 60, r["end_min"] % 60)
+        if block.start_time != new_start or block.end_time != new_end:
+            block.start_time = new_start
+            block.end_time = new_end
+            block.save(update_fields=["start_time", "end_time"])
+            moved.append({"title": block.title, "start_time": r["start_time"], "end_time": r["end_time"]})
+    return moved
+
+
+def _executer_organize_day(user, target_date, apply, arrangement):
+    """Corps d'OrganizeDayTool sur un arrangement (deja resolu par l'appelant).
+
+    Separe du solveur pour que l'agent v2 puisse appliquer un arrangement
+    valide sans re-resoudre.
+    """
+    placed, overnight, skipped, listing = _mettre_en_forme_jour(arrangement)
+    moved = _appliquer_jour(user, arrangement) if apply else []
+    head = "J'ai réorganisé" if apply else "Proposition (rien changé)"
+    msg = f"{head} le {DAY_NAMES[target_date.weekday()]} {target_date.isoformat()}: {listing}."
+    if skipped:
+        msg += " Non placé (journée trop pleine): " + ", ".join(r["title"] for r in skipped) + "."
+    return ToolResult(
+        success=True,
+        data={
+            "applied": apply,
+            "date": target_date.isoformat(),
+            "placed": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in placed],
+            "overnight_kept": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in overnight],
+            "skipped": [{"title": r["title"]} for r in skipped],
+            "moved": moved,
+        },
+        message=msg,
+    )
+
+
 class OrganizeDayTool(BaseTool):
     name = "organize_day"
     description = (
@@ -687,43 +741,13 @@ class OrganizeDayTool(BaseTool):
         except (ValueError, KeyError, TypeError):
             return ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.")
         apply = bool(kwargs.get("apply", False))
-
-        arrangement = solve_placement(user, target_date)  # fenêtre pleine journée
-        placed = [r for r in arrangement if not r["skipped"] and not r["overnight_kept"]]
-        overnight = [r for r in arrangement if r["overnight_kept"]]
-        skipped = [r for r in arrangement if r["skipped"] and not r.get("reporte_au_lendemain")]
-
-        moved = []
-        if apply:
-            for r in placed:
-                block = RecurringBlock.objects.filter(id=r["block_id"], user=user).first()
-                if block is None:
-                    continue
-                new_start = time(r["start_min"] // 60, r["start_min"] % 60)
-                new_end = time(r["end_min"] // 60, r["end_min"] % 60)
-                if block.start_time != new_start or block.end_time != new_end:
-                    block.start_time = new_start
-                    block.end_time = new_end
-                    block.save(update_fields=["start_time", "end_time"])
-                    moved.append({"title": block.title, "start_time": r["start_time"], "end_time": r["end_time"]})
-
-        listing = ", ".join(f"{r['title']} {r['start_time']}-{r['end_time']}" for r in placed) or "rien à replacer"
-        head = "J'ai réorganisé" if apply else "Proposition (rien changé)"
-        msg = f"{head} le {DAY_NAMES[target_date.weekday()]} {target_date.isoformat()}: {listing}."
-        if skipped:
-            msg += " Non placé (journée trop pleine): " + ", ".join(r["title"] for r in skipped) + "."
-        return ToolResult(
-            success=True,
-            data={
-                "applied": apply,
-                "date": target_date.isoformat(),
-                "placed": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in placed],
-                "overnight_kept": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in overnight],
-                "skipped": [{"title": r["title"]} for r in skipped],
-                "moved": moved,
-            },
-            message=msg,
-        )
+        # Kwarg PRIVE (agent v2): arrangement deja resolu et valide. Evite de
+        # re-resoudre a l'apply quand le plan vient d'etre verifie a
+        # l'identique. Jamais fourni par le modele ni v1.
+        arrangement = kwargs.pop("_arrangement", None)
+        if arrangement is None:
+            arrangement = solve_placement(user, target_date)  # fenêtre pleine journée
+        return _executer_organize_day(user, target_date, apply, arrangement)
 
 
 def _mettre_en_forme_semaine(user, start, arrangements):
