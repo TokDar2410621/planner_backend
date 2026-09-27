@@ -30,6 +30,12 @@ from services.pdf_extractor import (
 MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
 PDF_RENDER_ZOOM = 3  # ~216 DPI at zoom=3
 
+# Les photos sont envoyees a Gemini en PNG inline: une photo 12 MP
+# re-encodee depasse vite les limites de l'API. On downscale au-dela de
+# 2000 px sur le grand cote (comme le path PDF), largement suffisant
+# pour lire un horaire.
+MAX_IMAGE_SIDE_PX = 2000
+
 # Generic message persisted to / returned to the client on processing failure.
 # Raw exception strings must never leak to users (they can expose internals).
 GENERIC_PROCESSING_ERROR = (
@@ -50,6 +56,15 @@ try:
 except ImportError:
     HF_AVAILABLE = False
 
+try:
+    # Lecture des photos iPhone (HEIC/HEIF). Absent par defaut: _load_image
+    # leve alors une erreur EXPLICITE au lieu d'un crash PIL obscur.
+    from pillow_heif import register_heif_opener
+    HEIF_AVAILABLE = True
+except ImportError:
+    register_heif_opener = None
+    HEIF_AVAILABLE = False
+
 from datetime import time as dt_time
 from core.models import UploadedDocument, RecurringBlock
 from services.schedule_intent import has_schedule_signal
@@ -63,12 +78,14 @@ logger = logging.getLogger(__name__)
 PENDING_CONFIDENCE_THRESHOLD = 0.6
 
 
-def compute_block_confidence(*, start_defaulted, end_defaulted, title_generic, llm_confidence=None):
+def compute_block_confidence(*, start_defaulted, end_defaulted, title_generic, llm_confidence=None,
+                           day_ambiguous=False):
     """Confidence 0-1 that an extracted block is correct.
 
     Deterministic completeness score (penalise defaulted times / a generic
-    title), optionally blended with the model's own per-item confidence when the
-    extraction JSON provides one. Kept pure + module-level so it is unit-testable.
+    title / an ambiguous day), optionally blended with the model's own
+    per-item confidence when the extraction JSON provides one. Kept pure +
+    module-level so it is unit-testable.
     """
     score = 1.0
     if start_defaulted:
@@ -77,6 +94,11 @@ def compute_block_confidence(*, start_defaulted, end_defaulted, title_generic, l
         score -= 0.20
     if title_generic:
         score -= 0.25
+    if day_ambiguous:
+        # Jour resolu par heuristique (ex: "M" seul -> mardi ou mercredi):
+        # on ne veut PAS que ce bloc parte en planification sans validation.
+        # 1.0 - 0.45 = 0.55 < PENDING_CONFIDENCE_THRESHOLD (0.6) -> pending.
+        score -= 0.45
     score = max(0.0, min(1.0, score))
     if llm_confidence is not None:
         try:
@@ -90,10 +112,15 @@ def compute_block_confidence(*, start_defaulted, end_defaulted, title_generic, l
 
 def parse_time_string(time_str: str) -> Optional[dt_time]:
     """
-    Parse a time string like "08:00" or "14:30" to a time object.
+    Parse a time string like "08:00", "8h30" or "8h" to a time object.
+
+    Les minutes sont conservees EXACTES: l'ancien arrondi silencieux au
+    quart d'heure (8h07 -> 8h00) detruisait de l'information sans prevenir.
+    Si une quantisation est un jour necessaire en aval, elle se fera
+    explicitement la-bas, pas ici.
 
     Args:
-        time_str: Time string in HH:MM format
+        time_str: Time string in HH:MM, "8h30" or "8h" format
 
     Returns:
         time object or None if parsing fails
@@ -101,16 +128,13 @@ def parse_time_string(time_str: str) -> Optional[dt_time]:
     if not time_str:
         return None
     try:
-        parts = time_str.strip().split(':')
+        s = str(time_str).strip().lower().replace('h', ':').replace(' ', '')
+        parts = s.split(':')
         if len(parts) >= 2:
             hour = int(parts[0])
-            minute = int(parts[1])
-            # Normalize to quarter hours (00, 15, 30, 45)
-            minute = round(minute / 15) * 15
-            if minute == 60:
-                minute = 0
-                hour = (hour + 1) % 24
-            return dt_time(hour, minute)
+            minute = int(parts[1]) if parts[1] else 0
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return dt_time(hour, minute)
     except (ValueError, TypeError) as e:
         logger.warning(f"Could not parse time string '{time_str}': {e}")
     return None
@@ -162,7 +186,9 @@ class DocumentProcessor:
     # prompt ou de structure: le cache par hash de fichier ne doit JAMAIS
     # resservir une extraction d'une version anterieure (vecu: une photo de
     # matchs re-importee resservait l'extraction SANS dates d'avant le fix).
-    EXTRACTION_VERSION = 2
+    # v3 (2026-09-27): prompt durci (M seul positionnel, heures exactes),
+    # parse_time_string sans arrondi, _resolve_day, canal d'avertissements.
+    EXTRACTION_VERSION = 3
 
     # Unified extraction prompt that extracts all types of schedule data
     UNIFIED_EXTRACTION_PROMPT = """Tu es un expert en extraction de données d'emploi du temps. Analyse cette image avec une EXTRÊME PRÉCISION.
@@ -204,11 +230,16 @@ TOUJOURS convertir en français minuscule:
 - Ven/Ve/Fri/Friday → "vendredi"
 - Sam/Sa/Sat/Saturday → "samedi"
 - Dim/Di/Sun/Sunday → "dimanche"
+- M SEUL (en-têtes type L M M J V) : utilise la POSITION de la colonne.
+  Le 1er M après L = "mardi", le 2e M = "mercredi". Ne JAMAIS renvoyer "M"
+  seul dans le JSON : résous toujours avec la position avant d'écrire.
 
 === CONVERSION DES HEURES ===
-TOUJOURS format HH:MM (24h):
+TOUJOURS format HH:MM (24h), avec les minutes EXACTES, JAMAIS arrondies :
 - "8h" ou "8:00" → "08:00"
 - "8h30" ou "8:30" → "08:30"
+- "8h07" → "08:07" (PAS "08:00")
+- "14h52" → "14:52" (PAS "14:45" ni "15:00")
 - "14h" → "14:00"
 - "2pm" → "14:00"
 - "midi" → "12:00"
@@ -392,6 +423,35 @@ Analyse ce texte et retourne le JSON structuré:"""
         # English abbreviations
         'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4, 'sat': 5, 'sun': 6,
     }
+
+    @staticmethod
+    def _resolve_day(day_str, sibling_days=()):
+        """Resout un token de jour en 0-6. Retourne (jour, ambigu).
+
+        Le "M" seul est intrinsequement ambigu (mardi/mercredi): le prompt
+        demande au modele de le resoudre par la position de la colonne, mais
+        en filet de securite on tente ici une desambiguisation par les autres
+        jours du meme document (un document n'utilise pas deux tokens
+        differents pour le meme jour). Si ca echoue, on retourne
+        (None, True): l'appelant doit SIGNALER l'entree ignoree au lieu de
+        la jeter en silence.
+        """
+        if not day_str:
+            return None, False
+        key = str(day_str).strip().lower()
+        day = DocumentProcessor.DAY_MAPPING.get(key)
+        if day is not None:
+            return day, False
+        if key == 'm':
+            sibs = {str(s).strip().lower() for s in sibling_days if s}
+            mardi_tokens = {'mardi', 'mar', 'mar.', 'ma'}
+            mercredi_tokens = {'mercredi', 'mer', 'mer.', 'me'}
+            if (sibs & mardi_tokens) and not (sibs & mercredi_tokens):
+                return 2, True
+            if (sibs & mercredi_tokens) and not (sibs & mardi_tokens):
+                return 1, True
+            return None, True
+        return None, False
 
     def __init__(self):
         """Initialize the document processor with pdfplumber + Gemini."""
@@ -1006,13 +1066,51 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
         """
         Load an image file.
 
+        - HEIC/HEIF (photos iPhone): Pillow ne les lit pas sans pillow-heif.
+          Si la librairie manque, erreur EXPLICITE plutot qu'un crash obscur.
+        - Downscale: une photo 12 MP re-encodee en PNG inline depasse vite les
+          limites de l'API vision. On plafonne le grand cote a
+          MAX_IMAGE_SIDE_PX (meme logique que le path PDF), largement
+          suffisant pour lire un horaire.
+
         Args:
             file_path: Path to the image file
 
         Returns:
             PIL.Image: The loaded image
         """
-        return Image.open(file_path)
+        if self._is_heic_file(file_path):
+            if not HEIF_AVAILABLE:
+                raise RuntimeError(
+                    "Photo HEIC non prise en charge sur ce serveur "
+                    "(librairie pillow-heif manquante)"
+                )
+            register_heif_opener()
+        image = Image.open(file_path)
+        if max(image.size) > MAX_IMAGE_SIDE_PX:
+            image = image.copy()
+            image.thumbnail((MAX_IMAGE_SIDE_PX, MAX_IMAGE_SIDE_PX), Image.LANCZOS)
+            logger.info(
+                f"Image downscaled to {image.size} (cap {MAX_IMAGE_SIDE_PX}px)"
+            )
+        return image
+
+    @staticmethod
+    def _is_heic_file(file_path: str) -> bool:
+        """Detecte un conteneur HEIC/HEIF par ses magic bytes (ftyp@4)."""
+        try:
+            with open(file_path, 'rb') as f:
+                header = f.read(16)
+            return (
+                len(header) >= 12
+                and header[4:8] == b'ftyp'
+                and header[8:12] in (
+                    b'heic', b'heix', b'hevc', b'hevx', b'heim', b'heis',
+                    b'hevm', b'hevs', b'mif1', b'msf1',
+                )
+            )
+        except OSError:
+            return False
 
     def _get_extraction_prompt(self, doc_type: str) -> str:
         """
@@ -1058,7 +1156,8 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
             logger.warning(f"JSON decode error: {e}")
             return {"raw_response": response_text, "parse_error": True}
 
-    def _confidence_status(self, *, start_defaulted, end_defaulted, title_generic, llm_confidence=None):
+    def _confidence_status(self, *, start_defaulted, end_defaulted, title_generic, llm_confidence=None,
+                           day_ambiguous=False):
         """Return (confidence, status) for one extracted block.
 
         Blocks below PENDING_CONFIDENCE_THRESHOLD are created as 'pending' so
@@ -1069,6 +1168,7 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
             end_defaulted=end_defaulted,
             title_generic=title_generic,
             llm_confidence=llm_confidence,
+            day_ambiguous=day_ambiguous,
         )
         status = (
             RecurringBlock.STATUS_PENDING
@@ -1184,6 +1284,10 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
         """
         Create RecurringBlock instances from ALL extracted data types.
 
+        Les degradations (jour ignore, heure par defaut, jour ambigu) sont
+        collectees dans data['_warnings']: fini le silence, l'agent voit ce
+        qui a ete perdu ou approxime et peut le dire a l'utilisateur.
+
         Args:
             document: The source document
             data: Extracted data dictionary
@@ -1192,7 +1296,16 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
             list: List of created RecurringBlock instances
         """
         created_blocks = []
+        warnings = []
         user = document.user
+
+        # Tous les tokens de jour du document: sert a desambiguiser le "M"
+        # seul (mardi/mercredi) par le contexte.
+        sibling_days = (
+            [c.get('day') for c in data.get('courses', [])]
+            + [s.get('day') for s in data.get('shifts', [])]
+            + [e.get('day') for e in data.get('events', [])]
+        )
 
         # Check if blocks already exist for this document (prevent duplicates).
         # Use all_objects so pending blocks from a prior run also count.
@@ -1216,14 +1329,20 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                 if self._create_dated_entry(user, course, 'Cours', created_blocks):
                     continue
                 day_str = course.get('day', '')
-                if day_str:
-                    day = self.DAY_MAPPING.get(day_str.lower().strip())
-                else:
-                    day = None
+                day, day_ambiguous = self._resolve_day(day_str, sibling_days)
 
                 if day is None:
-                    logger.warning(f"Invalid day '{day_str}' for course: {course.get('name', 'Unknown')}")
+                    msg = (f"Entrée « {course.get('name', 'Cours')} » ignorée : "
+                           f"jour « {day_str} » non reconnu")
+                    logger.warning(msg)
+                    warnings.append(msg)
                     continue
+                if day_ambiguous:
+                    warnings.append(
+                        f"Jour ambigu « {day_str} » pour « {course.get('name', 'Cours')} » "
+                        f"résolu par heuristique ({'mercredi' if day == 2 else 'mardi'}) : "
+                        "bloc en attente de confirmation"
+                    )
 
                 # Parse time strings to time objects
                 start_time = parse_time_string(course.get('start_time', ''))
@@ -1233,10 +1352,16 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
 
                 if start_time is None:
                     start_time = dt_time(9, 0)  # Default 09:00
-                    logger.warning(f"Using default start time for course: {course.get('name', 'Unknown')}")
+                    msg = (f"Heure de début illisible pour « {course.get('name', 'Cours')} » "
+                           ": 09:00 par défaut")
+                    logger.warning(msg)
+                    warnings.append(msg)
                 if end_time is None:
                     end_time = dt_time(10, 0)  # Default 10:00
-                    logger.warning(f"Using default end time for course: {course.get('name', 'Unknown')}")
+                    msg = (f"Heure de fin illisible pour « {course.get('name', 'Cours')} » "
+                           ": 10:00 par défaut")
+                    logger.warning(msg)
+                    warnings.append(msg)
 
                 try:
                     # Handle None values from JSON (including string "None" from Gemini)
@@ -1267,6 +1392,7 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                         end_defaulted=end_defaulted,
                         title_generic=not (course.get('name') or '').strip(),
                         llm_confidence=course.get('confidence'),
+                        day_ambiguous=day_ambiguous,
                     )
 
                     course_start, course_end = self._entry_bounds(course)
@@ -1295,14 +1421,20 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                 if self._create_dated_entry(user, shift, 'Travail', created_blocks):
                     continue
                 day_str = shift.get('day', '')
-                if day_str:
-                    day = self.DAY_MAPPING.get(day_str.lower().strip())
-                else:
-                    day = None
+                day, day_ambiguous = self._resolve_day(day_str, sibling_days)
 
                 if day is None:
-                    logger.warning(f"Invalid day '{day_str}' for shift")
+                    msg = (f"Shift « {shift.get('role', 'Travail')} » ignoré : "
+                           f"jour « {day_str} » non reconnu")
+                    logger.warning(msg)
+                    warnings.append(msg)
                     continue
+                if day_ambiguous:
+                    warnings.append(
+                        f"Jour ambigu « {day_str} » pour un shift "
+                        f"résolu par heuristique ({'mercredi' if day == 2 else 'mardi'}) : "
+                        "bloc en attente de confirmation"
+                    )
 
                 # Parse time strings to time objects
                 start_time = parse_time_string(shift.get('start_time', ''))
@@ -1312,8 +1444,14 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
 
                 if start_time is None:
                     start_time = dt_time(9, 0)
+                    msg = "Heure de début illisible pour un shift : 09:00 par défaut"
+                    logger.warning(msg)
+                    warnings.append(msg)
                 if end_time is None:
                     end_time = dt_time(17, 0)
+                    msg = "Heure de fin illisible pour un shift : 17:00 par défaut"
+                    logger.warning(msg)
+                    warnings.append(msg)
 
                 try:
                     # Handle None values from JSON (including string "None" from Gemini)
@@ -1342,6 +1480,7 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                         end_defaulted=end_defaulted,
                         title_generic=not role,
                         llm_confidence=shift.get('confidence'),
+                        day_ambiguous=day_ambiguous,
                     )
 
                     block = RecurringBlock.objects.create(
@@ -1379,14 +1518,20 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                 title = 'Événement' if title_generic else raw_title.strip()
 
                 day_str = event.get('day', '')
-                if day_str:
-                    day = self.DAY_MAPPING.get(day_str.lower().strip())
-                else:
-                    day = None
+                day, day_ambiguous = self._resolve_day(day_str, sibling_days)
 
                 if day is None:
-                    logger.warning(f"Invalid day '{day_str}' for event: {event.get('title', 'Unknown')}")
+                    msg = (f"Événement « {raw_title or 'Événement'} » ignoré : "
+                           f"jour « {day_str} » non reconnu")
+                    logger.warning(msg)
+                    warnings.append(msg)
                     continue
+                if day_ambiguous:
+                    warnings.append(
+                        f"Jour ambigu « {day_str} » pour « {raw_title or 'Événement'} » "
+                        f"résolu par heuristique ({'mercredi' if day == 2 else 'mardi'}) : "
+                        "bloc en attente de confirmation"
+                    )
 
                 # Parse time strings to time objects
                 start_time = parse_time_string(event.get('start_time', ''))
@@ -1396,8 +1541,16 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
 
                 if start_time is None:
                     start_time = dt_time(9, 0)
+                    msg = (f"Heure de début illisible pour « {raw_title or 'Événement'} » "
+                           ": 09:00 par défaut")
+                    logger.warning(msg)
+                    warnings.append(msg)
                 if end_time is None:
                     end_time = dt_time(10, 0)
+                    msg = (f"Heure de fin illisible pour « {raw_title or 'Événement'} » "
+                           ": 10:00 par défaut")
+                    logger.warning(msg)
+                    warnings.append(msg)
 
                 try:
                     # Handle None values from JSON (including string "None" from Gemini)
@@ -1418,6 +1571,7 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                         end_defaulted=end_defaulted,
                         title_generic=title_generic,
                         llm_confidence=event.get('confidence'),
+                        day_ambiguous=day_ambiguous,
                     )
 
                     ev_start, ev_end = self._entry_bounds(event)
@@ -1438,5 +1592,14 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                     logger.info(f"Created event block: {block.title} (conf={confidence}, {block_status}) on day {day}")
                 except Exception as e:
                     logger.error(f"Error creating event block '{event.get('title', 'Unknown')}': {e}")
+
+        # Canal d'avertissements: ce qui a ete ignore ou approxime est
+        # persisté dans extracted_data pour que l'agent le voie (il dump ce
+        # JSON dans son contexte) au lieu de croire a une extraction parfaite.
+        if warnings:
+            data['_warnings'] = warnings
+            document.extracted_data = data
+            document.save(update_fields=['extracted_data'])
+            logger.info(f"Document {document.id}: {len(warnings)} extraction warning(s)")
 
         return created_blocks

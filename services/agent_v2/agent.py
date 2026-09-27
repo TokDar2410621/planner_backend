@@ -1441,6 +1441,11 @@ class PlannerAgentV2:
                         attachment.refresh_from_db()
                         if attachment.processed:
                             break
+                        if attachment.processing_error:
+                            # L'analyse a ECHOUE: inutile d'attendre la borne
+                            # de 45 s pour annoncer un "retard" qui n'en est
+                            # pas un. Le contexte ci-dessous le dit franchement.
+                            break
                         if tic and tic % 16 == 0:
                             yield ({"type": "status",
                                     "text": "J'analyse ton document... (presque fini)"}, None)
