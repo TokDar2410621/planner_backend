@@ -16,10 +16,12 @@ import time
 from django.contrib.auth.models import User
 from django.test import TestCase
 
+from services.agent.tools import ALL_TOOLS
 from services.agent.tools.base import ToolResult
 from services.agent_v2.outils import _fabriquer, outils_pour
 from services.agent_v2.prompts import REGLES_AGIR
-from services.agent_v2.registre import OUTILS_DE_MUTATION, Registre
+from services.agent_v2.registre import (OUTILS_DE_MUTATION, OUTILS_PARALLELES,
+                                        Registre)
 
 
 class _Piste:
@@ -132,16 +134,26 @@ class MutationsSerialiseesTests(TestCase):
         self.assertEqual(piste.max_en_cours, 1)
         self.assertEqual(len(registre.actions), 2)
 
-    def test_flags_sequential_mutations_seulement(self):
+    def test_flags_sequential_allowlist(self):
         user = User.objects.create_user(username="par3")
         registre = Registre()
         for outil in outils_pour(user, registre):
             with self.subTest(outil=outil.name):
                 self.assertEqual(
                     outil.tool_def.sequential,
-                    outil.name in OUTILS_DE_MUTATION,
-                    "seules les mutations forcent le batch en séquentiel",
+                    outil.name not in OUTILS_PARALLELES,
+                    "seules les lectures auditees partent en parallele; "
+                    "tout nouvel outil est sequentiel par defaut",
                 )
+
+    def test_chaque_outil_du_modele_est_classe(self):
+        noms = {t.name for t in ALL_TOOLS}
+        self.assertEqual(
+            noms - OUTILS_PARALLELES, noms & OUTILS_DE_MUTATION,
+            "chaque outil du modele est soit une mutation (sequentiel), "
+            "soit une lecture auditee (parallele): aucun ne doit rester "
+            "non classe",
+        )
 
 
 class PromptBatchingTests(TestCase):
@@ -149,3 +161,109 @@ class PromptBatchingTests(TestCase):
         self.assertIn("LECTURES GROUPEES", REGLES_AGIR)
         self.assertIn("en un seul bloc d'appels", REGLES_AGIR)
         self.assertIn("Ne groupe jamais une ecriture", REGLES_AGIR)
+
+
+class BatchReelTests(TestCase):
+    """Un vrai lot multi-appels, dispatché par pydantic-ai lui-même.
+
+    test_trois_lectures_se_chevauchent prouvait que les wrappers se
+    chevauchent via asyncio.gather; ici c'est le MODELE (faux) qui émet
+    trois appels dans UNE SEULE réponse, et c'est le dispatch réel de
+    pydantic-ai qui décide parallèle ou séquentiel selon les drapeaux
+    sequential. Sans réseau: FunctionModel ne fait aucun appel HTTP.
+    """
+
+    def test_batch_modele_trois_lectures_en_parallele(self):
+        from pydantic_ai import Agent
+        from pydantic_ai.messages import (ModelResponse, TextPart,
+                                          ToolCallPart)
+        from pydantic_ai.models.function import AgentInfo, FunctionModel
+        from pydantic_ai.tools import Tool
+
+        user = User.objects.create_user(username="par-batch")
+        registre = Registre()
+        piste = _Piste()
+        fabriques = {
+            f"lecture_test_{c}": _fabriquer(
+                _FauxOutil(f"lecture_test_{c}", piste), user,
+                registre, "montre mon planning", f"tache-batch-{c}")
+            for c in "abc"
+        }
+
+        def _outil(nom):
+            async def _appel() -> str:
+                return await fabriques[nom]()
+
+            _appel.__name__ = nom
+            return Tool(_appel, name=nom, description="lecture de test",
+                        sequential=False)
+
+        def _fonction(messages, info: AgentInfo) -> ModelResponse:
+            if any(isinstance(m, ModelResponse) for m in messages):
+                return ModelResponse(parts=[TextPart(content="voilà")])
+            return ModelResponse(parts=[
+                ToolCallPart(tool_name=f"lecture_test_{c}", args={},
+                             tool_call_id=f"appel-{c}")
+                for c in "abc"
+            ])
+
+        agent = Agent(FunctionModel(_fonction),
+                      tools=[_outil(f"lecture_test_{c}") for c in "abc"])
+        resultat = asyncio.run(agent.run("montre mon planning"))
+        # Le dispatch a chevauché les trois lectures, pas l'une après l'autre.
+        self.assertEqual(piste.max_en_cours, 3)
+        self.assertEqual(len(registre.actions), 3)
+        self.assertIn("voilà", resultat.output)
+
+    def test_batch_mixte_lecture_mutation_reste_sequentiel(self):
+        """Contre-épreuve: un seul appel marqué sequential dans le lot force
+        TOUT le lot en séquentiel (sémantique pydantic-ai). C'est ce qui
+        protège les mutations quand le modèle les batche avec des lectures.
+        """
+        from pydantic_ai import Agent
+        from pydantic_ai.messages import (ModelResponse, TextPart,
+                                          ToolCallPart)
+        from pydantic_ai.models.function import AgentInfo, FunctionModel
+        from pydantic_ai.tools import Tool
+
+        user = User.objects.create_user(username="par-batch-mixte")
+        registre = Registre()
+        piste = _Piste()
+        fabriques = {
+            "lecture_test_a": _fabriquer(
+                _FauxOutil("lecture_test_a", piste), user, registre,
+                "montre mon planning", "tache-mixte-a"),
+            # Nom de vraie mutation: _fabriquer lui fait tenir le verrou
+            # du tour, comme en production.
+            "create_task": _fabriquer(
+                _FauxOutil("create_task", piste), user, registre,
+                "cree une tache", "tache-mixte-m"),
+        }
+
+        def _outil(nom, sequential):
+            async def _appel() -> str:
+                return await fabriques[nom]()
+
+            _appel.__name__ = nom
+            return Tool(_appel, name=nom, description="outil de test",
+                        sequential=sequential)
+
+        def _fonction(messages, info: AgentInfo) -> ModelResponse:
+            if any(isinstance(m, ModelResponse) for m in messages):
+                return ModelResponse(parts=[TextPart(content="voilà")])
+            return ModelResponse(parts=[
+                ToolCallPart(tool_name="lecture_test_a", args={},
+                             tool_call_id="appel-a"),
+                ToolCallPart(tool_name="create_task", args={},
+                             tool_call_id="appel-m"),
+            ])
+
+        agent = Agent(FunctionModel(_fonction), tools=[
+            _outil("lecture_test_a", sequential=False),
+            _outil("create_task", sequential=True),
+        ])
+        resultat = asyncio.run(agent.run("montre mon planning"))
+        # Le lot mixte est resté séquentiel: jamais deux outils à la fois.
+        self.assertEqual(piste.max_en_cours, 1)
+        self.assertEqual(len(registre.actions), 2)
+        self.assertIn("voilà", resultat.output)

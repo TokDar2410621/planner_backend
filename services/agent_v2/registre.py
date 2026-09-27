@@ -30,6 +30,36 @@ OUTILS_DE_MUTATION = {
 }
 
 
+# Les outils du modele autorises a tourner EN PARALLELE dans un meme lot
+# d'appels (sequential=False). Audit du 2026-09-27, outil par outil:
+# aucun n'ecrit en base dans son execute(), aucun ne mute l'etat du tour
+# (etat.attente, etat.cache) dans _executer_appel: _analyser ne renvoie
+# de garde que pour les outils destructifs, _garde_creations et
+# _titre_du_formulaire rendent la main sauf pour les createurs (verrou
+# du tour tenu), _abandon_cible_changee n'est joignable que sur les
+# motifs portee_jour/destructif, _apres ne touche que schedule_task_at,
+# create_block et update_block, et _consigner passe par le registre
+# thread-safe et une file d'envoi thread-safe. send_notification a un
+# effet externe (push) mais sans etat partage: le parallelisme ne change
+# que le moment de l'envoi, pas sa semantique (aucune idempotence avant
+# comme apres). present_form/present_choices rendent leur demande dans
+# les donnees de l'action, consommees une par une au rendu.
+#
+# REGLE: tout nouvel outil du modele est SEQUENTIEL par defaut. On ne
+# l'ajoute ici qu'apres audit de son execute() et de son passage dans
+# _executer_appel. Un oubli coute du temps (lot sequentiel), jamais un
+# bug de concurrence.
+OUTILS_PARALLELES = frozenset({
+    "list_blocks", "list_tasks",
+    "get_today_schedule", "get_week_schedule", "find_free_slots",
+    "check_feasibility", "detect_conflicts", "get_productivity_stats",
+    "suggest_schedule_optimization",
+    "get_preferences", "list_goals",
+    "send_notification",
+    "present_form", "present_choices",
+})
+
+
 @dataclass(frozen=True)
 class Action:
     id: str

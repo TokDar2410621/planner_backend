@@ -54,7 +54,8 @@ from pydantic_ai.tools import Tool
 from services.agent.tools import ALL_TOOLS, TOOL_MAP
 from services.agent.tools.base import ToolResult
 from services.agent_v2 import demandes as dem
-from services.agent_v2.registre import (OUTILS_DE_MUTATION, Registre,
+from services.agent_v2.registre import (OUTILS_DE_MUTATION, OUTILS_PARALLELES,
+                                Registre,
                                         _empreinte, boucle_detectee)
 
 logger = logging.getLogger(__name__)
@@ -2030,9 +2031,11 @@ def outils_pour(user: User, registre: Registre, message_du_tour: str = "",
             outil.name,
             outil.description,
             outil.parameters,
-            # Une mutation dans le batch force TOUT le batch en sequentiel
-            # (pydantic-ai): les lectures pures, elles, partent en parallele.
-            sequential=(outil.name in OUTILS_DE_MUTATION),
+            # Allowlist: seules les lectures auditees partent en parallele.
+            # Tout nouvel outil est sequentiel par defaut (pydantic-ai force
+            # alors tout le lot en sequentiel), ce qui rend l'oubli sans
+            # danger. Voir OUTILS_PARALLELES dans registre.py.
+            sequential=(outil.name not in OUTILS_PARALLELES),
         )
         for outil in ALL_TOOLS
     ]
