@@ -305,3 +305,116 @@ def solve_placement(user, date, day_start=0, day_end=MINUTES_PER_DAY, time_limit
         r["block_id"],
     ))
     return results
+
+
+def _empreinte_entrees(user, debut, fin) -> str:
+    """Corps commun des empreintes: blocs (modeles, independants de la
+    fenetre) + exceptions/ponctuels sur [debut, fin) + profil."""
+    import hashlib
+    import json
+
+    from core.models import (
+        RecurringBlock,
+        RecurringBlockException,
+        ScheduledBlock,
+    )
+
+    blocs = (
+        RecurringBlock.objects.filter(user=user)
+        .select_related("place")
+        .order_by("id")
+    )
+    entrees_blocs = [
+        [
+            b.id, b.day_of_week, str(b.start_time), str(b.end_time),
+            b.flexibility, b.active, b.block_type, b.is_night_shift,
+            b.duration_minutes, str(b.start_date), str(b.end_date),
+            b.place_id,
+            (getattr(b.place, "travel_minutes", 0) or 0) if b.place_id else 0,
+        ]
+        for b in blocs
+    ]
+    exceptions = [
+        [bid, str(d)]
+        for bid, d in (
+            RecurringBlockException.objects.filter(
+                user=user, date__gte=debut, date__lt=fin
+            )
+            .order_by("recurring_block_id", "date")
+            .values_list("recurring_block_id", "date")
+        )
+    ]
+    ponctuels = (
+        ScheduledBlock.objects.filter(user=user, date__gte=debut, date__lt=fin)
+        .select_related("task", "task__place")
+        .order_by("id")
+    )
+    entrees_ponctuels = [
+        [
+            s.id, str(s.date), str(s.start_time), str(s.end_time),
+            s.actually_completed,
+            (s.task.completed if s.task_id else None),
+            (getattr(getattr(s.task, "place", None), "travel_minutes", 0) or 0),
+        ]
+        for s in ponctuels
+    ]
+    profil = getattr(user, "profile", None)
+    entrees_profil = [
+        (getattr(profil, "transport_time_minutes", 0) or 0),
+        (getattr(profil, "prep_time_minutes", 0) or 0),
+        (getattr(profil, "safety_margin_minutes", 0) or 0),
+    ]
+
+    brut = json.dumps(
+        {
+            "blocs": entrees_blocs,
+            "exceptions": exceptions,
+            "ponctuels": entrees_ponctuels,
+            "profil": entrees_profil,
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha1(brut.encode("utf-8")).hexdigest()[:16]
+
+
+def empreinte_entrees_semaine(user, start_date) -> str:
+    """Empreinte de TOUT ce que :func:`solve_placement` lit pour la semaine
+    [start_date, start_date + 7 jours).
+
+    Le solveur est deterministe (random_seed = 0): a entrees identiques, plan
+    identique. L'agent v2 s'en sert pour resservir un plan propose au lieu de
+    re-resoudre 7 jours a la confirmation.
+
+    COLOCALISEE avec le solveur a dessein: si solve_placement se met a lire
+    une nouvelle source (champ, table), c'est ICI qu'on l'ajoute. Oublier une
+    entree = resservir un plan perime apres une modification reelle.
+
+    Sources couvertes (7 jours + veille pour le debordement overnight):
+    - RecurringBlock: heures, flexibilite, actif, type, nuit, duree, bornes,
+      lieu (travel_minutes);
+    - RecurringBlockException: occurrences sautees;
+    - ScheduledBlock: date, heures, actually_completed, tache completee,
+      lieu de la tache (travel_minutes);
+    - profil: temps de transport / preparation / marge (murs de trajet).
+    """
+    from datetime import timedelta
+
+    return _empreinte_entrees(
+        user, start_date - timedelta(days=1), start_date + timedelta(days=7)
+    )
+
+
+def empreinte_entrees_jour(user, jour) -> str:
+    """Empreinte de TOUT ce que :func:`solve_placement` lit pour UN jour.
+
+    Fenetre [jour - 1, jour + 1): le jour + la veille (le sommeil reporte
+    de la veille mure le matin). Meme corps que l'empreinte semaine, meme
+    regle de colocalisation: toute nouvelle source lue par solve_placement
+    s'ajoute dans _empreinte_entrees.
+    """
+    from datetime import timedelta
+
+    return _empreinte_entrees(
+        user, jour - timedelta(days=1), jour + timedelta(days=1)
+    )
