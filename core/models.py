@@ -1182,3 +1182,26 @@ class ReveilPlanning(models.Model):
 
     def __str__(self):
         return f"ReveilPlanning {self.user_id} demande={self.demande_a} envoye={self.envoye_a}"
+
+
+class BudgetJetonsJournalier(models.Model):
+    """Compteur de jetons LLM par utilisateur et par jour (agent v2).
+
+    Garde-fou facture: quand le compteur atteint AGENT_V2_BUDGET_JETONS_JOUR,
+    les phases LLM du tour (AGIR, DIRE, LIRE) sont sautees et le tour se
+    degrade vers registre + repli. Le chemin rapide du code (D6) reste
+    utilisable: il ne coute aucun jeton.
+    """
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='budgets_jetons'
+    )
+    jour = models.DateField()
+    jetons = models.PositiveIntegerField(default=0)
+    mis_a_jour = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [('user', 'jour')]
+        indexes = [models.Index(fields=['user', 'jour'])]
+
+    def __str__(self):
+        return f"BudgetJetons {self.user.username} {self.jour}: {self.jetons}"

@@ -26,11 +26,14 @@ import queue
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Optional
 
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import close_old_connections
+from django.db.models import F
+from django.utils import timezone
 from pydantic_ai import Agent, ModelRetry
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (ModelRequest, ModelResponse, PartDeltaEvent,
@@ -38,7 +41,7 @@ from pydantic_ai.messages import (ModelRequest, ModelResponse, PartDeltaEvent,
                                   ThinkingPart, ThinkingPartDelta, UserPromptPart)
 from pydantic_ai.usage import UsageLimits
 
-from core.models import ConversationMessage, UploadedDocument
+from core.models import BudgetJetonsJournalier, ConversationMessage, UploadedDocument
 from services.agent_v2 import lecture, regles
 from services.agent_v2.mesure import epurer_reponse, fuites_reponse, questions_et_offres
 from services.agent_v2.modeles import REGLAGES_DIRE, modele_agir, modele_dire
@@ -56,6 +59,85 @@ logger = logging.getLogger(__name__)
 
 BUDGET_ETAPES = 10
 HISTORIQUE_MAX = 20
+
+
+# ── Garde-fous de disponibilite et de cout ────────────────────────────────
+#
+# Deux risques documentes mais non bornes: un tour sans deadline murale
+# (397 s mesures en prod le 2026-08-29) et une facture LLM sans plafond.
+# La philosophie reste la meme que budget_epuise: le tour est tronque,
+# jamais rate. Le registre survit, les faits deja vrais sont rendus.
+
+
+def _delai_tour() -> float:
+    """Duree murale maximale d'un tour (AGIR + DIRE), en secondes."""
+    try:
+        return max(1.0, float(getattr(settings, "AGENT_V2_DELAI_TOUR", 180.0)))
+    except (TypeError, ValueError):
+        return 180.0
+
+
+def _budget_jetons_agir() -> int:
+    try:
+        return max(0, int(getattr(settings, "AGENT_V2_BUDGET_JETONS_AGIR", 300000)))
+    except (TypeError, ValueError):
+        return 300000
+
+
+def _budget_jetons_dire() -> int:
+    try:
+        return max(0, int(getattr(settings, "AGENT_V2_BUDGET_JETONS_DIRE", 100000)))
+    except (TypeError, ValueError):
+        return 100000
+
+
+def _budget_jetons_jour() -> int:
+    try:
+        return max(0, int(getattr(settings, "AGENT_V2_BUDGET_JETONS_JOUR", 2000000)))
+    except (TypeError, ValueError):
+        return 2000000
+
+
+def _limites_jetons(budget: int) -> dict:
+    """Parametres UsageLimits pour un budget jetons (total = entree + sortie).
+    Un budget nul ou negatif desactive la garde plutot qu'imposer un plafond
+    de zero qui tronquerait chaque tour."""
+    if budget > 0:
+        return {"total_tokens_limit": budget}
+    return {}
+
+
+def _jetons_phase(cout: dict) -> int:
+    """Jetons consommes par une phase, depuis son dict _cout."""
+    if not isinstance(cout, dict):
+        return 0
+    return sum(int(cout.get(k, 0) or 0) for k in ("entree", "sortie", "raisonnement"))
+
+
+def _budget_jour_epuise(user) -> bool:
+    """Le compteur journalier de l'utilisateur a-t-il atteint le plafond ?
+
+    Un compteur illisible (table absente, DB en vrac) ne bloque jamais un
+    tour: la garde est un coupe-circuit, pas un verrou.
+    """
+    if _budget_jetons_jour() <= 0:
+        return False
+    try:
+        ligne = BudgetJetonsJournalier.objects.filter(
+            user=user, jour=timezone.localdate()).first()
+    except Exception:  # noqa: BLE001
+        return False
+    return ligne is not None and (ligne.jetons or 0) >= _budget_jetons_jour()
+
+
+def _enregistrer_jetons(user, total: int) -> None:
+    """Ajoute les jetons du tour au compteur journalier (increment atomique)."""
+    if total <= 0:
+        return
+    ligne, _ = BudgetJetonsJournalier.objects.get_or_create(
+        user=user, jour=timezone.localdate(), defaults={"jetons": 0})
+    BudgetJetonsJournalier.objects.filter(pk=ligne.pk).update(
+        jetons=F("jetons") + int(total))
 
 # Une phrase TERMINEE dans un flux de texte: ponctuation finale, guillemets
 # fermants eventuels, puis une espace. Tant que l'espace n'est pas arrivee,
@@ -79,6 +161,10 @@ REPLI_QUESTION = "Je n'ai pas compris. Tu veux ajouter, déplacer ou voir quelqu
 PROSE_FORMULAIRE = "Il me manque quelques précisions."
 PROSE_REPRISE = "Il me faut juste cette précision avant de toucher à ton horaire."
 PROSE_ANNULEE = "D'accord, je ne change rien."
+PROSE_DELAI = ("J'ai mis trop de temps à te répondre, je m'arrête ici. "
+               "Ce qui est déjà fait est affiché plus haut.")
+PROSE_BUDGET_JOUR = ("J'ai atteint ma limite d'IA pour aujourd'hui, "
+                     "je ne peux pas traiter ça maintenant. Réessaie demain.")
 
 # POOL DE THREADS REUTILISES, et le mot « reutilises » porte tout le poids.
 #
@@ -445,13 +531,15 @@ class PlannerAgentV2:
             resultat = agent.run_sync(
                 message,
                 message_history=self._historique(user),
-                usage_limits=UsageLimits(request_limit=BUDGET_ETAPES),
+                usage_limits=UsageLimits(request_limit=BUDGET_ETAPES,
+                                             **_limites_jetons(_budget_jetons_agir())),
                 event_stream_handler=self._sur_evenements,
             )
             self._cout_agir = _cout(resultat, time.perf_counter() - depart)
         except UsageLimitExceeded:
             # Le tour est tronque, pas rate: les outils deja executes ont
             # ecrit. Le bloc factuel le dira, c'est tout l'interet du registre.
+            # Declenche par le budget d'etapes OU le budget jetons.
             registre.budget_epuise = True
             self._cout_agir = {"etapes": BUDGET_ETAPES, "entree": 0, "sortie": 0,
                                "duree": time.perf_counter() - depart}
@@ -518,13 +606,19 @@ class PlannerAgentV2:
             close_old_connections()
             try:
                 depart_dire = time.perf_counter()
-                sortie = agent.run_sync(brief)
+                sortie = agent.run_sync(
+                    brief,
+                    usage_limits=UsageLimits(**_limites_jetons(_budget_jetons_dire())),
+                )
                 self._cout_dire = _cout(sortie, time.perf_counter() - depart_dire)
                 return sortie.output
             finally:
                 close_old_connections()
 
-        return _POOL_AGIR.submit(_rediger).result()
+        # Sans delai, un fournisseur lent tient le tour (et le worker) sans
+        # limite. Au depassement, TimeoutError remonte vers le repli du tour,
+        # qui rend les faits deja vrais: meme philosophie que budget_epuise.
+        return _POOL_AGIR.submit(_rediger).result(timeout=self._delai_restant())
 
     @staticmethod
     def _brief_dire(message: str, registre: Registre, etat: dict, faits: str,
@@ -601,6 +695,7 @@ class PlannerAgentV2:
         reste du tour lit le message comme avant."""
         self.user = user
         depart_tour = time.perf_counter()
+        self._depart_tour = depart_tour  # lu par _delai_restant (deadline du tour)
         self._cout_agir, self._cout_dire = {}, {}
         # Le message TAPE, avant tout enrichissement: c'est lui que lisent la
         # garde et les boutons forces.
@@ -695,10 +790,16 @@ class PlannerAgentV2:
         # Round 8: une piece jointe est toujours une demande pour AGIR, meme
         # quand le texte tape ne fait que repondre.
         par_le_code = attachment is None and self._tour_decide(registre, message)
+        # Compteur journalier epuise: on saute les phases LLM (LIRE, AGIR,
+        # DIRE). Le tour continue avec le registre tel quel: les choix du
+        # code et les faits restent rendus, sans couter un jeton de plus.
+        budget_jour_epuise = not par_le_code and _budget_jour_epuise(user)
+        if budget_jour_epuise:
+            logger.warning("agent_v2 budget jetons journalier epuise user=%s", user.pk)
         voix_agir = bool(getattr(getattr(user, "profile", None), "voix_agir", False))
         raisonnement, panne = "", None
         suivi_lire = lecture.sautee()
-        if par_le_code:
+        if par_le_code or budget_jour_epuise:
             self._file_pensees = None
         else:
             yield {"type": "status", "text": "Réflexion..."}
@@ -806,7 +907,8 @@ class PlannerAgentV2:
         panne_dire = False
         # Regle formulaire_cours: DIRE n'est pas appele. L'absence fausse et
         # les puces inventees ne peuvent plus s'ecrire; le code parle seul.
-        if par_le_code or prose_regle:
+        # Budget journalier epuise: meme traitement, sans appel LLM.
+        if par_le_code or prose_regle or budget_jour_epuise:
             compo = composer(None, registre, faits, gagnant)
         elif voix_agir:
             # Une seule tete (2026-09-17): celui qui a reflechi parle. Le
@@ -834,6 +936,8 @@ class PlannerAgentV2:
             except Exception as e:  # noqa: BLE001
                 logger.error("DIRE a echoue: %s", e, exc_info=True)
                 panne_dire = True
+                if isinstance(e, FuturesTimeoutError):
+                    registre.delai_depasse = True
                 compo = composer(None, registre, faits, gagnant)
 
         # Zero tiret long dans ce que lit l'utilisateur, quelle que soit la
@@ -860,10 +964,17 @@ class PlannerAgentV2:
             gagnant.get("source") == "formulaire" else None
         if panne_dire and faits and not prose:
             # DIRE est tombe. Se taire laisserait croire que rien n'a eu lieu.
-            prose = REPLI_PROSE if mutation_reussie else REPLI_PROSE_LECTURE
+            if registre.delai_depasse:
+                prose = PROSE_DELAI
+            else:
+                prose = REPLI_PROSE if mutation_reussie else REPLI_PROSE_LECTURE
         if formulaire and not faits and not prose:
             prose = PROSE_FORMULAIRE
-        if not faits and not prose and not question and not formulaire:
+        if budget_jour_epuise and not faits and not prose and not question and not formulaire:
+            # Le compteur journalier est epuise et le tour n'a rien produit:
+            # on le dit plutot que de laisser un silence.
+            prose, motif = PROSE_BUDGET_JOUR, "budget_jour"
+        elif not faits and not prose and not question and not formulaire:
             question, motif, chips = REPLI_QUESTION, "dire", []
 
         if prose:
@@ -948,6 +1059,16 @@ class PlannerAgentV2:
         )
 
         question_affichee = "" if motif == "formulaire" else question
+
+        # Compteur journalier (garde-fou facture): son echec ne doit jamais
+        # casser un tour qui vient de reussir.
+        try:
+            total_jetons = _jetons_phase(cout_agir) + _jetons_phase(cout_dire)
+            if total_jetons > 0:
+                _enregistrer_jetons(user, total_jetons)
+        except Exception:  # noqa: BLE001
+            logger.error("Compteur de jetons non enregistre", exc_info=True)
+
         metadonnees = {
             "agent": "v2",
             "en_reponse_a": self._exclu,
@@ -1026,6 +1147,18 @@ class PlannerAgentV2:
             if element is not None:
                 yield self._evenement_de_file(element)
 
+    def _delai_restant(self) -> float:
+        """Secondes restantes avant la deadline du tour.
+
+        Plancher a 1 s: un appel borne doit toujours avoir le temps de
+        tenter quelque chose, meme en fin de tour. Hors tour (tests qui
+        appellent _dire directement), c'est la deadline entiere.
+        """
+        depart = getattr(self, "_depart_tour", None)
+        if depart is None:
+            return _delai_tour()
+        return max(1.0, _delai_tour() - (time.perf_counter() - depart))
+
     def _agir_en_fond(self, user: User, message_enrichi: str, registre: Registre):
         """AGIR dans le pool, ses pensees streamees. Rend (raisonnement, panne).
 
@@ -1037,6 +1170,13 @@ class PlannerAgentV2:
         """
         raisonnement, panne = "", None
         file_agir = self._file_pensees
+        # Deadline murale du tour: le drainage s'interrompt quand elle est
+        # depassee au lieu de tenir la connexion SSE ouverte indefiniment
+        # (397 s en prod le 2026-08-29). Le thread orphelin finit seul en
+        # tache de fond: ses ecritures hors registre sont sans effet
+        # (signaler_outil est neutre sans file, et l'instance est jettee a
+        # la fin de la requete).
+        echeance = time.monotonic() + self._delai_restant()
 
         def travailler():
             nonlocal raisonnement, panne
@@ -1054,8 +1194,14 @@ class PlannerAgentV2:
         futur = _POOL_AGIR.submit(travailler)
         fragments = 0
         while True:
+            restant = echeance - time.monotonic()
+            if restant <= 0:
+                registre.delai_depasse = True
+                panne = panne or TimeoutError("delai du tour depasse pendant AGIR")
+                logger.warning("agent_v2 delai depasse pendant AGIR user=%s", user.pk)
+                break
             try:
-                element = file_agir.get(timeout=ATTENTE_PENSEE)
+                element = file_agir.get(timeout=min(ATTENTE_PENSEE, restant))
             except queue.Empty:
                 # Filet: si le thread s'est termine sans poser sa sentinelle
                 # (arret brutal du worker), on sort au lieu d'attendre pour
@@ -1067,7 +1213,16 @@ class PlannerAgentV2:
                 break
             fragments += 1
             yield self._evenement_de_file(element)
-        futur.result()  # remonte une panne du pool lui-meme, pas d'AGIR
+        if not registre.delai_depasse:
+            try:
+                futur.result(timeout=max(0.1, echeance - time.monotonic()))
+            except FuturesTimeoutError:
+                # Paranoia: le drainage a vu la sentinelle mais le thread ne
+                # rend pas la main. Meme traitement que ci-dessus.
+                registre.delai_depasse = True
+                panne = panne or TimeoutError(
+                    "delai du tour depasse: AGIR ne rend pas la main")
+                logger.warning("agent_v2 AGIR ne rend pas la main user=%s", user.pk)
         self._file_pensees = None
 
         # Repli pour les fournisseurs qui ne streament pas leurs deltas: sans

@@ -1282,6 +1282,8 @@ def rendre_faits(registre: Registre, aujourdhui: date | None = None,
     lignes = n.lignes_de_faits() + n.refus + n.retenues
     if registre.budget_epuise:
         lignes.append("Je me suis arrêté avant la fin : il restait trop d'étapes.")
+    if registre.delai_depasse:
+        lignes.append("Je me suis arrêté : le délai du tour était dépassé.")
     if getattr(registre, "boucle_interrompue", False):
         lignes.append("Je me suis arrêté : je répétais la même étape.")
 

@@ -272,6 +272,19 @@ DEEPSEEK_REASONING_EFFORT = os.getenv('DEEPSEEK_REASONING_EFFORT', 'high')
 DEEPSEEK_THINKING = os.getenv('DEEPSEEK_THINKING', 'true').lower() == 'true'
 DEEPSEEK_MAX_TOKENS = int(os.getenv('DEEPSEEK_MAX_TOKENS', '8192'))
 
+# Agent v2: garde-fous de disponibilite et de cout (services/agent_v2/agent.py).
+# DELAI_TOUR: duree murale maximale d'un tour (AGIR + DIRE), en secondes.
+# Au-dela, le tour est tronque et se degrade vers registre + repli au lieu de
+# tenir la connexion SSE ouverte indefiniment (incident du 2026-08-29: 397 s).
+# BUDGET_JETONS_*: coupe-circuit contre l'emballement, pas un optimiseur de
+# cout. Appliques via UsageLimits de pydantic-ai: le depassement leve
+# UsageLimitExceeded, deja gere en repli. BUDGET_JETONS_JOUR est suivi en base
+# (core.BudgetJetonsJournalier) et bloque les phases LLM du tour.
+AGENT_V2_DELAI_TOUR = float(os.getenv('AGENT_V2_DELAI_TOUR', '180'))
+AGENT_V2_BUDGET_JETONS_AGIR = int(os.getenv('AGENT_V2_BUDGET_JETONS_AGIR', '300000'))
+AGENT_V2_BUDGET_JETONS_DIRE = int(os.getenv('AGENT_V2_BUDGET_JETONS_DIRE', '100000'))
+AGENT_V2_BUDGET_JETONS_JOUR = int(os.getenv('AGENT_V2_BUDGET_JETONS_JOUR', '2000000'))
+
 # LIRE en mode ombre (services/agent_v2/lecture.py): une lecture typee du
 # message tape, journalisee a cote des lecteurs regex geles, qui ne decide rien.
 # Active quand la variable est absente; "0" ou "false" la coupe. Coupee par
