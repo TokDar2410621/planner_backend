@@ -726,6 +726,82 @@ class OrganizeDayTool(BaseTool):
         )
 
 
+def _mettre_en_forme_semaine(user, start, arrangements):
+    """Mise en forme (days_data, lines, skipped_total) d'arrangements existants.
+
+    Meme code que la boucle de _resoudre_semaine, sans le solveur: sert quand
+    l'agent v2 fournit un arrangement deja resolu et valide (_arrangements).
+    """
+    days_data = []
+    lines = []
+    skipped_total = 0
+    for offset, arrangement in enumerate(arrangements):
+        day = start + timedelta(days=offset)
+        placed = [r for r in arrangement if not r["skipped"] and not r["overnight_kept"]]
+        overnight = [r for r in arrangement if r["overnight_kept"]]
+        skipped = [r for r in arrangement if r["skipped"] and not r.get("reporte_au_lendemain")]
+
+        skipped_total += len(skipped)
+        days_data.append({
+            "date": day.isoformat(),
+            "placed": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in placed],
+            "overnight_kept": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in overnight],
+            "skipped": [{"title": r["title"]} for r in skipped],
+            "moved": [],
+        })
+        if placed or skipped:
+            seg = ", ".join(f"{r['title']} {r['start_time']}-{r['end_time']}" for r in placed) or "—"
+            line = f"{DAY_NAMES[day.weekday()]} {seg}"
+            if skipped:
+                line += " (non placé: " + ", ".join(r["title"] for r in skipped) + ")"
+            lines.append(line)
+    return days_data, lines, skipped_total
+
+
+def _resoudre_semaine(user, start):
+    """Les 7 solve_placement de la semaine + mise en forme.
+
+    Retourne (days_data, lines, skipped_total, arrangements). Les arrangements
+    bruts (avec block_id) sont conserves pour l'apply et pour le cache v2;
+    days_data seul ne suffirait pas (pas de block_id).
+    """
+    arrangements = [solve_placement(user, start + timedelta(days=offset)) for offset in range(7)]
+    days_data, lines, skipped_total = _mettre_en_forme_semaine(user, start, arrangements)
+    return days_data, lines, skipped_total, arrangements
+
+
+def _appliquer_arrangement(user, arrangement):
+    """Applique UN jour d'arrangement: ajuste les heures des blocs souples."""
+    moved = []
+    for r in arrangement:
+        if r["skipped"] or r["overnight_kept"]:
+            continue
+        block = RecurringBlock.objects.filter(id=r["block_id"], user=user).first()
+        if block is None:
+            continue
+        new_start = time(r["start_min"] // 60, r["start_min"] % 60)
+        new_end = time(r["end_min"] // 60, r["end_min"] % 60)
+        if block.start_time != new_start or block.end_time != new_end:
+            block.start_time = new_start
+            block.end_time = new_end
+            block.save(update_fields=["start_time", "end_time"])
+            moved.append({"title": block.title, "start_time": r["start_time"], "end_time": r["end_time"]})
+    return moved
+
+
+def _resultat_semaine(*, apply, start, days_data, lines, moved_total, skipped_total):
+    head = "Semaine réorganisée" if apply else "Proposition pour la semaine (rien n'est encore changé)"
+    msg = f"{head}: " + ("; ".join(lines) if lines else "rien à replacer, tout est déjà bien agencé") + "."
+    if skipped_total:
+        msg += f" {skipped_total} activité(s) ne rentrent pas entièrement (journées trop pleines)."
+    return ToolResult(
+        success=True,
+        data={"applied": apply, "start_date": start.isoformat(),
+              "days": days_data, "moved_count": moved_total, "skipped_count": skipped_total},
+        message=msg,
+    )
+
+
 class OptimizeWeekTool(BaseTool):
     name = "optimize_week"
     description = (
@@ -758,57 +834,25 @@ class OptimizeWeekTool(BaseTool):
         else:
             start = timezone.localdate()
         apply = bool(kwargs.get("apply", False))
+        # Kwarg PRIVE (agent v2): arrangement deja resolu et valide par la
+        # garde. Evite de re-resoudre 7 jours a l'apply quand le plan vient
+        # d'etre verifie a l'identique. Jamais fourni par le modele ni v1.
+        arrangements = kwargs.pop("_arrangements", None)
+        if arrangements is None:
+            days_data, lines, skipped_total, arrangements = _resoudre_semaine(user, start)
+        else:
+            days_data, lines, skipped_total = _mettre_en_forme_semaine(user, start, arrangements)
 
-        days_data = []
-        lines = []
         moved_total = 0
-        skipped_total = 0
-        for offset in range(7):
-            day = start + timedelta(days=offset)
-            arrangement = solve_placement(user, day)
-            placed = [r for r in arrangement if not r["skipped"] and not r["overnight_kept"]]
-            overnight = [r for r in arrangement if r["overnight_kept"]]
-            skipped = [r for r in arrangement if r["skipped"] and not r.get("reporte_au_lendemain")]
+        if apply:
+            for jour, arrangement in zip(days_data, arrangements):
+                moved = _appliquer_arrangement(user, arrangement)
+                jour["moved"] = moved
+                moved_total += len(moved)
 
-            moved = []
-            if apply:
-                for r in placed:
-                    block = RecurringBlock.objects.filter(id=r["block_id"], user=user).first()
-                    if block is None:
-                        continue
-                    new_start = time(r["start_min"] // 60, r["start_min"] % 60)
-                    new_end = time(r["end_min"] // 60, r["end_min"] % 60)
-                    if block.start_time != new_start or block.end_time != new_end:
-                        block.start_time = new_start
-                        block.end_time = new_end
-                        block.save(update_fields=["start_time", "end_time"])
-                        moved.append({"title": block.title, "start_time": r["start_time"], "end_time": r["end_time"]})
-
-            moved_total += len(moved)
-            skipped_total += len(skipped)
-            days_data.append({
-                "date": day.isoformat(),
-                "placed": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in placed],
-                "overnight_kept": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in overnight],
-                "skipped": [{"title": r["title"]} for r in skipped],
-                "moved": moved,
-            })
-            if placed or skipped:
-                seg = ", ".join(f"{r['title']} {r['start_time']}-{r['end_time']}" for r in placed) or "—"
-                line = f"{DAY_NAMES[day.weekday()]} {seg}"
-                if skipped:
-                    line += " (non placé: " + ", ".join(r["title"] for r in skipped) + ")"
-                lines.append(line)
-
-        head = "Semaine réorganisée" if apply else "Proposition pour la semaine (rien n'est encore changé)"
-        msg = f"{head}: " + ("; ".join(lines) if lines else "rien à replacer, tout est déjà bien agencé") + "."
-        if skipped_total:
-            msg += f" {skipped_total} activité(s) ne rentrent pas entièrement (journées trop pleines)."
-        return ToolResult(
-            success=True,
-            data={"applied": apply, "start_date": start.isoformat(),
-                  "days": days_data, "moved_count": moved_total, "skipped_count": skipped_total},
-            message=msg,
+        return _resultat_semaine(
+            apply=apply, start=start, days_data=days_data, lines=lines,
+            moved_total=moved_total, skipped_total=skipped_total,
         )
 
 

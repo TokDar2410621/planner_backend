@@ -750,17 +750,60 @@ def _empreinte_plan(donnees: dict) -> str:
     return hashlib.sha1(brut.encode("utf-8")).hexdigest()[:12]
 
 
+_PLAN_SEMAINE_TTL = 1800  # 30 min: une confirmation arrive vite; au-dela on re-resout.
+
+
+def _cle_plan_semaine(user_id: int, start_iso: str) -> str:
+    return f"agentv2:plan_semaine:v1:{user_id}:{start_iso}"
+
+
 def _plan_propose(outil, user, kwargs: dict):
-    parametres = {k: v for k, v in kwargs.items() if k != "plan_hash"}
-    parametres["apply"] = False
-    proposition = outil.execute(user, **parametres)
-    if not proposition.success:
-        return proposition, None
-    return proposition, _empreinte_plan(proposition.data or {})
+    """(proposition, empreinte, arrangements), avec cache inter-tours.
+
+    Le solveur est deterministe (random_seed = 0): si ses entrees n'ont pas
+    change depuis la proposition, on ressert le plan en cache au lieu de
+    re-resoudre 7 jours (~5 s mesures, plafond 14 s). Sinon on re-resout
+    (comportement historique): la fraicheur reste garantie par l'empreinte
+    des ENTREES (empreinte_entrees_semaine, colocalisee avec le solveur),
+    pas par un re-calcul systematique.
+    """
+    from django.core.cache import cache
+    from services.agent.tools.schedule import _resoudre_semaine, _resultat_semaine
+    from services.scheduling.solve_day import empreinte_entrees_semaine
+
+    parametres = {k: v for k, v in kwargs.items() if k not in ("plan_hash", "_arrangements")}
+    raw = parametres.get("start_date")
+    try:
+        start = datetime.strptime(raw, "%Y-%m-%d").date() if raw else timezone.localdate()
+    except (ValueError, TypeError):
+        # Date invalide: l'outil echouera de lui-meme; pas de cache.
+        proposition = outil.execute(user, **{**parametres, "apply": False})
+        return proposition, None, None
+    start_iso = start.isoformat()
+
+    cle = _cle_plan_semaine(user.pk, start_iso)
+    entrees = empreinte_entrees_semaine(user, start)
+    cached = cache.get(cle)
+    if cached and cached.get("entrees") == entrees:
+        logger.info("Plan semaine %s: servi du cache (entrees inchangees)", start_iso)
+        proposition = ToolResult(success=True, data=cached["data"], message=cached["message"])
+        return proposition, cached["empreinte"], cached["arrangements"]
+
+    days_data, lines, skipped_total, arrangements = _resoudre_semaine(user, start)
+    proposition = _resultat_semaine(apply=False, start=start, days_data=days_data,
+                                    lines=lines, moved_total=0, skipped_total=skipped_total)
+    empreinte = _empreinte_plan(proposition.data or {})
+    cache.set(cle, {"entrees": entrees, "empreinte": empreinte,
+                    "data": proposition.data, "message": proposition.message,
+                    "arrangements": arrangements},
+              _PLAN_SEMAINE_TTL)
+    return proposition, empreinte, arrangements
 
 
 def _demande_optimisation(kwargs: dict, empreinte: str, proposition: ToolResult) -> dict:
-    parametres = {k: v for k, v in kwargs.items() if k != "plan_hash"}
+    # Les kwargs prives (prefixe _) ne font jamais partie d'une demande
+    # persistee: ce sont des hints d'execution, pas l'intention metier.
+    parametres = {k: v for k, v in kwargs.items() if k != "plan_hash" and not k.startswith("_")}
     effet = dict(parametres)
     effet["apply"] = True
     cible = {"date": (proposition.data or {}).get("start_date")}
@@ -774,10 +817,13 @@ def _demande_optimisation(kwargs: dict, empreinte: str, proposition: ToolResult)
 
 def _garde_optimisation(ctx: _Contexte, outil, kwargs: dict, garde: _Garde):
     autorise, demande, _en_suspens = _reponse(ctx, garde.cles, outil.name)
-    proposition, empreinte = _plan_propose(outil, ctx.user, kwargs)
+    proposition, empreinte, arrangements = _plan_propose(outil, ctx.user, kwargs)
     if empreinte is None:
         return None  # l'outil echouera de lui-meme, rien a proteger
     if autorise and (demande.get("parametres") or {}).get("plan_hash") == empreinte:
+        # Plan confirme a l'identique: l'execution reutilise l'arrangement
+        # valide au lieu de re-resoudre (kwarg prive, retire apres l'appel).
+        kwargs["_arrangements"] = arrangements
         return None
     if demande is not None and not autorise:
         return MESSAGE_DEJA_TRANCHE
@@ -1761,10 +1807,12 @@ def _consigner(ctx: _Contexte, nom: str, kwargs: dict, resultat: ToolResult):
 
 def _pour_empreinte(nom: str, kwargs: dict) -> dict:
     """Arguments de la cle d'idempotence. `confirm` est force comme le fera
-    la garde, pour qu'un rejeu retrouve l'appel autorise."""
+    la garde, pour qu'un rejeu retrouve l'appel autorise. Les kwargs prives
+    (prefixe _) sont exclus: ce sont des hints d'execution, pas l'intention
+    metier (ex: _arrangements du plan OR-Tools valide)."""
     if nom in ("delete_task", "clear_all_blocks"):
         return {**kwargs, "confirm": True}
-    return kwargs
+    return {k: v for k, v in (kwargs or {}).items() if not k.startswith("_")}
 
 
 def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = None) -> str:
@@ -1886,11 +1934,14 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
     elif nom == "optimize_week" and kwargs.get("apply"):
         # Le plan confirme doit etre CELUI qu'on applique: s'il a change
         # depuis la question, on redemande au lieu d'appliquer autre chose.
+        # _plan_propose sert le plan en cache quand les entrees sont
+        # inchangees (0 s de solveur), re-resout sinon.
         try:
-            proposition, empreinte = _plan_propose(outil, ctx.user, kwargs)
+            proposition, empreinte, arrangements = _plan_propose(outil, ctx.user, kwargs)
         except Exception as e:  # noqa: BLE001
             logger.error("Proposition de plan en panne: %s", e, exc_info=True)
-            proposition, empreinte = ToolResult(success=False, data={}, message=f"Erreur de l'outil: {e}"), None
+            proposition, empreinte, arrangements = (
+                ToolResult(success=False, data={}, message=f"Erreur de l'outil: {e}"), None, None)
         if empreinte is None or empreinte != (choix.get("parametres") or {}).get("plan_hash"):
             donnees = {"cle_demande": choix.get("cle"), "par_le_code": True,
                        "decision_code": DECISION_EXECUTE}
@@ -1902,18 +1953,34 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
             refus = ToolResult(success=False, data=donnees, message=message)
             _consigner(ctx, nom, kwargs, refus)
             return refus.to_string()
+        # Niveau 3: l'apply reutilise l'arrangement valide au lieu de
+        # re-resoudre (kwarg prive, retire apres l'execution pour ne pas
+        # polluer le registre).
+        kwargs["_arrangements"] = arrangements
 
     # Meme marqueur que v1: le banc capte les appels d'outils par le
     # logger parent « services », et cette ligne est ce qu'il cherche.
-    logger.info(f"Executing tool: {nom}({kwargs})")
+    # Les kwargs prives (ex: _arrangements) sont exclus de l'affichage:
+    # le banc ne lit que le nom, et un dump multi-Ko polluerait les logs.
+    kwargs_publics = {k: v for k, v in kwargs.items() if not k.startswith("_")}
+    logger.info(f"Executing tool: {nom}({kwargs_publics})")
     try:
-        resultat = outil.execute(ctx.user, **kwargs)
+        if nom == "optimize_week" and not kwargs.get("apply"):
+            # La proposition passe par _plan_propose pour ALIMENTER le cache
+            # inter-tours: a la confirmation, le plan est resservi sans
+            # re-resoudre si les entrees sont inchangees. Resultat identique
+            # a l'execution directe (memes helpers de mise en forme).
+            resultat, _, _ = _plan_propose(outil, ctx.user, kwargs)
+        else:
+            resultat = outil.execute(ctx.user, **kwargs)
     except Exception as e:  # noqa: BLE001
         # v1 degrade une exception d'outil en ToolResult d'echec. Sans
         # cela, l'exception avorterait le run ET le registre ne garderait
         # aucune trace de la mutation tentee.
         logger.error("Tool %s a leve: %s", nom, e, exc_info=True)
         resultat = ToolResult(success=False, data={}, message=f"Erreur de l'outil: {e}")
+    # Kwarg prive du niveau 3: ne doit pas polluer le registre ni le rendu.
+    kwargs.pop("_arrangements", None)
 
     if choix is not None:
         resultat = ToolResult(
