@@ -7,6 +7,7 @@ de parler d'une action.
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 
 from services.agent.tools.base import ToolResult
@@ -101,28 +102,36 @@ class Registre:
         self.delai_depasse: bool = False
         self.boucle_interrompue: bool = False
         self._index: dict = {}
+        # Les outils de LECTURE peuvent desormais s'executer en parallele
+        # (pydantic-ai dispatche les appels batchés via asyncio.create_task):
+        # l'attribution des ids et l'indexation doivent rester atomiques.
+        # Ordre des verrous: verrou du tour (outils.py) PUIS celui-ci,
+        # jamais l'inverse.
+        self._verrou = threading.Lock()
 
     def ajouter(self, outil: str, parametres: dict, resultat: ToolResult) -> Action:
-        action = Action(
-            id=f"a{len(self.actions) + 1}",
-            outil=outil,
-            parametres=dict(parametres or {}),
-            succes=bool(resultat.success),
-            message=resultat.message or "",
-            donnees=dict(resultat.data or {}),
-        )
-        self.actions.append(action)
-        self._index[action.id] = action
-        return action
+        with self._verrou:
+            action = Action(
+                id=f"a{len(self.actions) + 1}",
+                outil=outil,
+                parametres=dict(parametres or {}),
+                succes=bool(resultat.success),
+                message=resultat.message or "",
+                donnees=dict(resultat.data or {}),
+            )
+            self.actions.append(action)
+            self._index[action.id] = action
+            return action
 
     def ajouter_ecart(self, action_id: str, description: str,
                       genre: str = "", donnees: dict | None = None) -> Ecart:
-        ecart = Ecart(id=f"e{len(self.ecarts) + 1}",
-                      action_id=action_id, description=description,
-                      genre=genre or "", donnees=dict(donnees or {}))
-        self.ecarts.append(ecart)
-        self._index[ecart.id] = ecart
-        return ecart
+        with self._verrou:
+            ecart = Ecart(id=f"e{len(self.ecarts) + 1}",
+                          action_id=action_id, description=description,
+                          genre=genre or "", donnees=dict(donnees or {}))
+            self.ecarts.append(ecart)
+            self._index[ecart.id] = ecart
+            return ecart
 
     def mutations(self) -> list[Action]:
         return [a for a in self.actions if a.est_mutation]
