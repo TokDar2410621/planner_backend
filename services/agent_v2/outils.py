@@ -128,11 +128,16 @@ def _autorise(motif, outil: str, option) -> bool:
 class _EtatTour:
     """Ce que partagent les appels d'un meme tour (un registre = un tour).
 
-    Le verrou serialise les appels: la garde de creations en masse compte
-    puis ecrit, et deux appels paralleles du modele verraient sinon le meme
-    compte. Les outils sont des ecritures ORM de quelques millisecondes.
+    Le verrou ne serialise plus QUE LES MUTATIONS: la garde de creations en
+    masse compte puis ecrit, et deux mutations paralleles verraient sinon le
+    meme compte; le cache d'idempotence est aussi un tester-puis-poser. Les
+    LECTURES s'executent en parallele: leurs gardes ne font que lire l'etat
+    du tour et la base, et le registre a son propre verrou pour l'ecriture.
+    Voir _fabriquer: pydantic-ai dispatche deja les appels batchés en
+    parallele, sauf si l'un d'eux est marque sequential (les mutations).
     """
     verrou: threading.RLock = field(default_factory=threading.RLock)
+    verrou_init: threading.Lock = field(default_factory=threading.Lock)
     cache: dict = field(default_factory=dict)
     attente: dict = field(default_factory=dict)
     armes: list = field(default_factory=list)
@@ -166,14 +171,20 @@ class _Contexte:
 
 
 def _attente(ctx: _Contexte) -> list[dict]:
-    """Les demandes en attente, lues UNE fois par tour."""
+    """Les demandes en attente, lues UNE fois par tour.
+
+    L'initialisation paresseuse est protegee: les lectures s'executent
+    desormais en parallele et deux threads pouvaient la declencher.
+    """
     etat = ctx.etat
     if "liste" not in etat.attente:
-        try:
-            etat.attente["liste"] = dem.demandes_en_attente(ctx.user)
-        except Exception:  # noqa: BLE001 - sans attente lisible, rien n'est autorise
-            logger.error("Demandes en attente illisibles", exc_info=True)
-            etat.attente["liste"] = []
+        with etat.verrou_init:
+            if "liste" not in etat.attente:
+                try:
+                    etat.attente["liste"] = dem.demandes_en_attente(ctx.user)
+                except Exception:  # noqa: BLE001 - sans attente lisible, rien n'est autorise
+                    logger.error("Demandes en attente illisibles", exc_info=True)
+                    etat.attente["liste"] = []
     return etat.attente["liste"]
 
 
@@ -1770,7 +1781,8 @@ def _pour_empreinte(nom: str, kwargs: dict) -> dict:
 def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = None) -> str:
     """Le chemin UNIQUE de tout appel d'outil du tour, qu'il vienne du modele
     ou d'un choix de l'utilisateur execute par le code (choix non nul).
-    Synchrone: il tourne dans un thread d'executeur, verrou du tour tenu."""
+    Synchrone: il tourne dans un thread d'executeur, verrou du tour tenu
+    pour les MUTATIONS seulement (voir _fabriquer)."""
     nom = outil.name
     kwargs = dict(kwargs or {})
     registre = ctx.registre
@@ -1959,10 +1971,17 @@ def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
     `cache` n'est plus lu: l'idempotence vit dans l'etat du tour, partage
     avec les choix executes par le code. Les regles de message lisent le
     message BRUT quand il est fourni, jamais le message enrichi du document.
+
+    Parallelisme: pydantic-ai execute en parallele les appels d'outils batchés
+    dans une meme etape, sauf si l'un est marque sequential. Les MUTATIONS
+    gardent le verrou du tour sur toute leur execution (garde tester-puis-
+    poser + cache d'idempotence + ecriture); les LECTURES s'executent sans
+    lui, le registre etant desormais thread-safe pour l'ecriture.
     """
     ctx = _Contexte(user=user, registre=registre, tache=tache,
                     texte=message_brut if message_brut is not None else (message_du_tour or ""),
                     signaler=signaler, tap=tap)
+    est_mutation = outil.name in OUTILS_DE_MUTATION
 
     def _appel_ferme(kwargs):
         """L'ORM tourne dans un thread du pool d'asgiref, hors du cycle de
@@ -1970,8 +1989,10 @@ def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
         deux cotes, comme le fait database_sync_to_async de channels."""
         close_old_connections()
         try:
-            with ctx.etat.verrou:
-                return _executer_appel(ctx, outil, kwargs)
+            if est_mutation:
+                with ctx.etat.verrou:
+                    return _executer_appel(ctx, outil, kwargs)
+            return _executer_appel(ctx, outil, kwargs)
         finally:
             close_old_connections()
 
@@ -2009,6 +2030,9 @@ def outils_pour(user: User, registre: Registre, message_du_tour: str = "",
             outil.name,
             outil.description,
             outil.parameters,
+            # Une mutation dans le batch force TOUT le batch en sequentiel
+            # (pydantic-ai): les lectures pures, elles, partent en parallele.
+            sequential=(outil.name in OUTILS_DE_MUTATION),
         )
         for outil in ALL_TOOLS
     ]
