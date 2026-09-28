@@ -25,7 +25,12 @@ from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.throttling import ScopedRateThrottle
+from rest_framework.throttling import (
+    AnonRateThrottle,
+    ScopedRateThrottle,
+    SimpleRateThrottle,
+    UserRateThrottle,
+)
 from rest_framework.views import APIView
 from rest_framework.authtoken.models import Token
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -140,6 +145,33 @@ class CheckEmailRateThrottle(ScopedRateThrottle):
             return super().get_rate()
         except ImproperlyConfigured:
             return '10/min'
+
+
+class AnonymousChatThrottle(ScopedRateThrottle):
+    """Quota du chat selon le type de compte.
+
+    Les comptes anonymes partagent le scope ``chat_anon`` (10/min par defaut),
+    resserre par rapport au scope ``chat`` (30/min) des comptes inscrits :
+    meme endpoint, compteurs independants. Sans ca, rester deconnecte
+    contournerait toute limite de cout.
+    """
+
+    def get_rate(self):
+        try:
+            return super().get_rate()
+        except ImproperlyConfigured:
+            return '10/min' if self.scope == 'chat_anon' else '30/min'
+
+    def allow_request(self, request, view):
+        from core.anonyme import est_anonyme
+        # Scope choisi selon l'utilisateur, pas selon la vue : on rejoue
+        # ScopedRateThrottle.allow_request en court-circuitant la lecture du
+        # scope sur la vue (ChatView/ChatStreamView n'ont pas de
+        # throttle_scope, le ScopedRateThrottle par defaut y est neutre).
+        self.scope = 'chat_anon' if est_anonyme(request.user) else 'chat'
+        self.rate = self.get_rate()
+        self.num_requests, self.duration = self.parse_rate(self.rate)
+        return SimpleRateThrottle.allow_request(self, request, view)
 
 
 class HealthCheckView(APIView):
@@ -539,6 +571,73 @@ class McpOAuthRedeemView(APIView):
         return Response({'token': token.key, 'username': c.user.username})
 
 
+# ============== Comptes anonymes ==============
+# Mode sans inscription (modele Firebase Anonymous Auth : signInAnonymously
+# puis linkWithCredential). Voir core/anonyme.py.
+
+def _compte_anonyme_convertible(request):
+    """Le compte anonyme porte par le JWT (header Authorization), ou None.
+
+    Les vues d'auth sont en AllowAny : request.user est renseigne quand un
+    JWT valide est fourni, Anonyme sinon. On ne convertit que ce cas.
+    """
+    from core.anonyme import est_anonyme
+    user = request.user
+    if getattr(user, 'is_authenticated', False) and est_anonyme(user):
+        return user
+    return None
+
+
+def _conflit_email_reel(email) -> bool:
+    """Un compte REEL (non anonyme) possede-t-il deja cet email ?
+
+    Boucle Python volontaire : avec un exclude() SQL, un profil manquant
+    (jointure NULL) serait ecarte du test et l'email ecrase en silence.
+    Ici un profil manquant vaut compte reel (direction prudente), et les
+    doublons d'email restent rarissimes.
+    """
+    for u in User.objects.filter(email__iexact=email):
+        profil = getattr(u, 'profile', None)
+        if not getattr(profil, 'is_anonymous', False):
+            return True
+    return False
+
+
+def _convertir_anonyme(user, email, first_name='', last_name=''):
+    """Attache l'email (deja verifie par le fournisseur) au compte anonyme.
+
+    Conversion, pas creation : les donnees (planning, conversation,
+    preferences) suivent sans migration. Le device_id est libere pour qu'un
+    futur appel /auth/anonymous/ sur cet appareil reparte sur un compte
+    frais au lieu de percuter la contrainte d'unicite.
+    """
+    user.email = email
+    champs = ['email']
+    if not user.first_name and first_name:
+        user.first_name = first_name[:150]
+        champs.append('first_name')
+    if not user.last_name and last_name:
+        user.last_name = last_name[:150]
+        champs.append('last_name')
+    user.save(update_fields=champs)
+    profil = user.profile
+    profil.is_anonymous = False
+    profil.device_id = None
+    profil.save(update_fields=['is_anonymous', 'device_id'])
+    # Jamais de token dans les logs : seul l'identifiant interne.
+    logger.info("anonyme_converti user_id=%s", user.pk)
+
+
+def _reponse_conflit_email():
+    """409 : l'email appartient deja a un vrai compte, on ne l'ecrase pas."""
+    return Response(
+        {'code': 'email_deja_utilise',
+         'error': ("Cet email est déjà lié à un compte existant. "
+                   "Connecte-toi directement avec ce compte.")},
+        status=status.HTTP_409_CONFLICT,
+    )
+
+
 class GoogleAuthView(APIView):
     """Google OAuth2 authentication endpoint."""
 
@@ -602,13 +701,32 @@ class GoogleAuthView(APIView):
             # has one owner, so duplicates are the same person -> sign into the
             # account holding their data instead of hard-blocking. See
             # services/social_login.resolve_social_user (also used by Apple).
+            #
+            # Conversion d'un compte anonyme : le JWT anonyme arrive dans le
+            # header Authorization. Le credential Google est DEJA verifie a ce
+            # stade (email verifie ci-dessus) ; la verification elle-meme est
+            # inchangee. On attache l'email AU COMPTE EXISTANT au lieu d'en
+            # creer un nouveau.
             from services.social_login import resolve_social_user
 
-            user, created = resolve_social_user(
-                email,
-                first_name=google_data.get('given_name', ''),
-                last_name=google_data.get('family_name', ''),
-            )
+            anonyme = _compte_anonyme_convertible(request)
+            if anonyme is not None:
+                if _conflit_email_reel(email):
+                    return _reponse_conflit_email()
+                user = anonyme
+                _convertir_anonyme(
+                    user, email,
+                    first_name=google_data.get('given_name', ''),
+                    last_name=google_data.get('family_name', ''),
+                )
+                created, converted = False, True
+            else:
+                user, created = resolve_social_user(
+                    email,
+                    first_name=google_data.get('given_name', ''),
+                    last_name=google_data.get('family_name', ''),
+                )
+                converted = False
 
             # Update profile with Google data (avatar, name)
             profile = user.profile
@@ -632,6 +750,7 @@ class GoogleAuthView(APIView):
                     'access': str(refresh.access_token),
                 },
                 'created': created,
+                'converted': converted,
             })
 
         except Exception as e:
@@ -686,7 +805,21 @@ class AppleAuthView(APIView):
         first_name = (name.get('firstName') or name.get('given_name') or '') if isinstance(name, dict) else ''
         last_name = (name.get('lastName') or name.get('family_name') or '') if isinstance(name, dict) else ''
 
-        user, created = resolve_social_user(email, first_name=first_name, last_name=last_name)
+        # Conversion d'un compte anonyme (meme contrat que GoogleAuthView) :
+        # le JWT anonyme arrive dans le header Authorization, le credential
+        # Apple est DEJA verifie a ce stade. On attache l'email au compte
+        # existant au lieu d'en creer un nouveau.
+        anonyme = _compte_anonyme_convertible(request)
+        if anonyme is not None:
+            if _conflit_email_reel(email):
+                return _reponse_conflit_email()
+            user = anonyme
+            _convertir_anonyme(user, email, first_name=first_name,
+                               last_name=last_name)
+            created, converted = False, True
+        else:
+            user, created = resolve_social_user(email, first_name=first_name, last_name=last_name)
+            converted = False
 
         # Exigence Apple (suppression de compte): garder de quoi REVOQUER.
         # Le client envoie le code d'autorisation; on l'echange contre un
@@ -709,7 +842,92 @@ class AppleAuthView(APIView):
             'user': UserSerializer(user).data,
             'tokens': {'refresh': str(refresh), 'access': str(refresh.access_token)},
             'created': created,
+            'converted': converted,
         })
+
+
+class AnonymousAuthView(APIView):
+    """Creation / reprise d'un compte anonyme (sans inscription).
+
+    Modele Firebase Anonymous Auth : l'app appelle une fois avec son
+    device_id, recoit un User + des JWT, et travaille ensuite comme un compte
+    normal (quotas resserres : throttle chat_anon, budget jetons reduit). Au
+    prochain lancement, le meme device_id reprend le meme compte. A la
+    connexion Google/Apple, le compte est CONVERTI (voir ci-dessus), jamais
+    duplique : les donnees suivent sans migration.
+
+    Anti-abus : 10 appels/heure par IP (scope ``auth_anon``). Le device_id est
+    valide strictement pour eviter les collisions malveillantes.
+    """
+
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'auth_anon'
+
+    def post(self, request):
+        from core.anonyme import device_id_valide
+
+        device_id = request.data.get('device_id')
+        if not device_id_valide(device_id):
+            return Response(
+                {'error': 'device_id invalide (8-64 caracteres : lettres, chiffres, - et _).'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user, created = _obtenir_ou_creer_anonyme(device_id)
+        # Jamais de token dans les logs : identifiants internes uniquement.
+        logger.info("anonyme_cree user_id=%s device_id=%s created=%s",
+                    user.pk, device_id, created)
+        refresh = RefreshToken.for_user(user)
+        return Response({
+            'user': UserSerializer(user).data,
+            'tokens': {
+                'refresh': str(refresh),
+                'access': str(refresh.access_token),
+            },
+            'created': created,
+            'converted': False,
+        })
+
+
+def _obtenir_ou_creer_anonyme(device_id):
+    """Reprend le compte anonyme du device_id, ou le cree. -> (user, created).
+
+    La course entre deux creations simultanees (double appel au premier
+    lancement) est absorbee : la contrainte d'unicite sur device_id fait
+    echouer le perdant, qui retombe sur la reprise.
+    """
+    import secrets
+
+    from django.db import IntegrityError, transaction
+
+    profil = UserProfile.objects.filter(
+        device_id=device_id, is_anonymous=True,
+    ).select_related('user').first()
+    if profil is not None:
+        return profil.user, False
+
+    try:
+        with transaction.atomic():
+            username = f"anon_{secrets.token_hex(6)}"
+            while User.objects.filter(username=username).exists():
+                username = f"anon_{secrets.token_hex(6)}"
+            # create_user (et pas create) : mot de passe inutilisable, le
+            # compte anonyme ne se connecte jamais par mot de passe.
+            user = User.objects.create_user(username=username, email='')
+            profil = user.profile
+            profil.is_anonymous = True
+            profil.device_id = device_id
+            profil.save(update_fields=['is_anonymous', 'device_id'])
+            return user, True
+    except IntegrityError:
+        # Un autre appel a cree le compte entre-temps : reprise.
+        profil = UserProfile.objects.filter(
+            device_id=device_id, is_anonymous=True,
+        ).select_related('user').first()
+        if profil is None:  # pragma: no cover - ne devrait pas arriver
+            raise
+        return profil.user, False
 
 
 # ============== Profile Views ==============
@@ -1004,6 +1222,10 @@ class ChatView(APIView):
     """Chat endpoint for conversational AI."""
 
     parser_classes = [MultiPartParser, FormParser]
+    # Quotas par defaut (user/anon) conserves ; AnonymousChatThrottle ajoute
+    # le scope chat_anon resserre pour les comptes anonymes. Le
+    # ScopedRateThrottle par defaut est neutre ici (pas de throttle_scope).
+    throttle_classes = [UserRateThrottle, AnonRateThrottle, AnonymousChatThrottle]
 
     def post(self, request):
         """Send a message and get AI response."""
@@ -1145,6 +1367,8 @@ class ChatStreamView(APIView):
     """
 
     parser_classes = [MultiPartParser, FormParser]
+    # Comme ChatView : quotas par defaut conserves + chat_anon resserre.
+    throttle_classes = [UserRateThrottle, AnonRateThrottle, AnonymousChatThrottle]
 
     def post(self, request):
         denied = ai_consent_denied(request.user)

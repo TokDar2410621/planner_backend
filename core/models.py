@@ -66,6 +66,21 @@ class UserProfile(models.Model):
     )
     onboarding_completed = models.BooleanField(default=False)
     onboarding_step = models.PositiveIntegerField(default=0)
+    # Compte anonyme (mode sans inscription, modele Firebase Anonymous Auth) :
+    # un User Django normal, sans email, rattache a l'appareil via device_id.
+    # A la connexion (Google/Apple), le compte est CONVERTI (email attache,
+    # is_anonymous=False, device_id libere) au lieu d'en creer un nouveau.
+    is_anonymous = models.BooleanField(
+        default=False,
+        help_text="Compte sans inscription, lie a un appareil via device_id.",
+    )
+    device_id = models.CharField(
+        max_length=64,
+        unique=True,
+        null=True,
+        blank=True,
+        help_text="Identifiant d'appareil pour la reprise d'un compte anonyme.",
+    )
     energy_levels = models.JSONField(
         default=dict,
         blank=True,
