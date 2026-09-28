@@ -38,7 +38,7 @@ _RELATIFS = {0: "aujourd'hui", 1: "demain", -1: "hier"}
 # l'agent.
 PRIORITE = [
     "portee_jour", "destructif", "heure_refusee", "creation_en_masse",
-    "optimisation", "formulaire", "choix_modele", "chevauchement",
+    "optimisation", "formulaire", "choix_modele", "question_libre", "chevauchement",
     "fin_recurrence", "creneaux", "dire",
 ]
 
@@ -1757,6 +1757,9 @@ _QUESTIONS = {
     "creation_en_masse": _question_creation_en_masse,
     "optimisation": _question_optimisation,
     "choix_modele": _question_choix_modele,
+    # question_libre a la meme forme que choix_modele (question + options
+    # libelle/valeur/id): le meme rendu suffit, sans dupliquer.
+    "question_libre": _question_choix_modele,
     "chevauchement": _question_chevauchement,
 }
 
@@ -1777,7 +1780,7 @@ def rendre_demandes(demandes: list[dict], aujourdhui: date | None = None) -> tup
     # etre nommes tous les deux (revue du 2026-09-14). Chaque fonction de
     # question dedoublonne ses objets; les cles rendues restent uniques.
     choisies = [d for d in valides if d["motif"] == motif]
-    if motif == "choix_modele":
+    if motif in ("choix_modele", "question_libre"):
         # Deux questions du modele ne fusionnent pas: la premiere seule.
         choisies = choisies[:1]
     question, chips = _QUESTIONS[motif](choisies, _aujourdhui(aujourdhui))

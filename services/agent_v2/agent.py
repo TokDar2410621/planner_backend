@@ -150,7 +150,7 @@ _FIN_DE_PHRASE_STREAMEE = re.compile(r"[.!?…][\"'»)\]]*\s")
 # marche.
 PRIORITE = [
     "portee_jour", "destructif", "heure_refusee", "creation_en_masse",
-    "optimisation", "formulaire", "choix_modele", "chevauchement",
+    "optimisation", "formulaire", "choix_modele", "question_libre", "chevauchement",
     "fin_recurrence", "creneaux", "dire",
 ]
 CHIPS_MAX = 4
@@ -871,7 +871,7 @@ class PlannerAgentV2:
         # Une lecture qui n'a servi qu'a preparer un formulaire ou un choix ne
         # se deverse pas au-dessus de la question (banc du round 4, s02-1).
         sans_lecture = bool(gagnant) and (
-            gagnant.get("source") == "formulaire" or gagnant.get("motif") == "choix_modele"
+            gagnant.get("source") == "formulaire" or gagnant.get("motif") in ("choix_modele", "question_libre")
         ) and not any(a.succes and a.est_mutation for a in registre.actions)
         titres_vises = [((d or {}).get("cible") or {}).get("titre")
                         for d in (gagnant.get("demandes") or [])] if par_demande else []

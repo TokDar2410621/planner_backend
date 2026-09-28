@@ -1747,6 +1747,27 @@ def _titre_du_formulaire(ctx: _Contexte, nom: str, kwargs: dict):
             f"une seance de plus de « {titre} », rappelle create_block avec ce titre.")
 
 
+MOTIFS_QUESTION_MODELE = ("choix_modele", "question_libre")
+
+
+def _question_deja_posee(ctx: _Contexte, nom: str, kwargs: dict):
+    """Une seule question du modele par tour. Si le registre porte deja une
+    demande de motif choix_modele ou question_libre emise ce tour, le second
+    appel est refuse avec une consigne, pas execute: deux questions ne se
+    rendent pas, et la seconde ecraserait la premiere au tap."""
+    if nom not in ("poser_question", "present_choices"):
+        return None
+    for a in ctx.registre.actions:
+        demande = (a.donnees or {}).get("demande")
+        if (isinstance(demande, dict)
+                and demande.get("motif") in MOTIFS_QUESTION_MODELE):
+            return ToolResult(
+                success=False,
+                message=("Question non posee : tu as deja pose une question ce tour. "
+                         "Attends la reponse de l'utilisateur."))
+    return None
+
+
 def _garde_creations(ctx: _Contexte, nom: str, kwargs: dict):
     from services.agent.tools.blocks import normaliser_jours
 
@@ -1997,6 +2018,8 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
                 issue = _garde_creations(ctx, nom, kwargs)
             if issue is None:
                 issue = _titre_du_formulaire(ctx, nom, kwargs)
+            if issue is None:
+                issue = _question_deja_posee(ctx, nom, kwargs)
             if nom == "present_form":
                 kwargs = formulaire_avec_heure(ctx.texte, kwargs)
         except Exception:  # noqa: BLE001
@@ -2275,7 +2298,7 @@ def _resume_sans_effet(demande: dict, option: str) -> str:
         if option == "autre_heure":
             return f"CHOISI PAR L'UTILISATEUR: une autre heure pour {titre}"
         return f"REFUSE PAR L'UTILISATEUR: {titre}, laisse faire"
-    if motif == "choix_modele":
+    if motif in ("choix_modele", "question_libre"):
         return f"CHOISI PAR L'UTILISATEUR: {_ascii(choisie.get('valeur') or choisie.get('libelle') or '')}"
     if option == "annuler":
         return f"REFUSE PAR L'UTILISATEUR: {_sujet(demande)}, n'y touche pas"

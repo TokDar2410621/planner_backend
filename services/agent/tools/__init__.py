@@ -34,7 +34,7 @@ from .preferences import GetPreferencesTool, UpdatePreferencesTool
 from .goals import ListGoalsTool, CreateGoalTool, UpdateGoalTool
 from .planning import SuggestOptimizationTool, DetectConflictsTool
 from .analytics import GetProductivityStatsTool
-from .interactive import PresentChoicesTool, PresentFormTool
+from .interactive import PresentChoicesTool, PresentFormTool, PoserQuestionTool
 from .notify import SendNotificationTool
 
 logger = logging.getLogger(__name__)
@@ -81,17 +81,18 @@ ALL_TOOLS: list[BaseTool] = [
     # Interactive UI
     PresentFormTool(),
     PresentChoicesTool(),
+    PoserQuestionTool(),
 ]
 
 # Index by name for fast lookup
 TOOL_MAP: dict[str, BaseTool] = {tool.name: tool for tool in ALL_TOOLS}
 
-# Outils que seul l'agent v2 sait relayer. present_choices range sa question
-# dans une DEMANDE que v2 transforme en done.quick_replies; v1 n'a pas ce
-# relais et poserait une question sans boutons. Ils restent dans ALL_TOOLS
-# (v2 les expose via services/agent_v2/outils.py) mais sortent de toute liste
-# offerte a v1.
-V2_SEULEMENT = {"present_choices"}
+# Outils que seul l'agent v2 sait relayer. present_choices et poser_question
+# rangent leur question dans une DEMANDE que v2 transforme en
+# done.quick_replies; v1 n'a pas ce relais et poserait une question sans
+# boutons. Ils restent dans ALL_TOOLS (v2 les expose via
+# services/agent_v2/outils.py) mais sortent de toute liste offerte a v1.
+V2_SEULEMENT = {"present_choices", "poser_question"}
 
 
 def get_tools_for_claude() -> list[dict]:
