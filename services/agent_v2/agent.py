@@ -92,7 +92,20 @@ def _budget_jetons_dire() -> int:
         return 100000
 
 
-def _budget_jetons_jour() -> int:
+def _budget_jetons_jour(user=None) -> int:
+    """Plafond journalier de jetons pour l'utilisateur.
+
+    Les comptes anonymes (mode sans inscription) ont un plafond resserre
+    (anti-abus) : quand il est epuise, le tour suggere la creation d'un
+    compte pour continuer. Un profil manquant vaut compte normal (direction
+    prudente : on ne resserre jamais par defaut).
+    """
+    from core.anonyme import est_anonyme
+    if user is not None and est_anonyme(user):
+        try:
+            return max(0, int(getattr(settings, "AGENT_V2_BUDGET_JETONS_JOUR_ANON", 400000)))
+        except (TypeError, ValueError):
+            return 400000
     try:
         return max(0, int(getattr(settings, "AGENT_V2_BUDGET_JETONS_JOUR", 2000000)))
     except (TypeError, ValueError):
@@ -121,14 +134,14 @@ def _budget_jour_epuise(user) -> bool:
     Un compteur illisible (table absente, DB en vrac) ne bloque jamais un
     tour: la garde est un coupe-circuit, pas un verrou.
     """
-    if _budget_jetons_jour() <= 0:
+    if _budget_jetons_jour(user) <= 0:
         return False
     try:
         ligne = BudgetJetonsJournalier.objects.filter(
             user=user, jour=timezone.localdate()).first()
     except Exception:  # noqa: BLE001
         return False
-    return ligne is not None and (ligne.jetons or 0) >= _budget_jetons_jour()
+    return ligne is not None and (ligne.jetons or 0) >= _budget_jetons_jour(user)
 
 
 def _enregistrer_jetons(user, total: int) -> None:
@@ -166,6 +179,9 @@ PROSE_DELAI = ("J'ai mis trop de temps à te répondre, je m'arrête ici. "
                "Ce qui est déjà fait est affiché plus haut.")
 PROSE_BUDGET_JOUR = ("J'ai atteint ma limite d'IA pour aujourd'hui, "
                      "je ne peux pas traiter ça maintenant. Réessaie demain.")
+# Compte anonyme au plafond resserre : on suggere la sortie, pas l'attente.
+PROSE_BUDGET_JOUR_ANON = ("J'ai atteint ma limite d'IA pour aujourd'hui. "
+                          "Crée un compte gratuit pour continuer sans limite.")
 
 # POOL DE THREADS REUTILISES, et le mot « reutilises » porte tout le poids.
 #
@@ -1012,8 +1028,14 @@ class PlannerAgentV2:
             prose = PROSE_FORMULAIRE
         if budget_jour_epuise and not faits and not prose and not question and not formulaire:
             # Le compteur journalier est epuise et le tour n'a rien produit:
-            # on le dit plutot que de laisser un silence.
-            prose, motif = PROSE_BUDGET_JOUR, "budget_jour"
+            # on le dit plutot que de laisser un silence. Un compte anonyme
+            # au plafond resserre se voit proposer la sortie (creer un
+            # compte), pas l'attente.
+            from core.anonyme import est_anonyme
+            if est_anonyme(user):
+                prose, motif = PROSE_BUDGET_JOUR_ANON, "budget_jour"
+            else:
+                prose, motif = PROSE_BUDGET_JOUR, "budget_jour"
         elif not faits and not prose and not question and not formulaire:
             question, motif, chips = REPLI_QUESTION, "dire", []
 

@@ -145,6 +145,11 @@ REST_FRAMEWORK = {
         'anon': os.getenv('THROTTLE_RATE_ANON', '50/day'),
         'chat': os.getenv('THROTTLE_RATE_CHAT', '30/min'),
         'upload': os.getenv('THROTTLE_RATE_UPLOAD', '20/min'),
+        # Comptes anonymes : quotas resserres (anti-abus du mode sans
+        # inscription). Scopes consommes par AnonymousChatThrottle (chat) et
+        # AnonymousAuthView (creation de compte).
+        'chat_anon': os.getenv('THROTTLE_RATE_CHAT_ANON', '10/min'),
+        'auth_anon': os.getenv('THROTTLE_RATE_AUTH_ANON', '10/hour'),
         # Anti-abus du reset de mot de passe (spam d'emails / énumération).
         'password_reset': os.getenv('THROTTLE_RATE_PASSWORD_RESET', '10/hour'),
     },
@@ -284,6 +289,10 @@ AGENT_V2_DELAI_TOUR = float(os.getenv('AGENT_V2_DELAI_TOUR', '180'))
 AGENT_V2_BUDGET_JETONS_AGIR = int(os.getenv('AGENT_V2_BUDGET_JETONS_AGIR', '300000'))
 AGENT_V2_BUDGET_JETONS_DIRE = int(os.getenv('AGENT_V2_BUDGET_JETONS_DIRE', '100000'))
 AGENT_V2_BUDGET_JETONS_JOUR = int(os.getenv('AGENT_V2_BUDGET_JETONS_JOUR', '2000000'))
+# Plafond journalier resserre pour les comptes anonymes (anti-abus du mode
+# sans inscription). Quand il est epuise, le tour suggere la creation d'un
+# compte pour continuer (voir PROSE_BUDGET_JOUR_ANON dans agent.py).
+AGENT_V2_BUDGET_JETONS_JOUR_ANON = int(os.getenv('AGENT_V2_BUDGET_JETONS_JOUR_ANON', '400000'))
 
 # LIRE en mode ombre (services/agent_v2/lecture.py): une lecture typee du
 # message tape, journalisee a cote des lecteurs regex geles, qui ne decide rien.

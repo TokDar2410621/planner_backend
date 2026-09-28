@@ -72,11 +72,20 @@ class UserSerializer(serializers.ModelSerializer):
     """Serializer for User model with profile."""
 
     profile = UserProfileSerializer(read_only=True)
+    # Compte anonyme (sans inscription) : expose en top-level pour que le
+    # client sache quand proposer la creation de compte. Lecture seule,
+    # defensive si le profil manque (donnees anciennes).
+    is_anonymous = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ['id', 'username', 'email', 'first_name', 'last_name', 'date_joined', 'profile']
-        read_only_fields = ['id', 'date_joined']
+        fields = ['id', 'username', 'email', 'first_name', 'last_name',
+                  'date_joined', 'profile', 'is_anonymous']
+        read_only_fields = ['id', 'date_joined', 'is_anonymous']
+
+    def get_is_anonymous(self, obj):
+        from core.anonyme import est_anonyme
+        return est_anonyme(obj)
 
 
 class UserRegistrationSerializer(serializers.ModelSerializer):
