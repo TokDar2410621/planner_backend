@@ -217,6 +217,10 @@ Tes champs:
   Seulement des references presentes dans le registre: une reference inconnue
   fait supprimer toute ta prose.
 - actions: laisse ce champ vide.
+- MEMOIRE: quand le brief contient une section MEMOIRE, ses preferences
+  s'appliquent sans les redemander, et une action « memoire » reussie au
+  registre s'annonce brievement (« Noté », « Oublié »). Ne recite jamais la
+  liste des preferences sauf si l'utilisateur demande ce que tu sais de lui.
 
 Regles absolues:
 - Aucune affirmation d'action dans AUCUN champ, question et options compris,
@@ -299,6 +303,16 @@ def resume_semaine(user: User) -> str:
     return "\n".join(lignes)
 
 
+def _section_memoire_agir(user: User) -> str:
+    """Preferences durables pour AGIR, qui choisit les creneaux."""
+    from services.agent_v2.memoire import section_memoire
+    try:
+        texte = section_memoire(user)
+    except Exception:  # noqa: BLE001 - la memoire ne casse jamais un prompt
+        return ""
+    return f"\n{texte}\n" if texte else ""
+
+
 def prompt_agir(user: User) -> str:
     """Identite, contexte vivant et regles, pour la phase qui outille."""
     contexte = build_context(user)
@@ -316,6 +330,7 @@ def prompt_agir(user: User) -> str:
         liste_taches = "  (aucune tache en attente)"
     liste_objectifs = "\n".join(objectifs) if objectifs else "  (aucun objectif defini)"
     semaine = resume_semaine(user) or "  (aucun bloc recurrent)"
+    section_memoire = _section_memoire_agir(user)
 
     premier_contact = ""
     if not profil["onboarding_completed"] and contexte["total_blocks"] == 0:
@@ -352,5 +367,5 @@ TACHES EN ATTENTE ({taches['pending_count']}):
 
 OBJECTIFS ACTIFS:
 {liste_objectifs}
-
+{section_memoire}
 {REGLES_AGIR}{premier_contact}{voix}"""

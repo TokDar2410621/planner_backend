@@ -112,6 +112,52 @@ class UserProfile(models.Model):
         verbose_name_plural = "Profils utilisateurs"
 
 
+class PreferenceUtilisateur(models.Model):
+    """Memoire durable des preferences dites ou confirmees par l'utilisateur.
+
+    Alimente l'agent v2: capture explicite (« souviens-toi que... »),
+    gestion (« oublie... », « que sais-tu de moi ? ») et proposition
+    inferee via chip de confirmation. Jamais de hard delete: `actif=False`
+    archive, l'historique reste auditable.
+    """
+
+    CATEGORIES = [
+        ('horaire', 'Horaire'),
+        ('lieu', 'Lieu'),
+        ('personne', 'Personne'),
+        ('habitude', 'Habitude'),
+        ('autre', 'Autre'),
+    ]
+    SOURCES = [
+        ('dite', 'Dite explicitement'),
+        ('inferee', 'Inferee puis confirmee'),
+    ]
+
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='preferences_memoire')
+    enonce = models.CharField(
+        max_length=500,
+        help_text="Preference en une ou deux phrases, telle que l'agent doit l'appliquer.")
+    categorie = models.CharField(
+        max_length=20, choices=CATEGORIES, default='autre')
+    source = models.CharField(
+        max_length=10, choices=SOURCES, default='dite')
+    confiance = models.FloatField(
+        default=1.0,
+        help_text="1.0 = dite explicitement, < 1.0 = inferee puis confirmee.")
+    actif = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Preference de {self.user.username}: {self.enonce[:60]}"
+
+    class Meta:
+        verbose_name = "Préférence mémorisée"
+        verbose_name_plural = "Préférences mémorisées"
+        ordering = ['-updated_at']
+
+
 @receiver(post_save, sender=User)
 def create_user_profile(sender, instance, created, **kwargs):
     """Create a UserProfile when a User is created."""

@@ -43,6 +43,7 @@ from pydantic_ai.usage import UsageLimits
 
 from core.models import BudgetJetonsJournalier, ConversationMessage, UploadedDocument
 from services.agent_v2 import lecture, regles
+from services.agent_v2 import memoire as memoire_prefs
 from services.agent_v2.mesure import epurer_reponse, fuites_reponse, questions_et_offres
 from services.agent_v2.modeles import REGLAGES_DIRE, modele_agir, modele_dire
 from services.agent_v2.outils import outils_pour
@@ -552,7 +553,8 @@ class PlannerAgentV2:
 
     def _dire(self, user: User, message: str, registre: Registre,
               etat: dict, faits: str, brouillon: str = "",
-              question_code: str = "", historique_court: str = "") -> ReponseDire:
+              question_code: str = "", historique_court: str = "",
+              memoire: str = "") -> ReponseDire:
         """Redige, sans outil. REGLAGES_DIRE coupe le raisonnement: verifie par
         sonde, DeepSeek refuse tool_choice=required en mode thinking, or c'est
         ainsi que PydanticAI force une sortie structuree."""
@@ -593,7 +595,8 @@ class PlannerAgentV2:
             return sortie
         brief = self._brief_dire(message, registre, etat, faits,
                                  brouillon=brouillon, question_code=question_code,
-                                 historique_court=historique_court)
+                                 historique_court=historique_court,
+                                 memoire=memoire)
 
         # DIRE passe par le MEME pool qu'AGIR, et ce n'est pas un detail de
         # style. Mesure du 2026-08-28: appeler run_sync depuis le thread
@@ -623,11 +626,13 @@ class PlannerAgentV2:
     @staticmethod
     def _brief_dire(message: str, registre: Registre, etat: dict, faits: str,
                     brouillon: str = "", question_code: str = "",
-                    historique_court: str = "") -> str:
+                    historique_court: str = "", memoire: str = "") -> str:
         lignes: list[str] = []
         if historique_court:
             lignes += ["DEUX DERNIERS ECHANGES (contexte, ne les repete pas):",
                        historique_court, ""]
+        if memoire:
+            lignes += [memoire, ""]
         lignes += [f"MESSAGE DE L'UTILISATEUR:\n{message}", ""]
         if registre.actions:
             lignes.append("REGISTRE DU TOUR (seules ces references existent):")
@@ -750,6 +755,40 @@ class PlannerAgentV2:
             inscrire_import(registre, user, attachment)
         except Exception:  # noqa: BLE001 - un recap absent vaut mieux qu'un tour tombe
             logger.error("Import du document non inscrit au registre", exc_info=True)
+
+        # Commande memoire deterministe (memoire.py): « souviens-toi que... »,
+        # « oublie... », « que sais-tu de moi ? ». Executee par le code AVANT
+        # AGIR, comme l'import: memoriser, oublier ou lister ne demande aucun
+        # appel au modele. Le resultat entre au registre pour que DIRE
+        # l'annonce; AGIR ne recoit que le reste eventuel du message.
+        # Un tap structure (chip d'une question en attente) n'est jamais une
+        # commande memoire.
+        try:
+            commande_memoire = (memoire_prefs.interpreter(message)
+                                if self._tap is None else None)
+        except Exception:  # noqa: BLE001 - une commande illisible ne casse pas le tour
+            commande_memoire = None
+            logger.error("Interpretation memoire impossible", exc_info=True)
+        if commande_memoire is not None:
+            try:
+                from services.agent.tools.base import ToolResult
+                if commande_memoire.genre == "memoriser":
+                    phrase = memoire_prefs.memoriser(user, commande_memoire.enonce)
+                elif commande_memoire.genre == "oublier":
+                    phrase = memoire_prefs.oublier(user, commande_memoire.enonce)
+                else:
+                    phrase = memoire_prefs.lister(user)
+                registre.ajouter("memoire", {"commande": commande_memoire.genre},
+                                 ToolResult(success=True, message=phrase))
+                if commande_memoire.pure and message_enrichi == message:
+                    # Rien d'autre a faire ce tour: AGIR ne doit pas relire
+                    # une commande memoire comme une demande de planification.
+                    message_enrichi = ("(Commande memoire deja executee par le "
+                                       "code: aucune action de planification.)")
+                elif commande_memoire.reste:
+                    message_enrichi = commande_memoire.reste
+            except Exception:  # noqa: BLE001 - le tour continue sans la memoire
+                logger.error("Commande memoire non executee", exc_info=True)
 
         # La reponse a une question du tour precedent s'execute par le CODE,
         # avant AGIR: un tap sur « Tous les jeudis » supprime la serie sans
@@ -927,7 +966,8 @@ class PlannerAgentV2:
                 brut = self._dire(user, message, registre, etat, faits,
                                   brouillon="" if reemises else self._brouillon_agir,
                                   question_code=question_deja,
-                                  historique_court=self._deux_derniers_echanges(user))
+                                  historique_court=self._deux_derniers_echanges(user),
+                                  memoire=memoire_prefs.section_memoire(user))
                 # Fuites APRES la seconde chance du validateur: ce compteur dit
                 # ce que le modele persiste a affirmer, pas ce qui part.
                 fuites = fuites_reponse(brut)
@@ -1403,14 +1443,24 @@ class PlannerAgentV2:
         chips disparaitraient en silence pour tout compte bascule.
 
         Les suggestions n'ont rien a voir avec la verite d'action, et v1 les
-        rend bien: on delegue plutot que de dupliquer."""
+        rend bien: on delegue plutot que de dupliquer.
+        La chip « Mémoriser ? » (memoire inferee) passe devant: un tap
+        rejoue la voie explicite, confirmation incluse.
+        """
+        chips: list[dict] = []
+        try:
+            chip = memoire_prefs.chip_inference(user, user_message or "")
+            if chip:
+                chips.append(chip)
+        except Exception:  # noqa: BLE001 - une suggestion ne remonte jamais d'erreur
+            logger.debug("Chip memoire indisponible", exc_info=True)
         try:
             from services.agent.agent import PlannerAgent
-            return PlannerAgent().quick_replies_for(
-                user, user_message, assistant_response) or []
+            chips.extend(PlannerAgent().quick_replies_for(
+                user, user_message, assistant_response) or [])
         except Exception:  # noqa: BLE001 - une suggestion ne remonte jamais d'erreur
             logger.debug("Suggestions indisponibles", exc_info=True)
-            return []
+        return chips
 
     # ------------------------------------------------------------------ util
 
