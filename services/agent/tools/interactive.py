@@ -760,6 +760,166 @@ class PresentChoicesTool(BaseTool):
         return {_plat(nom): nom for nom in noms if nom and _plat(nom)}
 
 
+MAX_QUESTION_LIBRE = 140
+MAX_LIBELLE_LIBRE = 40
+MAX_VALEUR_LIBRE = 200
+MAX_OPTIONS_LIBRE = 4
+MIN_OPTIONS_LIBRE = 2
+
+
+def _confirmation_destructive(question: str, options: list) -> bool:
+    """La question ressemble-t-elle a une confirmation de suppression ou
+    d'annulation ? Reutilise le lexique du code (demandes.py): une telle
+    confirmation ne se pose jamais par le modele, c'est le code qui la pose
+    quand le modele appelle l'outil vise."""
+    from services.agent_v2.demandes import LEXIQUE_SUPPRESSION
+    destructif = re.compile(LEXIQUE_SUPPRESSION)
+    textes = [question or ""]
+    for option in options or []:
+        if isinstance(option, dict):
+            textes.append(option.get("label") or "")
+            textes.append(option.get("value") or "")
+    return any(destructif.search(t) for t in textes)
+
+
+def _demande_question_libre(question: str, options: list) -> dict:
+    """La DEMANDE de motif question_libre, meme forme que choix_modele.
+
+    Les options ne portent AUCUN effet: un tap ne peut jamais executer un
+    outil. La valeur revient comme message utilisateur et AGIR l'interprete
+    au tour suivant. La cle derive de la question: la reposer a l'identique
+    ne duplique pas la demande au rendu.
+    """
+    import hashlib
+
+    return {
+        "type": "choix",
+        "motif": "question_libre",
+        "cle": "question:" + hashlib.sha1(question.encode("utf-8")).hexdigest()[:12],
+        "outil": "poser_question",
+        "parametres": {
+            "question": question,
+            "options": [{"label": o["label"], "value": o["value"]} for o in options],
+        },
+        "cible": {},
+        "options": [
+            {"id": f"o{rang}", "effet": None,
+             "libelle": option["label"], "valeur": option["value"]}
+            for rang, option in enumerate(options, start=1)
+        ],
+        "question": question,
+        "emise_le": timezone.now().isoformat(),
+    }
+
+
+class PoserQuestionTool(BaseTool):
+    """
+    Pose une question courte avec 2 a 4 reponses en un tap, a choix libre.
+
+    Complement de present_choices (options ancrees dans le planning reel):
+    ici les options sont arbitraires, pour les clarifications qui ne portent
+    pas sur un element du planning. Aucune option ne porte d'effet: un tap
+    n'execute jamais d'outil, la valeur revient comme message et AGIR
+    l'interprete au tour suivant. Reserve a v2 (V2_SEULEMENT dans
+    tools/__init__.py): la reponse part dans done.quick_replies par la
+    DEMANDE rangee dans data.
+    """
+
+    name = "poser_question"
+    description = (
+        "Pose UNE question courte avec 2 a 4 reponses en un tap, a choix libre. "
+        "Utilise-le quand la reponse est bornee mais ne porte sur aucun element "
+        "du planning (present_choices est reserve aux creneaux libres, blocs, "
+        "taches et jours existants). Exemples: une preference oui/non, un format "
+        "de reponse, une clarification binaire. N'affirme jamais d'action dans "
+        "la question ni dans les options: la question se pose avant d'agir. "
+        "Une seule question par tour: attends la reponse avant d'en poser "
+        "une autre. Ne t'en sers jamais pour une confirmation destructive: "
+        "appelle l'outil vise, le code pose la question lui-meme."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "La question, courte (140 caracteres max), qui finit par « ? ».",
+            },
+            "options": {
+                "type": "array",
+                "description": (
+                    "2 a 4 reponses. Chaque option a un label court "
+                    "(40 caracteres max, texte du bouton) et une value "
+                    "(200 caracteres max, phrase complete envoyee au tap)."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string"},
+                        "value": {"type": "string"},
+                    },
+                    "required": ["label", "value"],
+                },
+            },
+        },
+        "required": ["question", "options"],
+    }
+
+    @staticmethod
+    def _refus(message: str, **data) -> ToolResult:
+        return ToolResult(success=False, data=data, message=message)
+
+    def execute(self, user: User, **kwargs) -> ToolResult:
+        from services.agent_v2.mesure import fuite_question
+
+        question = _texte_court(kwargs.get("question"), MAX_QUESTION_LIBRE)
+        if question is None or not question.endswith("?"):
+            return self._refus(
+                "Question non posee : elle doit etre courte (140 caracteres max) "
+                "et finir par « ? ».")
+        if fuite_question(question):
+            return self._refus(
+                "Question non posee : elle affirme une action. "
+                "Pose-la sans rien raconter de ce qui a ete fait.")
+
+        brutes = kwargs.get("options")
+        candidates, vus, rejetees = [], set(), []
+        for option in brutes if isinstance(brutes, list) else []:
+            if not isinstance(option, dict):
+                continue
+            label = _texte_court(option.get("label"), MAX_LIBELLE_LIBRE)
+            value = _texte_court(option.get("value"), MAX_VALEUR_LIBRE)
+            if label is None or value is None:
+                continue
+            if _plat(label) in vus:
+                continue
+            if fuite_question(label) or fuite_question(value):
+                rejetees.append(label)
+                continue
+            vus.add(_plat(label))
+            candidates.append({"label": label, "value": value})
+        candidates = candidates[:MAX_OPTIONS_LIBRE]
+        if len(candidates) < MIN_OPTIONS_LIBRE:
+            detail = f" Options ecartees : {', '.join(rejetees)}." if rejetees else ""
+            return self._refus(
+                "Question non posee : il faut 2 a 4 options valides." + detail)
+        if _confirmation_destructive(question, candidates):
+            return self._refus(
+                "Question non posee : elle ressemble a une confirmation de "
+                "suppression ou d'annulation. Si une action destructive est en "
+                "jeu, appelle directement l'outil vise et laisse le code poser "
+                "la question ; sinon reformule sans verbe de suppression.")
+
+        demande = _demande_question_libre(question, candidates)
+        return ToolResult(
+            success=True,
+            data={"demande": demande},
+            message=(
+                f"Question posee a l'utilisateur ({len(candidates)} options). "
+                "Attends sa reponse, ne pose pas d'autre question."
+            ),
+        )
+
+
 class PresentQuickRepliesTool(BaseTool):
     """
     Present quick reply buttons to the user.

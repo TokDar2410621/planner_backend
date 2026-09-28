@@ -1747,6 +1747,27 @@ def _titre_du_formulaire(ctx: _Contexte, nom: str, kwargs: dict):
             f"une seance de plus de « {titre} », rappelle create_block avec ce titre.")
 
 
+MOTIFS_QUESTION_MODELE = ("choix_modele", "question_libre")
+
+
+def _question_deja_posee(ctx: _Contexte, nom: str, kwargs: dict):
+    """Une seule question du modele par tour. Si le registre porte deja une
+    demande de motif choix_modele ou question_libre emise ce tour, le second
+    appel est refuse avec une consigne, pas execute: deux questions ne se
+    rendent pas, et la seconde ecraserait la premiere au tap."""
+    if nom not in ("poser_question", "present_choices"):
+        return None
+    for a in ctx.registre.actions:
+        demande = (a.donnees or {}).get("demande")
+        if (isinstance(demande, dict)
+                and demande.get("motif") in MOTIFS_QUESTION_MODELE):
+            return ToolResult(
+                success=False,
+                message=("Question non posee : tu as deja pose une question ce tour. "
+                         "Attends la reponse de l'utilisateur."))
+    return None
+
+
 def _garde_creations(ctx: _Contexte, nom: str, kwargs: dict):
     from services.agent.tools.blocks import normaliser_jours
 
@@ -1997,6 +2018,8 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
                 issue = _garde_creations(ctx, nom, kwargs)
             if issue is None:
                 issue = _titre_du_formulaire(ctx, nom, kwargs)
+            if issue is None:
+                issue = _question_deja_posee(ctx, nom, kwargs)
             if nom == "present_form":
                 kwargs = formulaire_avec_heure(ctx.texte, kwargs)
         except Exception:  # noqa: BLE001
@@ -2164,6 +2187,16 @@ def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
     return executer
 
 
+# poser_question et present_choices forcent eux aussi le batch en sequentiel
+# (pydantic-ai): deux questions du modele dans le meme batch s'executeraient
+# en parallele et passeraient toutes les deux la garde « une seule question
+# par tour » avant que la premiere soit consignee. En sequentiel, la seconde
+# voit la demande de la premiere dans le registre et est refusee avec une
+# consigne. Ce ne sont pas des mutations (pas de verrou du tour, pas de
+# traitement « mutation » dans le rendu): seulement l'ordre d'execution.
+OUTILS_QUESTION = frozenset({"poser_question", "present_choices"})
+
+
 def outils_pour(user: User, registre: Registre, message_du_tour: str = "",
                 tache: str = "", signaler=None, message_brut: str | None = None,
                 tap: dict | None = None) -> list[Tool]:
@@ -2186,7 +2219,10 @@ def outils_pour(user: User, registre: Registre, message_du_tour: str = "",
             outil.parameters,
             # Une mutation dans le batch force TOUT le batch en sequentiel
             # (pydantic-ai): les lectures pures, elles, partent en parallele.
-            sequential=(outil.name in OUTILS_DE_MUTATION),
+            # Les outils de question aussi (voir OUTILS_QUESTION): deux
+            # questions du modele ne doivent jamais s'executer en parallele.
+            sequential=(outil.name in OUTILS_DE_MUTATION
+                        or outil.name in OUTILS_QUESTION),
         )
         for outil in ALL_TOOLS
     ]
@@ -2275,7 +2311,7 @@ def _resume_sans_effet(demande: dict, option: str) -> str:
         if option == "autre_heure":
             return f"CHOISI PAR L'UTILISATEUR: une autre heure pour {titre}"
         return f"REFUSE PAR L'UTILISATEUR: {titre}, laisse faire"
-    if motif == "choix_modele":
+    if motif in ("choix_modele", "question_libre"):
         return f"CHOISI PAR L'UTILISATEUR: {_ascii(choisie.get('valeur') or choisie.get('libelle') or '')}"
     if option == "annuler":
         return f"REFUSE PAR L'UTILISATEUR: {_sujet(demande)}, n'y touche pas"

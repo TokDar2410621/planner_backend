@@ -17,7 +17,7 @@ from django.contrib.auth.models import User
 from django.test import TestCase
 
 from services.agent.tools.base import ToolResult
-from services.agent_v2.outils import _fabriquer, outils_pour
+from services.agent_v2.outils import OUTILS_QUESTION, _fabriquer, outils_pour
 from services.agent_v2.prompts import REGLES_AGIR
 from services.agent_v2.registre import OUTILS_DE_MUTATION, Registre
 
@@ -132,15 +132,16 @@ class MutationsSerialiseesTests(TestCase):
         self.assertEqual(piste.max_en_cours, 1)
         self.assertEqual(len(registre.actions), 2)
 
-    def test_flags_sequential_mutations_seulement(self):
+    def test_flags_sequential_mutations_et_questions(self):
         user = User.objects.create_user(username="par3")
         registre = Registre()
         for outil in outils_pour(user, registre):
             with self.subTest(outil=outil.name):
                 self.assertEqual(
                     outil.tool_def.sequential,
-                    outil.name in OUTILS_DE_MUTATION,
-                    "seules les mutations forcent le batch en séquentiel",
+                    outil.name in OUTILS_DE_MUTATION or outil.name in OUTILS_QUESTION,
+                    "seules les mutations et les outils de question forcent "
+                    "le batch en séquentiel",
                 )
 
 
