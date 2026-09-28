@@ -767,6 +767,21 @@ MAX_OPTIONS_LIBRE = 4
 MIN_OPTIONS_LIBRE = 2
 
 
+def _confirmation_destructive(question: str, options: list) -> bool:
+    """La question ressemble-t-elle a une confirmation de suppression ou
+    d'annulation ? Reutilise le lexique du code (demandes.py): une telle
+    confirmation ne se pose jamais par le modele, c'est le code qui la pose
+    quand le modele appelle l'outil vise."""
+    from services.agent_v2.demandes import LEXIQUE_SUPPRESSION
+    destructif = re.compile(LEXIQUE_SUPPRESSION)
+    textes = [question or ""]
+    for option in options or []:
+        if isinstance(option, dict):
+            textes.append(option.get("label") or "")
+            textes.append(option.get("value") or "")
+    return any(destructif.search(t) for t in textes)
+
+
 def _demande_question_libre(question: str, options: list) -> dict:
     """La DEMANDE de motif question_libre, meme forme que choix_modele.
 
@@ -887,6 +902,12 @@ class PoserQuestionTool(BaseTool):
             detail = f" Options ecartees : {', '.join(rejetees)}." if rejetees else ""
             return self._refus(
                 "Question non posee : il faut 2 a 4 options valides." + detail)
+        if _confirmation_destructive(question, candidates):
+            return self._refus(
+                "Question non posee : elle ressemble a une confirmation de "
+                "suppression ou d'annulation. Si une action destructive est en "
+                "jeu, appelle directement l'outil vise et laisse le code poser "
+                "la question ; sinon reformule sans verbe de suppression.")
 
         demande = _demande_question_libre(question, candidates)
         return ToolResult(

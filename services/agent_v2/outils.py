@@ -2187,6 +2187,16 @@ def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
     return executer
 
 
+# poser_question et present_choices forcent eux aussi le batch en sequentiel
+# (pydantic-ai): deux questions du modele dans le meme batch s'executeraient
+# en parallele et passeraient toutes les deux la garde « une seule question
+# par tour » avant que la premiere soit consignee. En sequentiel, la seconde
+# voit la demande de la premiere dans le registre et est refusee avec une
+# consigne. Ce ne sont pas des mutations (pas de verrou du tour, pas de
+# traitement « mutation » dans le rendu): seulement l'ordre d'execution.
+OUTILS_QUESTION = frozenset({"poser_question", "present_choices"})
+
+
 def outils_pour(user: User, registre: Registre, message_du_tour: str = "",
                 tache: str = "", signaler=None, message_brut: str | None = None,
                 tap: dict | None = None) -> list[Tool]:
@@ -2209,7 +2219,10 @@ def outils_pour(user: User, registre: Registre, message_du_tour: str = "",
             outil.parameters,
             # Une mutation dans le batch force TOUT le batch en sequentiel
             # (pydantic-ai): les lectures pures, elles, partent en parallele.
-            sequential=(outil.name in OUTILS_DE_MUTATION),
+            # Les outils de question aussi (voir OUTILS_QUESTION): deux
+            # questions du modele ne doivent jamais s'executer en parallele.
+            sequential=(outil.name in OUTILS_DE_MUTATION
+                        or outil.name in OUTILS_QUESTION),
         )
         for outil in ALL_TOOLS
     ]

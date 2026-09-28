@@ -182,6 +182,63 @@ def oui_clair(message_brut) -> bool:
             and all(m in _OUI or m in _POLITESSE for m in mots))
 
 
+_NON = {"non", "no", "nan"}
+
+
+def non_clair(message_brut) -> bool:
+    """Miroir de oui_clair: le message n'est-il qu'un non, avec au plus de
+    la politesse autour ?"""
+    if not isinstance(message_brut, str) or "?" in message_brut:
+        return False
+    mots = [m for m in (x.strip("'-") for x in re.findall(r"[a-z0-9'-]+", _plat(message_brut))) if m]
+    return (any(m in _NON for m in mots)
+            and all(m in _NON or m in _POLITESSE for m in mots))
+
+
+def _polarite_label(label) -> str | None:
+    """La polarite d'un libelle de puce, ou None si elle n'est pas lisible
+    sans ambiguite. Strict: seuls les libelles qui SONT un oui ou un non
+    (avec au plus de la politesse) comptent."""
+    plat = _plat(label).strip() if isinstance(label, str) else ""
+    if not plat:
+        return None
+    mots = [m for m in (x.strip("'-") for x in re.findall(r"[a-z0-9'-]+", plat)) if m]
+    if (any(m in _OUI for m in mots)
+            and all(m in _OUI or m in _POLITESSE for m in mots)):
+        return "oui"
+    if (any(m in _NON for m in mots)
+            and all(m in _NON or m in _POLITESSE for m in mots)):
+        return "non"
+    return None
+
+
+def _oui_non_binaire(message_brut, demande):
+    """Question libre binaire (exactement 2 options, une oui et une non):
+    un oui/non clair en texte libre vaut la puce touchee.
+
+    Exempte de la regle du round 6 (D1): les options d'une question libre
+    ne portent aucun effet, un tap n'execute jamais d'outil. Le choix repart
+    vers AGIR comme message (« CHOISI PAR L'UTILISATEUR »), jamais comme
+    execution; le pire cas est une interpretation, pas une mutation."""
+    options = [o for o in demande.get("options") or []
+               if isinstance(o, dict) and o.get("id")]
+    if len(options) != 2:
+        return None
+    polarites = {}
+    for option in options:
+        polarite = _polarite_label(option.get("libelle"))
+        if polarite is None or polarite in polarites:
+            return None
+        polarites[polarite] = option.get("id")
+    if set(polarites) != {"oui", "non"}:
+        return None
+    if oui_clair(message_brut):
+        return polarites["oui"]
+    if non_clair(message_brut):
+        return polarites["non"]
+    return None
+
+
 def _ids_options(demande: dict) -> set:
     return {
         o.get("id") for o in demande.get("options") or []
@@ -355,6 +412,9 @@ def option_choisie(message_brut: str, demande: dict,
     puces. Seule la puce exacte donne une option destructive; une reponse
     libre ne donne au mieux que « annuler ».
 
+    Exception: pour le motif « question_libre » (options sans effet), une
+    question binaire oui/non accepte aussi un oui/non clair en texte libre.
+
     `tap` est le postback structure du front ({"demande": cle, "option": id})
     envoye quand l'utilisateur touche une puce: l'egalite d'identifiants
     remplace la comparaison de texte. Il n'ouvre aucune surface nouvelle
@@ -378,6 +438,8 @@ def option_choisie(message_brut: str, demande: dict,
             and demande.get("motif") in MOTIFS_LECTURE_LIBRE
             and annulation_libre(message_brut, demande)):
         choix = "annuler"
+    if choix is None and demande.get("motif") == "question_libre":
+        choix = _oui_non_binaire(message_brut, demande)
     return choix if choix in ids else None
 
 

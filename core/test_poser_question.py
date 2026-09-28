@@ -257,3 +257,103 @@ class UneSeuleQuestionTests(TransactionTestCase):
         second = self._appeler(tools, "poser_question", question=QUESTION,
                                options=OPTIONS)
         self.assertIn("deja pose une question", second)
+
+
+class DurcissementsTests(TransactionTestCase):
+    """Les 3 points durcis apres la revue: batch sequentiel, refus des
+    confirmations destructives, oui/non libre sur question binaire."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="durci", password="x")
+        from core.models import ConversationMessage
+        ConversationMessage.objects.create(user=self.user, role="user",
+                                           content="une question")
+        self.registre = Registre()
+        self.tools = {t.name: t for t in outils_v2.outils_pour(
+            self.user, self.registre, "une question", tache="u:1",
+            message_brut="une question")}
+
+    def _demande_oui_non(self):
+        outil = TOOL_MAP["poser_question"]
+        resultat = outil.execute(self.user, question=QUESTION, options=OPTIONS)
+        assert resultat.success, resultat.message
+        return resultat.data["demande"]
+
+    # -- 1. batch sequentiel
+
+    def test_outils_question_sequentiels(self):
+        self.assertTrue(self.tools["poser_question"].sequential)
+        self.assertTrue(self.tools["present_choices"].sequential)
+
+    def test_lecture_pure_reste_parallele(self):
+        self.assertFalse(self.tools["list_blocks"].sequential)
+
+    def test_mutation_reste_sequentielle(self):
+        self.assertTrue(self.tools["create_block"].sequential)
+        self.assertTrue(self.tools["delete_block"].sequential)
+
+    # -- 2. confirmation destructive refusee par le code
+
+    def _executer(self, **kwargs):
+        return TOOL_MAP["poser_question"].execute(self.user, **kwargs)
+
+    def test_question_suppression_refusee(self):
+        resultat = self._executer(question="Je supprime ce bloc ?",
+                                  options=OPTIONS)
+        self.assertFalse(resultat.success)
+        self.assertIn("suppression", resultat.message)
+
+    def test_option_suppression_refusee(self):
+        resultat = self._executer(
+            question="Tu veux un rappel la veille ?",
+            options=[{"label": "Oui, supprime-le",
+                      "value": "Oui, supprime le bloc."},
+                     {"label": "Non", "value": "Non, garde-le."}])
+        self.assertFalse(resultat.success)
+        self.assertIn("suppression", resultat.message)
+
+    def test_question_annulation_refusee(self):
+        resultat = self._executer(question="J'annule le rappel ?",
+                                  options=OPTIONS)
+        self.assertFalse(resultat.success)
+
+    def test_question_saine_acceptee(self):
+        resultat = self._executer(question=QUESTION, options=OPTIONS)
+        self.assertTrue(resultat.success)
+
+    # -- 3. oui/non libre sur question binaire
+
+    def test_oui_libre_vaut_la_puce(self):
+        demande = self._demande_oui_non()
+        ids = {o["libelle"]: o["id"] for o in demande["options"]}
+        self.assertEqual(dem.option_choisie("oui", demande), ids["Oui"])
+        self.assertEqual(dem.option_choisie("Oui stp", demande), ids["Oui"])
+
+    def test_non_libre_vaut_la_puce(self):
+        demande = self._demande_oui_non()
+        ids = {o["libelle"]: o["id"] for o in demande["options"]}
+        self.assertEqual(dem.option_choisie("non", demande), ids["Non"])
+        self.assertEqual(dem.option_choisie("non merci", demande), ids["Non"])
+
+    def test_reponse_floue_ignoree(self):
+        demande = self._demande_oui_non()
+        self.assertIsNone(dem.option_choisie("peut-être", demande))
+        self.assertIsNone(dem.option_choisie("je ne sais pas", demande))
+
+    def test_question_non_binaire_ignoree(self):
+        demande = self._demande_oui_non()
+        for option in demande["options"]:
+            option["libelle"] = {"o1": "Le matin", "o2": "Le soir"}.get(
+                option["id"], option["libelle"])
+        self.assertIsNone(dem.option_choisie("oui", demande))
+
+    def test_trois_options_ignoree(self):
+        demande = self._demande_oui_non()
+        demande["options"].append({"id": "o3", "libelle": "Peut-être",
+                                   "valeur": "Peut-etre.", "effet": None})
+        self.assertIsNone(dem.option_choisie("oui", demande))
+
+    def test_motif_garde_oui_libre_inchange(self):
+        demande = self._demande_oui_non()
+        demande["motif"] = "destructif"
+        self.assertIsNone(dem.option_choisie("oui", demande))
