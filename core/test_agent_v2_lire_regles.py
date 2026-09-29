@@ -32,6 +32,43 @@ from core.models import ConversationMessage, RecurringBlock
 from core.test_agent_v2_lire_ombre import _agir_scripte, _element, _heure, _normaliser, _ref
 from services.agent.tools.base import ToolResult
 from services.agent_v2 import boutons, lecture, regles
+
+
+def _boucle_scriptee(appel=None, elements=None, sortie=None, compteur=None):
+    """Boucle unique simulee: un appel d'outil au premier pas s'il y en a un,
+    puis la ReponseDire (avec la lecture typee injectee). Remplace le duo
+    modele_agir + modele_dire et l'injection via lecture.demarrer."""
+    from pydantic_ai.models.function import DeltaToolCall
+
+    def deja_appele(messages):
+        from pydantic_ai.messages import ToolReturnPart
+        return any(isinstance(p, ToolReturnPart) for m in messages for p in getattr(m, "parts", []))
+
+    def _args():
+        args = dict(sortie or {"ouverture": "", "suite": "", "question": "",
+                               "options": [], "refs": []})
+        if elements is not None:
+            args["lecture"] = {"elements": elements, "reponses": []}
+        return args
+
+    def repondre(messages, info: AgentInfo):
+        if compteur is not None:
+            compteur.append(1)
+        if appel and not deja_appele(messages):
+            return ModelResponse(parts=[ToolCallPart(tool_name=appel[0], args=appel[1])])
+        return ModelResponse(parts=[ToolCallPart(tool_name=info.output_tools[0].name,
+                                                args=_args())])
+
+    async def en_flux(messages, info: AgentInfo):
+        if compteur is not None:
+            compteur.append(1)
+        if appel and not deja_appele(messages):
+            yield {0: DeltaToolCall(name=appel[0], json_args=json.dumps(appel[1]))}
+        else:
+            yield {0: DeltaToolCall(name=info.output_tools[0].name,
+                                   json_args=json.dumps(_args()))}
+
+    return FunctionModel(repondre, stream_function=en_flux)
 from services.agent_v2 import lecture_schema as schema
 from services.agent_v2.registre import Registre
 
@@ -335,52 +372,42 @@ class ToursTests(TransactionTestCase):
 
     def _tour(self, user, message, elements=None, statut="ok", lire="1", regles_actives=None,
               appel=None, dire=DIRE_ABSENCE, libre=None, rapide=False):
+        """Boucle unique: la lecture typee est injectee via le champ `lecture`
+        de la ReponseDire simulee (plus d'injection via lecture.demarrer)."""
         from services.agent_v2 import agent as module_agent
         from services.agent_v2.agent import PlannerAgentV2
 
-        appels_dire: list = []
+        appels_boucle: list = []
 
-        def rediger(messages, info: AgentInfo):
-            appels_dire.append(1)
-            return ModelResponse(parts=[ToolCallPart(tool_name=info.output_tools[0].name, args=dire)])
+        # Lecture utilisable seulement si LIRE active et statut ok/partiel.
+        elements_si_ok = (elements if lire == "1" and statut in (lecture.OK, lecture.PARTIELLE)
+                          else None)
 
-        def demarrer(u, m):
-            prep = lecture.preparer(u, m)
-            lu = None
-            if elements is not None and statut in (lecture.OK, lecture.PARTIELLE):
-                brute = schema.LectureTour.model_validate({"elements": elements, "reponses": []})
-                lu, _rejets = schema.ancrer(brute, m, prep.aujourdhui, prep.refs)
-            return lecture.Suivi(preparation=prep, fixe=lecture.Resultat(
-                statut, lecture=lu, fournisseur="deepseek-flash" if lu is not None else ""))
-
-        reglages = {"LIRE_OMBRE": lire}
+        reglages = {}
         if regles_actives is not None:
             reglages["LIRE_REGLES"] = regles_actives
         with ExitStack() as pile:
             pile.enter_context(override_settings(**reglages))
-            pile.enter_context(patch.object(module_agent, "modele_agir", side_effect=lambda: _agir_scripte(appel)))
-            pile.enter_context(patch.object(module_agent, "modele_dire", side_effect=lambda: FunctionModel(rediger)))
-            if lire == "1":
-                pile.enter_context(patch.object(lecture, "demarrer", side_effect=demarrer))
+            pile.enter_context(patch.object(
+                module_agent, "modele_agir",
+                side_effect=lambda: _boucle_scriptee(appel, elements_si_ok, dire,
+                                                     compteur=appels_boucle)))
             if libre is not None:
                 pile.enter_context(patch("services.scheduling.placement.open_intervals", return_value=libre))
             if rapide:
                 pile.enter_context(patch.object(PlannerAgentV2, "_tour_decide",
                                                 staticmethod(lambda registre, message: True)))
-            conclure = pile.enter_context(patch.object(lecture, "conclure", wraps=lecture.conclure))
-            journal = pile.enter_context(self.assertLogs(JOURNAL, "INFO"))
             evenements = list(PlannerAgentV2().process_message_stream(user, message))
         assistant = ConversationMessage.objects.filter(user=user, role="assistant").latest("pk")
-        lignes = [r.getMessage() for r in journal.records
-                  if r.getMessage().startswith("agent_v2 lire statut=")]
-        return SimpleNamespace(done=evenements[-1], assistant=assistant, dire=len(appels_dire),
-                               conclure=conclure.call_count, lignes=lignes)
+        return SimpleNamespace(done=evenements[-1], assistant=assistant, boucle=len(appels_boucle))
 
     # -- regle 1
 
     def test_mets_mon_cours_de_maths_formulaire_du_code_et_dire_muet(self):
         t = self._tour(self._utilisateur("maths"), "mets mon cours de maths", [COURS_MATHS_TOUR])
-        self.assertEqual(t.dire, 0)
+        # Boucle unique: la boucle tourne (pour la lecture typee) mais sa prose
+        # est coupee par la regle; le code parle seul.
+        self.assertEqual(t.boucle, 1)
         self.assertEqual(t.done["response"], REPONSE_MATHS)
         self.assertEqual(t.assistant.content, REPONSE_MATHS)
         self.assertEqual(t.done["quick_replies"], [])
@@ -389,16 +416,13 @@ class ToursTests(TransactionTestCase):
         self.assertEqual(t.assistant.metadata["interactive_inputs"], t.done["interactive_inputs"])
         self.assertTrue(any(a["outil"] == "present_form" and a["par_le_code"]
                             for a in t.assistant.metadata["actions"]))
-        self.assertEqual(t.conclure, 1, "la lecture ne s'attend qu'une fois par tour")
-        self.assertEqual(len(t.lignes), 1)
-        self.assertTrue(t.lignes[0].endswith(" regle=formulaire_cours"), t.lignes[0])
+        self.assertNotIn("Je ne vois pas de cours de maths", t.done["response"])
 
     def test_regle_coupee_le_tour_de_main_reste(self):
         t = self._tour(self._utilisateur("coupee"), "mets mon cours de maths", [COURS_MATHS_TOUR],
                        regles_actives="creneaux")
-        self.assertEqual(t.dire, 1)
+        self.assertEqual(t.boucle, 1)
         self.assertIn("Je ne vois pas de cours de maths dans ton horaire.", t.done["response"])
-        self.assertTrue(t.lignes[0].endswith(" regle=-"))
 
     def test_sans_lecture_utilisable_le_tour_est_celui_de_main(self):
         message = "mets mon cours de maths"
@@ -416,31 +440,30 @@ class ToursTests(TransactionTestCase):
                                  json.dumps(_normaliser(reference.done), sort_keys=True, ensure_ascii=False))
                 self.assertEqual(t.assistant.content, reference.assistant.content)
                 self.assertEqual(sans_lire(t.assistant), sans_lire(reference.assistant))
-                self.assertEqual(t.conclure, 1)
 
     def test_une_creation_reussie_ce_tour_garde_dire(self):
         appel = ("create_block", {"title": "Maths", "block_type": "course", "days": ["mardi"],
                                   "start_time": "09:00", "end_time": "10:00"})
         t = self._tour(self._utilisateur("creation"), "mets mon cours de maths", [COURS_MATHS_TOUR],
                        appel=appel, dire=DIRE_NEUTRE)
-        self.assertEqual(t.dire, 1)
+        # Boucle unique: 2 passages (appel d'outil puis ReponseDire), prose gardee.
+        self.assertEqual(t.boucle, 2)
         self.assertFalse(t.done.get("interactive_inputs"))
-        self.assertTrue(t.lignes[0].endswith(" regle=-"))
+        self.assertIn("D'accord.", t.done["response"])
 
     def test_une_reponse_de_formulaire_garde_dire(self):
         message = "Voici mes réponses :\nCours: maths"
         t = self._tour(self._utilisateur("reponse"), message,
                        [_element(mention="maths", genre="course", candidats=["s1"])], dire=DIRE_NEUTRE)
-        self.assertEqual(t.dire, 1)
+        self.assertEqual(t.boucle, 1)
         self.assertFalse(t.done.get("interactive_inputs"))
-        self.assertTrue(t.lignes[0].endswith(" regle=-"))
+        self.assertIn("D'accord.", t.done["response"])
 
     def test_le_chemin_rapide_n_evalue_aucune_regle(self):
         t = self._tour(self._utilisateur("rapide"), "oui", [COURS_MATHS_TOUR], rapide=True)
-        self.assertEqual(t.dire, 0)
+        # Chemin rapide: la boucle ne tourne pas, aucune regle evaluee.
+        self.assertEqual(t.boucle, 0)
         self.assertFalse(t.done.get("interactive_inputs"))
-        self.assertEqual(t.assistant.metadata["lecture_statut"], "sautee")
-        self.assertTrue(t.lignes[0].endswith(" regle=-"))
 
     # -- regle 2
 
@@ -455,9 +478,9 @@ class ToursTests(TransactionTestCase):
                        [REVISION_DEMIN], dire=DIRE_NEUTRE, libre=OCCUPE)
         for cle in ("quick_replies", "question", "question_motif", "response"):
             self.assertEqual(t.done[cle], main.done[cle], cle)
-        self.assertEqual(t.dire, 1)
-        self.assertEqual(t.conclure, 1)
-        self.assertTrue(t.lignes[0].endswith(" regle=creneaux"), t.lignes[0])
+        self.assertEqual(t.boucle, 1)
+        # La regle creneaux a force les puces (question identique a main).
+        self.assertEqual(t.done["question_motif"], "creneaux")
 
     def test_creneaux_coupe_ou_lecture_tardive_comme_main(self):
         for nom, options in (("creneaux-coupe", dict(elements=[REVISION_DEMIN], regles_actives="formulaire_cours")),
@@ -466,4 +489,5 @@ class ToursTests(TransactionTestCase):
                 t = self._tour(self._utilisateur(nom), "planifie revision demin de 14h a 16h",
                                dire=DIRE_NEUTRE, libre=OCCUPE, **options)
                 self.assertEqual(t.done["quick_replies"], [])
-                self.assertTrue(t.lignes[0].endswith(" regle=-"))
+                # Regle coupee ou lecture inutilisable: la prose neutre survit.
+                self.assertIn("D'accord.", t.done["response"])

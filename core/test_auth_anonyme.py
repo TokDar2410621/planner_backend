@@ -268,10 +268,8 @@ class BudgetAnonymeTest(APITestCase):
         anon = _creer_anonyme('device-budget-04')
         BudgetJetonsJournalier.objects.create(
             user=anon, jour=timezone.localdate(), jetons=400000)
-        with patch.object(PlannerAgentV2, '_agir',
-                          side_effect=AssertionError("AGIR ne doit pas tourner")), \
-             patch.object(PlannerAgentV2, '_dire',
-                          side_effect=AssertionError("DIRE ne doit pas tourner")):
+        with patch.object(PlannerAgentV2, '_boucle',
+                          side_effect=AssertionError("la boucle ne doit pas tourner")):
             res = PlannerAgentV2().process_message(anon, "bonjour")
         self.assertIn("Crée un compte", res['response'])
 

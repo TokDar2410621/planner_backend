@@ -83,7 +83,7 @@ def _textes_envoyes_au_modele() -> dict:
     from services.agent.tools import ALL_TOOLS
     from services.agent_v2 import prompts
 
-    textes = {nom: getattr(prompts, nom) for nom in ("REGLES_AGIR", "PREMIER_CONTACT", "PROMPT_DIRE")}
+    textes = {nom: getattr(prompts, nom) for nom in ("REGLES_AGIR", "PREMIER_CONTACT", "PROSE_BOUCLE")}
     textes["ReponseDire"] = json.dumps(ReponseDire.model_json_schema(), ensure_ascii=False)
     for outil in ALL_TOOLS:
         textes[f"outil {outil.name}"] = (
@@ -106,10 +106,10 @@ class P1FuiteDuBancTests(SimpleTestCase):
         self.assertIn("outil create_block", textes)
         self.assertIn("outil present_choices", textes)
         self.assertIn("outil cancel_scheduled_block", textes)
-        self.assertIn("PROMPT_DIRE", textes)
+        self.assertIn("PROSE_BOUCLE", textes)
 
     def test_les_regles_restent(self):
-        from services.agent_v2.prompts import PROMPT_DIRE, REGLES_AGIR
+        from services.agent_v2.prompts import REGLES_AGIR
         for requis in ("COURS EXISTANT", "AJOUT AVEC JOURS ET HEURES",
                        "c'est un nouveau cours: create_block dans ce tour",
                        "un cours revient chaque semaine par defaut",
@@ -117,7 +117,7 @@ class P1FuiteDuBancTests(SimpleTestCase):
                        "Exemples: « L", "echeance sans jour choisi"):
             with self.subTest(requis=requis):
                 self.assertIn(requis, REGLES_AGIR)
-        self.assertIn("seulement cette fois ou chaque semaine", " ".join(PROMPT_DIRE.split()))
+        self.assertIn("cette date seulement ou toute la serie", REGLES_AGIR)
 
 
 # ── P2: un jour nomme sans mot de recurrence donne un evenement unique ──────
@@ -127,11 +127,11 @@ class P2RegleTests(SimpleTestCase):
 
     def test_le_prompt_dit_la_regle(self):
         from services.agent_v2.prompts import REGLES_AGIR
-        for requis in ("UN JOUR NOMME SANS MOT DE RECURRENCE",
-                       "un seul evenement date -> schedule_task_at",
-                       "« chaque », « tous les », « toutes les », « les lundis »"):
-            with self.subTest(requis=requis):
-                self.assertIn(requis, REGLES_AGIR)
+        # Boucle unique: la regle de recurrence vit dans les descriptions
+        # d'outils (le modele choisit l'outil par sa description), pas dans
+        # le prompt. Le prompt le dit explicitement.
+        self.assertIn("choisis l'outil par sa description", REGLES_AGIR)
+        self.assertNotIn("UN JOUR NOMME SANS MOT DE RECURRENCE", REGLES_AGIR)
         # La vieille regle attrapait tout jour + heure pour create_block.
         self.assertNotIn("l'utilisateur decrit ses horaires habituels AVEC jours et heures -> create_block.",
                          REGLES_AGIR)
@@ -278,10 +278,13 @@ class P3ProseSousQuestionDuCodeTests(SimpleTestCase):
                           "chips": [], "demandes": [], "cles_posees": []})
         self.assertEqual(compo.prose, "Bonne idée.")
 
-    def test_le_prompt_dire_ne_fait_plus_parler_d_attente(self):
-        from services.agent_v2.prompts import PROMPT_DIRE
-        self.assertIn("QUESTION DEJA POSEE PAR LE CODE: laisse ouverture et suite vides", PROMPT_DIRE)
-        self.assertNotIn("seulement ce jeudi ou tous les jeudis", PROMPT_DIRE)
+    def test_le_prompt_de_boucle_ne_fait_plus_parler_d_attente(self):
+        from services.agent_v2.prompts import REGLES_AGIR
+        # Le prompt de la boucle est compose de REGLES_AGIR + PROSE_BOUCLE;
+        # l'instruction vit dans REGLES_AGIR.
+        self.assertIn("question est posee par le code", REGLES_AGIR)
+        self.assertIn("ne repose pas la question", REGLES_AGIR)
+        self.assertNotIn("seulement ce jeudi ou tous les jeudis", REGLES_AGIR)
 
 
 class P3ListeEtQuestionTests(SimpleTestCase):

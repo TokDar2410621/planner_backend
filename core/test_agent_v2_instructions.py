@@ -24,12 +24,14 @@ class InstructionsDeSuiviTests(SimpleTestCase):
 
         def repondre(messages, info: AgentInfo):
             vues.append(list(messages))
-            return ModelResponse(parts=[TextPart(content="ok")])
+            # La boucle rend une sortie structuree: le modele script doit
+            # produire du JSON valide pour ReponseDire.
+            return ModelResponse(parts=[TextPart(content='{"ouverture": "ok"}')])
 
         async def en_flux(messages, info: AgentInfo):
-            # _agir passe un event_stream_handler: la requete est streamee.
+            # _boucle passe un event_stream_handler: la requete est streamee.
             vues.append(list(messages))
-            yield "ok"
+            yield '{"ouverture": "ok"}'
 
         historique = [ModelRequest(parts=[UserPromptPart(content="place ma révision")]),
                       ModelResponse(parts=[TextPart(content="Quel jour ?")])]
@@ -40,7 +42,7 @@ class InstructionsDeSuiviTests(SimpleTestCase):
              patch.object(module_agent, "prompt_agir", return_value="DATE: lundi 2026-09-14"), \
              patch.object(module_agent, "outils_pour", return_value=[]), \
              patch.object(PlannerAgentV2, "_historique", return_value=historique):
-            agent._agir(None, "Jeudi", Registre())
+            agent._boucle(None, "Jeudi", Registre())
 
         self.assertTrue(vues)
         derniere = [m for m in vues[-1] if isinstance(m, ModelRequest)][-1]

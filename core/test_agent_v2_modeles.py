@@ -19,12 +19,12 @@ class ConstructionTests(SimpleTestCase):
         """Un nom en dur ferait comparer deux MODELES et non deux boucles."""
         self.assertIn('deepseek-v4-pro', modeles.noms_de(modeles.modele_agir())[0])
 
-    def test_dire_coupe_le_raisonnement(self):
+    def test_la_boucle_coupe_le_raisonnement(self):
         """Verifie par sonde: en mode thinking, DeepSeek refuse
         tool_choice=required, que PydanticAI utilise pour forcer la sortie
-        structuree. Sans ce reglage, DIRE echoue 10 fois sur 10."""
+        structuree. Sans ce reglage, la boucle echoue 10 fois sur 10."""
         self.assertEqual(
-            modeles.REGLAGES_DIRE['extra_body']['thinking']['type'], 'disabled')
+            modeles.REGLAGES_BOUCLE_SANS_RAISONNEMENT['extra_body']['thinking']['type'], 'disabled')
 
 
 class AbsenceDeClesTests(SimpleTestCase):

@@ -38,10 +38,22 @@ class Action:
     succes: bool
     message: str
     donnees: dict
+    # Recu d'idempotence (boucle unique, 2026-09-29). `cle_operation` identifie
+    # l'intention metier (tache + outil + empreinte des parametres); `recu`
+    # porte le statut de confirmation. Une mutation dont le resultat est
+    # ambigu (timeout, exception transitoire) n'est ni un succes ni un echec:
+    # elle est `pending_confirmation` et doit etre reconciliee par requete
+    # avant toute reemission. Le modele ne reexecute jamais a l'aveugle.
+    cle_operation: str = ""
+    recu: dict = field(default_factory=dict)
 
     @property
     def est_mutation(self) -> bool:
         return self.outil in OUTILS_DE_MUTATION
+
+    @property
+    def en_attente_confirmation(self) -> bool:
+        return bool((self.donnees or {}).get("pending_confirmation"))
 
 
 @dataclass(frozen=True)
@@ -109,15 +121,33 @@ class Registre:
         # jamais l'inverse.
         self._verrou = threading.Lock()
 
-    def ajouter(self, outil: str, parametres: dict, resultat: ToolResult) -> Action:
+    def ajouter(self, outil: str, parametres: dict, resultat: ToolResult,
+                cle_operation: str = "") -> Action:
         with self._verrou:
+            donnees = dict(resultat.data or {})
+            recu = {}
+            if outil in OUTILS_DE_MUTATION:
+                # Le recu est la preuve verifiable d'une ecriture: la phase
+                # de rendu n'a le droit d'affirmer une action que contre un
+                # recu confirme (verifier-puis-rendre).
+                recu = {
+                    "cle_operation": cle_operation or "",
+                    "statut": ("pending_confirmation"
+                               if donnees.get("pending_confirmation")
+                               else ("confirme" if resultat.success else "echec")),
+                }
+                objet_id = donnees.get("block_id") or donnees.get("task_id")
+                if objet_id is not None:
+                    recu["objet_id"] = objet_id
             action = Action(
                 id=f"a{len(self.actions) + 1}",
                 outil=outil,
                 parametres=dict(parametres or {}),
                 succes=bool(resultat.success),
                 message=resultat.message or "",
-                donnees=dict(resultat.data or {}),
+                donnees=donnees,
+                cle_operation=cle_operation or "",
+                recu=recu,
             )
             self.actions.append(action)
             self._index[action.id] = action
@@ -135,6 +165,22 @@ class Registre:
 
     def mutations(self) -> list[Action]:
         return [a for a in self.actions if a.est_mutation]
+
+    def recus_confirmes(self) -> list[Action]:
+        """Les ecritures prouvees: succes + recu confirme. Seule source de
+        verite de la phase de rendu."""
+        return [a for a in self.actions
+                if a.est_mutation and a.succes
+                and (a.recu or {}).get("statut") == "confirme"]
+
+    def en_attente(self, cle_operation: str) -> Action | None:
+        """Une tentative ambigue (pending_confirmation) pour cette cle ?"""
+        if not cle_operation:
+            return None
+        for a in reversed(self.actions):
+            if a.cle_operation == cle_operation and a.en_attente_confirmation:
+                return a
+        return None
 
     def par_id(self, ident):
         if not ident or not isinstance(ident, str):

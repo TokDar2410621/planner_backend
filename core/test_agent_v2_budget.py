@@ -48,11 +48,11 @@ class _FauxAgent:
         return _FauxResultat()
 
 
-def _agir_muet(self_agent, user, message, registre):
+def _effet_muet(self_agent, user, message, registre):
     return None
 
 
-def _agir_qui_cree(self_agent, user, message, registre):
+def _effet_qui_cree(self_agent, user, message, registre):
     registre.ajouter('create_block', {'title': 'Maths'},
                      ToolResult(success=True, message="Bloc 'Maths' cree",
                                 data={'created': [{
@@ -80,26 +80,26 @@ class DelaiDuTourTests(TestCase):
         agent = PlannerAgentV2()
         self.assertAlmostEqual(agent._delai_restant(), 180.0, delta=1.0)
 
-    def test_agir_en_fond_abandonne_sur_delai(self):
-        """AGIR qui ne rend jamais la main: le tour continue, tronque."""
-        def agir_lent(self_agent, user, message, registre):
+    def test_boucle_en_fond_abandonne_sur_delai(self):
+        """Boucle qui ne rend jamais la main: le tour continue, tronque."""
+        def boucle_lente(self_agent, user, message, registre):
             time.sleep(2.0)
-            return "trop tard"
+            return ReponseDire(ouverture="trop tard")
 
         agent = PlannerAgentV2()
         agent._file_pensees = queue.Queue()
         registre = Registre()
-        with patch.object(PlannerAgentV2, '_agir', agir_lent), \
+        with patch.object(PlannerAgentV2, '_boucle', boucle_lente), \
              override_settings(AGENT_V2_DELAI_TOUR=0.5):
             depart = time.monotonic()
-            # _agir_en_fond est un generateur: (raisonnement, panne) arrive
-            # comme valeur de retour, pas comme element itere.
-            gen = agent._agir_en_fond(self.user, "bonjour", registre)
+            # _boucle_en_fond est un generateur: (reponse, panne, raisonnement)
+            # arrive comme valeur de retour, pas comme element itere.
+            gen = agent._boucle_en_fond(self.user, "bonjour", registre)
             try:
                 while True:
                     next(gen)
             except StopIteration as fin:
-                raisonnement, panne = fin.value
+                reponse, panne, raisonnement = fin.value
             duree = time.monotonic() - depart
         self.assertTrue(registre.delai_depasse)
         # TimeoutError natif, celui que leve _agir_en_fond. Jusqu'a Python
@@ -111,11 +111,14 @@ class DelaiDuTourTests(TestCase):
         # Plancher de 1 s sur le delai restant: le test attend ~1 s, pas 2.
         self.assertLess(duree, 1.8)
 
-    def test_dire_en_delai_rend_les_faits(self):
-        """DIRE qui depasse la deadline: les faits restent, la prose le dit."""
-        with patch.object(PlannerAgentV2, '_agir', _agir_qui_cree), \
-             patch.object(PlannerAgentV2, '_dire',
-                          side_effect=FuturesTimeoutError("trop lent")):
+    def test_boucle_en_delai_rend_les_faits(self):
+        """Boucle qui depasse la deadline: les faits restent, la prose le dit."""
+        def _boucle(self_agent, user, message, registre):
+            _effet_qui_cree(self_agent, user, message, registre)
+            registre.delai_depasse = True
+            raise FuturesTimeoutError("trop lent")
+
+        with patch.object(PlannerAgentV2, '_boucle', _boucle):
             res = PlannerAgentV2().process_message(self.user, "ajoute maths")
         self.assertIn('Maths', res['response'])
         self.assertIn('trop de temps', res['response'])
@@ -128,25 +131,16 @@ class BudgetJetonsTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user(username='budget', password='x')
 
-    def test_agir_recoit_le_budget_jetons(self):
+    def test_boucle_recoit_le_budget_jetons(self):
         faux = _FauxAgent()
         with patch.object(module_agent, 'Agent', return_value=faux), \
              patch.object(module_agent, 'modele_agir', return_value=object()), \
              patch.object(module_agent, 'outils_pour', return_value=[]), \
              patch.object(module_agent, 'prompt_agir', return_value=""):
-            PlannerAgentV2()._agir(self.user, "bonjour", Registre())
+            PlannerAgentV2()._boucle(self.user, "bonjour", Registre())
         limites = faux.run_kwargs['usage_limits']
         self.assertEqual(limites.request_limit, 10)
         self.assertEqual(limites.total_tokens_limit, 300000)
-
-    def test_dire_recoit_le_budget_jetons(self):
-        faux = _FauxAgent()
-        with patch.object(module_agent, 'Agent', return_value=faux), \
-             patch.object(module_agent, 'modele_dire', return_value=object()), \
-             patch.object(PlannerAgentV2, '_brief_dire', return_value=""):
-            PlannerAgentV2()._dire(self.user, "bonjour", Registre(), {}, "")
-        limites = faux.run_kwargs['usage_limits']
-        self.assertEqual(limites.total_tokens_limit, 100000)
 
     def test_budget_nul_desactive_la_garde(self):
         """Un budget a zero ne doit pas tronquer chaque tour."""
@@ -171,13 +165,11 @@ class BudgetJetonsTests(TestCase):
             BudgetJetonsJournalier.objects.filter(user=self.user).exists())
 
     def test_budget_jour_bloque_les_phases_llm(self):
-        """Compteur epuise: ni AGIR ni DIRE ne tournent, le tour le dit."""
+        """Compteur epuise: la boucle ne tourne pas, le tour le dit."""
         BudgetJetonsJournalier.objects.create(
             user=self.user, jour=timezone.localdate(), jetons=2000000)
-        with patch.object(PlannerAgentV2, '_agir',
-                          side_effect=AssertionError("AGIR ne doit pas tourner")), \
-             patch.object(PlannerAgentV2, '_dire',
-                          side_effect=AssertionError("DIRE ne doit pas tourner")):
+        with patch.object(PlannerAgentV2, '_boucle',
+                          side_effect=AssertionError("la boucle ne doit pas tourner")):
             res = PlannerAgentV2().process_message(self.user, "bonjour")
         self.assertIn("limite d'IA", res['response'])
 

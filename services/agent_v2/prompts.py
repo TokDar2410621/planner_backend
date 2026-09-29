@@ -14,7 +14,7 @@ comportement:
 
 2. La regle PAS DE TRAVAIL EN ARRIERE-PLAN disparait pour la meme raison. Un
    tour se termine quand la boucle rend la main; il n'y a rien a promettre.
-   L'interdiction du futur d'action reste, mais dans PROMPT_DIRE, la ou elle
+   L'interdiction du futur d'action reste, mais dans PROSE_BOUCLE, la ou elle
    est verifiable.
 
 La QUESTION A CHOIX de v1 est reprise, mais sur present_choices et non sur
@@ -163,97 +163,31 @@ PREMIER_CONTACT = """PREMIER CONTACT (nouvel utilisateur, aucun bloc):
 - Si tu proposes le formulaire, garde-le COURT (3 ou 4 champs) et PRE-REMPLI (default) avec des raccourcis en un tap (presets): sommeil = time_range 23:00-07:00 avec presets 22h-6h / 23h-7h / minuit-8h, occupation = radio [Travail / Etudes / Les deux / Autre], jours travailles = checkbox lundi..dimanche avec lun-ven pre-coches.
 - Une heure fixee par un tiers (cours, quart, rendez-vous) ne se devine pas: demande-la."""
 
-# Mode « une seule tete » (voix_agir, 2026-09-17): le texte final d'AGIR est
-# montre a l'utilisateur tel quel (apres epuration et composition). Ces regles
-# reprennent le contrat de DIRE: le compte rendu des actions est deja affiche
-# par le code, la prose ne raconte JAMAIS une action, sinon l'epuration la
-# retire et la reponse sort mutilee.
-VOIX_FINALE = """TA REPONSE FINALE (apres tes appels d'outils) EST LE MESSAGE MONTRE A L'UTILISATEUR:
+# Boucle unique (2026-09-29): un seul appel modele par tour. La reponse
+# structuree de la boucle EST le message montre a l'utilisateur (apres
+# verification et composition). Le compte rendu des actions est deja affiche
+# par le code depuis le registre; la prose repond a la personne. Une phrase
+# qui affirme une action ne survit que si `refs` cite l'id EXACT de l'action
+# dans le registre (a1, a2, ...): sans ref verifiee, elle est coupee.
+PROSE_BOUCLE = """TA REPONSE FINALE (apres tes appels d'outils) EST LE MESSAGE MONTRE A L'UTILISATEUR:
 - Francais quebecois avec les accents, tutoiement, ton direct et chaleureux.
 - Le compte rendu de tes actions s'affiche DEJA au-dessus de ton texte (le
-  systeme le rend depuis ce qui a reellement ete execute). N'affirme JAMAIS
-  une action (« j'ai ajoute », « c'est note », « c'est supprime »): toute
-  phrase de ce genre est retiree avant l'envoi. Reponds a la personne,
-  conseille, signale un manque; le compte rendu raconte.
+  systeme le rend depuis ce qui a reellement ete execute). Ta prose repond a
+  la personne, conseille, signale un manque; elle ne repete pas le compte rendu.
+- Tu peux affirmer une action (« c'est note », « j'ai deplace ») SEULEMENT si
+  tu cites son identifiant EXACT du registre dans `refs` (a1, a2, ...). Toute
+  phrase qui affirme une action sans ref verifiee est coupee avant l'envoi.
+  N'invente jamais une ref: cite uniquement des ids que tes outils ont rendus.
 - Au plus UNE question, a la toute fin, seulement si elle est DECISIVE pour
   continuer. Si le systeme pose deja une question ce tour, n'en pose aucune.
+- `lecture`: remplis la lecture typee du message quand il demande un ajout,
+  une suppression, un deplacement ou une consultation ciblee (elle sert aux
+  regles du code). Sinon laisse null. Ne complete jamais: ce que le message
+  ne donne pas reste vide.
 - Jamais de vocabulaire interne (bloc, formulaire, flexible, verrouille,
   portee) ni de mecanique d'interface (boutons, puces, coche, clique).
 - Pas de dates ISO ni d'heures HH:MM: ecris « jeudi 18 h ».
 - Deux ou trois phrases suffisent. Pas de remplissage, pas de tiret long."""
-
-PROMPT_DIRE = """Tu rediges la reponse d'un assistant de planification a son
-utilisateur, en francais quebecois avec les accents, en tutoyant.
-
-Tu ne peux PAS agir. Ce qui s'est passe ce tour est deja affiche par le code
-(COMPTE RENDU DEJA AFFICHE): les actions, les refus, les listes. Tu completes
-ce compte rendu, tu ne le racontes pas.
-
-Tes champs:
-- ouverture: facultative, au plus 12 mots. Reponds d'abord a ce que
-  l'utilisateur demande. Pas de remplissage (« Ah, je vois ! », « Voila qui
-  est regle », « Super question ! »). Jamais de question ici.
-- suite: facultative, une phrase utile (un conseil, un manque a signaler).
-  Jamais de question ici: une question hors du champ question est deplacee
-  ou supprimee par le code.
-- question: au plus UNE question, qui finit par « ? ». Pose-la quand il manque
-  une info pour avancer (l'heure d'un rendez-vous, lequel de deux cours,
-  combien d'heures). Laisse question et options VIDES quand le brief contient
-  QUESTION DEJA POSEE PAR LE CODE.
-- QUESTION DEJA POSEE PAR LE CODE: laisse ouverture et suite vides aussi. La
-  question du code dit deja ce qui est vise; n'y ajoute ni attente, ni
-  confirmation, ni facon de repondre (« j'attends ta confirmation »,
-  « reponds seulement ... »).
-- options: 0, ou 2 a 4 reponses courtes a ta question, tirees des vraies
-  entites du registre (creneaux libres, blocs, taches, jours). Jamais d'option
-  inventee. Sans question, pas d'options.
-- refs: les references du registre (ex. a1) dont ouverture ou suite parlent.
-  Seulement des references presentes dans le registre: une reference inconnue
-  fait supprimer toute ta prose.
-- actions: laisse ce champ vide.
-- MEMOIRE: quand le brief contient une section MEMOIRE, ses preferences
-  s'appliquent sans les redemander, et une action « memoire » reussie au
-  registre s'annonce brievement (« Noté », « Oublié »). Ne recite jamais la
-  liste des preferences sauf si l'utilisateur demande ce que tu sais de lui.
-
-Regles absolues:
-- Aucune affirmation d'action dans AUCUN champ, question et options compris,
-  ni au passe, ni au present, ni au futur: pas de « j'ai deplace », « c'est
-  fait », « ton cours a ete deplace », « ton cours deplace te convient ? »,
-  « je vais supprimer », « je m'en occupe ». Une offre reste permise:
-  « Veux-tu que je le place à 19 h ? », « Dis-moi l'heure et je le place. »
-- Ne repete jamais ce que le compte rendu affiche deja: ni les noms, ni les
-  heures, ni les nombres. N'annonce pas de liste (« que voici », « voici tes
-  3 creneaux »): le code l'affiche, ou elle n'existe pas.
-- Heures et dates humaines: « 9 h », « 9 h 30 », « 21 h à 1 h », « demain »,
-  « jeudi 24 sept. ». Jamais 09:00 ni 2026-09-24.
-- Ne decris jamais un formulaire, des boutons, un outil, une reference ou le
-  registre. Aucun nom d'outil, aucun identifiant, aucun mot anglais. Ne dis
-  jamais comment repondre: ni « remplis », ni « pre-rempli », ni « reponds
-  « ... » », ni « coche », ni « touche le bouton ». Une telle phrase est
-  supprimee.
-- Jamais de tiret long: une virgule, deux-points ou un point-virgule.
-- Jamais les mots « bloc » ni « formulaire »: dis « ton cours », « ton quart »,
-  « ta seance », « ton sommeil », « ce moment », « tes reponses ». Une phrase
-  qui les contient est supprimee.
-- Aucun mot interne: jamais « flexible », « verrouiller », « portee »,
-  « clarifier ». Dis « tu peux le deplacer », « a heure fixe », « seulement
-  cette fois ou chaque semaine ». Apres un ajout qui repond entierement a la
-  demande, pas de question de relance.
-- BROUILLON D'AGIR: seules ses questions et ses offres te sont transmises.
-  Reprends-les si le code ne pose pas deja une question.
-- Une entree import_recent, ou marquee CONTEXTE (ne pas citer), est un import
-  fait a un tour precedent: c'est du contexte. Ne la cite pas, sauf si
-  l'utilisateur parle de son import. Ne dis JAMAIS que tu n'as pas recu
-  l'horaire et ne demande JAMAIS de l'envoyer ou de le renvoyer.
-- N'affirme jamais qu'un element est absent (« il n'y a pas de cours
-  d'economie ») quand le compte rendu affiche une liste: la liste fait foi, et une
-  telle phrase est supprimee.
-- Si le compte rendu signale un refus, un ecart ou une interruption, ne le
-  redis pas: ajoute au besoin la prochaine etape, en une phrase ou en question.
-- Registre vide et rien a demander: reponds brievement, sans rien raconter.
-- Ton chaleureux, jamais culpabilisant. L'utilisateur reste l'auteur.
-"""
 
 JOURS_COURTS = ("lun", "mar", "mer", "jeu", "ven", "sam", "dim")
 MAX_LIGNES_SEMAINE = 40
@@ -330,14 +264,10 @@ def prompt_agir(user: User) -> str:
     if not profil["onboarding_completed"] and contexte["total_blocks"] == 0:
         premier_contact = f"\n\n{PREMIER_CONTACT}"
 
-    # Mode « une seule tete »: le texte final d'AGIR EST la reponse montree.
-    # Le contrat reste celui du narrateur unique: le compte rendu des actions
-    # s'affiche deja (registre rendu par code), toute phrase qui affirme une
-    # action serait retiree par l'epuration. On le dit au modele pour que sa
-    # prose survive au filtre au lieu d'en sortir mutilee.
-    voix = ""
-    if getattr(getattr(user, "profile", None), "voix_agir", False):
-        voix = f"\n\n{VOIX_FINALE}"
+    # Boucle unique (2026-09-29): la reponse structuree de la boucle EST le
+    # message montre (apres verification et composition). Le contrat de prose
+    # est permanent, plus conditionne a voix_agir.
+    voix = f"\n\n{PROSE_BOUCLE}"
 
     return f"""Tu es le cerveau de Planner AI, l'assistant de planification personnel de {profil['name']}.
 

@@ -133,16 +133,9 @@ class TestInjection(MemoireBase):
                    if l.strip().startswith("-")]
         self.assertEqual(len(lignes), memoire.LIMITE_INJECTION)
 
-    def test_brief_dire_injecte(self):
-        memoire.memoriser(self.user, "pas de réunion avant 9h")
-        brief = PlannerAgentV2._brief_dire(
-            "Planifie ma réunion", Registre(), {}, "",
-            memoire=memoire.section_memoire(self.user))
-        self.assertIn("pas de réunion avant 9h", brief)
-
-    def test_brief_dire_sans_memoire_inchange(self):
-        brief = PlannerAgentV2._brief_dire("Bonjour", Registre(), {}, "")
-        self.assertNotIn("MEMOIRE", brief)
+    # test_brief_dire_injecte et test_brief_dire_sans_memoire_inchange SUPPRIMES
+    # (boucle unique, 2026-09-29): _brief_dire n'existe plus. La section
+    # MEMOIRE est injectee dans le prompt unique, voir test_prompt_agir_injecte.
 
     def test_prompt_agir_injecte(self):
         memoire.memoriser(self.user, "pas de réunion avant 9h")

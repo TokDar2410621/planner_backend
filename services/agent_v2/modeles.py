@@ -1,10 +1,10 @@
 """
-Les modeles de v2 et leur chaine de secours.
+Les modeles de la boucle unique et leur chaine de secours.
 
-AGIR raisonne et outille. DIRE redige, sans outil et SANS raisonnement: verifie
-par sonde, DeepSeek refuse tool_choice=required en mode thinking, or c'est
-ainsi que PydanticAI force une sortie structuree. Sans le reglage, DIRE echoue
-systematiquement.
+La boucle raisonne, outille et rend une reponse structuree (ReponseDire).
+DeepSeek refuse tool_choice=required en mode thinking (verifie par sonde),
+or c'est ainsi que PydanticAI force une sortie structuree: REGLAGES_BOUCLE_
+SANS_RAISONNEMENT existe pour ce cas.
 """
 from __future__ import annotations
 
@@ -14,8 +14,11 @@ from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.deepseek import DeepSeekProvider
 
-# Coupe le raisonnement pour la phase DIRE. Voir docs/sonde-agent-v2-2026-08-24.md
-REGLAGES_DIRE = {"extra_body": {"thinking": {"type": "disabled"}}}
+# Coupe le raisonnement pour la boucle unique quand le fournisseur l'exige.
+# (DeepSeek refuse tool_choice=required en mode thinking, or c'est ainsi que
+# PydanticAI force une sortie structuree.) Reserve aux modeles qui en ont
+# besoin; la boucle par defaut raisonne normalement.
+REGLAGES_BOUCLE_SANS_RAISONNEMENT = {"extra_body": {"thinking": {"type": "disabled"}}}
 
 
 # Au-dela, on considere que le fournisseur ne repond plus assez vite pour un
@@ -89,10 +92,6 @@ def _chaine():
 
 
 def modele_agir():
-    return _chaine()
-
-
-def modele_dire():
     return _chaine()
 
 

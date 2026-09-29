@@ -129,9 +129,8 @@ class FormatCommunTests(TestCase):
         with patch.object(PlannerAgent, '_build_provider', return_value=faux):
             PlannerAgent().process_message(self.u1, "bonjour")
 
-        with patch.object(PlannerAgentV2, '_agir', lambda s, u, m, r: None), \
-             patch.object(PlannerAgentV2, '_dire',
-                          return_value=ReponseDire(ouverture="Salut.")):
+        with patch.object(PlannerAgentV2, '_boucle',
+                          lambda s, u, m, r: ReponseDire(ouverture="Salut.")):
             PlannerAgentV2().process_message(self.u2, "bonjour")
 
         self.assertEqual(self._messages(self.u1), self._messages(self.u2))
@@ -144,10 +143,11 @@ class FormatCommunTests(TestCase):
         from services.agent_v2 import PlannerAgentV2
         from services.agent_v2.redaction import ReponseDire
 
-        with patch.object(PlannerAgentV2, '_agir',
-                          lambda s, u, m, r: "PENSEE INTERNE SECRETE"), \
-             patch.object(PlannerAgentV2, '_dire',
-                          return_value=ReponseDire(ouverture="Salut.")):
+        def _boucle(s, u, m, r):
+            s.pousser_pensee("PENSEE INTERNE SECRETE")
+            return ReponseDire(ouverture="Salut.")
+
+        with patch.object(PlannerAgentV2, '_boucle', _boucle):
             res = PlannerAgentV2().process_message(self.u2, "bonjour")
 
         self.assertEqual(res['raisonnement'], "PENSEE INTERNE SECRETE")

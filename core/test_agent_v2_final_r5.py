@@ -333,26 +333,42 @@ class V1BrouillonTests(SimpleTestCase):
                 self.assertTrue(fuite_question(texte))
         self.assertEqual(fuite_question("C'est bon pour toi ?"), [])
 
-    def test_une_action_en_echec_efface_le_brouillon(self):
+    def test_une_action_en_echec_efface_la_prose(self):
+        """Boucle unique: le brouillon d'AGIR n'existe plus; verifier_prose
+        coupe les affirmations d'action detectees quand le registre ne porte
+        aucun recu verifie (action en echec)."""
+        from services.agent_v2.mesure import verifier_prose
+        from services.agent_v2.redaction import ReponseDire
+        from services.agent_v2.registre import Registre
         echecs = (ToolResult(success=False, data={'date_passee': '2026-09-10'},
                              message='Refuse par le code: 2026-09-10 est deja passe.'),
                   ToolResult(success=False, data={}, message="Erreur de l'outil: conflit"))
+        affirmations = ("Je l'ai mis jeudi à 9 h, veux-tu que je change ?",
+                        "C'est noté pour jeudi à 14 h, autre chose ?",
+                        "J'ai ajouté ton gym jeudi.")
         for resultat in echecs:
             registre = Registre()
             registre.ajouter('schedule_task_at', {'title': 'Rapport', 'date': '2026-09-10',
                                                   'start_time': '14:00'}, resultat)
-            for brouillon in AFFIRMATIONS + ('Veux-tu que je le place vendredi ?',):
-                with self.subTest(resultat=resultat.message, brouillon=brouillon):
-                    brief = PlannerAgentV2._brief_dire('mets mon rapport jeudi à 14 h', registre,
-                                                       {}, '', brouillon=brouillon)
-                    self.assertNotIn("BROUILLON D'AGIR", brief)
+            for affirmation in affirmations:
+                with self.subTest(resultat=resultat.message, affirmation=affirmation):
+                    reponse, supprimees, _ = verifier_prose(
+                        ReponseDire(ouverture=affirmation), registre)
+                    self.assertNotIn(affirmation, reponse.ouverture)
+                    self.assertGreater(supprimees, 0)
 
     def test_registre_vide_rien_d_affirme(self):
-        for brouillon in AFFIRMATIONS:
-            with self.subTest(brouillon=brouillon):
-                brief = PlannerAgentV2._brief_dire('mets mon rapport jeudi à 14 h', Registre(),
-                                                   {}, '', brouillon=brouillon)
-                self.assertNotIn("BROUILLON D'AGIR", brief)
+        from services.agent_v2.mesure import verifier_prose
+        from services.agent_v2.redaction import ReponseDire
+        from services.agent_v2.registre import Registre
+        for affirmation in ("Je l'ai mis jeudi à 9 h, veux-tu que je change ?",
+                            "C'est noté pour jeudi à 14 h, autre chose ?",
+                            "J'ai ajouté ton gym jeudi."):
+            with self.subTest(affirmation=affirmation):
+                reponse, supprimees, _ = verifier_prose(
+                    ReponseDire(ouverture=affirmation), Registre())
+                self.assertNotIn(affirmation, reponse.ouverture)
+                self.assertGreater(supprimees, 0)
 
 
 # ── L1: absence contredite, lecture deversee sous un formulaire ─────────────

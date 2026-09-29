@@ -32,19 +32,17 @@ class OrdreDesEvenementsTests(TestCase):
         self.Agent = PlannerAgentV2
 
     @staticmethod
-    def _agir_qui_pense(self_agent, user, message, registre):
-        """Simule un AGIR lent qui produit du raisonnement en cours de route."""
+    def _boucle_qui_pense(self_agent, user, message, registre):
+        """Simule une boucle lente qui produit du raisonnement en cours de route."""
         for morceau in ("Je regarde ", "le planning ", "du jeudi."):
             self_agent.pousser_pensee(morceau)
             time.sleep(0.05)
         registre.ajouter('create_block', {'title': 'Maths'},
                          ToolResult(success=True, message="Bloc 'Maths' cree"))
-        return "Je regarde le planning du jeudi."
+        return ReponseDire(ouverture="C'est fait.")
 
-    def _evenements(self, agir=None):
-        with patch.object(self.Agent, '_agir', agir or self._agir_qui_pense), \
-             patch.object(self.Agent, '_dire',
-                          return_value=ReponseDire(ouverture="C'est fait.")):
+    def _evenements(self, boucle=None):
+        with patch.object(self.Agent, '_boucle', boucle or self._boucle_qui_pense):
             return list(self.Agent().process_message_stream(self.user, "ajoute maths"))
 
     def test_le_raisonnement_arrive_avant_le_compte_rendu(self):
@@ -68,16 +66,16 @@ class OrdreDesEvenementsTests(TestCase):
         self.assertEqual(evts[-1]['type'], 'done')
         self.assertIn('response', evts[-1])
 
-    def test_un_agir_muet_ne_produit_aucun_thinking(self):
+    def test_une_boucle_muette_ne_produit_aucun_thinking(self):
         """Contre-epreuve: on n'invente pas d'evenement quand le modele ne
         raisonne pas. Un thinking vide ferait clignoter le volet pour rien."""
         def muet(self_agent, user, message, registre):
-            return ""
+            return ReponseDire(ouverture="Ok.")
         types = [e['type'] for e in self._evenements(muet)]
         self.assertNotIn('thinking', types)
 
-    def test_une_panne_d_agir_ne_bloque_pas_le_flux(self):
-        """AGIR tourne maintenant dans un thread: une exception qui y reste
+    def test_une_panne_de_boucle_ne_bloque_pas_le_flux(self):
+        """La boucle tourne dans un thread: une exception qui y reste
         coincee ferait attendre le client jusqu'au timeout."""
         def casse(self_agent, user, message, registre):
             raise RuntimeError("modele indisponible")
@@ -114,41 +112,9 @@ class PousseePenseeTests(TestCase):
         self.assertTrue(self.agent._file_pensees.empty())
 
 
-class RepliSansStreamingTests(TestCase):
-    """Tous les fournisseurs ne streament pas leurs deltas de raisonnement.
 
-    Sans repli, leur raisonnement n'atteindrait le client que dans la charge
-    utile finale et le volet resterait vide tout le tour. On perd alors le
-    gain de latence, jamais l'information."""
 
-    def setUp(self):
-        self.user = User.objects.create_user(username='repli', password='x')
-        from services.agent_v2 import PlannerAgentV2
-        self.Agent = PlannerAgentV2
-
-    def test_un_agir_qui_ne_pousse_rien_emet_quand_meme_son_raisonnement(self):
-        def sans_deltas(self_agent, user, message, registre):
-            return "Raisonnement rendu d'un bloc, sans fragments."
-
-        with patch.object(self.Agent, '_agir', sans_deltas), \
-             patch.object(self.Agent, '_dire',
-                          return_value=ReponseDire(ouverture="Ok.")):
-            evts = list(self.Agent().process_message_stream(self.user, "bonjour"))
-
-        pensees = [e for e in evts if e['type'] == 'thinking']
-        self.assertEqual(len(pensees), 1)
-        self.assertIn("d'un bloc", pensees[0]['text'])
-
-    def test_un_agir_qui_pousse_ne_reemet_PAS_le_bloc_entier(self):
-        """Contre-epreuve: sans elle, un fournisseur qui streame afficherait
-        son raisonnement deux fois, en fragments puis en entier."""
-        def avec_deltas(self_agent, user, message, registre):
-            self_agent.pousser_pensee("un fragment")
-            return "un fragment"
-
-        with patch.object(self.Agent, '_agir', avec_deltas), \
-             patch.object(self.Agent, '_dire',
-                          return_value=ReponseDire(ouverture="Ok.")):
-            evts = list(self.Agent().process_message_stream(self.user, "bonjour"))
-
-        self.assertEqual(len([e for e in evts if e['type'] == 'thinking']), 1)
+# RepliSansStreamingTests SUPPRIME (boucle unique, 2026-09-29): testait le
+# repli ou _agir rendait son raisonnement en texte quand le fournisseur
+# ne streamait pas. La boucle rend une ReponseDire structuree, pas un
+# texte de raisonnement; le raisonnement ne vient que de pousser_pensee.
