@@ -2339,6 +2339,61 @@ def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
 OUTILS_QUESTION = frozenset({"poser_question", "present_choices"})
 
 
+# Descriptions V2 (doctrine 2026-09-29): le modele choisit l'outil par sa
+# description, jamais par des declencheurs ecrits dans le prompt. Ces
+# surcharges ne s'appliquent qu'a la boucle V2: v1 garde les descriptions
+# d'origine pour les utilisateurs non migres. Les regles d'usage qui vivaient
+# dans REGLES_AGIR demenagent ici, sans vocabulaire declencheur.
+DESCRIPTIONS_V2 = {
+    # Remplacement complet: l'ancienne description ordonnait de consulter
+    # l'outil avant d'affirmer quoi que ce soit, ce qui le faisait appeler a
+    # chaque tour pour aujourd'hui alors que le planning du jour est deja
+    # dans le prompt.
+    "get_today_schedule": (
+        "Recupere le planning EFFECTIF d'un AUTRE jour qu'aujourd'hui "
+        "(blocs recurrents aux heures PLACEES, taches planifiees, creneaux "
+        "libres; parametre date, defaut = aujourd'hui, que tu ne dois jamais "
+        "utiliser). Le planning d'AUJOURD'HUI est deja dans ton prompt "
+        "(PLANNING AUJOURD'HUI), a l'etat effectif: fie-toi a lui tel quel et "
+        "ne rappelle jamais cet outil pour aujourd'hui. Consulte-le avant "
+        "d'affirmer ou se trouve une activite un autre jour ou si elle a "
+        "bouge, et parle des heures effectives, jamais de memoire ni d'apres "
+        "l'historique (un bloc souple peut etre place a une autre heure que "
+        "son heure habituelle)."
+    ),
+}
+
+COMPLEMENTS_V2 = {
+    "optimize_week": (
+        "apply=true seulement apres confirmation explicite de l'utilisateur: "
+        "propose toujours d'abord avec apply=false."
+    ),
+    "create_block": (
+        "Avant de creer, verifie la SEMAINE TYPE deja dans ton prompt: si le "
+        "bloc y figure deja, modifie-le (update_block) au lieu de le recreer. "
+        "Un ajout avec jours et heures, y compris en reponse a ta propre "
+        "question: si ces jours et heures ne sont pas deja ceux d'un cours de "
+        "la SEMAINE TYPE, c'est un nouveau cours: create_block dans ce tour, "
+        "avec le nom que l'utilisateur a dit. Ne demande ni lequel, ni de "
+        "confirmer la recurrence: un cours revient chaque semaine par defaut."
+    ),
+    "update_block": (
+        "Pour borner une serie dans le temps (debut/fin de session), passe "
+        "start_date/end_date, jamais en supprimant et recreant le bloc."
+    ),
+}
+
+
+def description_v2(outil) -> str:
+    """La description effective d'un outil dans la boucle V2."""
+    if outil.name in DESCRIPTIONS_V2:
+        return DESCRIPTIONS_V2[outil.name]
+    complement = COMPLEMENTS_V2.get(outil.name)
+    if complement:
+        return f"{outil.description} {complement}"
+    return outil.description
+
+
 def outils_pour(user: User, registre: Registre, message_du_tour: str = "",
                 tache: str = "", signaler=None, message_brut: str | None = None,
                 tap: dict | None = None) -> list[Tool]:
@@ -2357,7 +2412,7 @@ def outils_pour(user: User, registre: Registre, message_du_tour: str = "",
             _fabriquer(outil, user, registre, message_du_tour, tache, None,
                        signaler, message_brut, tap),
             outil.name,
-            outil.description,
+            description_v2(outil),
             outil.parameters,
             # Une mutation dans le batch force TOUT le batch en sequentiel
             # (pydantic-ai): les lectures pures, elles, partent en parallele.

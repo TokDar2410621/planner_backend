@@ -20,6 +20,7 @@ D6  tour_entierement_decide_par_le_code dit quand AGIR peut etre saute.
 Horloge du harnais: lundi 14 septembre 2026, 8 h (jour 0 = lundi).
 """
 from datetime import timedelta
+from unittest import mock
 
 from django.test import SimpleTestCase, TransactionTestCase
 from django.utils import timezone
@@ -27,6 +28,7 @@ from django.utils import timezone
 from core.models import (ConversationMessage, RecurringBlock,
                          RecurringBlockException, ScheduledBlock, Task)
 from core.test_agent_v2_gardes import AUJOURDHUI, HarnaisGardes, puces
+from core.test_agent_v2_jugement import juger_script
 from services.agent_v2 import demandes as dem
 from services.agent_v2 import outils as outils_v2
 from services.agent_v2.registre import Registre
@@ -111,13 +113,18 @@ class D1PuceExacteTests(SimpleTestCase):
             "n'efface rien, tous les jeudis restent", 'garde le quart', "j'ai changé d'avis, garde-le",
             'annule, laisse tous les jeudis',
         )
-        for demande in (PORTEE, DESTR):
-            for brut in garder:
-                with self.subTest(motif=demande['motif'], brut=brut):
-                    self.assertEqual(dem.option_choisie(brut, demande), 'annuler')
-        self.assertEqual(dem.option_choisie('non', MASSE), 'annuler')
-        self.assertEqual(dem.option_choisie('non, arrête', MASSE), 'annuler')
-        self.assertEqual(dem.option_choisie('non', PLAN), 'annuler')
+        # Le juge lit un refus clair dans chacun de ces messages. Sans juge
+        # scripte, ces tests dependent d'un LLM ou de Jev en direct.
+        script = {brut: {'intention': ('refuse', 0.95)} for brut in garder}
+        script.update({'non, arrête': {'intention': ('refuse', 0.95)}})
+        with mock.patch("services.agent_v2.jugement.juger", juger_script(script)):
+            for demande in (PORTEE, DESTR):
+                for brut in garder:
+                    with self.subTest(motif=demande['motif'], brut=brut):
+                        self.assertEqual(dem.option_choisie(brut, demande), 'annuler')
+            self.assertEqual(dem.option_choisie('non', MASSE), 'annuler')
+            self.assertEqual(dem.option_choisie('non, arrête', MASSE), 'annuler')
+            self.assertEqual(dem.option_choisie('non', PLAN), 'annuler')
 
     def test_garder_ambigu_ne_tranche_rien(self):
         ambigus = (
@@ -135,11 +142,19 @@ class D1PuceExacteTests(SimpleTestCase):
     def test_annule_ne_garde_pas_un_evenement_qu_on_propose_d_annuler(self):
         """« J'annule le dentiste ? » « annule »: c'est un oui, pas un refus. Ni
         l'un ni l'autre n'est lu en texte libre."""
-        for brut in ('annule', 'annule-le', 'oui annule'):
-            with self.subTest(brut=brut):
-                self.assertIsNone(dem.option_choisie(brut, ANNULER_EVENEMENT))
-        self.assertEqual(dem.option_choisie('non, garde-le', ANNULER_EVENEMENT), 'annuler')
-        self.assertEqual(dem.option_choisie('Oui, je confirme.', ANNULER_EVENEMENT), 'confirmer')
+        script = {
+            'annule': {'intention': ('accepte', 0.95)},
+            'annule-le': {'intention': ('accepte', 0.95)},
+            'oui annule': {'intention': ('accepte', 0.95)},
+            'non, garde-le': {'intention': ('refuse', 0.95)},
+            'Oui, je confirme.': {'intention': ('accepte', 0.95)},
+        }
+        with mock.patch("services.agent_v2.jugement.juger", juger_script(script)):
+            for brut in ('annule', 'annule-le', 'oui annule'):
+                with self.subTest(brut=brut):
+                    self.assertIsNone(dem.option_choisie(brut, ANNULER_EVENEMENT))
+            self.assertEqual(dem.option_choisie('non, garde-le', ANNULER_EVENEMENT), 'annuler')
+            self.assertEqual(dem.option_choisie('Oui, je confirme.', ANNULER_EVENEMENT), 'confirmer')
 
 
 class D1BoutEnBoutTests(HarnaisGardes, TransactionTestCase):
@@ -185,18 +200,20 @@ class D1BoutEnBoutTests(HarnaisGardes, TransactionTestCase):
     def test_garder_en_texte_libre_ferme_et_retient_le_modele(self):
         demande = puces(self.demande_portee())
         brut = 'Non, garde tous les jeudis.'
-        self.attendre([demande], brut)
-        registre = Registre()
-        sorties = outils_v2.appliquer_choix_en_attente(self.user, registre, brut, 'g:1')
-        self.assertEqual(sorties[0]['option'], 'annuler')
-        _, tools = self.outils(brut, registre=registre, tache='g:1')
-        retour = self.appeler(tools, 'delete_block', block_id=self.q.id)
-        self.assertEqual(retour, outils_v2.MESSAGE_DEJA_TRANCHE)
-        # Seule la decision « annulee » est au registre, et ce n'est pas une mutation.
-        self.assertEqual([(a.outil, a.donnees.get('decision_code')) for a in registre.actions],
-                         [(outils_v2.OUTIL_DECISION, 'annulee')])
-        self.assertFalse(any(a.succes and a.est_mutation for a in registre.actions))
-        self.assertActif(self.q)
+        script = {brut: {'intention': ('refuse', 0.95)}}
+        with mock.patch("services.agent_v2.jugement.juger", juger_script(script)):
+            self.attendre([demande], brut)
+            registre = Registre()
+            sorties = outils_v2.appliquer_choix_en_attente(self.user, registre, brut, 'g:1')
+            self.assertEqual(sorties[0]['option'], 'annuler')
+            _, tools = self.outils(brut, registre=registre, tache='g:1')
+            retour = self.appeler(tools, 'delete_block', block_id=self.q.id)
+            self.assertEqual(retour, outils_v2.MESSAGE_DEJA_TRANCHE)
+            # Seule la decision « annulee » est au registre, et ce n'est pas une mutation.
+            self.assertEqual([(a.outil, a.donnees.get('decision_code')) for a in registre.actions],
+                             [(outils_v2.OUTIL_DECISION, 'annulee')])
+            self.assertFalse(any(a.succes and a.est_mutation for a in registre.actions))
+            self.assertActif(self.q)
 
 
 # ── D2: reposee une fois, puis abandonnee ───────────────────────────────────
@@ -265,31 +282,36 @@ class D2ReposeeUneFoisTests(HarnaisGardes, TransactionTestCase):
         self.assertActif(self.q, False)
 
     def test_une_nouvelle_requete_abandonne_sans_reposer(self):
-        for i, brut in enumerate(("c'est quoi mon horaire demain ?", 'ajoute gym demain à 18 h',
-                                  'merci, bonne nuit', 'supprime mon gym tous les jeudis')):
-            with self.subTest(brut=brut):
-                demande = puces(self.demande_portee(tache=f'n:{i}'))
-                self.attendre([demande], brut)
-                registre = Registre()
-                outils_v2.appliquer_choix_en_attente(self.user, registre, brut, f'n:{i}')
-                decisions = self._decisions(registre)
-                self.assertEqual([a.donnees['decision_code'] for a in decisions], ['abandonnee'])
-                self.assertFalse(any((a.donnees or {}).get('reposee_par_le_code')
-                                     for a in registre.actions))
-                self.assertActif(self.q)
+        bruts = ("c'est quoi mon horaire demain ?", 'ajoute gym demain à 18 h',
+                 'merci, bonne nuit', 'supprime mon gym tous les jeudis')
+        script = {b: {'intention': ('nouvelle_requete', 0.95)} for b in bruts}
+        with mock.patch("services.agent_v2.jugement.juger", juger_script(script)):
+            for i, brut in enumerate(bruts):
+                with self.subTest(brut=brut):
+                    demande = puces(self.demande_portee(tache=f'n:{i}'))
+                    self.attendre([demande], brut)
+                    registre = Registre()
+                    outils_v2.appliquer_choix_en_attente(self.user, registre, brut, f'n:{i}')
+                    decisions = self._decisions(registre)
+                    self.assertEqual([a.donnees['decision_code'] for a in decisions], ['abandonnee'])
+                    self.assertFalse(any((a.donnees or {}).get('reposee_par_le_code')
+                                         for a in registre.actions))
+                    self.assertActif(self.q)
 
     def test_annulee_consignee_sans_question(self):
         demande = puces(self.demande_portee())
-        for i, brut in enumerate(('Non, ne change rien.', 'laisse tomber')):
-            with self.subTest(brut=brut):
-                self.attendre([demande], brut)
-                registre = Registre()
-                outils_v2.appliquer_choix_en_attente(self.user, registre, brut, f'a:{i}')
-                [annulee] = self._decisions(registre)
-                self.assertEqual(annulee.donnees['decision_code'], 'annulee')
-                self.assertNotIn('demande', annulee.donnees)
-                self.assertFalse(annulee.est_mutation)
-                self.assertActif(self.q)
+        script = {'laisse tomber': {'intention': ('refuse', 0.95)}}
+        with mock.patch("services.agent_v2.jugement.juger", juger_script(script)):
+            for i, brut in enumerate(('Non, ne change rien.', 'laisse tomber')):
+                with self.subTest(brut=brut):
+                    self.attendre([demande], brut)
+                    registre = Registre()
+                    outils_v2.appliquer_choix_en_attente(self.user, registre, brut, f'a:{i}')
+                    [annulee] = self._decisions(registre)
+                    self.assertEqual(annulee.donnees['decision_code'], 'annulee')
+                    self.assertNotIn('demande', annulee.donnees)
+                    self.assertFalse(annulee.est_mutation)
+                    self.assertActif(self.q)
 
     def test_apres_abandon_le_modele_pose_une_demande_neuve(self):
         demande = puces(self.demande_portee())
@@ -337,9 +359,14 @@ class D6TourDecideParLeCodeTests(HarnaisGardes, TransactionTestCase):
 
     def test_pas_decide(self):
         demande = puces(self.demande_portee())
-        # Une nouvelle requete: AGIR doit la servir.
-        self.assertFalse(self._decide([demande], "c'est quoi mon horaire demain ?", 'p:1'))
-        self.assertFalse(self._decide([demande], 'ajoute gym demain à 18 h', 'p:2'))
+        script = {
+            "c'est quoi mon horaire demain ?": {'intention': ('nouvelle_requete', 0.95)},
+            'ajoute gym demain à 18 h': {'intention': ('nouvelle_requete', 0.95)},
+        }
+        with mock.patch("services.agent_v2.jugement.juger", juger_script(script)):
+            # Une nouvelle requete: AGIR doit la servir.
+            self.assertFalse(self._decide([demande], "c'est quoi mon horaire demain ?", 'p:1'))
+            self.assertFalse(self._decide([demande], 'ajoute gym demain à 18 h', 'p:2'))
         # Aucune demande en attente.
         self.message_courant('Tous les jeudis')
         registre = Registre()

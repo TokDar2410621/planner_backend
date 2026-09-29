@@ -307,18 +307,27 @@ class PromptsTests(TestCase):
         from services.agent_v2.prompts import REGLES_AGIR
         for interdit in ("Neuf fois sur dix", "AGIS avant de demander",
                          "PROPOSE PLUTOT QUE DEMANDER", "create_block (recurrent) tout de suite",
-                         "(tu choisis l'heure toi-meme)", "la question etait inutile"):
+                         "(tu choisis l'heure toi-meme)", "la question etait inutile",
+                         "optimise ma semaine",
+                         "cette semaine je veux lire plus"):
             with self.subTest(interdit=interdit):
                 self.assertNotIn(interdit, REGLES_AGIR)
-        for requis in ("present_choices", "QUESTION A CHOIX", "rendez-vous", "SUITE AU CHOIX",
+        for requis in ("present_choices", "rendez-vous", "SUITE AU CHOIX",
                        "Une heure donnee par l'utilisateur ne se change jamais sans lui demander",
                        "Quand un outil te repond qu'une question est posee par le code, n'agis "
                        "pas sur ce point et ne repose pas la question",
                        "ne refais rien de ce qui y est marque FAIT, ne touche pas a ce qui est REFUSE",
-                       "une demande pour cette semaine ne cree pas d'habitude sans fin",
-                       "optimize_week apply=true seulement apres confirmation"):
+                       "une demande pour cette semaine ne cree pas d'habitude sans fin"):
             with self.subTest(requis=requis):
                 self.assertIn(requis, REGLES_AGIR)
+        # Doctrine 2026-09-29: les guidages d'usage vivent dans les
+        # descriptions d'outils V2, pas dans le prompt.
+        from services.agent.tools import TOOL_MAP
+        from services.agent_v2.outils import description_v2
+        self.assertIn("apply=true seulement apres confirmation",
+                      description_v2(TOOL_MAP["optimize_week"]))
+        self.assertIn("tirées du planning réel",
+                      description_v2(TOOL_MAP["present_choices"]))
 
     def test_table_de_decision_nomme_les_cas_a_demander(self):
         from services.agent_v2.prompts import REGLES_AGIR

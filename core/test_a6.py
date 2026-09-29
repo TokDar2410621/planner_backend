@@ -137,7 +137,7 @@ def _fake_google_response(payload, status_code=200):
 
 
 @pytest.mark.django_db
-@override_settings(GOOGLE_CLIENT_ID='test-client-id')
+@override_settings(GOOGLE_ALLOWED_CLIENT_IDS=['test-client-id'])
 def test_google_auth_rejects_unverified_email():
     """A Google token with email_verified=false must be rejected (no account link)."""
     payload = {
@@ -159,7 +159,7 @@ def test_google_auth_rejects_unverified_email():
 
 
 @pytest.mark.django_db
-@override_settings(GOOGLE_CLIENT_ID='test-client-id')
+@override_settings(GOOGLE_ALLOWED_CLIENT_IDS=['test-client-id'])
 def test_google_auth_accepts_verified_email():
     """A verified Google token creates/logs in the user (no regression)."""
     payload = {
@@ -180,7 +180,7 @@ def test_google_auth_accepts_verified_email():
 
 
 @pytest.mark.django_db
-@override_settings(GOOGLE_CLIENT_ID='test-client-id')
+@override_settings(GOOGLE_ALLOWED_CLIENT_IDS=['test-client-id'])
 def test_google_auth_duplicate_email_no_500():
     """Two accounts sharing a (Google-verified) email must not crash, and must
     not hard-block: sign into one of them deterministically (a verified email

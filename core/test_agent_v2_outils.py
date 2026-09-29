@@ -42,12 +42,32 @@ class PariteDesOutilsTests(TestCase):
         self.assertEqual(set(self.exposes), attendus)
 
     def test_chaque_description_est_identique_octet_pour_octet(self):
+        # Doctrine 2026-09-29 : la boucle V2 surcharge volontairement les
+        # descriptions via DESCRIPTIONS_V2 / COMPLEMENTS_V2 (les regles d'usage
+        # demenagent du prompt vers les descriptions). La parite reste exigible
+        # pour tous les autres outils : une derive hors surcharge explicite
+        # est un bug.
+        surcharges = set(outils_v2.DESCRIPTIONS_V2) | set(outils_v2.COMPLEMENTS_V2)
         for outil in ALL_TOOLS:
             with self.subTest(outil=outil.name):
-                self.assertEqual(
-                    self.exposes[outil.name].description.encode('utf-8'),
-                    outil.description.encode('utf-8'),
-                )
+                if outil.name in surcharges:
+                    self.assertEqual(
+                        self.exposes[outil.name].description,
+                        outils_v2.description_v2(outil),
+                    )
+                else:
+                    self.assertEqual(
+                        self.exposes[outil.name].description.encode('utf-8'),
+                        outil.description.encode('utf-8'),
+                    )
+
+    def test_surcharges_v2_limitees_aux_outils_documentes(self):
+        # Garde contre une surcharge ajoutee par inadvertance : l'ensemble des
+        # outils dont la description V2 differe de v1 est fige ici.
+        self.assertEqual(
+            set(outils_v2.DESCRIPTIONS_V2) | set(outils_v2.COMPLEMENTS_V2),
+            {"get_today_schedule", "optimize_week", "create_block", "update_block"},
+        )
 
     def test_chaque_schema_serialise_est_identique(self):
         for outil in ALL_TOOLS:

@@ -351,15 +351,15 @@ def annulation_libre(message_brut, demande: dict) -> bool:
     """Le juge dit-il que le message refuse ce que la question propose ?
 
     Vrai ferme la demande sur « annuler »: rien ne s'execute. Tout doute rend
-    Faux, donc aucune option.
+    Faux, donc aucune option. Pour « J'annule le dentiste ? », « annule »
+    seul se lit « accepte » (un oui ambigu), jamais « refuse »: c'est
+    l'intention qui desambigue, pas un mot banni.
     """
     if (not isinstance(message_brut, str) or "?" in message_brut
             or not isinstance(demande, dict)):
         return False
     # « J'annule le dentiste ? » « annule »: la c'est un oui. Ni l'un ni
     # l'autre ne se lit en texte libre.
-    if demande.get("outil") == "cancel_scheduled_block":
-        return False
     return (_intention(message_brut, demande) == "refuse"
             and "annuler" in _ids_options(demande)
             and demande.get("motif") in MOTIFS_LECTURE_LIBRE)
@@ -378,8 +378,10 @@ def _choix_juge(message_brut: str, demande: dict, ids: set) -> str | None:
     """
     motif = demande.get("motif")
     intention = _intention(message_brut, demande)
-    if demande.get("outil") == "cancel_scheduled_block" and intention in (
-            "accepte", "refuse"):
+    if demande.get("outil") == "cancel_scheduled_block" and intention == "accepte":
+        # « annule » face a « J'annule le dentiste ? » est un oui ambigu,
+        # pas un refus lisible. Un refus clair (« non, garde-le ») passe
+        # par la voie « refuse » ci-dessous.
         return None
     if intention == "accepte":
         # Un oui libre ne confirme que ce qui ne detruit rien (I1/I3).

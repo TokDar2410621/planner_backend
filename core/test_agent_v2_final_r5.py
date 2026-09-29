@@ -31,6 +31,7 @@ from core import test_agent_v2_voix_r4 as voix_r4
 from core.models import (ConversationMessage, RecurringBlock,
                          RecurringBlockException, ScheduledBlock)
 from core.test_agent_v2_gardes import AUJOURDHUI, HarnaisGardes, puces
+from core.test_agent_v2_jugement import juger_script
 from core.test_agent_v2_narrateur import NarrateurBase, faux_rendu, formulaire, ok
 from services.agent.tools.base import ToolResult
 from services.agent_v2 import demandes as dem
@@ -76,12 +77,15 @@ class G1LecteurTests(SimpleTestCase):
         self.assertIsNone(dem.option_choisie('Oui, je confirme ?', avec_puces))
 
     def test_garder_en_nommant_la_portee_tranche(self):
-        for brut in ('Non, garde tous les jeudis.', 'Non garde tous les jeudis',
-                     'Laisse tous les jeudis', 'Garde-la tous les jeudis',
-                     'Je veux la garder chaque semaine', 'non non garde tous les jeudis je te dis',
-                     'garde tous les jeudis', "n'efface rien, tous les jeudis restent"):
-            with self.subTest(brut=brut):
-                self.assertEqual(dem.option_choisie(brut, PORTEE_JEUDI), 'annuler')
+        bruts = ('Non, garde tous les jeudis.', 'Non garde tous les jeudis',
+                 'Laisse tous les jeudis', 'Garde-la tous les jeudis',
+                 'Je veux la garder chaque semaine', 'non non garde tous les jeudis je te dis',
+                 'garde tous les jeudis', "n'efface rien, tous les jeudis restent")
+        script = {b: {'intention': ('refuse', 0.95)} for b in bruts}
+        with patch("services.agent_v2.jugement.juger", juger_script(script)):
+            for brut in bruts:
+                with self.subTest(brut=brut):
+                    self.assertEqual(dem.option_choisie(brut, PORTEE_JEUDI), 'annuler')
 
     def test_seule_la_puce_tranche_la_portee(self):
         # Round 6 (D1): remplace « les reponses claires restent lisibles ».
@@ -139,15 +143,18 @@ class R2ReemissionTests(HarnaisGardes, TransactionTestCase):
                 and (a.donnees or {}).get('reposee_par_le_code')]
 
     def test_un_message_sans_rapport_ne_repose_pas(self):
-        for i, brut in enumerate(("c'est quoi mon horaire demain ?", 'ajoute gym demain à 18 h',
-                                  'merci, bonne nuit')):
-            with self.subTest(brut=brut):
-                demande = puces(self.demande_portee(tache=f's:{i}'))
-                self.attendre([demande], brut)
-                registre = Registre()
-                outils_v2.appliquer_choix_en_attente(self.user, registre, brut, f'n:{i}')
-                self.assertEqual(self._reemises(registre), [])
-                self.assertActif(self.q)
+        bruts = ("c'est quoi mon horaire demain ?", 'ajoute gym demain à 18 h',
+                 'merci, bonne nuit')
+        script = {b: {'intention': ('nouvelle_requete', 0.95)} for b in bruts}
+        with patch("services.agent_v2.jugement.juger", juger_script(script)):
+            for i, brut in enumerate(bruts):
+                with self.subTest(brut=brut):
+                    demande = puces(self.demande_portee(tache=f's:{i}'))
+                    self.attendre([demande], brut)
+                    registre = Registre()
+                    outils_v2.appliquer_choix_en_attente(self.user, registre, brut, f'n:{i}')
+                    self.assertEqual(self._reemises(registre), [])
+                    self.assertActif(self.q)
 
     def test_reposee_une_seule_fois_avec_sa_date_d_origine(self):
         demande = puces(self.demande_portee())
@@ -196,22 +203,27 @@ class L2BoucleDeGardeTests(voix_r4.DemandeReemiseTests):
     test_une_reponse_claire_n_est_pas_reemise = None
 
     def test_non_garde_tous_les_jeudis_ferme_la_question(self):
-        premier = self._tour('enlève le quart de jeudi', agir=self._supprimer)
-        self.assertEqual(premier['question_motif'], 'portee_jour')
-        done = self._tour('Non, garde tous les jeudis.')
-        self.assertNotEqual(done['question_motif'], 'portee_jour')
-        self.assertFalse(done['question_posee'])
-        self.assertEqual(self._meta()['demandes'], [])
-        self.assertTrue(RecurringBlock.all_objects.get(pk=self.quart.pk).active)
+        script = {'Non, garde tous les jeudis.': {'intention': ('refuse', 0.95)}}
+        with patch("services.agent_v2.jugement.juger", juger_script(script)):
+            premier = self._tour('enlève le quart de jeudi', boucle=self._supprimer)
+            self.assertEqual(premier['question_motif'], 'portee_jour')
+            done = self._tour('Non, garde tous les jeudis.')
+            self.assertNotEqual(done['question_motif'], 'portee_jour')
+            self.assertFalse(done['question_posee'])
+            self.assertEqual(self._meta()['demandes'], [])
+            self.assertTrue(RecurringBlock.all_objects.get(pk=self.quart.pk).active)
 
     def test_un_sujet_sans_rapport_ne_repose_pas_la_question(self):
-        self._tour('enlève le quart de jeudi', agir=self._supprimer)
-        done = self._tour("c'est quoi mon horaire demain ?")
-        self.assertNotEqual(done['question_motif'], 'portee_jour')
-        self.assertEqual(self._meta()['demandes'], [])
+        script = {"c'est quoi mon horaire demain ?":
+                  {'intention': ('nouvelle_requete', 0.95)}}
+        with patch("services.agent_v2.jugement.juger", juger_script(script)):
+            self._tour('enlève le quart de jeudi', boucle=self._supprimer)
+            done = self._tour("c'est quoi mon horaire demain ?")
+            self.assertNotEqual(done['question_motif'], 'portee_jour')
+            self.assertEqual(self._meta()['demandes'], [])
 
     def test_la_question_reposee_ne_porte_pas_d_accuse_de_decision(self):
-        self._tour('enlève le quart de jeudi', agir=self._supprimer)
+        self._tour('enlève le quart de jeudi', boucle=self._supprimer)
         done = self._tour('Oui, supprime-le.',
                           dire=ReponseDire(ouverture="D'accord, je garde ton quart."))
         self.assertEqual(done['question_motif'], 'portee_jour')

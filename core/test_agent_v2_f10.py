@@ -110,14 +110,23 @@ class P1FuiteDuBancTests(SimpleTestCase):
 
     def test_les_regles_restent(self):
         from services.agent_v2.prompts import REGLES_AGIR
-        for requis in ("COURS EXISTANT", "AJOUT AVEC JOURS ET HEURES",
-                       "c'est un nouveau cours: create_block dans ce tour",
-                       "un cours revient chaque semaine par defaut",
+        for requis in ("COURS EXISTANT",
                        'present_choices (source "blocs") avec ces seuls cours',
-                       "Exemples: « L", "echeance sans jour choisi"):
+                       "echeance sans jour choisi"):
             with self.subTest(requis=requis):
                 self.assertIn(requis, REGLES_AGIR)
         self.assertIn("cette date seulement ou toute la serie", REGLES_AGIR)
+        # Doctrine 2026-09-29: la mecanique d'ajout a demenage dans la
+        # description V2 de create_block, sans vocabulaire declencheur.
+        from services.agent.tools import TOOL_MAP
+        from services.agent_v2.outils import description_v2
+        desc = description_v2(TOOL_MAP["create_block"])
+        for requis in ("y compris en reponse a ta propre question",
+                       "c'est un nouveau cours", "create_block dans ce tour",
+                       "Ne demande ni lequel",
+                       "un cours revient chaque semaine par defaut"):
+            with self.subTest(requis=requis):
+                self.assertIn(requis, desc)
 
 
 # ── P2: un jour nomme sans mot de recurrence donne un evenement unique ──────

@@ -12,8 +12,18 @@ from services.agent_v2 import modeles
 class ConstructionTests(SimpleTestCase):
     def test_l_ordre_commence_par_deepseek(self):
         noms = modeles.noms_de(modeles.modele_agir())
-        self.assertEqual(len(noms), 3)
+        self.assertGreaterEqual(len(noms), 1)
         self.assertIn('deepseek', noms[0].lower())
+        # L'ordre de priorite est respecte pour les fournisseurs presents
+        # (le nombre exact depend des paquets optionnels installes).
+        priorite = ['deepseek', 'gemini', 'claude']
+        indices = []
+        for nom in noms:
+            for i, p in enumerate(priorite):
+                if p in nom.lower():
+                    indices.append(i)
+                    break
+        self.assertEqual(indices, sorted(indices))
 
     def test_le_modele_vient_des_settings(self):
         """Un nom en dur ferait comparer deux MODELES et non deux boucles."""

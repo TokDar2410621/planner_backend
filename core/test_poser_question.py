@@ -55,8 +55,12 @@ class ExpositionTests(SimpleTestCase):
         self.assertIn("value", schema["properties"]["options"]["items"]["properties"])
 
     def test_prompt_agir_documente_l_outil(self):
-        self.assertIn("poser_question", REGLES_AGIR)
+        # Doctrine 2026-09-29: l'usage des outils vit dans leurs descriptions,
+        # pas dans le prompt.
         self.assertIn("present_choices", REGLES_AGIR)
+        from services.agent.tools import TOOL_MAP
+        from services.agent_v2.outils import description_v2
+        self.assertIn("choix libre", description_v2(TOOL_MAP["poser_question"]))
 
     def test_priorites_connaissent_le_motif(self):
         self.assertIn("question_libre", rendu.PRIORITE)
