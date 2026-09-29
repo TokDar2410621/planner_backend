@@ -45,6 +45,7 @@ from pydantic_ai.usage import UsageLimits
 from core.models import BudgetJetonsJournalier, ConversationMessage, UploadedDocument
 from services.agent_v2 import lecture, regles
 from services.agent_v2 import memoire as memoire_prefs
+from services.agent_v2 import jugement as _jugement
 from services.agent_v2.mesure import verifier_prose
 from services.agent_v2.modeles import (REGLAGES_BOUCLE_SANS_RAISONNEMENT,
                                        modele_agir)
@@ -660,13 +661,28 @@ class PlannerAgentV2:
         budget_jour_epuise = not par_le_code and _budget_jour_epuise(user)
         if budget_jour_epuise:
             logger.warning("agent_v2 budget jetons journalier epuise user=%s", user.pk)
+        # Voie rapide sociale: une salutation ou un remerciement ne merite
+        # pas la boucle lourde (15k tokens de contexte). Le juge semantique
+        # tranche, jamais une liste de mots. La reponse breve entre dans un
+        # ReponseDire pour suivre le chemin de composition normal.
+        voie_rapide = (
+            not par_le_code and not budget_jour_epuise
+            and self._voie_rapide_sociale(user, message, attachment)
+        )
+        if voie_rapide:
+            texte_rapide = self._reponse_rapide(user, message)
+            if texte_rapide:
+                reponse_boucle = ReponseDire(ouverture=texte_rapide)
+                logger.info("agent_v2 voie rapide sociale user=%s", user.pk)
+            else:
+                voie_rapide = False
         # Boucle unique: un seul appel modele par tour (plus de LIRE ni de
         # DIRE separes). Le chemin rapide et le budget epuise sautent la
         # boucle; le registre (choix du code, faits) est rendu tel quel.
-        reponse_boucle: ReponseDire | None = None
+        reponse_boucle: ReponseDire | None = reponse_boucle if voie_rapide else None
         panne = None
         raisonnement = ""
-        if par_le_code or budget_jour_epuise:
+        if par_le_code or budget_jour_epuise or voie_rapide:
             self._file_pensees = None
         else:
             yield {"type": "status", "text": "Réflexion..."}
@@ -1083,6 +1099,66 @@ class PlannerAgentV2:
         except Exception:  # noqa: BLE001 - dans le doute, AGIR tourne
             logger.error("Decision du code illisible", exc_info=True)
             return False
+
+    def _voie_rapide_sociale(self, user: User, message: str, attachment) -> bool:
+        """Le message merite-t-il la voie rapide (simple interaction sociale) ?
+
+        La decision est SEMANTIQUE (juge Jev, question typee), jamais une
+        liste de mots ni une regex: la doctrine l'interdit. Les garde-fous
+        sont STRUCTURELS (pas d'intention): pas de piece jointe, pas de tap,
+        pas de demande en attente, message court. Seuil de confiance eleve
+        (0.9): rater une optimisation vaut mieux que rater une vraie demande.
+        """
+        try:
+            # Garde-fous structurels: jamais de voie rapide si le tour a
+            # autre chose a traiter qu'un simple message texte court.
+            if attachment is not None:
+                return False
+            if self._tap is not None:
+                return False
+            if len(message.split()) > 8:
+                return False
+            from services.agent_v2 import demandes as _demandes
+            if _demandes.demandes_en_attente(user):
+                return False
+            # Le JUGE tranche, pas une liste de mots.
+            resultats = _jugement.juger(
+                message, {"sociale": _jugement.q_interaction_sociale()})
+            rep = (resultats or {}).get("sociale") or {}
+            return (
+                rep.get("statut") == _jugement.STATUT_DECISION
+                and rep.get("valeur") == "oui"
+                and float(rep.get("confiance") or 0) >= 0.9
+            )
+        except Exception:  # noqa: BLE001 - dans le doute, la boucle tourne
+            logger.warning("Voie rapide sociale illisible", exc_info=True)
+            return False
+
+    def _reponse_rapide(self, user: User, message: str) -> str:
+        """Repond a une interaction sociale sans la boucle lourde.
+
+        Prompt minimal, aucun outil, aucun contexte planning: le message
+        n'attend qu'une reponse sociale breve. En cas d'echec, chaine vide
+        (l'appelant bascule sur la boucle normale).
+        """
+        try:
+            from services.agent_v2.modeles import modele_agir
+            agent = Agent(
+                modele_agir(),
+                instructions=(
+                    "Tu es l'assistant Planner, chaleureux et direct, "
+                    "tutoiement, francais quebecois. Reponds en UNE phrase "
+                    "breve a ce simple message social. Ne parle jamais de "
+                    "planning, d'horaire ou de taches: l'utilisateur n'a "
+                    "rien demande."
+                ),
+            )
+            resultat = agent.run_sync(message)
+            texte = (getattr(resultat, "output", "") or "").strip()
+            return texte if isinstance(texte, str) else ""
+        except Exception:  # noqa: BLE001 - la boucle normale prend le relais
+            logger.warning("Reponse rapide impossible", exc_info=True)
+            return ""
 
     def _choisir_question(self, user: User, message: str, attachment,
                           registre: Registre, attachment_traite_ce_tour: bool,

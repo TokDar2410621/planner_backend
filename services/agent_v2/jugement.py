@@ -195,6 +195,31 @@ def q_saut_ou_suppression() -> dict:
     }
 
 
+def q_interaction_sociale() -> dict:
+    """Noul : le message est-il une simple interaction sociale ?
+
+    Une salutation, un remerciement, un acquiescement, une formule de
+    politesse : rien qui demande une action sur le planning, une
+    information du planning, ou une reponse qui necessite le contexte.
+    Reponds oui seulement si le message n'attend rien d'autre qu'une
+    reponse sociale breve.
+    """
+    return {
+        "type": TYPE_NOUL,
+        "instructions": (
+            "Ce message est-il une simple interaction sociale (salutation, "
+            "remerciement, acquiescement, formule de politesse), sans "
+            "demande d'action sur le planning ni demande d'information du "
+            "planning ? Reponds oui seulement si le message n'attend rien "
+            "d'autre qu'une reponse sociale breve."
+        ),
+        "criteria": {
+            "oui": "simple interaction sociale, rien d'autre attendu",
+            "non": "le message demande ou implique autre chose",
+        },
+    }
+
+
 def q_choix(options: dict[str, str]) -> dict:
     """Choice : quelle option l'utilisateur choisit-il, parmi celles-ci ?
 
