@@ -578,3 +578,87 @@ def fuites_reponse(reponse: ReponseDire) -> list[str]:
                     vues.append(fuite)
         fuites.extend(f"options:{fuite}" for fuite in vues)
     return fuites
+
+
+# ------------------------------------------------------- verifier-puis-rendre
+
+
+def _refs_verifiees(reponse, registre) -> set[str]:
+    """Les refs de la reponse qui nomment une action reelle et reussie."""
+    if registre is None:
+        return set()
+    verifiees = set()
+    for ref in getattr(reponse, "refs", None) or []:
+        action = registre.par_id(ref)
+        if action is not None and getattr(action, "succes", False):
+            verifiees.add(ref)
+    return verifiees
+
+
+def verifier_prose(reponse: ReponseDire, registre) -> tuple[ReponseDire, int, list[str]]:
+    """Verifier-puis-rendre (boucle unique, 2026-09-29).
+
+    Remplace epurer_reponse pour la prose de la boucle unique. Une phrase qui
+    affirme une action ne survit que si la reponse cite au moins une ref
+    VERIFIEE (un id d'action du registre, avec succes=True). Les affirmations
+    sans recu sont coupees: les faits du code racontent deja ce qui est vrai.
+    Les questions et options gardent le traitement d'epurer_reponse.
+
+    Rend (reponse, supprimees, fuites): fuites nomme les affirmations non
+    verifiees coupees, pour la ligne du tour.
+    """
+    schema = _champs_du_schema(reponse)
+    verifiees = _refs_verifiees(reponse, registre)
+    supprimees = 0
+    fuites: list[str] = []
+    champs: dict = {}
+    for champ in ("ouverture", "suite"):
+        gardees: list[str] = []
+        precedente_supprimee = False
+        coupees = 0
+        for phrase in _phrases(getattr(reponse, champ, "") or ""):
+            nette = phrase.strip()
+            if _fuites_de_prose(nette):
+                if verifiees:
+                    precedente_supprimee = False
+                    gardees.append(nette)
+                    continue
+                coupees += 1
+                precedente_supprimee = True
+                fuites.append(f"{champ}:affirmation_sans_recu")
+                continue
+            if (precedente_supprimee and _ORPHELIN.match(nette)
+                    and not _finit_par_question(nette)):
+                coupees += 1
+                continue
+            precedente_supprimee = False
+            gardees.append(nette)
+        if coupees:
+            supprimees += coupees
+            champs[champ] = " ".join(gardees)
+
+    if "question" in schema:
+        question = getattr(reponse, "question", "") or ""
+        if question.strip() and fuite_question(question):
+            supprimees += 1
+            champs["question"] = ""
+            if "options" in schema and getattr(reponse, "options", None):
+                champs["options"] = []
+    if "options" in schema and "options" not in champs:
+        options = list(getattr(reponse, "options", None) or [])
+        gardees_opt = [o for o in options
+                       if not (isinstance(o, str) and fuite_question(o))]
+        if len(gardees_opt) != len(options):
+            supprimees += len(options) - len(gardees_opt)
+            champs["options"] = gardees_opt
+
+    # Les refs inconnues meurent ici aussi, pas seulement dans assembler.
+    refs = list(getattr(reponse, "refs", None) or [])
+    if refs and "refs" in schema:
+        gardees_refs = [r for r in refs if r in verifiees]
+        if len(gardees_refs) != len(refs):
+            champs["refs"] = gardees_refs
+
+    if not supprimees and "refs" not in champs:
+        return reponse, 0, []
+    return reponse.model_copy(update=champs), supprimees, fuites

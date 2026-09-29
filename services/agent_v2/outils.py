@@ -1899,8 +1899,9 @@ def _apres(ctx: _Contexte, nom: str, kwargs: dict, resultat: ToolResult,
 
 # -------------------------------------------------------------------- noyau
 
-def _consigner(ctx: _Contexte, nom: str, kwargs: dict, resultat: ToolResult):
-    action = ctx.registre.ajouter(nom, kwargs, resultat)
+def _consigner(ctx: _Contexte, nom: str, kwargs: dict, resultat: ToolResult,
+               cle_operation: str = ""):
+    action = ctx.registre.ajouter(nom, kwargs, resultat, cle_operation=cle_operation)
     if ctx.signaler:
         ctx.signaler(action)
     return action
@@ -1914,6 +1915,115 @@ def _pour_empreinte(nom: str, kwargs: dict) -> dict:
     if nom in ("delete_task", "clear_all_blocks"):
         return {**kwargs, "confirm": True}
     return {k: v for k, v in (kwargs or {}).items() if not k.startswith("_")}
+
+
+# Les ecritures dont une reemission aveugle creerait un doublon visible.
+# Pour les autres (update, delete, ...), la reconciliation est une relecture
+# d'etat que le modele fait lui-meme avec ses outils de lecture.
+_CREATIONS_RECONCILIABLES = {"create_block", "create_task", "schedule_task_at"}
+
+
+def _transitoire(erreur: BaseException) -> bool:
+    """Une exception qui laisse le resultat d'une ecriture AMBIGU.
+
+    Timeout, connexion perdue, 429, base momentanement indisponible: dans
+    tous ces cas l'ecriture a pu etre validee cote base avant que l'erreur
+    ne remonte. Le resultat n'est ni un succes ni un echec, c'est une
+    tentative en attente de confirmation.
+    """
+    from django.db import OperationalError
+    nom = type(erreur).__name__
+    if isinstance(erreur, (TimeoutError, OperationalError, ConnectionError)):
+        return True
+    return nom in {"TimeoutError", "ConnectTimeout", "ReadTimeout",
+                   "TooManyRequests", "RateLimitError", "ServiceUnavailable",
+                   "OperationalError", "InterfaceError", "InternalError"}
+
+
+def _doublon_recent(user, nom: str, kwargs: dict):
+    """L'objet que la tentative ambigue aurait cree, s'il existe en base.
+
+    Fenetre: cree depuis le debut du tour (bornée a 10 minutes, le tour ne
+    dure jamais plus longtemps). Retourne l'objet trouve ou None. Lecture
+    seule: aucun effet de bord.
+    """
+    from django.utils import timezone
+
+    from core.models import RecurringBlock, ScheduledBlock, Task
+    debut = timezone.now() - timezone.timedelta(minutes=10)
+    titre = str(kwargs.get("title") or "").strip()
+    if not titre:
+        return None
+    try:
+        if nom == "create_block":
+            jours = kwargs.get("days") or kwargs.get("day_of_week")
+            if isinstance(jours, int):
+                jours = [jours]
+            filtre = RecurringBlock.objects.filter(
+                user=user, active=True, title=titre, created_at__gte=debut)
+            if jours:
+                filtre = filtre.filter(day_of_week__in=list(jours))
+            debut_h = str(kwargs.get("start_time") or "")
+            if debut_h:
+                filtre = filtre.filter(start_time=debut_h)
+            return filtre.order_by("-created_at").first()
+        if nom == "create_task":
+            return Task.objects.filter(
+                user=user, title=titre, created_at__gte=debut).order_by("-created_at").first()
+        if nom == "schedule_task_at":
+            # Filtre precis (tache, date, heures) : sans lui, la fenetre de
+            # 10 minutes confondrait l'operation ambigue avec une creation
+            # anterieure legitime du meme tour.
+            filtre = ScheduledBlock.objects.filter(
+                user=user, created_at__gte=debut)
+            if titre:
+                filtre = filtre.filter(task__title=titre)
+            jour = kwargs.get("date")
+            if jour:
+                filtre = filtre.filter(date=jour)
+            debut_h = str(kwargs.get("start_time") or "")
+            if debut_h:
+                filtre = filtre.filter(start_time=debut_h)
+            fin_h = str(kwargs.get("end_time") or "")
+            if fin_h:
+                filtre = filtre.filter(end_time=fin_h)
+            return filtre.order_by("-created_at").first()
+    except Exception:  # noqa: BLE001 - la reconciliation ne casse jamais un tour
+        logger.error("Reconciliation: recherche de doublon en panne", exc_info=True)
+    return None
+
+
+def _reconcilier(ctx: _Contexte, nom: str, kwargs: dict, cle: str) -> str | None:
+    """Avant de reemettre une mutation dont une tentative est ambigue.
+
+    Rend la chaine a renvoyer au modele si la reconciliation tranche, None
+    pour laisser l'execution suivre son cours. Deux issues tranchent:
+    - l'objet existe en base -> recu reconcilie rejoue comme succes;
+    - l'objet n'existe pas et l'outil est une creation reconciliable ->
+      None (la reemission est sure : rien n'a ete ecrit).
+    Pour les autres outils, on laisse le modele verifier lui-meme: le
+    message de pending_confirmation le lui a dit.
+    """
+    attente = ctx.registre.en_attente(cle)
+    if attente is None or nom not in _CREATIONS_RECONCILIABLES:
+        return None
+    doublon = _doublon_recent(ctx.user, nom, kwargs)
+    if doublon is None:
+        logger.info("Reconciliation %s: rien en base, reemission autorisee", cle)
+        return None
+    resultat = ToolResult(
+        success=True,
+        message=f"{attente.message} (confirme par reconciliation)",
+        data={**(attente.donnees or {}), "pending_confirmation": False,
+              "reconciliation": True,
+              "block_id": getattr(doublon, "pk", None)},
+    )
+    # La cle d'idempotence retient le recu reconcilie: une troisieme
+    # tentative rejouera celui-ci, jamais une nouvelle ecriture.
+    ctx.etat.cache[cle] = resultat
+    _consigner(ctx, nom, kwargs, resultat, cle_operation=cle)
+    logger.info("Reconciliation %s: ecriture retrouvee en base, recu rejoue", cle)
+    return resultat.to_string()
 
 
 def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = None) -> str:
@@ -1978,8 +2088,17 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
             deja = etat.cache[cle]
             logger.info(f"Executing tool: {nom}({kwargs})")
             logger.info("Idempotence: %s deja execute ce tour, resultat rejoue", nom)
-            _consigner(ctx, nom, kwargs, deja)
+            _consigner(ctx, nom, kwargs, deja, cle_operation=cle)
             return deja.to_string()
+        # RECONCILIATION (boucle unique, 2026-09-29). Une tentative precedente
+        # de la meme operation est restee ambigue (timeout, exception
+        # transitoire): on ne reemet JAMAIS a l'aveugle. On verifie d'abord
+        # en base si l'ecriture a bien eu lieu; si oui, le recu reconcilie
+        # est rejoue comme un succes, sans reexecuter.
+        if choix is None:
+            reconcilie = _reconcilier(ctx, nom, kwargs, cle)
+            if reconcilie is not None:
+                return reconcilie
 
     if choix is None:
         try:
@@ -2102,7 +2221,25 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
         # cela, l'exception avorterait le run ET le registre ne garderait
         # aucune trace de la mutation tentee.
         logger.error("Tool %s a leve: %s", nom, e, exc_info=True)
-        resultat = ToolResult(success=False, data={}, message=f"Erreur de l'outil: {e}")
+        if cle is not None and _transitoire(e):
+            # AMBIGU, pas echoue: l'ecriture a peut-etre eu lieu (timeout
+            # apres commit, 429, connexion perdue). Ni succes ni echec:
+            # pending_confirmation. Le modele doit VERIFIER par une lecture
+            # avant toute reemission, et le code reconciliera par requete
+            # (voir _reconcilier). On ne met PAS en cache: un echec mis en
+            # cache empecherait toute reprise, et un succes serait un
+            # mensonge.
+            resultat = ToolResult(
+                success=False,
+                data={"pending_confirmation": True, "cle_operation": cle,
+                      "erreur": type(e).__name__},
+                message=(f"{nom}: resultat incertain ({type(e).__name__}), "
+                         "action en attente de confirmation. Verifie l'etat "
+                         "reel avec un outil de lecture avant de reessayer; "
+                         "ne reemets pas a l'aveugle."),
+            )
+        else:
+            resultat = ToolResult(success=False, data={}, message=f"Erreur de l'outil: {e}")
     # Kwargs prives du niveau 3: ne doivent pas polluer le registre ni le rendu.
     kwargs.pop("_arrangements", None)
     kwargs.pop("_arrangement", None)
@@ -2122,11 +2259,13 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
 
     # On ne met en cache que les SUCCES: un echec peut etre transitoire
     # (429, timeout), et rejouer un echec empecherait toute reprise.
+    # Un pending_confirmation n'est ni l'un ni l'autre: il reste
+    # reconcilable par _reconcilier a la prochaine tentative.
     if cle is not None and resultat.success:
         etat.cache[cle] = resultat
     # Diffuse au fil de l'execution: c'est ce qui meuble l'attente cote
     # interface.
-    _consigner(ctx, nom, kwargs, resultat)
+    _consigner(ctx, nom, kwargs, resultat, cle_operation=cle or "")
 
     # Garde de terminaison, ici parce que c'est le seul point par lequel
     # TOUS les appels passent. On rend au modele une consigne explicite

@@ -378,20 +378,25 @@ class PromptsTests(TestCase):
         self.assertEqual(resume_semaine(self.user), "")
         self.assertIn("(aucun bloc recurrent)", prompt_agir(self.user))
 
-    def test_prompt_dire(self):
-        from services.agent_v2.prompts import PROMPT_DIRE
-        for requis in ("12 mots", "question", "options", "import_recent", "refs",
-                       "ouverture", "suite", "QUESTION DEJA POSEE PAR LE CODE",
-                       "BROUILLON D'AGIR", "CONTEXTE (ne pas citer)", "9 h 30"):
+    def test_prompt_boucle(self):
+        """Boucle unique: les instructions de redaction sont dans le prompt
+        unique (plus de PROMPT_DIRE separe)."""
+        from services.agent_v2.prompts import prompt_agir
+        prompt = prompt_agir(self.user)
+        for requis in ("TA REPONSE FINALE", "UNE question", "refs",
+                       "Si le systeme pose deja une question ce tour",
+                       "tutoiement", "Deux ou trois phrases",
+                       "Ne complete jamais"):
             with self.subTest(requis=requis):
-                self.assertIn(requis, PROMPT_DIRE)
-        self.assertNotIn("Chaque action mentionnee DOIT porter la reference", PROMPT_DIRE)
+                self.assertIn(requis, prompt)
 
     def test_aucun_tiret_cadratin(self):
         from services.agent_v2 import prompts
-        for nom in ("REGLES_AGIR", "PROMPT_DIRE", "PREMIER_CONTACT"):
+        for nom in ("REGLES_AGIR", "PREMIER_CONTACT"):
             with self.subTest(nom=nom):
                 self.assertNotIn(chr(0x2014), getattr(prompts, nom))
+        # Le prompt unique (prompt_agir) non plus.
+        self.assertNotIn(chr(0x2014), prompts.prompt_agir(self.user))
 
 
 JOUR_LOIN = date(2030, 6, 10)

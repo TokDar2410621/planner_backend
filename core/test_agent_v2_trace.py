@@ -30,8 +30,8 @@ class TraceDesOutilsTests(TestCase):
         self.Agent = PlannerAgentV2
 
     @staticmethod
-    def _agir_avec_deux_outils(self_agent, user, message, registre):
-        """Simule AGIR: deux outils, une lecture puis une ecriture."""
+    def _boucle_avec_deux_outils(self_agent, user, message, registre):
+        """Simule la boucle: deux outils, une lecture puis une ecriture."""
         for outil, params, res in (
             ('list_blocks', {'day_of_week': 'jeudi'},
              ToolResult(success=True, data={'count': 2}, message='2 blocs trouves')),
@@ -40,12 +40,10 @@ class TraceDesOutilsTests(TestCase):
         ):
             action = registre.ajouter(outil, params, res)
             self_agent.signaler_outil(action)
-        return "Je regarde le planning."
+        return ReponseDire(ouverture="C'est fait.")
 
-    def _evenements(self, agir=None):
-        with patch.object(self.Agent, '_agir', agir or self._agir_avec_deux_outils), \
-             patch.object(self.Agent, '_dire',
-                          return_value=ReponseDire(ouverture="C'est fait.")):
+    def _evenements(self, boucle=None):
+        with patch.object(self.Agent, '_boucle', boucle or self._boucle_avec_deux_outils):
             return list(self.Agent().process_message_stream(self.user, "ajoute maths"))
 
     def test_chaque_outil_produit_un_evenement(self):
@@ -90,17 +88,17 @@ class TraceDesOutilsTests(TestCase):
         self.assertNotIn('args', premier)
         self.assertNotIn('parametres', premier)
 
-    def test_un_agir_sans_outil_ne_produit_aucun_evenement_outil(self):
+    def test_une_boucle_sans_outil_ne_produit_aucun_evenement_outil(self):
         """Contre-epreuve: on n'invente pas de jalon."""
         def muet(self_agent, user, message, registre):
-            return ""
+            return ReponseDire(ouverture="Ok.")
         types = [e['type'] for e in self._evenements(muet)]
         self.assertNotIn('tool', types)
 
 
 class SignalerOutilTests(TestCase):
     """La primitive, testee a part: sans file, elle doit etre sans effet, sinon
-    tout appel direct a _agir (banc, tests) casserait."""
+    tout appel direct a _boucle (banc, tests) casserait."""
 
     def setUp(self):
         from services.agent_v2 import PlannerAgentV2

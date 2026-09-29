@@ -12,7 +12,7 @@ class ReemiseEtGardeTests(voix_r4.DemandeReemiseTests):
     """Herite du harnais; les tests du parent tournent deja dans leur module."""
 
     def _flou(self):
-        premier = self._tour("efface tout jeudi", agir=self._supprimer)
+        premier = self._tour("efface tout jeudi", boucle=self._supprimer)
         self.assertEqual(premier["question_motif"], "portee_jour")
         cle = self._meta()["demandes"][0]["cle"]
         flou = self._tour("Oui, supprime ces trois blocs.",

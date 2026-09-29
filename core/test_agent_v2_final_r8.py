@@ -198,26 +198,24 @@ class F5PieceJointeTests(_TourDecideBase):
         doc = UploadedDocument.objects.create(user=self.user, file_name='horaire.pdf',
                                               processed=True)
 
-        def _agir(self_agent, user, msg, registre):
-            self.ordre.append('agir')
-            return ''
+        def _boucle(self_agent, user, msg, registre):
+            self.ordre.append('boucle')
+            return ReponseDire(ouverture='Ok.')
 
         with patch.object(PlannerAgentV2, '_contexte_document', return_value=iter(())), \
-             patch.object(PlannerAgentV2, '_agir', _agir), \
-             patch.object(PlannerAgentV2, '_dire', return_value=ReponseDire(ouverture='Ok.')):
+             patch.object(PlannerAgentV2, '_boucle', _boucle):
             list(PlannerAgentV2().process_message_stream(self.user, 'oui', doc))
-        self.assertIn('agir', self.ordre)
+        self.assertIn('boucle', self.ordre)
 
     def test_sans_piece_jointe_le_chemin_rapide_reste(self):
         self.decide = True
 
-        def _agir(*a, **k):
-            raise AssertionError('AGIR ne doit pas tourner')
+        def _boucle(*a, **k):
+            raise AssertionError('la boucle ne doit pas tourner')
 
-        with patch.object(PlannerAgentV2, '_agir', _agir), \
-             patch.object(PlannerAgentV2, '_dire', return_value=ReponseDire(ouverture='Ok.')):
+        with patch.object(PlannerAgentV2, '_boucle', _boucle):
             list(PlannerAgentV2().process_message_stream(self.user, 'oui'))
-        self.assertNotIn('agir', self.ordre)
+        self.assertNotIn('boucle', self.ordre)
 
 
 # ── F6: une nouvelle demande destructive est une nouvelle requete ───────────

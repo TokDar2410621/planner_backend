@@ -1,15 +1,15 @@
 """
-La boucle: AGIR, RECONCILIER, DIRE.
+La boucle unique (2026-09-29): COMPRENDRE+OUTILLER, RECONCILIER, RENDRE.
 
-La difference de fond avec v1 tient en une phrase: le recit d'action n'est plus
-produit par le modele. AGIR outille et alimente un registre ecrit par le
-runtime; le code rend un compte rendu factuel depuis ce registre; DIRE ne fait
-qu'enrober, et toute sortie citant une action qui n'existe pas est ecartee a
-l'assemblage.
+La difference de fond avec v1 tient en une phrase: le recit d'action n'est
+plus produit par le modele. La boucle outille et alimente un registre ecrit
+par le runtime; le code rend un compte rendu factuel depuis ce registre; la
+prose du modele ne survit que contre des refs verifiees (verifier_prose), et
+toute affirmation d'action qui n'existe pas est ecartee avant l'assemblage.
 
 Depuis le 2026-09-14 (lots 1 a 3), un tour s'affiche en trois sections
-streamees dans leur ordre final: FAITS (code), PROSE (DIRE epuree), QUESTION
-(une seule, choisie par PRIORITE). done.response est exactement la
+streamees dans leur ordre final: FAITS (code), PROSE (boucle verifiee),
+QUESTION (une seule, choisie par PRIORITE). done.response est exactement la
 concatenation des deltas, et le message persiste porte ses boutons et ses
 demandes en metadonnees pour que le tour suivant sache a quoi l'utilisateur
 repond.
@@ -28,32 +28,34 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Optional
+from types import SimpleNamespace
 
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import close_old_connections
 from django.db.models import F
 from django.utils import timezone
-from pydantic_ai import Agent, ModelRetry
+from pydantic_ai import Agent
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (ModelRequest, ModelResponse, PartDeltaEvent,
-                                  PartStartEvent, TextPart, TextPartDelta,
+                                  PartStartEvent, TextPart,
                                   ThinkingPart, ThinkingPartDelta, UserPromptPart)
 from pydantic_ai.usage import UsageLimits
 
 from core.models import BudgetJetonsJournalier, ConversationMessage, UploadedDocument
 from services.agent_v2 import lecture, regles
 from services.agent_v2 import memoire as memoire_prefs
-from services.agent_v2.mesure import epurer_reponse, fuites_reponse, questions_et_offres
-from services.agent_v2.modeles import REGLAGES_DIRE, modele_agir, modele_dire
+from services.agent_v2.mesure import verifier_prose
+from services.agent_v2.modeles import (REGLAGES_BOUCLE_SANS_RAISONNEMENT,
+                                       modele_agir)
 from services.agent_v2.outils import outils_pour
-from services.agent_v2.prompts import PROMPT_DIRE, prompt_agir
+from services.agent_v2.prompts import prompt_agir
 from services.agent_v2.reconciliation import detecter_ecarts, reconcilier
 from services.agent_v2.importation import inscrire_import
 from services.agent_v2.redaction import (LECTURES_RENDUES, ReponseDire,
-                                          bloc_factuel, bloc_reste, composer,
-                                          contient_question, marqueurs_bruts,
-                                          question_code, sans_tiret_long)
+                                         bloc_factuel, bloc_reste, composer,
+                                         contient_question, marqueurs_bruts,
+                                         question_code, sans_tiret_long)
 from services.agent_v2.registre import Registre
 
 logger = logging.getLogger(__name__)
@@ -372,7 +374,7 @@ class PlannerAgentV2:
 
     def __init__(self, user: Optional[User] = None):
         self.user = user
-        # Poses ici et pas seulement dans le flux: _agir et _historique sont
+        # Poses ici et pas seulement dans le flux: _boucle et _historique sont
         # appelables directement (banc, tests), et une instance a demi
         # initialisee leverait un AttributeError loin de sa cause.
         self._tache: str = ""
@@ -380,14 +382,6 @@ class PlannerAgentV2:
         self._file_pensees: Optional[queue.Queue] = None
         self._message_brut: Optional[str] = None
         self._tap: Optional[dict] = None
-        self._brouillon_agir: str = ""
-        # Apercu streame (mode voix_agir): la reponse s'ecrit pendant qu'AGIR
-        # la produit, phrase par phrase, chacune passee par le MEME filtre
-        # que la composition finale.
-        self._apercu_actif: bool = False
-        self._apercu_tampon: str = ""
-        self._apercu_emis: bool = False
-        self._apercu_phrases: int = 0
         self._registre_courant: Optional[Registre] = None
 
     def pousser_pensee(self, texte: str) -> None:
@@ -399,72 +393,6 @@ class PlannerAgentV2:
         """
         if self._file_pensees is not None and texte:
             self._file_pensees.put(("thinking", texte))
-
-    def _phrase_publiable(self, phrase: str) -> str:
-        """La phrase telle que la composition finale la garderait, ou « ».
-
-        On ne re-implemente RIEN: la phrase passe par epurer_reponse puis
-        composer, exactement le chemin de la reponse finale. Une phrase qui
-        affirme une action (que le registre ne couvre pas), qui parle
-        vocabulaire interne ou mecanique d'interface, ou qui POSE une
-        question (elle appartient a la fin du tour, ou au code) n'en
-        ressort pas. Un mensonge ne peut donc pas s'afficher, meme une
-        seconde.
-        """
-        registre = self._registre_courant
-        if registre is None or not phrase.strip():
-            return ""
-        # Une garde a pose une demande ce tour: la question du code gagnera
-        # et la prose d'AGIR sera taillee ou jetee. On n'affiche rien qu'il
-        # faudrait reprendre.
-        if any((a.donnees or {}).get("demande") for a in registre.actions):
-            return ""
-        try:
-            brut, _ = epurer_reponse(ReponseDire(ouverture=phrase))
-            compo = composer(brut, registre, "", None)
-        except Exception:  # noqa: BLE001 - un apercu ne casse jamais un tour
-            logger.debug("Apercu non publiable", exc_info=True)
-            return ""
-        return sans_tiret_long(compo.prose or "").strip()
-
-    def pousser_brouillon(self, fragment: str) -> None:
-        """Accumule le texte final d'AGIR et publie ses phrases completes."""
-        if not self._apercu_actif or not fragment or self._file_pensees is None:
-            return
-        self._apercu_tampon += fragment
-        while True:
-            fin = _FIN_DE_PHRASE_STREAMEE.search(self._apercu_tampon)
-            if fin is None:
-                return
-            phrase = self._apercu_tampon[:fin.end()]
-            self._apercu_tampon = self._apercu_tampon[fin.end():]
-            publiable = self._phrase_publiable(phrase)
-            if not publiable:
-                continue
-            texte = f" {publiable}" if self._apercu_emis else publiable
-            self._apercu_emis = True
-            self._apercu_phrases += 1
-            self._file_pensees.put(("delta", texte))
-
-    def reliquat_apercu(self) -> str:
-        """La DERNIERE phrase, publiee quand AGIR a fini d'ecrire.
-
-        Une phrase n'est publiable qu'une fois terminee, et « terminee » se
-        reconnait a l'espace qui suit son point: la derniere phrase d'un
-        texte n'en a pas et restait donc dans le tampon (sonde prod du
-        2026-09-18: apercu=1 sur une reponse de deux phrases). Quand AGIR
-        rend la main, il n'y a plus rien a attendre: on la publie.
-        """
-        reste, self._apercu_tampon = self._apercu_tampon, ""
-        if not self._apercu_actif:
-            return ""
-        publiable = self._phrase_publiable(reste)
-        if not publiable:
-            return ""
-        texte = f" {publiable}" if self._apercu_emis else publiable
-        self._apercu_emis = True
-        self._apercu_phrases += 1
-        return texte
 
     def signaler_outil(self, action) -> None:
         """Diffuse un appel d'outil vers le flux, s'il y a un flux.
@@ -494,38 +422,34 @@ class PlannerAgentV2:
 
         Deux defauts corriges le 2026-09-14: la version precedente lisait
         `content_delta` sur tout evenement, donc les brouillons en francais
-        d'AGIR (TextPartDelta) se melaient au raisonnement anglais du volet;
-        et elle ignorait PartStartEvent, qui porte le PREMIER fragment de
-        chaque partie (d'ou « user wants » sans « The »).
+        de la boucle (TextPartDelta) se melaient au raisonnement anglais du
+        volet; et elle ignorait PartStartEvent, qui porte le PREMIER fragment
+        de chaque partie (d'ou « user wants » sans « The »).
 
-        Les deux canaux restent SEPARES: la pensee va au volet, le texte va
-        a l'apercu streame (mode voix_agir seulement, ou le texte final
-        d'AGIR est la reponse). Hors de ce mode, pousser_brouillon ne fait
-        rien et le comportement est celui d'avant.
+        Boucle unique (2026-09-29): seul le raisonnement est streame en
+        direct. Le texte final est une sortie structuree (JSON): il n'est
+        jamais pousse tel quel, la reponse verifiee part en deltas ordonnes
+        apres composition.
         """
         async for evenement in evenements:
             if isinstance(evenement, PartStartEvent):
                 if isinstance(evenement.part, ThinkingPart):
                     self.pousser_pensee(evenement.part.content)
-                elif isinstance(evenement.part, TextPart):
-                    self.pousser_brouillon(evenement.part.content)
             elif isinstance(evenement, PartDeltaEvent):
                 if isinstance(evenement.delta, ThinkingPartDelta):
                     self.pousser_pensee(evenement.delta.content_delta)
-                elif isinstance(evenement.delta, TextPartDelta):
-                    self.pousser_brouillon(evenement.delta.content_delta)
 
-    def _agir(self, user: User, message: str, registre: Registre) -> str:
-        """Laisse le modele outiller. Rend son raisonnement, jamais persiste.
+    def _boucle(self, user: User, message: str, registre: Registre) -> ReponseDire | None:
+        """Boucle unique (2026-09-29): UN SEUL appel modele par tour.
+
+        Le modele comprend, outille et rend une reponse STRUCTUREE
+        (ReponseDire): prose + refs vers le registre + lecture typee pour les
+        regles du code. Plus d'etapes LIRE ni DIRE separees.
 
         Le registre est alimente par l'adaptateur d'outils a chaque execution:
         cette methode ne l'ecrit pas elle-meme, et c'est voulu. Une action ne
         peut entrer dans le registre qu'en ayant reellement ete executee.
-
-        Le texte final d'AGIR est garde dans `_brouillon_agir`: c'est la que
-        vivent ses questions de clarification, que DIRE doit reprendre.
         """
-        self._brouillon_agir = ""
         # Les regles de la garde (confirmation, heure dite, portee d'un jour)
         # lisent le message TAPE, jamais sa version enrichie du document.
         brut = self._message_brut if self._message_brut is not None else message
@@ -533,168 +457,58 @@ class PlannerAgentV2:
                              tache=self._tache, signaler=self.signaler_outil,
                              message_brut=brut, tap=self._tap)
         # instructions= et non system_prompt=: pydantic-ai n'ajoute les system
-        # prompts QUE si l'historique est vide. Sur tout tour de suivi, AGIR
-        # tournait sans date, sans table de decision ni semaine type, et a
-        # place une revision en 2025 (banc du 2026-09-14). Les instructions
-        # partent a chaque requete.
+        # prompts QUE si l'historique est vide. Sur tout tour de suivi, la
+        # boucle tournait sans date, sans table de decision ni semaine type,
+        # et a place une revision en 2025 (banc du 2026-09-14). Les
+        # instructions partent a chaque requete.
         agent = Agent(
             modele_agir(),
             instructions=prompt_agir(user),
             tools=outils,
+            output_type=ReponseDire,
+            # DeepSeek refuse tool_choice=required (la sortie structuree)
+            # en mode thinking: mesure du 2026-08-24, gardee pour la boucle
+            # qui rend elle aussi une sortie structuree.
+            model_settings=REGLAGES_BOUCLE_SANS_RAISONNEMENT,
         )
 
         depart = time.perf_counter()
         try:
-            resultat = agent.run_sync(
-                message,
+            resultat = self._executer_boucle(
+                agent, message,
                 message_history=self._historique(user),
                 usage_limits=UsageLimits(request_limit=BUDGET_ETAPES,
-                                             **_limites_jetons(_budget_jetons_agir())),
+                                         **_limites_jetons(_budget_jetons_agir())),
                 event_stream_handler=self._sur_evenements,
             )
-            self._cout_agir = _cout(resultat, time.perf_counter() - depart)
+            self._cout_boucle = _cout(resultat, time.perf_counter() - depart)
         except UsageLimitExceeded:
             # Le tour est tronque, pas rate: les outils deja executes ont
             # ecrit. Le bloc factuel le dira, c'est tout l'interet du registre.
             # Declenche par le budget d'etapes OU le budget jetons.
             registre.budget_epuise = True
-            self._cout_agir = {"etapes": BUDGET_ETAPES, "entree": 0, "sortie": 0,
-                               "duree": time.perf_counter() - depart}
-            return ""
-        sortie = getattr(resultat, "output", "")
-        self._brouillon_agir = sortie.strip() if isinstance(sortie, str) else ""
-        return self._raisonnement(resultat)
-
-    # ------------------------------------------------------------------ DIRE
-
-    def _dire(self, user: User, message: str, registre: Registre,
-              etat: dict, faits: str, brouillon: str = "",
-              question_code: str = "", historique_court: str = "",
-              memoire: str = "") -> ReponseDire:
-        """Redige, sans outil. REGLAGES_DIRE coupe le raisonnement: verifie par
-        sonde, DeepSeek refuse tool_choice=required en mode thinking, or c'est
-        ainsi que PydanticAI force une sortie structuree."""
-        agent = Agent(
-            modele_dire(),
-            output_type=ReponseDire,
-            system_prompt=PROMPT_DIRE,
-            model_settings=REGLAGES_DIRE,
-            output_retries=1,
-        )
-
-        tentatives = {"n": 0}
-
-        @agent.output_validator
-        def _sans_affirmation_d_action(sortie: ReponseDire) -> ReponseDire:
-            # SECONDE CHANCE avant la guillotine, et JAMAIS plus. Contre-
-            # expertise du 2026-08-30: lever encore a la recidive faisait
-            # exploser run_sync (UnexpectedModelBehavior), la reponse entiere
-            # partait au repli et la guillotine ne coupait jamais. Ici la
-            # recidive est LIVREE a l'assemblage, qui supprime les phrases
-            # fautives: la verite ne depend pas de la cooperation du modele.
-            tentatives["n"] += 1
-            fuites = fuites_reponse(sortie)
-            if fuites and tentatives["n"] <= 1:
-                champs = ", ".join(sorted({f.split(":", 1)[0] for f in fuites}))
-                # On demande de RETIRER, pas de deguiser en passif. Mais on dit
-                # aussi ce qui reste permis: la version precedente faisait
-                # fuir les questions et les offres avec les affirmations, et
-                # l'agent ne demandait plus rien.
-                raise ModelRetry(
-                    f"Les champs {champs} presentent une action comme deja "
-                    "faite ou en cours. SUPPRIME ces phrases: les actions "
-                    "reelles sont deja affichees par le code. Les questions et "
-                    "les offres restent permises, par exemple « Veux-tu que je "
-                    "le deplace a 14 h ? » ou « Donne-moi l'heure et je le "
-                    "place. »"
-                )
-            return sortie
-        brief = self._brief_dire(message, registre, etat, faits,
-                                 brouillon=brouillon, question_code=question_code,
-                                 historique_court=historique_court,
-                                 memoire=memoire)
-
-        # DIRE passe par le MEME pool qu'AGIR, et ce n'est pas un detail de
-        # style. Mesure du 2026-08-28: appeler run_sync depuis le thread
-        # principal apres qu'un thread du pool en a fait un bloque
-        # indefiniment. Le tour se figeait juste apres le compte rendu
-        # factuel, donc apres avoir tout affiche, ce qui rendait le defaut
-        # particulierement trompeur. La seule configuration verifiee est
-        # « tous les appels au modele sur le pool ».
-        def _rediger():
-            close_old_connections()
-            try:
-                depart_dire = time.perf_counter()
-                sortie = agent.run_sync(
-                    brief,
-                    usage_limits=UsageLimits(**_limites_jetons(_budget_jetons_dire())),
-                )
-                self._cout_dire = _cout(sortie, time.perf_counter() - depart_dire)
-                return sortie.output
-            finally:
-                close_old_connections()
-
-        # Sans delai, un fournisseur lent tient le tour (et le worker) sans
-        # limite. Au depassement, TimeoutError remonte vers le repli du tour,
-        # qui rend les faits deja vrais: meme philosophie que budget_epuise.
-        return _POOL_AGIR.submit(_rediger).result(timeout=self._delai_restant())
+            self._cout_boucle = {"etapes": BUDGET_ETAPES, "entree": 0, "sortie": 0,
+                                 "duree": time.perf_counter() - depart}
+            return None
+        sortie = getattr(resultat, "output", None)
+        return sortie if isinstance(sortie, ReponseDire) else None
 
     @staticmethod
-    def _brief_dire(message: str, registre: Registre, etat: dict, faits: str,
-                    brouillon: str = "", question_code: str = "",
-                    historique_court: str = "", memoire: str = "") -> str:
-        lignes: list[str] = []
-        if historique_court:
-            lignes += ["DEUX DERNIERS ECHANGES (contexte, ne les repete pas):",
-                       historique_court, ""]
-        if memoire:
-            lignes += [memoire, ""]
-        lignes += [f"MESSAGE DE L'UTILISATEUR:\n{message}", ""]
-        if registre.actions:
-            lignes.append("REGISTRE DU TOUR (seules ces references existent):")
-            for a in registre.actions:
-                if a.outil == "import_recent":
-                    # Un import d'un tour precedent: DIRE s'en sert pour
-                    # repondre, mais le citer a chaque tour pendant vingt
-                    # minutes redisait « c'est importe » a toute question.
-                    etiquette = "CONTEXTE (ne pas citer)"
-                else:
-                    etiquette = "OK" if a.succes else "ECHEC"
-                lignes.append(f"  {a.id} [{etiquette}] {a.outil}: {a.message}")
-                # Le CONTENU des lectures, sans quoi DIRE ne peut repondre a
-                # « c'est quoi mon planning ? »: il saurait qu'un outil a
-                # tourne sans savoir ce qu'il a renvoye (defaut observe le
-                # 2026-08-25 sur un tour reel). Les MUTATIONS en sont exclues:
-                # leur recit reste tenu par le bloc factuel et la validation
-                # des references, et deverser leurs donnees brutes rouvrirait
-                # le canal que la garantie structurelle ferme.
-                if a.succes and not a.est_mutation and a.donnees:
-                    lignes.append(f"       donnees: {_extrait(a.donnees)}")
-        else:
-            lignes.append("REGISTRE DU TOUR: VIDE. Tu n'as rien accompli.")
-        for e in registre.ecarts:
-            lignes.append(f"  {e.id} [ECART] {e.description}")
-        if faits:
-            lignes += ["", "COMPTE RENDU DEJA AFFICHE (ne repete ni ses noms, ni ses "
-                       "heures, ni ses nombres):", faits]
-        if question_code:
-            lignes += ["", "QUESTION DEJA POSEE PAR LE CODE (laisse question et "
-                       "options vides):", question_code]
-        # Le brouillon d'AGIR est le canal ou le modele raconte ses actions,
-        # y compris celles qu'une garde a retenues (revue de verite du round
-        # 3). Seules ses questions et ses offres propres entrent au brief, et
-        # rien du tout quand une garde a retenu une action ce tour: le code
-        # pose alors la question.
-        brouillon = "" if _brouillon_interdit(registre) else questions_et_offres(brouillon)
-        if brouillon:
-            extrait = brouillon if len(brouillon) <= BROUILLON_MAX \
-                else f"{brouillon[:BROUILLON_MAX]}... (tronque)"
-            lignes += ["", "BROUILLON D'AGIR (ses questions et offres seulement):", extrait]
-        if etat:
-            lignes += ["", f"ETAT RELU APRES ECRITURE: {list(etat)}"]
-        return "\n".join(lignes)
+    def _executer_boucle(agent, message, **kwargs):
+        """La boucle, avec UNE reprise bornee sur stream vide.
 
-    # ---------------------------------------------------------------- PUBLIC
+        Defaut observe en prod le 2026-09-29: un fournisseur rend un stream
+        vide (« Streamed response ended without content or tool calls ») et
+        le tour meurt sans action. Un seul reessai, pas d'acharnement: la
+        resilience reste assuree par la chaine de repli (FallbackModel).
+        """
+        try:
+            return agent.run_sync(message, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            if "without content or tool calls" not in str(e):
+                raise
+            logger.warning("Boucle: stream vide, une reprise bornee")
+            return agent.run_sync(message, **kwargs)
 
     def process_message_stream(
         self,
@@ -717,14 +531,11 @@ class PlannerAgentV2:
         self.user = user
         depart_tour = time.perf_counter()
         self._depart_tour = depart_tour  # lu par _delai_restant (deadline du tour)
-        self._cout_agir, self._cout_dire = {}, {}
+        self._cout_boucle = {}
         # Le message TAPE, avant tout enrichissement: c'est lui que lisent la
         # garde et les boutons forces.
         self._message_brut = message
         self._tap = tap if isinstance(tap, dict) and tap.get("demande") and tap.get("option") else None
-        self._brouillon_agir = ""
-        self._apercu_actif, self._apercu_tampon = False, ""
-        self._apercu_emis, self._apercu_phrases = False, 0
         self._journaliser_reponse_formulaire(user, message)
 
         # Persiste d'abord, puis exclut CETTE ligne de l'historique par son id.
@@ -741,8 +552,6 @@ class PlannerAgentV2:
         self._tache = f"{user.pk}:{courant.pk}"
 
         registre = Registre()
-        # L'apercu streame lit ce registre pour savoir ce qui est deja vrai
-        # (et s'il porte une demande) avant de publier une phrase.
         self._registre_courant = registre
 
         # Le document et l'import recent DOIVENT entrer dans le message vu par
@@ -851,36 +660,22 @@ class PlannerAgentV2:
         budget_jour_epuise = not par_le_code and _budget_jour_epuise(user)
         if budget_jour_epuise:
             logger.warning("agent_v2 budget jetons journalier epuise user=%s", user.pk)
-        voix_agir = bool(getattr(getattr(user, "profile", None), "voix_agir", False))
-        raisonnement, panne = "", None
-        suivi_lire = lecture.sautee()
+        # Boucle unique: un seul appel modele par tour (plus de LIRE ni de
+        # DIRE separes). Le chemin rapide et le budget epuise sautent la
+        # boucle; le registre (choix du code, faits) est rendu tel quel.
+        reponse_boucle: ReponseDire | None = None
+        panne = None
+        raisonnement = ""
         if par_le_code or budget_jour_epuise:
             self._file_pensees = None
         else:
             yield {"type": "status", "text": "Réflexion..."}
-            # LIRE en mode ombre (lecture.py): soumise ici et pas plus tot, pour
-            # que le chemin rapide n'en paie ni le contexte ni l'appel. Apres
-            # inscrire_import (un document importe est deja en base) et apres
-            # les choix du code, soit l'etat que voit AGIR. Rien ne l'attend
-            # avant la fin du tour.
-            suivi_lire = lecture.demarrer(user, message)
-            # Apercu streame: seulement quand AGIR est CELUI QUI PARLE
-            # (voix_agir), et pas sur un tour de reprise, ou le code parle
-            # a sa place. Ailleurs, rien ne change.
-            self._apercu_actif = voix_agir and not reemises
-            self._apercu_tampon, self._apercu_emis = "", False
-            self._apercu_phrases = 0
-            raisonnement, panne = yield from self._agir_en_fond(user, message_enrichi, registre)
-            # AGIR a rendu la main: sa derniere phrase n'attend plus rien.
-            reliquat = self.reliquat_apercu()
-            self._apercu_actif = False
-            if reliquat:
-                yield {"type": "delta", "text": reliquat}
-
+            reponse_boucle, panne, raisonnement = yield from self._boucle_en_fond(
+                user, message_enrichi, registre)
         if panne is not None:
-            # Une panne d'AGIR ne doit pas effacer ce que les outils ont deja
-            # ecrit: le registre survit et le tour continue vers DIRE.
-            logger.error("AGIR a echoue: %s", panne, exc_info=panne)
+            # Une panne de la boucle ne doit pas effacer ce que les outils
+            # ont deja ecrit: le registre survit et le tour continue.
+            logger.error("Boucle a echoue: %s", panne, exc_info=panne)
 
         etat: dict = {}
         if registre.mutations():
@@ -888,16 +683,12 @@ class PlannerAgentV2:
             etat = reconcilier(user, registre)
             detecter_ecarts(registre)
 
-        # LIRE decide (regles.py, LIRE_REGLES). La lecture se recueille UNE
-        # fois, ici, avec l'attente bornee: le meme resultat sert aux regles
-        # puis aux metadonnees et a la ligne du tour. Sans lecture utilisable,
-        # LIRE coupe ou regle coupee, rien de ce qui suit ne change.
-        # Sans regle configuree, l'attente reste en fin de tour comme en mode
-        # ombre seul (relecture Codex): rien ne retarde la question ni le flux.
+        # La lecture typee vient de la boucle elle-meme (champ `lecture` de
+        # sa reponse structuree): plus d'appel LIRE separe. Elle alimente les
+        # deux regles qui en ont besoin (formulaire_cours, creneaux).
         configurees = frozenset() if par_le_code else lecture.regles_actives()
-        resultat_lire = lecture.recueillir(suivi_lire) if configurees else None
-        lecture_typee = (regles.lecture_du_tour(suivi_lire, resultat_lire)
-                         if resultat_lire is not None else None)
+        lecture_typee = (self._lecture_de_boucle(user, message, reponse_boucle)
+                         if configurees else None)
         actives = configurees if lecture_typee is not None else frozenset()
         regle, prose_regle = "-", ""
         if regles.FORMULAIRE_COURS in actives:
@@ -940,61 +731,33 @@ class PlannerAgentV2:
             faits = f"{faits}\n{reste}" if faits else reste
         faits = sans_tiret_long(faits or "")
 
-        # Un apercu a deja ecrit la prose chez le client. Re-emettre les
-        # sections la dupliquerait: `response` reste la verite canonique
-        # (faits, prose, question) et le client remplace la bulle par
-        # done.response, comme le contrat SSE le prevoit deja.
-        apercu = self._apercu_emis
+        # Les faits partent AVANT la redaction: ils sont deja vrais, et
+        # l'utilisateur n'a pas a attendre l'enrobage pour les voir.
         emis: list[str] = []
         if faits:
-            # Les faits partent AVANT la redaction: ils sont deja vrais, et
-            # l'utilisateur n'a pas a attendre l'enrobage pour les voir.
             emis.append(faits)
-            if not apercu:
-                yield {"type": "delta", "text": faits}
-
-        question_deja = ""
-        if gagnant:
-            question_deja = gagnant.get("question") or "(un formulaire est affiché)"
+            yield {"type": "delta", "text": faits}
 
         supprimees = 0
         fuites: list[str] = []
-        panne_dire = False
-        # Regle formulaire_cours: DIRE n'est pas appele. L'absence fausse et
-        # les puces inventees ne peuvent plus s'ecrire; le code parle seul.
-        # Budget journalier epuise: meme traitement, sans appel LLM.
+        # Regle formulaire_cours: le code parle seul (pas de prose generee).
+        # Chemin rapide et budget journalier epuise: meme traitement.
+        t0_verif = time.perf_counter()
         if par_le_code or prose_regle or budget_jour_epuise:
             compo = composer(None, registre, faits, gagnant)
-        elif voix_agir:
-            # Une seule tete (2026-09-17): celui qui a reflechi parle. Le
-            # texte final d'AGIR devient la reponse, DIRE saute (une phase
-            # LLM de moins). MEME contrat que DIRE, rien de moins: fuites
-            # comptees, phrases d'action epurees (les faits du registre
-            # parlent), questions et filtres par composer. Le raisonnement
-            # streame et la reponse sortent donc de la meme tete.
-            brut = ReponseDire(
-                ouverture="" if reemises else (self._brouillon_agir or ""))
-            fuites = fuites_reponse(brut)
-            brut, supprimees = epurer_reponse(brut)
+        elif reponse_boucle is not None:
+            # Verifier-puis-rendre: la prose de la boucle ne survit que contre
+            # des refs verifiees (ids d'actions reelles du registre). Sur un
+            # tour de reprise, le code parle seul (PROSE_REPRISE plus bas).
+            brut = (reponse_boucle.model_copy(update={"ouverture": "", "suite": ""})
+                    if reemises else reponse_boucle)
+            brut, supprimees, fuites = verifier_prose(brut, registre)
             compo = composer(brut, registre, faits, gagnant)
         else:
-            try:
-                brut = self._dire(user, message, registre, etat, faits,
-                                  brouillon="" if reemises else self._brouillon_agir,
-                                  question_code=question_deja,
-                                  historique_court=self._deux_derniers_echanges(user),
-                                  memoire=memoire_prefs.section_memoire(user))
-                # Fuites APRES la seconde chance du validateur: ce compteur dit
-                # ce que le modele persiste a affirmer, pas ce qui part.
-                fuites = fuites_reponse(brut)
-                brut, supprimees = epurer_reponse(brut)
-                compo = composer(brut, registre, faits, gagnant)
-            except Exception as e:  # noqa: BLE001
-                logger.error("DIRE a echoue: %s", e, exc_info=True)
-                panne_dire = True
-                if isinstance(e, FuturesTimeoutError):
-                    registre.delai_depasse = True
-                compo = composer(None, registre, faits, gagnant)
+            # La boucle n'a rien rendu (panne, budget d'etapes): les faits
+            # parlent, et le repli aussi (plus bas).
+            compo = composer(None, registre, faits, gagnant)
+        duree_verif = time.perf_counter() - t0_verif
 
         # Zero tiret long dans ce que lit l'utilisateur, quelle que soit la
         # source (banc du round 3, s06-1).
@@ -1018,8 +781,9 @@ class PlannerAgentV2:
             prose = PROSE_ANNULEE
         formulaire = gagnant.get("interactive_inputs") if gagnant and \
             gagnant.get("source") == "formulaire" else None
-        if panne_dire and faits and not prose:
-            # DIRE est tombe. Se taire laisserait croire que rien n'a eu lieu.
+        if panne is not None and reponse_boucle is None and faits and not prose:
+            # La boucle est tombee. Se taire laisserait croire que rien n'a
+            # eu lieu, alors que le planning a peut-etre change.
             if registre.delai_depasse:
                 prose = PROSE_DELAI
             else:
@@ -1042,13 +806,11 @@ class PlannerAgentV2:
         if prose:
             morceau = ("\n\n" if emis else "") + prose
             emis.append(morceau)
-            if not apercu:
-                yield {"type": "delta", "text": morceau}
+            yield {"type": "delta", "text": morceau}
         if question:
             morceau = ("\n\n" if emis else "") + question
             emis.append(morceau)
-            if not apercu:
-                yield {"type": "delta", "text": morceau}
+            yield {"type": "delta", "text": morceau}
         response = "".join(emis)
 
         quick_replies = _chips_reponse(chips, compo.demandes if par_demande else [])
@@ -1067,24 +829,21 @@ class PlannerAgentV2:
         # Recueillie avant la question quand une regle est configuree; sinon
         # ici seulement, une fois la reponse figee. La ligne du tour nomme la
         # regle qui a decide.
-        if resultat_lire is None:
-            resultat_lire = lecture.recueillir(suivi_lire)
-        metadonnees_lire = lecture.clore(suivi_lire, resultat_lire, regle)
+        metadonnees_lire = {"lecture": "boucle"}
 
         # Une seule ligne par tour, mais pas toujours au meme niveau: une
         # reference rejetee est un mensonge que la garantie structurelle vient
-        # d'attraper, et une fuite est une affirmation d'action dans le canal
-        # qu'elle ne protege pas. Ce sont LES deux signaux du projet; en INFO
-        # ils se noieraient dans le bruit et personne ne les verrait passer.
-        cout_agir = getattr(self, "_cout_agir", None) or {}
-        cout_dire = getattr(self, "_cout_dire", None) or {}
+        # d'attraper, et une fuite est une affirmation d'action sans recu.
+        # Ce sont LES deux signaux du projet; en INFO ils se noieraient dans
+        # le bruit et personne ne les verrait passer.
+        cout = getattr(self, "_cout_boucle", None) or {}
         anormal = bool(rejetees or fuites)
         logger.log(
             logging.WARNING if anormal else logging.INFO,
             "agent_v2 tour actions=%d rejetees=%d fuites=%d supprimees=%d ecarts=%d%s"
-            " agir=%.1fs/%dep/%d->%dj/r%d/c%d dire=%.1fs/%dep/%d->%dj/r%d"
+            " boucle=%.1fs/%dep/%d->%dj/r%d/c%d verif=%.2fs"
             " asked=%d form=%d choices=%d read_without_list=%d raw_marker_count=%d"
-            " motif=%s choix_code=%d chemin=%s apercu=%d tour=%.2fs",
+            " motif=%s choix_code=%d chemin=%s tour=%.2fs",
             len(registre.actions),
             rejetees,
             len(fuites),
@@ -1097,12 +856,10 @@ class PlannerAgentV2:
             # En production le 2026-08-29, la mediane etait de 57 s et un tour
             # a atteint 397 s sans qu'aucun log ne dise ou passait le temps: on
             # ne pouvait qu'inferer des ecarts entre lignes httpx.
-            cout_agir.get("duree", 0.0), cout_agir.get("etapes", 0),
-            cout_agir.get("entree", 0), cout_agir.get("sortie", 0),
-            cout_agir.get("raisonnement", 0), cout_agir.get("cache", 0),
-            cout_dire.get("duree", 0.0), cout_dire.get("etapes", 0),
-            cout_dire.get("entree", 0), cout_dire.get("sortie", 0),
-            cout_dire.get("raisonnement", 0),
+            cout.get("duree", 0.0), cout.get("etapes", 0),
+            cout.get("entree", 0), cout.get("sortie", 0),
+            cout.get("raisonnement", 0), cout.get("cache", 0),
+            duree_verif,
             # MESURE DES QUESTIONS (lot 3g): a-t-on demande, par quel canal,
             # combien de boutons, une lecture sans liste, du texte machine.
             1 if question_posee else 0,
@@ -1113,10 +870,7 @@ class PlannerAgentV2:
             motif or "-",
             choix_code,
             # Latence du chemin rapide (D6) contre la boucle complete.
-            "code" if par_le_code else "agir",
-            # Phrases parties AVANT la fin du tour (apercu streame): 0 dit
-            # que la reponse est arrivee d'un bloc.
-            self._apercu_phrases,
+            "code" if par_le_code else "boucle",
             time.perf_counter() - depart_tour,
         )
 
@@ -1125,7 +879,7 @@ class PlannerAgentV2:
         # Compteur journalier (garde-fou facture): son echec ne doit jamais
         # casser un tour qui vient de reussir.
         try:
-            total_jetons = _jetons_phase(cout_agir) + _jetons_phase(cout_dire)
+            total_jetons = _jetons_phase(cout)
             if total_jetons > 0:
                 _enregistrer_jetons(user, total_jetons)
         except Exception:  # noqa: BLE001
@@ -1221,16 +975,20 @@ class PlannerAgentV2:
             return _delai_tour()
         return max(1.0, _delai_tour() - (time.perf_counter() - depart))
 
-    def _agir_en_fond(self, user: User, message_enrichi: str, registre: Registre):
-        """AGIR dans le pool, ses pensees streamees. Rend (raisonnement, panne).
+    def _boucle_en_fond(self, user: User, message_enrichi: str, registre: Registre):
+        """La boucle dans le pool, ses pensees streamees.
 
-        AGIR tourne dans un THREAD pour qu'on puisse emettre pendant qu'il
-        travaille. Mesure du 2026-08-28: sur une demande multi-etapes il
-        occupe 15 s des 25 s du tour, et l'utilisateur n'avait rien a lire
-        pendant ce temps. Le raisonnement etait bien capte, mais emis apres
-        coup: il decrivait une reflexion deja terminee.
+        Rend (ReponseDire|None, panne, raisonnement): le raisonnement est le
+        texte pense collecte pendant le drainage, pour l'evenement done.
+
+        La boucle tourne dans un THREAD pour qu'on puisse emettre pendant
+        qu'elle travaille. Mesure du 2026-08-28: sur une demande multi-etapes
+        la phase LLM occupe 15 s des 25 s du tour, et l'utilisateur n'avait
+        rien a lire pendant ce temps. Le raisonnement etait bien capte, mais
+        emis apres coup: il decrivait une reflexion deja terminee.
         """
-        raisonnement, panne = "", None
+        reponse, panne = None, None
+        pensees: list[str] = []
         file_agir = self._file_pensees
         # Deadline murale du tour: le drainage s'interrompt quand elle est
         # depassee au lieu de tenir la connexion SSE ouverte indefiniment
@@ -1241,12 +999,12 @@ class PlannerAgentV2:
         echeance = time.monotonic() + self._delai_restant()
 
         def travailler():
-            nonlocal raisonnement, panne
+            nonlocal reponse, panne
             # Ce thread vit hors du cycle de requete Django, qui ferme les
             # connexions: on s'en charge des deux cotes.
             close_old_connections()
             try:
-                raisonnement = self._agir(user, message_enrichi, registre) or ""
+                reponse = self._boucle(user, message_enrichi, registre)
             except Exception as e:  # noqa: BLE001
                 panne = e
             finally:
@@ -1259,8 +1017,8 @@ class PlannerAgentV2:
             restant = echeance - time.monotonic()
             if restant <= 0:
                 registre.delai_depasse = True
-                panne = panne or TimeoutError("delai du tour depasse pendant AGIR")
-                logger.warning("agent_v2 delai depasse pendant AGIR user=%s", user.pk)
+                panne = panne or TimeoutError("delai du tour depasse pendant la boucle")
+                logger.warning("agent_v2 delai depasse pendant la boucle user=%s", user.pk)
                 break
             try:
                 element = file_agir.get(timeout=min(ATTENTE_PENSEE, restant))
@@ -1274,7 +1032,10 @@ class PlannerAgentV2:
             if element is None:
                 break
             fragments += 1
-            yield self._evenement_de_file(element)
+            evt = self._evenement_de_file(element)
+            if evt["type"] == "thinking":
+                pensees.append(evt["text"])
+            yield evt
         if not registre.delai_depasse:
             try:
                 futur.result(timeout=max(0.1, echeance - time.monotonic()))
@@ -1283,17 +1044,35 @@ class PlannerAgentV2:
                 # rend pas la main. Meme traitement que ci-dessus.
                 registre.delai_depasse = True
                 panne = panne or TimeoutError(
-                    "delai du tour depasse: AGIR ne rend pas la main")
-                logger.warning("agent_v2 AGIR ne rend pas la main user=%s", user.pk)
+                    "delai du tour depasse: la boucle ne rend pas la main")
+                logger.warning("agent_v2 la boucle ne rend pas la main user=%s", user.pk)
         self._file_pensees = None
 
-        # Repli pour les fournisseurs qui ne streament pas leurs deltas: sans
-        # lui, leur raisonnement n'atteindrait le client que dans la charge
-        # utile finale, et le volet resterait vide tout le tour. On perd le
-        # gain de latence, jamais l'information.
-        if raisonnement and not fragments:
-            yield {"type": "thinking", "text": raisonnement}
-        return raisonnement, panne
+        return reponse, panne, "".join(pensees)
+
+    @staticmethod
+    def _lecture_de_boucle(user: User, message: str,
+                           reponse_boucle: ReponseDire | None):
+        """La lecture typee pour les regles, produite par la boucle unique.
+
+        Remplace l'appel LIRE separe: le champ `lecture` de la reponse
+        structuree traverse les memes regles (lecture_du_tour), sur une
+        preparation faite par le code avec le message TAPE.
+        """
+        lecture_boucle = getattr(reponse_boucle, "lecture", None)
+        if lecture_boucle is None:
+            return None
+        try:
+            preparation = lecture.preparer(user, message)
+        except Exception:  # noqa: BLE001
+            return None
+        suivi = SimpleNamespace(preparation=preparation)
+        resultat = SimpleNamespace(lecture=lecture_boucle, statut=lecture.OK)
+        try:
+            return regles.lecture_du_tour(suivi, resultat)
+        except Exception:  # noqa: BLE001 - une lecture ne casse pas un tour
+            logger.error("Lecture de boucle illisible", exc_info=True)
+            return None
 
     @staticmethod
     def _tour_decide(registre: Registre, message: str) -> bool:

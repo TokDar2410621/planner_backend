@@ -193,18 +193,15 @@ class D6CheminRapideTests(_TourDecideBase):
         self.decide = True
 
     def _interdits(self):
-        def _agir(*a, **k):
-            raise AssertionError("AGIR ne doit pas tourner")
-
-        def _dire(*a, **k):
-            raise AssertionError("DIRE ne doit pas tourner")
-        return _agir, _dire
+        def _boucle(*a, **k):
+            raise AssertionError("la boucle ne doit pas tourner")
+        return _boucle
 
     def _tour_rapide(self, message):
-        agir, dire = self._interdits()
+        boucle = self._interdits()
         depart = time.perf_counter()
         with self.assertLogs("services.agent_v2.agent", level="INFO") as journal:
-            _, done = self.tour(message=message, agir=agir, dire_effet=dire)
+            _, done = self.tour(message=message, agir=boucle, dire_effet=boucle)
         self.duree = time.perf_counter() - depart
         self.assertTrue(any("chemin=code" in l for l in journal.output), journal.output)
         return done
@@ -239,10 +236,10 @@ class D6CheminRapideTests(_TourDecideBase):
         self.assertEqual(done["response"], module_agent.PROSE_ANNULEE)
         self.assertFalse(done["question_posee"])
 
-    def test_sans_decision_du_code_agir_tourne(self):
+    def test_sans_decision_du_code_la_boucle_tourne(self):
         self.decide = False
         _, done = self.tour(message="ajoute gym demain")
-        self.assertIn("agir", self.ordre)
+        self.assertIn("boucle", self.ordre)
 
 
 class D6ChargeurTests(SimpleTestCase):

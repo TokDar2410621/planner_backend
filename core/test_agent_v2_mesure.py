@@ -24,14 +24,30 @@ class FuiteLexicaleTests(SimpleTestCase):
         self.assertEqual(fuite_lexicale("Je peux organiser ta semaine si tu veux."), [])
 
 
-def _agir_qui_pense_et_cree(self_agent, user, message, registre):
-    registre.ajouter(
-        "create_block",
-        {"title": "Maths"},
-        ToolResult(success=True, message="Bloc 'Maths' cree"),
-    )
-    registre.ajouter_ecart("a1", "verification mesure")
-    return "I need to inspect the schedule before answering."
+def _fabriquer_boucle(reponse):
+    """Fabrique une _boucle simulee: remplit le registre, emet une pensee, rend la ReponseDire."""
+    def _boucle(self_agent, user, message, registre):
+        registre.ajouter(
+            "create_block",
+            {"title": "Maths"},
+            ToolResult(success=True, message="Bloc 'Maths' cree"),
+        )
+        registre.ajouter_ecart("a1", "verification mesure")
+        # La pensee passe par la file, comme le ferait le modele.
+        self_agent._file_pensees.put(("thinking", "I need to inspect the schedule before answering."))
+        return reponse
+    return _boucle
+
+
+def _boucle_qui_pense_et_cree(self_agent, user, message, registre):
+    return _fabriquer_boucle(ReponseDire(
+        ouverture="Je vais organiser ton planning.",
+        actions=[
+            ActionCitee(ref="a1", phrase="Maths est cale."),
+            ActionCitee(ref="a42", phrase="J'ai aussi tout reorganise."),
+        ],
+        suite="J'ai supprime les doublons.",
+    ))(self_agent, user, message, registre)
 
 
 class FluxMesureTests(TestCase):
@@ -42,18 +58,7 @@ class FluxMesureTests(TestCase):
         self.Agent = PlannerAgentV2
 
     def test_le_flux_emet_thinking_et_done_reste_autoritaire(self):
-        brut = ReponseDire(
-            ouverture="Je vais organiser ton planning.",
-            actions=[
-                ActionCitee(ref="a1", phrase="Maths est cale."),
-                ActionCitee(ref="a42", phrase="J'ai aussi tout reorganise."),
-            ],
-            suite="J'ai supprime les doublons.",
-        )
-
-        with patch.object(self.Agent, "_agir", _agir_qui_pense_et_cree), patch.object(
-            self.Agent, "_dire", return_value=brut
-        ):
+        with patch.object(self.Agent, "_boucle", _boucle_qui_pense_et_cree):
             events = list(self.Agent().process_message_stream(self.user, "organise"))
 
         self.assertEqual(
@@ -85,8 +90,7 @@ class FluxMesureTests(TestCase):
             suite="",
         )
 
-        with patch.object(self.Agent, "_agir", _agir_qui_pense_et_cree), patch.object(
-            self.Agent, "_dire", return_value=brut
+        with patch.object(self.Agent, "_boucle", _fabriquer_boucle(brut)
         ), self.assertLogs("services.agent_v2.agent", level="INFO") as logs:
             list(
                 self.Agent().process_message_stream(

@@ -35,7 +35,6 @@ CHIPS_PORTEE = [
     {"label": "Tous les jeudis", "value": "Tous les jeudis (supprimer la série).", "option": "serie"},
     {"label": "Non, garde tout", "value": "Non, ne change rien.", "option": "annuler"},
 ]
-BROUILLON = "Tu veux que je supprime toute la série, ou seulement ce jeudi ?"
 
 
 def faux_rendu(journal: dict) -> SimpleNamespace:
@@ -119,19 +118,34 @@ class NarrateurBase(TestCase):
         return list(self.choix)
 
     def tour(self, actions=(), dire=None, message="bonjour", agir=None, dire_effet=None):
+        """Un tour avec la boucle simulee.
+
+        `agir` (optionnel) est l'effet de bord de l'ancien _agir sur le
+        registre, de signature (self_agent, user, msg, registre). `dire`
+        est le ReponseDire que la boucle retourne. `dire_effet` est soit
+        une exception (la boucle leve -> chemin "panne"), soit un appelable
+        de signature (user, msg, registre) -> ReponseDire qui remplace la
+        boucle (ex. mouchard qui ne doit jamais tourner).
+        """
         vus = {}
 
-        def _agir(self_agent, user, msg, registre):
-            self.ordre.append("agir")
-            vus["message_agir"] = msg
+        def _effet_defaut(self_agent, user, msg, registre):
+            self.ordre.append("boucle")
+            vus["message_boucle"] = msg
             for outil, params, res in actions:
                 self_agent.signaler_outil(registre.ajouter(outil, params, res))
-            return ""
 
-        options = ({"side_effect": dire_effet} if dire_effet is not None else
-                   {"return_value": dire if dire is not None else ReponseDire(ouverture="Ok.")})
-        with patch.object(PlannerAgentV2, "_agir", agir or _agir), \
-             patch.object(PlannerAgentV2, "_dire", **options):
+        effet = agir or _effet_defaut
+
+        def _boucle(self_agent, user, msg, registre):
+            effet(self_agent, user, msg, registre)
+            if isinstance(dire_effet, BaseException):
+                raise dire_effet
+            if callable(dire_effet):
+                return dire_effet(user, msg, registre)
+            return dire if dire is not None else ReponseDire(ouverture="Ok.")
+
+        with patch.object(PlannerAgentV2, "_boucle", new=_boucle):
             evts = list(PlannerAgentV2().process_message_stream(self.user, message))
         self.vus = vus
         return evts, evts[-1]
@@ -252,7 +266,7 @@ class ComposerTests(SimpleTestCase):
 
 
 class AgentFactice:
-    sortie = ""
+    sortie = ReponseDire(ouverture="Ok.")
 
     def __init__(self, *a, **kw):
         pass
@@ -271,52 +285,40 @@ class MessageBrutTests(NarrateurBase):
             user=self.user, title="Anglais", block_type="course", day_of_week=3,
             start_time="14:00", end_time="16:00", source_document=doc)
 
-    def _vrai_agir(self, outils_pour, sortie="", dire=None):
-        AgentFactice.sortie = sortie
+    def _vraie_boucle(self, outils_pour, reponse=None):
+        AgentFactice.sortie = reponse or ReponseDire(ouverture="Ok.")
         with patch.object(module_agent, "Agent", AgentFactice), \
              patch.object(module_agent, "modele_agir", return_value=None), \
              patch.object(module_agent, "prompt_agir", return_value=""), \
              patch.object(module_agent, "outils_pour", outils_pour), \
-             patch.object(PlannerAgentV2, "_historique", return_value=[]), \
-             patch.object(PlannerAgentV2, "_dire", **(dire or {"return_value": ReponseDire(ouverture="Ok.")})):
+             patch.object(PlannerAgentV2, "_historique", return_value=[]):
             return PlannerAgentV2().process_message(self.user, "c'est bon ?")
 
     def test_le_guard_recoit_le_message_brut(self):
         self._import_recent()
         outils_pour = MagicMock(return_value=[])
-        self._vrai_agir(outils_pour)
+        self._vraie_boucle(outils_pour)
         kwargs = outils_pour.call_args.kwargs
         self.assertEqual(kwargs["message_brut"], "c'est bon ?")
         self.assertTrue(kwargs["message_du_tour"].startswith("c'est bon ?\n\n"))
         self.assertNotEqual(kwargs["message_du_tour"], kwargs["message_brut"])
 
-    def test_le_texte_final_d_agir_devient_le_brouillon(self):
-        vus = {}
-
-        def _dire(user, message, registre, etat, faits, **kw):
-            vus.update(kw)
-            return ReponseDire(ouverture="Ok.")
-
-        self._vrai_agir(MagicMock(return_value=[]), sortie=f"  {BROUILLON}  ",
-                        dire={"side_effect": _dire})
-        self.assertEqual(vus["brouillon"], BROUILLON)
-
-    def test_choix_du_code_avant_agir(self):
+    def test_choix_du_code_avant_boucle(self):
         resume = "FAIT PAR LE CODE (a1): delete_block Quart"
         self.choix = [{"cle": "k", "motif": "portee_jour", "option": "serie",
                        "action_id": "a1", "resume": resume}]
         vus = {}
 
-        def _dire(user, message, registre, etat, faits, **kw):
-            vus["message_dire"] = message
+        def _boucle(user, msg, registre):
+            vus["message_boucle"] = msg
             return ReponseDire(ouverture="Ok.")
 
         with self.assertLogs("services.agent_v2.agent", level="INFO") as logs:
-            self.tour(message="Tous les jeudis (supprimer la série).", dire_effet=_dire)
-        self.assertEqual(self.ordre, ["appliquer", "agir"])
-        self.assertIn("SUITE AU CHOIX", self.vus["message_agir"])
-        self.assertIn(resume, self.vus["message_agir"])
-        self.assertEqual(vus["message_dire"], "Tous les jeudis (supprimer la série).")
+            self.tour(message="Tous les jeudis (supprimer la série).", dire_effet=_boucle)
+        self.assertEqual(self.ordre, ["appliquer", "boucle"])
+        self.assertIn("SUITE AU CHOIX", self.vus["message_boucle"])
+        self.assertIn(resume, self.vus["message_boucle"])
+        self.assertTrue(vus["message_boucle"].startswith("Tous les jeudis (supprimer la série)."))
         args, kwargs = self.journal["appliquer"]
         self.assertEqual(args[0], self.user)
         self.assertEqual(args[2], "Tous les jeudis (supprimer la série).")
@@ -328,7 +330,7 @@ class MessageBrutTests(NarrateurBase):
                        "action_id": None, "resume": "REFUSE PAR L'UTILISATEUR: clear_all_blocks"}]
         with self.assertLogs("services.agent_v2.agent", level="INFO") as logs:
             self.tour(message="Non, ne change rien.")
-        self.assertIn("REFUSE", self.vus["message_agir"])
+        self.assertIn("REFUSE", self.vus["message_boucle"])
         self.assertTrue(any("choix_code=0" in ligne for ligne in logs.output), logs.output)
 
     def test_l_effet_execute_par_le_code_est_trace_et_persiste(self):
@@ -359,49 +361,18 @@ class MessageBrutTests(NarrateurBase):
         self.assertEqual(done["response"], "Ok.")
 
 
-# ── 2a: DIRE voit le brouillon, pose sa question ─────────────────────────
+# ── 2a: la boucle voit le contexte, ne cite pas l'import ──────────────────
 
 
-class BriefDeDireTests(NarrateurBase):
-    def _brief(self, actions=(), agir=None, message="bonjour"):
-        vus = {}
+class ContexteBoucleTests(NarrateurBase):
+    """L'ancien _brief_dire n'existe plus : la boucle recoit le contexte dans
+    son message enrichi et l'historique en messages. La garantie qui survit :
+    un import recent ne doit jamais etre cite dans la reponse."""
 
-        def _dire(user, message, registre, etat, faits, **kw):
-            vus["brief"] = PlannerAgentV2._brief_dire(message, registre, etat, faits, **kw)
-            return ReponseDire(ouverture="Ok.")
-
-        self.tour(actions=actions, agir=agir, message=message, dire_effet=_dire)
-        return vus["brief"]
-
-    def test_le_brouillon_d_agir_atteint_dire(self):
-        def _agir(self_agent, user, message, registre):
-            self_agent._brouillon_agir = BROUILLON
-            return ""
-
-        brief = self._brief(agir=_agir)
-        self.assertIn("BROUILLON D'AGIR", brief)
-        self.assertIn(BROUILLON, brief)
-
-    def test_la_question_du_code_est_annoncee_a_dire(self):
-        brief = self._brief(actions=[refus("delete_block", demande=demande("portee_jour", "p1"))])
-        self.assertIn("QUESTION DEJA POSEE PAR LE CODE", brief)
-        self.assertIn(QUESTION_PORTEE, brief)
-
-    def test_les_deux_derniers_echanges_arrivent(self):
-        ConversationMessage.objects.create(user=self.user, role="user", content="ajoute mon quart")
-        ConversationMessage.objects.create(user=self.user, role="assistant",
-                                           content="À quelle heure commence ton quart ?")
-        brief = self._brief(message="19 h")
-        self.assertIn("DEUX DERNIERS ECHANGES", brief)
-        self.assertIn("Assistant: À quelle heure commence ton quart ?", brief)
-        self.assertNotIn("Utilisateur: 19 h", brief)
-
-    def test_import_recent_en_contexte(self):
+    def test_import_recent_jamais_cite(self):
         actions = [("import_recent", {"document": "recent.pdf"}, ToolResult(
             success=True, message="Horaire importé depuis « recent.pdf » : 1 entrée ajoutée",
             data={"fichier": "recent.pdf", "blocs": [{"titre": "Anglais"}]}))]
-        brief = self._brief(actions=actions)
-        self.assertIn("CONTEXTE (ne pas citer)", brief)
         _, done = self.tour(actions=actions)
         self.assertNotIn("import", done["response"].lower())
 
@@ -425,17 +396,28 @@ class QuestionDeDireTests(NarrateurBase):
         self.assertEqual(done["quick_replies"], [])
         self.assertEqual(done["question"], "À quelle heure ?")
 
-    def test_reference_inventee_coupe_tout(self):
+    def test_affirmation_sans_recu_coupee_ref_inventee_retiree(self):
+        """Boucle unique: verifier_prose remplace la guillotine de DIRE.
+
+        Une ref inventee ne fait plus tomber toute la prose; elle est
+        retiree, et chaque affirmation d'action sans recu verifie est
+        coupee phrase par phrase. La garantie de securite tient: aucune
+        action affirmee sans recu n'atteint l'utilisateur."""
         with self.assertLogs("services.agent_v2.agent", level="WARNING") as logs:
             _, done = self.tour(
                 actions=[ok("create_block", created=[{"title": "Maths"}])],
-                dire=ReponseDire(refs=["a9"], ouverture="Top !", suite="Tout roule.",
+                dire=ReponseDire(refs=["a9"], ouverture="Top !",
+                                 suite="J'ai ajouté ton gym jeudi.",
                                  question="Tu gardes ça ?", options=["Oui", "Non"]))
-        self.assertEqual(done["response"], "FAITS")
-        self.assertEqual(done["question"], "")
-        self.assertEqual(done["quick_replies"], [])
-        self.assertFalse(done["question_posee"])
-        self.assertTrue(any("rejetees=1" in ligne for ligne in logs.output), logs.output)
+        # La ref inventee n'est citee nulle part, l'affirmation sans recu
+        # est coupee.
+        self.assertNotIn("a9", done["response"])
+        self.assertNotIn("J'ai ajouté ton gym", done["response"])
+        # Les faits du registre parlent, la prose innocente survit.
+        self.assertIn("FAITS", done["response"])
+        self.assertIn("Top !", done["response"])
+        self.assertEqual(done["question"], "Tu gardes ça ?")
+        self.assertTrue(any("fuites=1" in ligne for ligne in logs.output), logs.output)
 
 
 # ── Une question par tour, selon PRIORITE ────────────────────────────────
@@ -556,7 +538,7 @@ class PrioriteTests(NarrateurBase):
             start_time="14:00", end_time="16:00", source_document=doc)
         with patch.object(module_agent, "_charger_question_forcee", return_value=forcee):
             self.tour(message="c'est bon ?")
-        self.assertTrue(self.vus["message_agir"].startswith("c'est bon ?\n\n"))
+        self.assertTrue(self.vus["message_boucle"].startswith("c'est bon ?\n\n"))
         self.assertEqual(appels[0][1], "c'est bon ?")
 
 
@@ -616,7 +598,7 @@ class NarrateurUniqueTests(NarrateurBase):
             self.assertEqual(done["quick_replies"], [])
             self.assertEqual("".join(self.deltas(evts)), done["response"])
 
-    def test_la_panne_de_dire_garde_la_question_du_code(self):
+    def test_la_panne_de_boucle_garde_la_question_du_code(self):
         _, done = self.tour(actions=[refus("delete_block", demande=demande("portee_jour", "p1"))],
                             dire_effet=RuntimeError("502"))
         self.assertEqual(done["response"], QUESTION_PORTEE)

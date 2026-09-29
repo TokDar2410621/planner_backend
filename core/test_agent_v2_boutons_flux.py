@@ -52,11 +52,11 @@ class BranchementDansLeFluxTests(TestCase):
             start_time=dtime(9, 0), end_time=dtime(11, 0), source_document=doc)
         return doc
 
-    def _done(self, doc, agir=None, message="voici mon horaire"):
-        def _muet(self_agent, user, message, registre):
-            return ""
-        with patch.object(self.Agent, "_agir", agir or _muet), \
-             patch.object(self.Agent, "_dire", return_value=ReponseDire(ouverture="Reçu.")):
+    def _done(self, doc, effet=None, message="voici mon horaire"):
+        def _boucle(self_agent, user, message, registre):
+            (effet or (lambda s, u, m, r: None))(self_agent, user, message, registre)
+            return ReponseDire(ouverture="Reçu.")
+        with patch.object(self.Agent, "_boucle", _boucle):
             return self.Agent().process_message(self.user, message, doc)
 
     def _persiste(self):

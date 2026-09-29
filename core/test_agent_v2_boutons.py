@@ -253,11 +253,11 @@ class MesureDesFormulairesTests(TestCase):
         from services.agent_v2 import PlannerAgentV2
         self.Agent = PlannerAgentV2
 
-    def _logs(self, message, agir=None):
-        def _muet(self_agent, user, message, registre):
-            return ""
-        with patch.object(self.Agent, "_agir", agir or _muet), \
-             patch.object(self.Agent, "_dire", return_value=ReponseDire(ouverture="Ok.")), \
+    def _logs(self, message, effet=None):
+        def _boucle(self_agent, user, message, registre):
+            (effet or (lambda s, u, m, r: None))(self_agent, user, message, registre)
+            return ReponseDire(ouverture="Ok.")
+        with patch.object(self.Agent, "_boucle", _boucle), \
              self.assertLogs("services.agent_v2.agent", level="INFO") as logs:
             self.Agent().process_message(self.user, message)
         return [ligne for ligne in logs.output if "formulaire" in ligne and "agent_v2 tour" not in ligne]

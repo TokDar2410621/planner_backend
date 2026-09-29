@@ -35,15 +35,14 @@ class PieceJointeTests(TestCase):
         from services.agent_v2 import PlannerAgentV2
         self.Agent = PlannerAgentV2
 
-    def _message_vu_par_agir(self, attachment=None, texte="voici mon horaire, gere ca"):
+    def _message_vu_par_boucle(self, attachment=None, texte="voici mon horaire, gere ca"):
         vus = {}
 
-        def _agir(self_agent, user, message, registre):
+        def _boucle(self_agent, user, message, registre):
             vus['message'] = message
-            return None
+            return ReponseDire(ouverture="Ok.")
 
-        with patch.object(self.Agent, '_agir', _agir), \
-             patch.object(self.Agent, '_dire', return_value=ReponseDire(ouverture="Ok.")):
+        with patch.object(self.Agent, '_boucle', _boucle):
             self.Agent().process_message(self.user, texte, attachment)
         return vus['message']
 
@@ -52,7 +51,7 @@ class PieceJointeTests(TestCase):
             user=self.user, file_name='horaire.pdf',
             document_type='course_schedule', processed=True,
             extracted_data={'courses': [{'name': 'Physique', 'day': 'mercredi'}]})
-        message = self._message_vu_par_agir(doc)
+        message = self._message_vu_par_boucle(doc)
         self.assertIn('Physique', message)
         self.assertIn('horaire.pdf', message)
 
@@ -61,7 +60,7 @@ class PieceJointeTests(TestCase):
         doc = UploadedDocument.objects.create(
             user=self.user, file_name='lent.pdf', processed=False)
         with self.settings(ATTACHMENT_WAIT_SECONDS=0):
-            message = self._message_vu_par_agir(doc)
+            message = self._message_vu_par_boucle(doc)
         self.assertIn('ANALYSE', message.upper())
 
     def test_sans_piece_jointe_un_import_recent_est_quand_meme_signale(self):
@@ -78,13 +77,13 @@ class PieceJointeTests(TestCase):
         RecurringBlock.objects.create(
             user=self.user, title='Anglais', block_type='course', day_of_week=3,
             start_time='14:00', end_time='16:00', source_document=doc)
-        message = self._message_vu_par_agir(None, texte="c'est bon ?")
+        message = self._message_vu_par_boucle(None, texte="c'est bon ?")
         self.assertIn('IMPORT', message.upper())
         self.assertIn('Anglais', message)
 
     def test_sans_document_le_message_reste_intact(self):
         """Contre-epreuve: on n'injecte rien quand il n'y a rien a injecter."""
-        self.assertEqual(self._message_vu_par_agir(None, texte="bonjour"), "bonjour")
+        self.assertEqual(self._message_vu_par_boucle(None, texte="bonjour"), "bonjour")
 
 
 class AncrageTemporelTests(TestCase):
@@ -157,12 +156,11 @@ class ImportAuRegistreTests(TestCase):
     def _tour(self, attachment=None, texte="voici mon horaire, gere ca"):
         vus = {}
 
-        def _agir(self_agent, user, message, registre):
+        def _boucle(self_agent, user, message, registre):
             vus['registre'] = registre
-            return None
+            return ReponseDire(ouverture="Ok.")
 
-        with patch.object(self.Agent, '_agir', _agir), \
-             patch.object(self.Agent, '_dire', return_value=ReponseDire(ouverture="Ok.")):
+        with patch.object(self.Agent, '_boucle', _boucle):
             resultat = self.Agent().process_message(self.user, texte, attachment)
         return resultat, vus['registre']
 
@@ -212,19 +210,8 @@ class ImportAuRegistreTests(TestCase):
         self.assertIn('Physique', resultat['response'])
         self.assertIn('Programmation Web', resultat['response'])
 
-    def test_le_brief_de_dire_ne_dit_plus_que_le_registre_est_vide(self):
-        from core.models import RecurringBlock
-        doc = self._document(cours=[{'name': 'Physique'}])
-        RecurringBlock.objects.create(
-            user=self.user, title='Physique', block_type='course', day_of_week=2,
-            start_time='13:30', end_time='15:20', source_document=doc)
-        _, registre = self._tour(doc)
-        brief = self.Agent._brief_dire("voici mon horaire", registre, {}, "")
-        self.assertNotIn('VIDE', brief)
-        self.assertIn('import_document', brief)
-
     def test_un_import_recent_sans_piece_jointe_est_une_lecture(self):
-        """« c'est bon ? » au tour suivant: DIRE connait les blocs, mais le
+        """« c'est bon ? » au tour suivant: la boucle connait les blocs, mais le
         bloc factuel ne rejoue pas l'import."""
         from core.models import RecurringBlock
         doc = self._document(nom='recent.pdf', cours=[{'name': 'Anglais'}])
@@ -239,9 +226,6 @@ class ImportAuRegistreTests(TestCase):
         self.assertFalse(lectures[0].est_mutation)
         self.assertNotIn('Horaire importé', resultat['response'])
         self.assertNotIn("C'est importé", resultat['response'])
-        brief = self.Agent._brief_dire("c'est bon ?", registre, {}, "")
-        self.assertNotIn('VIDE', brief)
-        self.assertIn('Anglais', brief)
 
     def test_un_document_sans_entree_exploitable_est_dit_sans_annoncer_un_import(self):
         doc = self._document(nom='vide.pdf', cours=[])

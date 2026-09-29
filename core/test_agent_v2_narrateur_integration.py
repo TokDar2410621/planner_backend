@@ -39,21 +39,21 @@ def _modules_prets() -> bool:
 LIBELLES_PORTEE = ["Seulement ce jeudi", "Tous les jeudis", "Non, garde tout"]
 
 
-def agir_qui_appelle(*appels):
-    """Un AGIR simule qui appelle de VRAIS outils par l'adaptateur de v2."""
-    def _agir(self_agent, user, message, registre):
+def boucle_qui_appelle(*appels):
+    """L'effet de bord d'une boucle simulee: appelle de VRAIS outils par
+    l'adaptateur de v2."""
+    def _effet(self_agent, user, message, registre):
         from services.agent_v2.outils import outils_pour
         outils = {t.name: t for t in outils_pour(
             user, registre, message_du_tour=message, tache=self_agent._tache,
             signaler=self_agent.signaler_outil, message_brut=self_agent._message_brut)}
         for nom, kwargs in appels:
             asyncio.run(outils[nom].function_schema.function(**kwargs))
-        return ""
-    return _agir
+    return _effet
 
 
-def agir_muet(self_agent, user, message, registre):
-    return ""
+def _effet_muet(self_agent, user, message, registre):
+    pass
 
 
 @skipUnless(_modules_prets(), "integration")
@@ -69,10 +69,11 @@ class NarrateurIntegrationTests(TransactionTestCase):
             day_of_week=3, start_time=dtime(19, 0), end_time=dtime(2, 0),
             flexibility="fixed", is_night_shift=True)
 
-    def _tour(self, message, agir=agir_muet, dire=None):
-        with patch.object(self.Agent, "_agir", agir), \
-             patch.object(self.Agent, "_dire",
-                          return_value=dire or ReponseDire(ouverture="D'accord.")):
+    def _tour(self, message, boucle=None, dire=None):
+        def _boucle(self_agent, user, msg, registre):
+            (boucle or _effet_muet)(self_agent, user, msg, registre)
+            return dire or ReponseDire(ouverture="D'accord.")
+        with patch.object(self.Agent, "_boucle", new=_boucle):
             return self.Agent().process_message(self.user, message)
 
     def _meta(self):
@@ -90,7 +91,7 @@ class NarrateurIntegrationTests(TransactionTestCase):
     def test_chips_reelles_portee_jour(self):
         q = self._quart()
         done = self._tour("efface le quart de jeudi",
-                          agir_qui_appelle(("delete_block", {"block_id": q.pk})))
+                          boucle_qui_appelle(("delete_block", {"block_id": q.pk})))
         self.assertEqual(done["question_motif"], "portee_jour")
         self.assertEqual([c["label"] for c in done["quick_replies"]], LIBELLES_PORTEE)
         self.assertTrue(done["question"].endswith("?"))
@@ -104,7 +105,7 @@ class NarrateurIntegrationTests(TransactionTestCase):
     def _premier_tour_portee(self):
         q = self._quart()
         done = self._tour("efface le quart de jeudi",
-                          agir_qui_appelle(("delete_block", {"block_id": q.pk})))
+                          boucle_qui_appelle(("delete_block", {"block_id": q.pk})))
         self.assertEqual(done["question_motif"], "portee_jour")
         return q, done
 
@@ -139,7 +140,7 @@ class NarrateurIntegrationTests(TransactionTestCase):
         q = self._quart()
         aujourdhui = timezone.localdate()
         samedi = aujourdhui + timedelta(days=(5 - aujourdhui.weekday()) % 7 or 7)
-        agir = agir_qui_appelle(
+        boucle = boucle_qui_appelle(
             ("delete_block", {"block_id": q.pk}),
             ("create_block", {"title": "Études", "block_type": "revision",
                               "days": [0, 1, 2, 3, 4],
@@ -147,7 +148,7 @@ class NarrateurIntegrationTests(TransactionTestCase):
             ("schedule_task_at", {"title": "Lecture", "date": samedi.isoformat(),
                                   "start_time": "10:00", "end_time": "11:00"}),
         )
-        done = self._tour("efface le quart de jeudi, ajoute mes études et ma lecture", agir)
+        done = self._tour("efface le quart de jeudi, ajoute mes études et ma lecture", boucle)
         self.assertEqual(done["question_motif"], "portee_jour")
         self.assertEqual(done["response"].count("?"), 1, done["response"])
         self.assertIn("pas encore", done["response"])
@@ -161,21 +162,21 @@ class NarrateurIntegrationTests(TransactionTestCase):
         RecurringBlock.objects.create(
             user=self.user, title="Physique mécanique", block_type="course",
             day_of_week=2, start_time=dtime(13, 0), end_time=dtime(15, 0))
-        agir = agir_qui_appelle(("present_choices", {
+        boucle = boucle_qui_appelle(("present_choices", {
             "question": "Lequel de tes cours ?",
             "options": [{"label": "Calcul différentiel", "value": "Le cours de Calcul différentiel"},
                         {"label": "Physique mécanique", "value": "Le cours de Physique mécanique"}],
             "source": "blocs"}))
-        done = self._tour("déplace mon cours", agir)
+        done = self._tour("déplace mon cours", boucle)
         self.assertEqual(done["question_motif"], "choix_modele")
         self.assertEqual([c["label"] for c in done["quick_replies"]],
                          ["Calcul différentiel", "Physique mécanique"])
         self.assertEqual(done["question"], "Lequel de tes cours ?")
 
     def test_aucun_marqueur_brut_sur_une_creation(self):
-        agir = agir_qui_appelle(("create_block", {
+        boucle = boucle_qui_appelle(("create_block", {
             "title": "Statistiques", "block_type": "course", "days": [4],
             "start_time": "10:00", "end_time": "12:00"}))
-        done = self._tour("ajoute Statistiques le vendredi de 10 h à midi", agir)
+        done = self._tour("ajoute Statistiques le vendredi de 10 h à midi", boucle)
         self.assertIn("Statistiques", done["response"])
         self.assertEqual(self._meta()["raw_markers"], [])

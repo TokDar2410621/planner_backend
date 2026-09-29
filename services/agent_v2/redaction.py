@@ -17,10 +17,20 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
 from services.agent_v2.registre import Registre
+
+# La lecture typee que la boucle unique produit pour les deux regles qui en
+# ont besoin (formulaire_cours, creneaux). Avant la boucle unique, elle venait
+# d'un appel modele separe (LIRE); desormais le meme tour la remplit, sans
+# appel supplementaire.
+try:
+    from services.agent_v2.lecture_schema import LectureTour
+except Exception:  # noqa: BLE001 - schema indisponible dans le portage seul
+    LectureTour = Any  # type: ignore[assignment,misc]
 
 # Les cinq lectures dont le resultat merite une liste rendue par le code. Un
 # tour ou l'une d'elles a reussi sans que rien ne s'affiche est compte dans
@@ -37,11 +47,12 @@ class ActionCitee(BaseModel):
 class ReponseDire(BaseModel):
     ouverture: str = Field(
         default="",
-        description="Facultative, au plus 12 mots. Répond d'abord. Aucune action "
-                    "affirmée, aucun fait déjà affiché répété.")
+        description="Facultative, au plus 12 mots. Répond d'abord. Une action "
+                    "affirmée exige sa ref dans `refs`, sinon la phrase est coupée.")
     suite: str = Field(
         default="",
-        description="Facultative, une phrase. Aucune action affirmée. Pas de question ici.")
+        description="Facultative, une phrase. Une action affirmée exige sa ref "
+                    "dans `refs`. Pas de question ici.")
     question: str = Field(
         default="",
         description="Au plus UNE question, finit par '?'. Vide si le code pose déjà une question.")
@@ -51,11 +62,19 @@ class ReponseDire(BaseModel):
                     "entités du registre (créneaux, blocs, jours).")
     refs: list[str] = Field(
         default_factory=list,
-        description="Références du registre dont ouverture ou suite parlent, ex. a1.")
+        description="Ids EXACTS du registre (a1, a2, ...) dont ouverture ou suite "
+                    "affirment une action. Sans ref vérifiée, l'affirmation est coupée.")
     # Garde pour compatibilite: un modele qui la remplit encore voit ses
     # references verifiees, mais ses phrases ne sont JAMAIS rendues.
     actions: list[ActionCitee] = Field(
         default_factory=list, description="Obsolète: laisse vide.")
+    # Lecture typee pour les regles du code (formulaire_cours, creneaux).
+    # Remplis-la quand le message demande un ajout, une suppression, un
+    # deplacement ou une consultation ciblee; sinon laisse null. Ne complete
+    # jamais: ce que le message ne donne pas reste vide.
+    lecture: Optional[LectureTour] = Field(
+        default=None,
+        description="Lecture typee du message (regles formulaire_cours/creneaux), ou null.")
 
 
 # ── Couture avec rendu.py ────────────────────────────────────────────────

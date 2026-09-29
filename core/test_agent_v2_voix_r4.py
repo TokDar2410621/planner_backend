@@ -27,43 +27,12 @@ TIRET_LONG = chr(0x2014)
 # ── V1: le brouillon d'AGIR n'entre au brief que par ses questions et offres ──
 
 
-class BrouillonFiltreTests(NarrateurBase):
-    def _brief(self, actions=(), brouillon=""):
-        vus = {}
 
-        def _agir(self_agent, user, message, registre):
-            for outil, params, res in actions:
-                registre.ajouter(outil, params, res)
-            self_agent._brouillon_agir = brouillon
-            return ""
 
-        def _dire(user, message, registre, etat, faits, **kw):
-            vus["brief"] = PlannerAgentV2._brief_dire(message, registre, etat, faits, **kw)
-            return ReponseDire(ouverture="Ok.")
-
-        self.tour(agir=_agir, dire_effet=_dire)
-        return vus["brief"]
-
-    def test_les_affirmations_du_brouillon_n_atteignent_pas_dire(self):
-        brief = self._brief(brouillon=(
-            "J'ai ajouté ton gym jeudi. Gym retiré pour vendredi. "
-            "Veux-tu que je le déplace à 14 h ?"))
-        self.assertIn("Veux-tu que je le déplace à 14 h ?", brief)
-        self.assertNotIn("J'ai ajouté", brief)
-        self.assertNotIn("Gym retiré", brief)
-
-    def test_une_question_qui_fuit_est_ecartee(self):
-        brief = self._brief(brouillon="Ton gym, retiré pour jeudi, te convient ?")
-        self.assertNotIn("retiré", brief)
-        self.assertNotIn("BROUILLON D'AGIR", brief)
-
-    def test_une_action_retenue_efface_tout_le_brouillon(self):
-        brief = self._brief(
-            actions=[refus("delete_block", demande=demande("portee_jour", "p1"))],
-            brouillon="Tu veux que je supprime toute la série, ou seulement ce jeudi ?")
-        self.assertNotIn("BROUILLON D'AGIR", brief)
-        self.assertNotIn("toute la série", brief)
-
+# BrouillonFiltreTests SUPPRIME (boucle unique, 2026-09-29): testait
+# _brief_dire qui filtrait le brouillon d'AGIR. Le brouillon n'existe
+# plus; verifier_prose coupe les affirmations sans recu (voir
+# test_agent_v2_final_r5.py V1BrouillonTests).
 
 class ParticipeNuEnProseTests(SimpleTestCase):
     def test_participe_nu_coupe_en_ouverture(self):
@@ -183,9 +152,6 @@ class MecaniqueEtSecondeQuestionTests(NarrateurBase):
 # ── B1: la reponse floue fait reemettre la demande par le code ────────────
 
 
-def _agir_muet(self_agent, user, message, registre):
-    return ""
-
 
 class DemandeReemiseTests(TransactionTestCase):
     def setUp(self):
@@ -195,10 +161,14 @@ class DemandeReemiseTests(TransactionTestCase):
             day_of_week=3, start_time=dtime(19, 0), end_time=dtime(2, 0),
             flexibility="fixed", is_night_shift=True)
 
-    def _tour(self, message, agir=_agir_muet, dire=None):
-        with patch.object(PlannerAgentV2, "_agir", agir), \
-             patch.object(PlannerAgentV2, "_dire",
-                          return_value=dire or ReponseDire(ouverture="D'accord.")):
+    def _tour(self, message, boucle=None, dire=None):
+        """Boucle unique: `boucle` est l'effet sur le registre (signature
+        (self_agent, user, message, registre)), `dire` le ReponseDire rendu."""
+        def _boucle(self_agent, user, msg, registre):
+            if boucle is not None:
+                boucle(self_agent, user, msg, registre)
+            return dire or ReponseDire(ouverture="D'accord.")
+        with patch.object(PlannerAgentV2, "_boucle", _boucle):
             return PlannerAgentV2().process_message(self.user, message)
 
     def _meta(self):
@@ -209,17 +179,16 @@ class DemandeReemiseTests(TransactionTestCase):
     def _supprimer(self):
         quart = self.quart
 
-        def _agir(self_agent, user, message, registre):
+        def _boucle_effet(self_agent, user, message, registre):
             from services.agent_v2.outils import outils_pour
             outils = {t.name: t for t in outils_pour(
                 user, registre, message_du_tour=message, tache=self_agent._tache,
                 signaler=self_agent.signaler_outil, message_brut=self_agent._message_brut)}
             asyncio.run(outils["delete_block"].function_schema.function(block_id=quart.pk))
-            return ""
-        return _agir
+        return _boucle_effet
 
     def test_oui_flou_puis_tous_les_jeudis(self):
-        premier = self._tour("efface tout jeudi", agir=self._supprimer)
+        premier = self._tour("efface tout jeudi", boucle=self._supprimer)
         self.assertEqual(premier["question_motif"], "portee_jour")
         cle = self._meta()["demandes"][0]["cle"]
 
@@ -240,7 +209,7 @@ class DemandeReemiseTests(TransactionTestCase):
         self.assertFalse(RecurringBlock.all_objects.get(pk=self.quart.pk).active)
 
     def test_une_reponse_claire_n_est_pas_reemise(self):
-        self._tour("efface tout jeudi", agir=self._supprimer)
+        self._tour("efface tout jeudi", boucle=self._supprimer)
         done = self._tour("Non, ne change rien.")
         self.assertEqual(self._meta()["demandes"], [])
         self.assertNotEqual(done["question_motif"], "portee_jour")

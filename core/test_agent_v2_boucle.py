@@ -1,5 +1,5 @@
 """
-La boucle complete, avec des modeles SIMULES (aucun appel reseau).
+La boucle complete, avec une boucle SIMULEE (aucun appel reseau).
 
 On patche la CLASSE, jamais une instance: la boucle en fabrique plusieurs.
 
@@ -17,12 +17,11 @@ from services.agent.tools.base import ToolResult
 from services.agent_v2.redaction import ActionCitee, ReponseDire
 
 
-def _agir_muet(self_agent, user, message, registre):
-    """AGIR qui n'appelle aucun outil: le registre reste vide."""
-    return None
+def _effet_muet(self_agent, user, message, registre):
+    """Boucle simulee qui n'appelle aucun outil: le registre reste vide."""
 
 
-def _agir_qui_cree(self_agent, user, message, registre):
+def _effet_qui_cree(self_agent, user, message, registre):
     # Les donnees ont la forme que rend create_block: le rendu des faits lit
     # les donnees, jamais le message ecrit pour le modele.
     registre.ajouter('create_block', {'title': 'Maths'},
@@ -31,7 +30,15 @@ def _agir_qui_cree(self_agent, user, message, registre):
                                     'title': 'Maths', 'day_of_week': 0,
                                     'day_name': 'Lundi', 'start_time': '09:00',
                                     'end_time': '12:00'}]}))
-    return None
+
+
+def _boucle_simulee(effet, reponse):
+    """Une _boucle patchee: l'effet remplit le registre, puis la reponse
+    structuree simulee est rendue."""
+    def _boucle(self_agent, user, message, registre):
+        effet(self_agent, user, message, registre)
+        return reponse
+    return _boucle
 
 
 class BoucleTests(TestCase):
@@ -47,28 +54,28 @@ class BoucleTests(TestCase):
             actions=[ActionCitee(ref='a1',
                                  phrase="J'ai supprime les blocs qui chevauchent.")],
             suite="")
-        with patch.object(self.Agent, '_agir', _agir_muet), \
-             patch.object(self.Agent, '_dire', return_value=menteur):
+        with patch.object(self.Agent, '_boucle',
+                          _boucle_simulee(_effet_muet, menteur)):
             res = self.Agent().process_message(self.user, "mes cours sont prioritaires")
         self.assertNotIn('supprime les blocs', res['response'])
-        # Depuis le 2026-09-14, une reference inventee fait tomber TOUTE la
-        # prose de DIRE, accroche comprise: un redacteur qui ment sur une
-        # action n'est pas cru sur le reste.
-        self.assertNotIn('Absolument', res['response'])
+        # Boucle unique: verifier_prose coupe phrase par phrase, pas en
+        # guillotine. L'affirmation d'action sans recu est coupee; la
+        # garantie de securite tient (aucune action affirmee sans recu).
+        self.assertNotIn("J'ai supprime", res['response'])
         self.assertTrue(res['response'].strip())
 
     def test_un_recit_vrai_survit(self):
         """Contre-epreuve: sans elle, un agent qui supprime tout passerait.
 
         Un seul narrateur depuis le 2026-09-14: l'action vraie est racontee
-        par les faits rendus par le code, et la phrase citee par DIRE n'est
-        plus recopiee a cote (elle doublait chaque ligne)."""
+        par les faits rendus par le code, et la phrase citee par le modele
+        n'est plus recopiee a cote (elle doublait chaque ligne)."""
         vrai = ReponseDire(
             ouverture="C'est fait.",
             actions=[ActionCitee(ref='a1', phrase="Maths est cale le lundi.")],
             suite="")
-        with patch.object(self.Agent, '_agir', _agir_qui_cree), \
-             patch.object(self.Agent, '_dire', return_value=vrai):
+        with patch.object(self.Agent, '_boucle',
+                          _boucle_simulee(_effet_qui_cree, vrai)):
             res = self.Agent().process_message(self.user, "ajoute maths")
         self.assertIn('Maths', res['response'])
         self.assertNotIn('Maths est cale', res['response'])
@@ -76,15 +83,15 @@ class BoucleTests(TestCase):
     def test_les_quatre_cles_du_contrat_sont_presentes(self):
         """views.py:861 lit result['response'] par indexation DIRECTE: une cle
         manquante rend un 500 a l'utilisateur."""
-        with patch.object(self.Agent, '_agir', _agir_muet), \
-             patch.object(self.Agent, '_dire', return_value=ReponseDire(ouverture="Salut.")):
+        with patch.object(self.Agent, '_boucle',
+                          _boucle_simulee(_effet_muet, ReponseDire(ouverture="Salut."))):
             res = self.Agent().process_message(self.user, "bonjour")
         for cle in ('response', 'quick_replies', 'blocks_created', 'tasks_created'):
             self.assertIn(cle, res)
 
     def test_le_flux_emet_done_en_dernier(self):
-        with patch.object(self.Agent, '_agir', _agir_muet), \
-             patch.object(self.Agent, '_dire', return_value=ReponseDire(ouverture="Salut.")):
+        with patch.object(self.Agent, '_boucle',
+                          _boucle_simulee(_effet_muet, ReponseDire(ouverture="Salut."))):
             evts = list(self.Agent().process_message_stream(self.user, "bonjour"))
         self.assertEqual(evts[-1]['type'], 'done')
         self.assertIn('response', evts[-1])
@@ -114,8 +121,8 @@ class PersistanceTests(TransactionTestCase):
 
     def _tour(self, message="bonjour", reponse=None):
         reponse = reponse or ReponseDire(ouverture="Salut.")
-        with patch.object(self.Agent, '_agir', _agir_muet), \
-             patch.object(self.Agent, '_dire', return_value=reponse):
+        with patch.object(self.Agent, '_boucle',
+                          _boucle_simulee(_effet_muet, reponse)):
             return self.Agent().process_message(self.user, message)
 
     def test_les_deux_messages_du_tour_sont_persistes(self):
@@ -140,15 +147,14 @@ class PersistanceTests(TransactionTestCase):
         self._tour("premier message")
         vus = {}
 
-        def _agir_qui_regarde(self_agent, user, message, registre):
+        def _boucle_qui_regarde(self_agent, user, message, registre):
             vus['historique'] = [
                 p.content for m in self_agent._historique(user)
                 for p in m.parts if hasattr(p, 'content')
             ]
-            return None
+            return ReponseDire(ouverture="Ok.")
 
-        with patch.object(self.Agent, '_agir', _agir_qui_regarde), \
-             patch.object(self.Agent, '_dire', return_value=ReponseDire(ouverture="Ok.")):
+        with patch.object(self.Agent, '_boucle', _boucle_qui_regarde):
             self.Agent().process_message(self.user, "deuxieme message")
 
         self.assertIn('premier message', vus['historique'])
@@ -164,18 +170,19 @@ class PersistanceTests(TransactionTestCase):
 @override_settings(DEEPSEEK_API_KEY='factice')
 class ReglagesTests(TestCase):
     """Le test de construction verifiait que la constante vaut ce qu'elle vaut.
-    Ici on verifie qu'elle atteint VRAIMENT l'agent DIRE: sans ce reglage,
-    DeepSeek refuse tool_choice=required en mode thinking et DIRE echoue dix
-    fois sur dix (mesure du 2026-08-24)."""
+    Ici on verifie qu'elle atteint VRAIMENT l'agent de la boucle: sans ce
+    reglage, DeepSeek refuse tool_choice=required en mode thinking et la
+    boucle echoue dix fois sur dix (mesure du 2026-08-24, transposee de DIRE
+    a la boucle unique qui rend aussi une sortie structuree)."""
 
     def setUp(self):
         self.user = User.objects.create_user(username='reglages', password='x')
         from services.agent_v2 import PlannerAgentV2
         self.Agent = PlannerAgentV2
 
-    def test_dire_construit_son_agent_avec_le_reglage_qui_coupe_le_raisonnement(self):
+    def test_la_boucle_construit_son_agent_avec_le_reglage_qui_coupe_le_raisonnement(self):
         from services.agent_v2 import agent as module_agent
-        from services.agent_v2.modeles import REGLAGES_DIRE
+        from services.agent_v2.modeles import REGLAGES_BOUCLE_SANS_RAISONNEMENT
 
         vus = {}
 
@@ -183,62 +190,15 @@ class ReglagesTests(TestCase):
             def __init__(self, *a, **kw):
                 vus.update(kw)
 
-            def run_sync(self, *a, **kw):
-                class R:
-                    output = ReponseDire(ouverture="Salut.")
-                return R()
+        class Resultat:
+            output = ReponseDire(ouverture="Salut.")
 
         with patch.object(module_agent, 'Agent', AgentEspion), \
-             patch.object(self.Agent, '_agir', _agir_muet):
+             patch.object(module_agent, 'modele_agir', return_value=object()), \
+             patch.object(self.Agent, '_executer_boucle', return_value=Resultat()):
             self.Agent().process_message(self.user, "bonjour")
 
-        self.assertEqual(vus.get('model_settings'), REGLAGES_DIRE)
-
-
-class MatierePremiereTests(TestCase):
-    """DIRE doit RECEVOIR le contenu des lectures.
-
-    Defaut observe le 2026-08-25 sur un tour reel: a « tu peux me rappeler ce
-    que j'ai mardi ? », l'agent appelait bien list_blocks puis repondait « J'ai
-    trouve votre bloc de mardi. Veux-tu que je t'en donne le detail ? ». Il
-    avait la donnee et ne la livrait pas.
-
-    Cause: bloc_factuel ne rend que les MUTATIONS, et le brief ne passait que
-    le message de chaque action. Sur un tour de pure lecture, DIRE savait
-    qu'un outil avait tourne sans savoir ce qu'il avait renvoye.
-    """
-
-    def setUp(self):
-        from services.agent_v2 import PlannerAgentV2
-        self.Agent = PlannerAgentV2
-
-    def _brief_avec(self, outil, donnees, message=""):
-        from services.agent_v2.registre import Registre
-        registre = Registre()
-        registre.ajouter(outil, {}, ToolResult(
-            success=True, data=donnees, message=message))
-        return self.Agent._brief_dire("et mardi ?", registre, {}, ''), registre
-
-    def test_le_contenu_d_une_lecture_arrive_dans_le_brief(self):
-        brief, _ = self._brief_avec(
-            'list_blocks',
-            {'blocks': [{'title': 'Cours de chimie', 'day_name': 'Mardi',
-                         'start_time': '09:00', 'end_time': '11:00'}]},
-            message="1 bloc trouve")
-        self.assertIn('Cours de chimie', brief)
-        self.assertIn('09:00', brief)
-
-    def test_une_mutation_ne_deverse_PAS_ses_donnees_dans_le_brief(self):
-        """Contre-epreuve: le recit des mutations reste tenu par le bloc
-        factuel et la validation des references. Deverser leurs donnees
-        brutes rouvrirait le canal que la garantie structurelle ferme."""
-        brief, _ = self._brief_avec(
-            'create_block',
-            {'created': [{'title': 'Bloc secret', 'id': 42}]},
-            message="1 bloc cree")
-        self.assertNotIn('Bloc secret', brief)
-        self.assertIn('1 bloc cree', brief)
-
+        self.assertEqual(vus.get('model_settings'), REGLAGES_BOUCLE_SANS_RAISONNEMENT)
 
 class ResilienceTests(TestCase):
     def setUp(self):
@@ -246,22 +206,24 @@ class ResilienceTests(TestCase):
         from services.agent_v2 import PlannerAgentV2
         self.Agent = PlannerAgentV2
 
-    def test_une_panne_de_dire_apres_mutation_annonce_QUAND_MEME_les_faits(self):
-        """Le pire cas du produit: on a ecrit dans le planning et le redacteur
+    def test_une_panne_de_boucle_apres_mutation_annonce_QUAND_MEME_les_faits(self):
+        """Le pire cas du produit: on a ecrit dans le planning et la boucle
         tombe. Se taire laisserait l'utilisateur croire que rien n'a eu lieu,
         alors que son planning a change."""
-        with patch.object(self.Agent, '_agir', _agir_qui_cree), \
-             patch.object(self.Agent, '_dire', side_effect=RuntimeError('502')):
+        def _boucle(self_agent, user, message, registre):
+            _effet_qui_cree(self_agent, user, message, registre)
+            raise RuntimeError('502')
+
+        with patch.object(self.Agent, '_boucle', _boucle):
             res = self.Agent().process_message(self.user, "ajoute maths")
         self.assertIn('Maths', res['response'])
 
     def test_un_budget_epuise_est_dit_a_l_utilisateur(self):
-        def _agir_sature(self_agent, user, message, registre):
+        def _boucle_sature(self_agent, user, message, registre):
             registre.budget_epuise = True
-            return None
+            return ReponseDire(ouverture="Bon.")
 
-        with patch.object(self.Agent, '_agir', _agir_sature), \
-             patch.object(self.Agent, '_dire', return_value=ReponseDire(ouverture="Bon.")):
+        with patch.object(self.Agent, '_boucle', _boucle_sature):
             res = self.Agent().process_message(self.user, "fais tout")
         texte = res['response'].lower()
         self.assertTrue('interrompu' in texte or 'arrêté' in texte, texte)
