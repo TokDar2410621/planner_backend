@@ -128,25 +128,28 @@ class LoadImageTests(TestCase):
         from PIL import Image
 
         proc = DocumentProcessor()
+        # Le unlink vit HORS du with: sous Windows, supprimer un fichier dont
+        # le handle est encore ouvert leve WinError 32.
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            Image.new("RGB", (3000, 100), "white").save(tmp.name, "PNG")
-            try:
-                img = proc._load_image(tmp.name)
-                self.assertLessEqual(max(img.size), MAX_IMAGE_SIDE_PX)
-            finally:
-                os.unlink(tmp.name)
+            chemin = tmp.name
+        Image.new("RGB", (3000, 100), "white").save(chemin, "PNG")
+        try:
+            img = proc._load_image(chemin)
+            self.assertLessEqual(max(img.size), MAX_IMAGE_SIDE_PX)
+        finally:
+            os.unlink(chemin)
 
     def test_heic_sans_librairie_erreur_explicite(self):
         proc = DocumentProcessor()
         with tempfile.NamedTemporaryFile(suffix=".heic", delete=False) as tmp:
             tmp.write(_HEIC)
-            tmp.flush()
-            try:
-                with patch.object(dp, "HEIF_AVAILABLE", False):
-                    with self.assertRaisesRegex(RuntimeError, "pillow-heif"):
-                        proc._load_image(tmp.name)
-            finally:
-                os.unlink(tmp.name)
+            chemin = tmp.name
+        try:
+            with patch.object(dp, "HEIF_AVAILABLE", False):
+                with self.assertRaisesRegex(RuntimeError, "pillow-heif"):
+                    proc._load_image(chemin)
+        finally:
+            os.unlink(chemin)
 
     def test_version_extraction_bump(self):
         self.assertEqual(DocumentProcessor.EXTRACTION_VERSION, 3)

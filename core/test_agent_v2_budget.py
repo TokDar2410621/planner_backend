@@ -102,7 +102,12 @@ class DelaiDuTourTests(TestCase):
                 raisonnement, panne = fin.value
             duree = time.monotonic() - depart
         self.assertTrue(registre.delai_depasse)
-        self.assertIsInstance(panne, FuturesTimeoutError)
+        # TimeoutError natif, celui que leve _agir_en_fond. Jusqu'a Python
+        # 3.10, concurrent.futures.TimeoutError est une classe DISTINCTE du
+        # TimeoutError natif (les deux ont fusionne en 3.11): exiger la
+        # version futures rendait le test rouge sur 3.10, pour un type qui
+        # ne change rien au comportement (la panne est seulement journalisee).
+        self.assertIsInstance(panne, TimeoutError)
         # Plancher de 1 s sur le delai restant: le test attend ~1 s, pas 2.
         self.assertLess(duree, 1.8)
 
