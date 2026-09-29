@@ -32,13 +32,17 @@ class RegleCoursExistantTests(SimpleTestCase):
 
     def test_un_ajout_complet_se_cree(self):
         from services.agent_v2.prompts import REGLES_AGIR
-        for requis in ("AJOUT AVEC JOURS ET HEURES",
-                       "y compris en reponse a ta propre question",
-                       "c'est un nouveau cours: create_block dans ce tour",
-                       "Ne demande ni lequel, ni « chaque semaine ? »",
-                       "REPONSE A TA QUESTION"):
+        self.assertIn("REPONSE A TA QUESTION", REGLES_AGIR)
+        # Doctrine 2026-09-29: la mecanique d'ajout vit dans la description
+        # V2 de create_block, pas dans le prompt.
+        from services.agent.tools import TOOL_MAP
+        from services.agent_v2.outils import description_v2
+        desc = description_v2(TOOL_MAP["create_block"])
+        for requis in ("y compris en reponse a ta propre question",
+                       "c'est un nouveau cours", "create_block dans ce tour",
+                       "Ne demande ni lequel"):
             with self.subTest(requis=requis):
-                self.assertIn(requis, REGLES_AGIR)
+                self.assertIn(requis, desc)
 
     def test_la_designation_ambigue_reste_un_choix_entre_vrais_cours(self):
         from services.agent_v2.prompts import REGLES_AGIR
