@@ -135,6 +135,10 @@ class P2RegleTests(SimpleTestCase):
         # La vieille regle attrapait tout jour + heure pour create_block.
         self.assertNotIn("l'utilisateur decrit ses horaires habituels AVEC jours et heures -> create_block.",
                          REGLES_AGIR)
+        # Le planning du jour est deja dans le prompt, construit par le code:
+        # le modele ne doit pas le relire via l'outil a chaque tour.
+        self.assertIn("Ne le relis JAMAIS avec", REGLES_AGIR)
+        self.assertIn("get_today_schedule pour aujourd'hui", REGLES_AGIR)
 
     def test_les_descriptions_disent_la_regle(self):
         from services.agent.tools import TOOL_MAP
