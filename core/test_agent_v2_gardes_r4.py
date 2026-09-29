@@ -19,9 +19,11 @@ from django.test import SimpleTestCase, TransactionTestCase
 
 from core.models import ConversationMessage, RecurringBlock, ScheduledBlock
 from core.test_agent_v2_gardes import AUJOURDHUI, HarnaisGardes, puces
+from core.test_agent_v2_jugement import juger_script
 from services.agent_v2 import demandes as dem
 from services.agent_v2 import outils as outils_v2
 from services.agent_v2.registre import Registre
+from unittest import mock
 
 PORTEE = {'motif': 'portee_jour', 'cle': 'p',
           'options': [{'id': 'occurrence'}, {'id': 'serie'}, {'id': 'annuler'}]}
@@ -38,9 +40,14 @@ GARDER = (
 class G1LectureDePorteeTests(SimpleTestCase):
 
     def test_garder_ou_annuler_ne_donne_jamais_la_serie(self):
-        for brut in GARDER:
-            with self.subTest(brut=brut):
-                self.assertIn(dem.option_choisie(brut, PORTEE), (None, 'annuler'))
+        # « garde » = le juge lit un refus de la suppression: « annuler » ou
+        # rien, jamais la serie.
+        script = {brut: {"intention": ("refuse", 0.9)} for brut in GARDER}
+        with mock.patch("services.agent_v2.jugement.juger",
+                        juger_script(script)):
+            for brut in GARDER:
+                with self.subTest(brut=brut):
+                    self.assertIn(dem.option_choisie(brut, PORTEE), (None, 'annuler'))
 
     def test_la_serie_ne_se_lit_que_sur_la_puce(self):
         # Round 6 (D1): remplace « la serie reste lisible ». La lecture libre
@@ -54,9 +61,15 @@ class G1LectureDePorteeTests(SimpleTestCase):
                "j'aimerais que tous les jeudis soient libres": None,
                'Non, ne change rien.': 'annuler', 'non': 'annuler',
                'juste celui-là': None}
-        for brut, attendu in cas.items():
-            with self.subTest(brut=brut):
-                self.assertEqual(dem.option_choisie(brut, PORTEE), attendu)
+        # Le juge est scripte: sans lui, « non » rendrait indisponible (None)
+        # au lieu de « annuler », comme en production sans cle ni repli.
+        script = {brut: {"intention": ("refuse", 0.9)}
+                  for brut, attendu in cas.items() if attendu == 'annuler'}
+        with mock.patch("services.agent_v2.jugement.juger",
+                        juger_script(script)):
+            for brut, attendu in cas.items():
+                with self.subTest(brut=brut):
+                    self.assertEqual(dem.option_choisie(brut, PORTEE), attendu)
         avec_puces = puces(dict(PORTEE, cible={'jour': 3, 'date': '2026-09-17'}))
         for brut in ('tous les jeudis', 'Tous les jeudis', 'Tous les jeudis (supprimer la série).'):
             with self.subTest(brut=brut, puces=True):

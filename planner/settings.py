@@ -294,6 +294,26 @@ AGENT_V2_BUDGET_JETONS_JOUR = int(os.getenv('AGENT_V2_BUDGET_JETONS_JOUR', '2000
 # compte pour continuer (voir PROSE_BUDGET_JOUR_ANON dans agent.py).
 AGENT_V2_BUDGET_JETONS_JOUR_ANON = int(os.getenv('AGENT_V2_BUDGET_JETONS_JOUR_ANON', '400000'))
 
+# Couche de jugement (services/agent_v2/jugement.py): des decisions typees
+# (choice/score/noul) au lieu des regex d'intention ecrites a la main.
+# Fournisseur principal : Jev, un modele de decision non autoregressif.
+# JEV_API_KEY est un secret backend: jamais journalisee, jamais stockee,
+# elle ne sort que dans l'en-tete Authorization de l'appel Jev. A defaut,
+# le client accepte aussi TYPESAFE_API_KEY (convention des SDK officiels).
+# Sans cle, le repli est un LLM en sortie structuree (JUGEMENT_REPLI_LLM="0"
+# pour le couper: les jugements deviennent alors indisponibles).
+# JUGEMENT_SEUIL_DECISION: confiance minimale pour qu'une reponse devienne
+# une decision exploitable par le code; en dessous c'est "incertain" et
+# l'appelant applique le comportement prudent (demander, jamais executer).
+JEV_API_KEY = os.getenv('JEV_API_KEY', '')
+# Endpoint officiel verifie sur docs.typesafe.ai (quickstart + reference API).
+# thejevai.com est un tiers non affilie a TypeSafe: ne pas l'utiliser.
+JEV_API_URL = os.getenv('JEV_API_URL', 'https://api.typesafe.ai/v1/systemone')
+JEV_MODEL = os.getenv('JEV_MODEL', 'jev-latest')
+JEV_TIMEOUT = float(os.getenv('JEV_TIMEOUT', '2.5'))
+JUGEMENT_SEUIL_DECISION = float(os.getenv('JUGEMENT_SEUIL_DECISION', '0.8'))
+JUGEMENT_REPLI_LLM = os.getenv('JUGEMENT_REPLI_LLM', '1')
+
 # LIRE en mode ombre (services/agent_v2/lecture.py): une lecture typee du
 # message tape, journalisee a cote des lecteurs regex geles, qui ne decide rien.
 # Active quand la variable est absente; "0" ou "false" la coupe. Coupee par
