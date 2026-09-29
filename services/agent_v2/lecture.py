@@ -574,13 +574,21 @@ def accord_dates(lecture, message: str, aujourdhui: date) -> str:
 
 def accord_jour_vise(lecture, message: str, aujourdhui: date) -> str:
     """demandes.jour_vise, qui choisit la forme de la question de suppression:
-    ne s'applique qu'a un retrait, lu d'un cote ou de l'autre."""
+    ne s'applique qu'a un retrait, lu d'un cote ou de l'autre. Compare LIRE
+    au JUGEMENT (les regex ont ete supprimees le 2026-09-29): sans tranchee
+    du juge, pas de comparaison."""
     retraits = _retraits(lecture)
-    if not retraits and not dem.suppression_demandee(message):
+    sup_visee, sup_tranchee = dem.suppression_tranchee(message)
+    if not sup_tranchee:
+        return NA
+    if not retraits and not sup_visee:
         return NA
     dates, question = _dates_typees(retraits or lecture.elements, aujourdhui)
     typee = bool(dates) or question
-    return ACCORD if typee == dem.jour_vise(message) else DESACCORD
+    jour_visee, jour_tranche = dem.jour_vise_tranche(message)
+    if not jour_tranche:
+        return NA
+    return ACCORD if typee == jour_visee else DESACCORD
 
 
 def accord_date_visee(lecture, message: str, aujourdhui: date, refs: dict) -> str:
@@ -610,8 +618,11 @@ def accord_date_visee(lecture, message: str, aujourdhui: date, refs: dict) -> st
 
 
 def accord_suppression(lecture, message: str) -> str:
-    """demandes.suppression_demandee."""
-    return _booleens(dem.suppression_demandee(message), bool(_retraits(lecture)))
+    """demandes.suppression_demandee, lue par le jugement."""
+    visee, tranchee = dem.suppression_tranchee(message)
+    if not tranchee:
+        return NA
+    return _booleens(visee, bool(_retraits(lecture)))
 
 
 def accord_evenement_unique(lecture, message: str) -> str:

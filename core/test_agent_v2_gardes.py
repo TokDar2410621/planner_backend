@@ -29,6 +29,7 @@ from django.utils import timezone
 
 from core.models import (ConversationMessage, RecurringBlock,
                          RecurringBlockException, ScheduledBlock, Task)
+from core.test_agent_v2_jugement import juger_script
 from services.agent.tools import TOOL_MAP, execute_tool
 from services.agent_v2 import demandes as dem
 from services.agent_v2 import outils as outils_v2
@@ -232,26 +233,32 @@ class GardesDestructivesTests(HarnaisGardes, TransactionTestCase):
 
     def test_confirmation_generique_au_tour_suivant(self):
         chimie = self.bloc('Chimie générale', 1, '13:00', '15:00')
-        action = self.premier_tour('supprime mon cours de chimie', 'delete_block',
-                                   block_id=chimie.id)
-        demande = action.donnees['demande']
-        self.assertEqual(demande['motif'], 'destructif')
-        self.assertEqual([o['id'] for o in demande['options']], ['confirmer', 'annuler'])
-        self.assertEqual(demande['cible']['titre'], 'Chimie générale')
-        self.assertActif(chimie)
+        script = {"supprime mon cours de chimie": {"jour_vise": (False, 0.9)},
+                  "Oui, vas-y": {"jour_vise": (False, 0.9),
+                                 "intention": ("accepte", 0.9)},
+                  "Oui, je confirme.": {"jour_vise": (False, 0.9)}}
+        with mock.patch("services.agent_v2.jugement.juger",
+                        juger_script(script)):
+            action = self.premier_tour('supprime mon cours de chimie', 'delete_block',
+                                       block_id=chimie.id)
+            demande = action.donnees['demande']
+            self.assertEqual(demande['motif'], 'destructif')
+            self.assertEqual([o['id'] for o in demande['options']], ['confirmer', 'annuler'])
+            self.assertEqual(demande['cible']['titre'], 'Chimie générale')
+            self.assertActif(chimie)
 
-        # Round 6 (D1): un oui libre n'autorise plus rien; seule la puce le fait.
-        self.attendre([puces(demande)], 'Oui, vas-y')
-        registre, tools = self.outils('Oui, vas-y', tache='u:2')
-        self.appeler(tools, 'delete_block', block_id=chimie.id)
-        self.assertFalse(registre.actions[-1].succes)
-        self.assertActif(chimie)
+            # Round 6 (D1): un oui libre n'autorise plus rien; seule la puce le fait.
+            self.attendre([puces(demande)], 'Oui, vas-y')
+            registre, tools = self.outils('Oui, vas-y', tache='u:2')
+            self.appeler(tools, 'delete_block', block_id=chimie.id)
+            self.assertFalse(registre.actions[-1].succes)
+            self.assertActif(chimie)
 
-        self.attendre([puces(demande)], 'Oui, je confirme.')
-        registre, tools = self.outils('Oui, je confirme.', tache='u:3')
-        self.appeler(tools, 'delete_block', block_id=chimie.id)
-        self.assertTrue(registre.actions[-1].succes)
-        self.assertActif(chimie, False)
+            self.attendre([puces(demande)], 'Oui, je confirme.')
+            registre, tools = self.outils('Oui, je confirme.', tache='u:3')
+            self.appeler(tools, 'delete_block', block_id=chimie.id)
+            self.assertTrue(registre.actions[-1].succes)
+            self.assertActif(chimie, False)
 
     def test_ok_mais_autre_chose_ne_confirme_pas(self):
         chimie = self.bloc('Chimie générale', 1, '13:00', '15:00')
@@ -387,56 +394,66 @@ class GardesDestructivesTests(HarnaisGardes, TransactionTestCase):
 
     def test_message_brut_et_non_enrichi(self):
         chimie = self.bloc('Chimie générale', 1, '13:00', '15:00')
-        demande = puces(self.premier_tour('supprime mon cours de chimie', 'delete_block',
-                                          block_id=chimie.id).donnees['demande'])
         brut = 'Oui, je confirme.'
         enrichi = brut + '\n\nIMPORT RECENT: Calcul différentiel lundi 10:30, cette semaine, jeudi'
-        self.attendre([demande], brut)
+        script = {"supprime mon cours de chimie": {"jour_vise": (False, 0.9)},
+                  "Oui, je confirme.": {"jour_vise": (False, 0.9)},
+                  enrichi: {"jour_vise": (True, 0.9)}}
+        with mock.patch("services.agent_v2.jugement.juger",
+                        juger_script(script)):
+            demande = puces(self.premier_tour('supprime mon cours de chimie', 'delete_block',
+                                              block_id=chimie.id).donnees['demande'])
+            self.attendre([demande], brut)
 
-        # Contre-epreuve: lue sur le message enrichi, la regle refuserait.
-        registre_e = Registre()
-        tools_e = {t.name: t for t in outils_pour(self.user, registre_e, enrichi, tache='u:x')}
-        self.appeler(tools_e, 'delete_block', block_id=chimie.id)
-        self.assertFalse(registre_e.actions[-1].succes)
-        self.assertActif(chimie)
+            # Contre-epreuve: lue sur le message enrichi, la regle refuserait.
+            registre_e = Registre()
+            tools_e = {t.name: t for t in outils_pour(self.user, registre_e, enrichi, tache='u:x')}
+            self.appeler(tools_e, 'delete_block', block_id=chimie.id)
+            self.assertFalse(registre_e.actions[-1].succes)
+            self.assertActif(chimie)
 
-        registre, tools = self.outils(brut, enrichi=enrichi, tache='u:2')
-        self.appeler(tools, 'delete_block', block_id=chimie.id)
-        self.assertTrue(registre.actions[-1].succes)
-        self.assertActif(chimie, False)
+            registre, tools = self.outils(brut, enrichi=enrichi, tache='u:2')
+            self.appeler(tools, 'delete_block', block_id=chimie.id)
+            self.assertTrue(registre.actions[-1].succes)
+            self.assertActif(chimie, False)
 
-        # Tour neuf: les heures et « cette semaine » de l'import ne comptent pas.
-        self.bloc('Calcul différentiel', 3, '10:00', '11:50')
-        brut = 'ajoute ma lecture'
-        self.message_courant(brut)
-        registre, tools = self.outils(brut, enrichi=brut + enrichi[len('Oui, je confirme.'):],
-                                      tache='u:3')
-        self.appeler(tools, 'schedule_task_at', title='Lecture', date='2026-09-17',
-                     start_time='10:30', end_time='11:30')
-        conflit = registre.actions[-1]
-        self.assertFalse(conflit.succes)
-        self.assertIn('conflict', conflit.donnees)
-        self.assertNotIn('demande', conflit.donnees)
-        self.appeler(tools, 'create_block', title='Étude', block_type='revision',
-                     days=['lundi'], start_time='16:00', end_time='18:00')
-        cree = registre.actions[-1]
-        self.assertTrue(cree.succes)
-        self.assertNotIn('borne_auto', cree.donnees)
-        self.assertIsNone(RecurringBlock.objects.get(user=self.user, title='Étude').end_date)
+            # Tour neuf: les heures et « cette semaine » de l'import ne comptent pas.
+            self.bloc('Calcul différentiel', 3, '10:00', '11:50')
+            brut = 'ajoute ma lecture'
+            self.message_courant(brut)
+            registre, tools = self.outils(brut, enrichi=brut + enrichi[len('Oui, je confirme.'):],
+                                          tache='u:3')
+            self.appeler(tools, 'schedule_task_at', title='Lecture', date='2026-09-17',
+                         start_time='10:30', end_time='11:30')
+            conflit = registre.actions[-1]
+            self.assertFalse(conflit.succes)
+            self.assertIn('conflict', conflit.donnees)
+            self.assertNotIn('demande', conflit.donnees)
+            self.appeler(tools, 'create_block', title='Étude', block_type='revision',
+                         days=['lundi'], start_time='16:00', end_time='18:00')
+            cree = registre.actions[-1]
+            self.assertTrue(cree.succes)
+            self.assertNotIn('borne_auto', cree.donnees)
+            self.assertIsNone(RecurringBlock.objects.get(user=self.user, title='Étude').end_date)
 
     def test_saut_en_masse_contourne_refuse(self):
-        action = self.premier_tour('efface tout jeudi', 'skip_block_occurrence',
-                                   date='2026-09-17', title='Quart au dépanneur')
-        self.assertFalse(action.succes)
-        self.assertEqual(action.donnees['demande']['motif'], 'portee_jour')
-        self.assertFalse(RecurringBlockException.objects.exists())
+        # Les valeurs scriptees sont les IDs d'options du contrat choice.
+        script = {"efface tout jeudi": {"saut": ("suppression_large", 0.9)},
+                  "saute mon gym demain": {"saut": ("saut_ponctuel", 0.92)}}
+        with mock.patch("services.agent_v2.jugement.juger",
+                        juger_script(script)):
+            action = self.premier_tour('efface tout jeudi', 'skip_block_occurrence',
+                                       date='2026-09-17', title='Quart au dépanneur')
+            self.assertFalse(action.succes)
+            self.assertEqual(action.donnees['demande']['motif'], 'portee_jour')
+            self.assertFalse(RecurringBlockException.objects.exists())
 
-        gym = self.bloc('Gym', 1, '18:00', '19:00', block_type='sport')
-        action = self.premier_tour('saute mon gym demain', 'skip_block_occurrence', tache='u:2',
-                                   date='2026-09-15', title='Gym')
-        self.assertTrue(action.succes)
-        self.assertTrue(RecurringBlockException.objects.filter(
-            recurring_block=gym, date=date(2026, 9, 15)).exists())
+            gym = self.bloc('Gym', 1, '18:00', '19:00', block_type='sport')
+            action = self.premier_tour('saute mon gym demain', 'skip_block_occurrence', tache='u:2',
+                                       date='2026-09-15', title='Gym')
+            self.assertTrue(action.succes)
+            self.assertTrue(RecurringBlockException.objects.filter(
+                recurring_block=gym, date=date(2026, 9, 15)).exists())
 
     def test_fin_de_bloc_demande_confirmation(self):
         action = self.premier_tour("mon quart s'arrête aujourd'hui", 'update_block',
@@ -774,14 +791,24 @@ class LectureDesReponsesTests(SimpleTestCase):
 
     def test_oui_non(self):
         # Round 6 (D1): sans puce, aucun oui libre ne confirme; « non » ferme.
-        cas = {'Oui, vas-y': None, 'oui': None, "d'accord": None,
-               'c’est bon': None, 'Oui, je confirme.': None,
-               'non merci': 'annuler', 'ok mais enlève aussi la chimie': None,
-               'ok efface tout mon planning': None,
-               'oui je pense que ce serait bien de le faire un jour': None}
-        for brut, attendu in cas.items():
-            with self.subTest(brut=brut):
-                self.assertEqual(dem.option_choisie(brut, self.DESTRUCTIF), attendu)
+        # Le juge est scripte (le francais est couvert par le banc): le test
+        # verifie le mapping, y compris quand le juge dit oui avec confiance.
+        cas = {'Oui, vas-y': (None, 'accepte'), 'oui': (None, 'accepte'),
+               "d'accord": (None, 'accepte'), 'c’est bon': (None, 'accepte'),
+               'Oui, je confirme.': (None, 'accepte'),
+               'non merci': ('annuler', 'refuse'),
+               'ok mais enlève aussi la chimie': (None, 'nouvelle_requete'),
+               'ok efface tout mon planning': (None, 'nouvelle_requete'),
+               'oui je pense que ce serait bien de le faire un jour':
+                   (None, 'incertain')}
+        script = {brut: {"intention": (intent, 0.9)}
+                  for brut, (_, intent) in cas.items()}
+        with mock.patch("services.agent_v2.jugement.juger",
+                        juger_script(script)):
+            for brut, (attendu, _) in cas.items():
+                with self.subTest(brut=brut):
+                    self.assertEqual(dem.option_choisie(brut, self.DESTRUCTIF),
+                                     attendu)
         avec_puces = puces(dict(self.DESTRUCTIF, cible={}))
         for brut, attendu in {'Oui, je confirme.': 'confirmer', 'Oui, confirme': 'confirmer',
                               'Oui, vas-y': None, 'Non, ne change rien.': 'annuler'}.items():
@@ -790,14 +817,24 @@ class LectureDesReponsesTests(SimpleTestCase):
 
     def test_portee(self):
         # Round 6 (D1): la portee ne se lit plus en texte libre; la puce seule.
-        cas = {'Tous les jeudis (supprimer la série).': None, 'la série': None,
-               "Seulement ce jeudi 17 sept. (sauter l'occurrence).": None,
-               'juste celui-là': None, 'non': 'annuler', 'oui': None,
-               'je ne veux pas tous les jeudis': None,
-               'pas tous les jeudis, juste celui-là': None}
-        for brut, attendu in cas.items():
-            with self.subTest(brut=brut):
-                self.assertEqual(dem.option_choisie(brut, self.PORTEE), attendu)
+        # Le juge est scripte: meme une portee jugee avec confiance ne sort
+        # pas du texte libre; seul « refuse » ferme sur « annuler ».
+        cas = {'Tous les jeudis (supprimer la série).': (None, 'precise'),
+               'la série': (None, 'incertain'),
+               "Seulement ce jeudi 17 sept. (sauter l'occurrence).":
+                   (None, 'precise'),
+               'juste celui-là': (None, 'precise'), 'non': ('annuler', 'refuse'),
+               'oui': (None, 'accepte'),
+               'je ne veux pas tous les jeudis': (None, 'precise'),
+               'pas tous les jeudis, juste celui-là': (None, 'precise')}
+        script = {brut: {"intention": (intent, 0.9)}
+                  for brut, (_, intent) in cas.items()}
+        with mock.patch("services.agent_v2.jugement.juger",
+                        juger_script(script)):
+            for brut, (attendu, _) in cas.items():
+                with self.subTest(brut=brut):
+                    self.assertEqual(dem.option_choisie(brut, self.PORTEE),
+                                     attendu)
         avec_puces = puces(dict(self.PORTEE, cible={'jour': 3, 'date': '2026-09-17'}))
         for brut, attendu in {'Tous les jeudis (supprimer la série).': 'serie',
                               "Seulement ce jeudi 17 sept. (sauter l'occurrence).": 'occurrence',
@@ -832,13 +869,20 @@ class LectureDesReponsesTests(SimpleTestCase):
                 self.assertEqual(dem.heures_dites(brut), attendu)
 
     def test_jour_vise(self):
-        for brut in ('efface tout jeudi', 'demain', 'le 17 septembre', 'tous les lundis',
-                     "aujourd'hui"):
-            with self.subTest(brut=brut):
-                self.assertTrue(dem.jour_vise(brut))
-        for brut in ('supprime mon cours de chimie', 'Oui, je confirme.'):
-            with self.subTest(brut=brut):
-                self.assertFalse(dem.jour_vise(brut))
+        # Le juge est scripte: le test verifie le mapping, pas le francais.
+        oui = ('efface tout jeudi', 'demain', 'le 17 septembre',
+               'tous les lundis', "aujourd'hui")
+        non = ('supprime mon cours de chimie', 'Oui, je confirme.')
+        script = {brut: {"jour_vise": (True, 0.9)} for brut in oui}
+        script.update({brut: {"jour_vise": (False, 0.9)} for brut in non})
+        with mock.patch("services.agent_v2.jugement.juger",
+                        juger_script(script)):
+            for brut in oui:
+                with self.subTest(brut=brut):
+                    self.assertTrue(dem.jour_vise(brut))
+            for brut in non:
+                with self.subTest(brut=brut):
+                    self.assertFalse(dem.jour_vise(brut))
 
     def test_date_visee(self):
         self.assertEqual(dem.date_visee('efface tout jeudi', 3, AUJOURDHUI), date(2026, 9, 17))
@@ -881,15 +925,21 @@ class EcheanceSansJourTests(HarnaisGardes, TransactionTestCase):
         self.assertTrue(registre.actions[-1].succes, registre.actions[-1].donnees)
 
     def test_un_jour_nomme_ou_sans_echeance_passe(self):
-        for i, brut in enumerate(('place ma révision mercredi avant vendredi',
-                                  "d'ici jeudi, mets ma lecture demain",
-                                  'place ma révision mercredi')):
-            with self.subTest(brut=brut):
-                self.message_courant(brut)
-                registre, tools = self.outils(brut, tache=f'u:{i}')
-                self.appeler(tools, 'schedule_task_at', title=f'Révision {i}', date='2026-09-16',
-                             start_time=f'{9 + 2 * i}:00', end_time=f'{10 + 2 * i}:00')
-                self.assertTrue(registre.actions[-1].succes, registre.actions[-1].donnees)
+        # La garde ne voit que le message sans l'echeance (« reste »); le
+        # juge est scripte dessus.
+        script = {"place ma revision mercredi": {"jour_vise": (True, 0.92)},
+                  ", mets ma lecture demain": {"jour_vise": (True, 0.92)}}
+        with mock.patch("services.agent_v2.jugement.juger",
+                        juger_script(script)):
+            for i, brut in enumerate(('place ma révision mercredi avant vendredi',
+                                      "d'ici jeudi, mets ma lecture demain",
+                                      'place ma révision mercredi')):
+                with self.subTest(brut=brut):
+                    self.message_courant(brut)
+                    registre, tools = self.outils(brut, tache=f'u:{i}')
+                    self.appeler(tools, 'schedule_task_at', title=f'Révision {i}', date='2026-09-16',
+                                 start_time=f'{9 + 2 * i}:00', end_time=f'{10 + 2 * i}:00')
+                    self.assertTrue(registre.actions[-1].succes, registre.actions[-1].donnees)
 
 
 class ContournementsDeLaRevueTests(HarnaisGardes, TransactionTestCase):
@@ -897,20 +947,30 @@ class ContournementsDeLaRevueTests(HarnaisGardes, TransactionTestCase):
 
     def test_oui_avec_un_jour_ne_confirme_pas_la_serie(self):
         chimie = self.bloc('Chimie générale', 3, '13:00', '15:00')
-        demande = puces(self.premier_tour('supprime mon cours de chimie', 'delete_block',
-                                          block_id=chimie.id).donnees['demande'])
-        self.assertEqual(demande['motif'], 'destructif')
-        for brut in ('oui pour jeudi seulement', 'oui juste cette fois', 'oui le 17 sept.',
-                     'ok demain'):
-            with self.subTest(brut=brut):
-                self.assertIsNone(dem.option_choisie(brut, demande))
-        # Round 6 (D1): un oui poli ne confirme plus; la puce exacte, oui.
-        for brut in ('oui merci', 'Oui, vas-y', "ok c'est bon"):
-            with self.subTest(brut=brut):
-                self.assertIsNone(dem.option_choisie(brut, demande))
-        for brut in ('oui je confirme', 'Oui, je confirme.', 'Oui, confirme'):
-            with self.subTest(brut=brut):
-                self.assertEqual(dem.option_choisie(brut, demande), 'confirmer')
+        script = {"supprime mon cours de chimie": {"jour_vise": (False, 0.9)},
+                  "oui pour jeudi seulement": {"intention": ("incertain", 0.5)},
+                  "oui juste cette fois": {"intention": ("incertain", 0.5)},
+                  "oui le 17 sept.": {"intention": ("incertain", 0.5)},
+                  "ok demain": {"intention": ("incertain", 0.5)},
+                  "oui merci": {"intention": ("accepte", 0.9)},
+                  "Oui, vas-y": {"intention": ("accepte", 0.9)},
+                  "ok c'est bon": {"intention": ("accepte", 0.9)}}
+        with mock.patch("services.agent_v2.jugement.juger",
+                        juger_script(script)):
+            demande = puces(self.premier_tour('supprime mon cours de chimie', 'delete_block',
+                                              block_id=chimie.id).donnees['demande'])
+            self.assertEqual(demande['motif'], 'destructif')
+            for brut in ('oui pour jeudi seulement', 'oui juste cette fois', 'oui le 17 sept.',
+                         'ok demain'):
+                with self.subTest(brut=brut):
+                    self.assertIsNone(dem.option_choisie(brut, demande))
+            # Round 6 (D1): un oui poli ne confirme plus; la puce exacte, oui.
+            for brut in ('oui merci', 'Oui, vas-y', "ok c'est bon"):
+                with self.subTest(brut=brut):
+                    self.assertIsNone(dem.option_choisie(brut, demande))
+            for brut in ('oui je confirme', 'Oui, je confirme.', 'Oui, confirme'):
+                with self.subTest(brut=brut):
+                    self.assertEqual(dem.option_choisie(brut, demande), 'confirmer')
         brut = 'oui pour jeudi seulement'
         self.attendre([demande], brut)
         registre = Registre()

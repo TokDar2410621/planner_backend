@@ -105,8 +105,6 @@ AUTORISANTES = {
 }
 MOTIFS_GARDES = {"portee_jour", "destructif", "creation_en_masse", "optimisation"}
 
-_TOUT = re.compile(r"\btou(t|s|te|tes)\b")
-_UNE_SEULE_FOIS = re.compile(r"\b(seulement|juste|cette fois|demain|aujourd'?hui)\b")
 _SEMAINE = re.compile(r"\bcette semaine\b|\bpour la semaine\b")
 _SEMAINE_SANS_FIN = re.compile(
     r"(a partir|des|depuis) (de )?cette semaine|et les suivantes|et apres|"
@@ -489,11 +487,12 @@ def _options_portee(block, jour: date, cible: dict) -> list[dict]:
 
 def _saut_suspect(texte: str) -> bool:
     """Un saut d'occurrence qui ressemble a une suppression large (« efface
-    tout jeudi »). Le saut unique explicite (« saute mon gym demain ») passe."""
-    plat = dem.sans_accents(texte)
-    if not dem.suppression_demandee(texte) or not dem.jour_vise(texte):
-        return False
-    return bool(_TOUT.search(plat)) or not _UNE_SEULE_FOIS.search(plat)
+    tout jeudi »). Le saut unique explicite (« saute mon gym demain ») passe.
+
+    Le jugement remplace les anciennes regex _TOUT/_UNE_SEULE_FOIS: en cas de
+    doute, le saut est suspect et le code pose la question de portee.
+    """
+    return dem.saut_suspect(texte)
 
 
 def _analyser(ctx: _Contexte, nom: str, kwargs: dict):
@@ -1488,7 +1487,11 @@ def _jour_a_choisir(ctx: _Contexte, nom: str, kwargs: dict):
     if m is None:
         return None
     reste = plat[:m.start()] + " " + plat[m.end():]
-    if dem.jour_vise(reste):
+    # Un jour nomme hors de l'echeance (« mercredi avant vendredi ») passe:
+    # le jour est choisi. En cas de doute du juge, la garde reste active et
+    # propose les jours libres plutot que de laisser AGIR placer au hasard.
+    vise, tranche = dem.jour_vise_tranche(reste)
+    if vise and tranche:
         return None
     debut, fin = _heure_normale(kwargs.get("start_time")), _heure_normale(kwargs.get("end_time"))
     duree = ((_minutes(fin) - _minutes(debut)) % (24 * 60)) if debut and fin else 60
@@ -2331,11 +2334,14 @@ def _appliquer(ctx: _Contexte) -> list[dict]:
     etat = ctx.etat
     abandonnees = etat.attente.setdefault("abandonnees", set())
     options = {id(d): dem.option_choisie(ctx.texte, d, tap=ctx.tap) for d in attente}
-    # D2: un message qui ne repond a aucune demande (ni puce, ni garde, ni
-    # reponse meme floue) porte une nouvelle requete. Cette lecture choisit
-    # seulement entre reposer et abandonner; elle n'autorise jamais rien.
-    nouvelle = bool(attente) and not any(options.values()) and not any(
-        dem.reponse_plausible(ctx.texte, d) for d in attente)
+    # D2: un message qui ne repond a aucune demande porte une nouvelle
+    # requete. Le juge tranche par demande: « nouvelle_requete » partout (et
+    # aucune option choisie) abandonne; un doute (« incertain ») repose la
+    # question au lieu d'abandonner. Cette lecture choisit seulement entre
+    # reposer et abandonner; elle n'autorise jamais rien.
+    classes = {id(d): dem.classification_reponse(ctx.texte, d) for d in attente}
+    nouvelle = bool(attente) and not any(options.values()) and all(
+        c == "nouvelle_requete" for c in classes.values())
     decisions: dict = {}
     codes: dict = {}
     for demande in attente:

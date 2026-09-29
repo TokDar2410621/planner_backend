@@ -35,11 +35,6 @@ from django.utils import timezone
 # plus rien, elle fait reposer la question.
 FENETRE_ATTENTE = timedelta(minutes=30)
 
-LEXIQUE_SUPPRESSION = (
-    r"\b(supprim\w*|effac\w*|enlev\w*|retir\w*|annul\w*|vide[rz]?|debarrasse\w*)\b"
-)
-_LEXIQUE_SUPPRESSION = re.compile(LEXIQUE_SUPPRESSION)
-
 _JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
 _MOIS = {
     "janv": 1, "fevr": 2, "mars": 3, "avr": 4, "mai": 5, "juin": 6,
@@ -274,134 +269,148 @@ def puce_touchee(message_brut, demande: dict):
     return None
 
 
-# -- garder ou annuler, en texte libre
+# -- lire l'intention: la couche de jugement, pas des regex
+#
+# 2026-09-29 (Darius): jamais de vocabulaire ecrit a la main, de listes de
+# declencheurs ou de regex pour detecter l'intention utilisateur afin de
+# declencher ou restreindre une action. L'intention peut etre tout autre.
+# Les anciennes regex (_MARQUE_GARDE, _VERBE_SUPPRESSION, _NOUVELLE_REQUETE,
+# _LEXIQUE_SUPPRESSION, ...) sont supprimees. Le code pose des questions
+# typees a services/agent_v2/jugement.py (Jev, repli LLM) et ne lit que des
+# decisions typees. Les politiques restent dans le code: une option
+# destructive ne provient que d'une puce exacte ou d'un postback; une
+# reponse libre ne donne au mieux que « confirmer » (motifs non destructifs)
+# ou « annuler »; incertain/indisponible repose la question, jamais d'action.
 
-_MARQUE_GARDE = re.compile(r"\b(?:gard\w*|laiss\w*|conserv\w*|annul\w*|non|nan|finalement|arret\w*)\b")
-_VERBE_SUPPRESSION = re.compile(r"\b(?:supprim\w*|effac\w*|enlev\w*|retir\w*|vide[rz]?|debarrass\w*)\b")
-# Ces verbes ne gardent que nies (« ne touche pas », « change rien »).
-_VERBE_A_NIER = re.compile(r"\b(?:touch\w*|chang\w*|boug\w*)\b")
-_CHANGE_D_AVIS = re.compile(r"\bchang\w*\s+d'?\s*avis\b")
-_NEGATIONS_DU_VERBE = {"pas", "rien", "aucun", "aucune", "jamais", "pu", "plus", "ne"}
-# « non pas tous les jeudis », « pas juste celui-la »: la portee elle-meme est
-# niee, l'utilisateur en veut peut-etre une autre.
-_PORTEE_NIEE = re.compile(
-    r"\b(?:pas|jamais|non)\s+(?:tous|toutes|tout|chaque|la serie|juste|seulement|"
-    r"ce|cet|cette|celui|celle)\b")
-# Une portee d'une fois (« laisse ce jeudi », « garde celui-la ») laisse
-# entendre qu'une autre occurrence part: on ne ferme pas la demande.
-_OCCURRENCE = re.compile(
-    r"\b(?:seulement|juste|cette fois|celui-la|celle-la|"
-    r"ce (?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche))\b")
-# « laisse tomber le cours » peut vouloir dire « supprime le cours ».
-_TOMBER_AVEC_OBJET = re.compile(
-    r"\blaiss\w*[\s-]+tomber\s+(?:le|la|les|l'|ce|cet|cette|ces|mon|ma|mes|ton|ta|tes|"
-    r"son|sa|ses|un|une)\b")
-_VOCABULAIRE_DE_GARDE = {
-    "non", "nan", "ne", "n", "pas", "rien", "plus", "pu", "jamais", "tomber",
-    "le", "la", "les", "l", "lui", "leur", "y", "en", "ce", "ca", "c", "ces",
-    "mon", "ma", "mes", "ton", "ta", "tes", "son", "sa", "ses", "moi",
-    "tous", "toutes", "tout", "toute", "chaque", "semaine", "semaines", "serie",
-    "toujours", "definitivement", "reste", "restent", "rester", "comme", "est",
-    "je", "j", "ai", "veux", "voudrais", "prefere", "te", "dis", "a", "au", "aux",
-    "de", "des", "du", "d", "avis", "alors", "bon", "ben", "euh", "hmm", "tant", "pis",
-    "merci", "stp", "svp", "s", "il", "plait", "finalement", "encore",
-}
+from services.agent_v2 import jugement as _jugement
 
 
-def _mots(texte: str) -> list[str]:
-    return [m for m in re.split(r"[\s-]+", texte) if m]
-
-
-def _verbe_nie(plat: str, m) -> bool:
-    if plat[:m.start()].endswith("n'"):
-        return True
-    avant = [x.strip("'") for x in _mots(plat[:m.start()])][-2:]
-    apres = [x.strip("'") for x in _mots(plat[m.end():])][:2]
-    return bool(_NEGATIONS_DU_VERBE.intersection(avant + apres))
-
-
-_VERBE_DE_GARDE = re.compile(r"(?:gard|laiss|conserv|arret)")
-# Avant un verbe de garde, « rien » est l'objet du verbe precedent (« n'efface
-# rien, garde-le »): il ne nie pas la garde.
-_NEGATIONS_AVANT_GARDE = {"ne", "pas", "plus", "pu", "jamais"}
-_NEGATIONS_APRES_GARDE = {"pas", "rien", "plus", "pu", "jamais", "aucun", "aucune"}
-
-
-def _garde_nie(plat: str, m) -> bool:
-    if plat[:m.start()].endswith("n'"):
-        return True
-    avant = [x.strip("'") for x in _mots(plat[:m.start()])][-2:]
-    apres = [x.strip("'") for x in _mots(plat[m.end():])][:2]
-    return bool(_NEGATIONS_AVANT_GARDE.intersection(avant)
-                or _NEGATIONS_APRES_GARDE.intersection(apres))
-
-
-def _jetons(texte: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", sans_accents(texte))
-
-
-def _meme_mot(a: str, b: str) -> bool:
-    if a == b:
-        return True
-    return len(a) >= 4 and len(b) >= 4 and a[:4] == b[:4]
-
-
-def _jours_permis(jour) -> set:
-    """Les noms de jour qu'une reponse peut porter: celui de la cible
-    seulement. « garde-le vendredi » ne repond pas a une question sur jeudi."""
+def _etat_lecture(message_brut: str, demande: dict) -> dict:
+    """L'etat passe au juge: le message brut, la question posee, son sujet."""
+    cible = demande.get("cible") or {}
+    morceaux = [str(cible.get("titre") or "")]
+    jour = cible.get("jour")
     if isinstance(jour, int) and 0 <= jour <= 6:
-        return {_JOURS[jour], _JOURS[jour] + "s"}
-    return set()
+        morceaux.append(_JOURS[jour])
+    if cible.get("date"):
+        morceaux.append(str(cible.get("date")))
+    return {
+        "message": message_brut,
+        "question": (demande.get("question") or "").strip(),
+        "sujet": " ".join(m for m in morceaux if m).strip(),
+        "motif": demande.get("motif"),
+    }
+
+
+def _jugements(message_brut: str, demande: dict) -> dict:
+    """Un seul appel au juge par (message, demande): l'intention, plus le
+    choix libre quand le motif le demande (choix_modele, question_libre: des
+    options sans effet). La portee d'une suppression ne se lit jamais en
+    texte libre (D1): pas de question de portee ici. Le cache de
+    jugement.juger rend les appels repetes gratuits dans le tour."""
+    etat = _etat_lecture(message_brut, demande)
+    questions = {"intention": _jugement.q_intention(
+        etat["question"], etat["sujet"])}
+    motif = demande.get("motif")
+    if motif in ("choix_modele", "question_libre"):
+        options = {}
+        for opt in demande.get("options") or []:
+            if not isinstance(opt, dict) or opt.get("id") == "annuler":
+                continue
+            oid = opt.get("id")
+            options[oid] = str(opt.get("libelle") or opt.get("valeur")
+                               or opt.get("value") or oid)
+        if options:
+            questions["choix"] = _jugement.q_choix(options)
+    return _jugement.juger(etat, questions)
+
+
+def _intention(message_brut: str, demande: dict) -> str:
+    """Ce que le message fait face a la question en attente, selon le juge.
+
+    'accepte' | 'refuse' | 'precise' | 'nouvelle_requete' | 'incertain'.
+    Incertain couvre aussi l'indisponible: le juge n'a pas tranche.
+    """
+    res = _jugements(message_brut, demande).get("intention") or {}
+    if res.get("statut") != _jugement.STATUT_DECISION:
+        return "incertain"
+    return res.get("valeur") or "incertain"
+
+
+def _noul(message_brut, qid: str, fabrique, prudent: bool) -> tuple[bool, bool]:
+    """Un jugement noul: (valeur, tranchee). Tranchee est Faux quand le juge
+    est incertain ou indisponible; la valeur vaut alors le repli prudent."""
+    res = _jugement.juger(
+        {"message": message_brut}, {qid: fabrique()}).get(qid) or {}
+    if res.get("statut") == _jugement.STATUT_DECISION:
+        return bool(res.get("valeur")), True
+    return prudent, False
 
 
 def annulation_libre(message_brut, demande: dict) -> bool:
-    """Le message ne dit-il QUE garder ou annuler, sans rien nommer d'autre ?
+    """Le juge dit-il que le message refuse ce que la question propose ?
 
     Vrai ferme la demande sur « annuler »: rien ne s'execute. Tout doute rend
     Faux, donc aucune option.
     """
-    if not isinstance(message_brut, str) or "?" in message_brut or not isinstance(demande, dict):
-        return False
-    plat = _plat(message_brut)
-    if not plat or _PORTEE_NIEE.search(plat) or _OCCURRENCE.search(plat):
-        return False
-    if _TOMBER_AVEC_OBJET.search(plat):
+    if (not isinstance(message_brut, str) or "?" in message_brut
+            or not isinstance(demande, dict)):
         return False
     # « J'annule le dentiste ? » « annule »: la c'est un oui. Ni l'un ni
     # l'autre ne se lit en texte libre.
-    annuler_est_l_action = demande.get("outil") == "cancel_scheduled_block"
-    garde = False
-    for m in _VERBE_SUPPRESSION.finditer(plat):
-        if not _verbe_nie(plat, m):
-            return False
-        garde = True
-    for m in _VERBE_A_NIER.finditer(plat):
-        if _CHANGE_D_AVIS.match(plat, m.start()):
-            garde = True
-            continue
-        if not _verbe_nie(plat, m):
-            return False
-        garde = True
-    for m in _MARQUE_GARDE.finditer(plat):
-        if annuler_est_l_action and m.group(0).startswith("annul"):
-            return False
-        # Round 8: « ne le garde pas », « garde rien », « laisse pas »,
-        # « n'arrete pas » disent l'inverse: la demande se repose.
-        if _VERBE_DE_GARDE.match(m.group(0)) and _garde_nie(plat, m):
-            return False
-        garde = True
-    if not garde:
+    if demande.get("outil") == "cancel_scheduled_block":
         return False
-    cible = demande.get("cible") or {}
-    titre = [m for m in _jetons(cible.get("titre") or "") if len(m) >= 3]
-    jours = _jours_permis(cible.get("jour"))
-    for mot in _jetons(plat):
-        if (mot in _VOCABULAIRE_DE_GARDE or mot in jours
-                or _MARQUE_GARDE.fullmatch(mot) or _VERBE_SUPPRESSION.fullmatch(mot)
-                or _VERBE_A_NIER.fullmatch(mot) or any(_meme_mot(mot, t) for t in titre)):
-            continue
-        return False
-    return True
+    return (_intention(message_brut, demande) == "refuse"
+            and "annuler" in _ids_options(demande)
+            and demande.get("motif") in MOTIFS_LECTURE_LIBRE)
+
+
+def _choix_juge(message_brut: str, demande: dict, ids: set) -> str | None:
+    """L'option que le juge lit dans une reponse libre, ou None.
+
+    Politique inchangee, seul le lecteur change (D1, round 6): une option
+    qui detruit (confirmer une suppression, occurrence/serie d'une portee)
+    ne provient que d'une puce exacte ou d'un postback, jamais d'ici. Une
+    reponse libre ne donne au mieux que « confirmer » (motifs non
+    destructifs), « annuler », ou le choix juge pour les motifs sans effet
+    (choix_modele, question_libre). « J'annule le dentiste ? » + « annule »
+    ne se lit pas en texte libre.
+    """
+    motif = demande.get("motif")
+    intention = _intention(message_brut, demande)
+    if demande.get("outil") == "cancel_scheduled_block" and intention in (
+            "accepte", "refuse"):
+        return None
+    if intention == "accepte":
+        # Un oui libre ne confirme que ce qui ne detruit rien (I1/I3).
+        if "confirmer" in ids and motif in MOTIFS_OUI_LIBRE:
+            return "confirmer"
+        return None
+    if intention == "refuse":
+        return "annuler" if annulation_libre(message_brut, demande) else None
+    if intention == "precise" and motif in ("choix_modele", "question_libre"):
+        res = _jugements(message_brut, demande).get("choix") or {}
+        if (res.get("statut") == _jugement.STATUT_DECISION
+                and res.get("valeur") in ids):
+            return res["valeur"]
+    return None
+
+
+def classification_reponse(message_brut, demande: dict) -> str:
+    """'reponse' | 'nouvelle_requete' | 'incertain'.
+
+    Ne sert qu'a choisir entre reposer la question et l'abandonner (D2), et a
+    dire si le tour peut se passer d'AGIR (D6). Une erreur ici coute une
+    question reposee ou abandonnee, jamais une action.
+    """
+    if not isinstance(message_brut, str) or not isinstance(demande, dict):
+        return "incertain"
+    intention = _intention(message_brut, demande)
+    if intention == "nouvelle_requete":
+        return "nouvelle_requete"
+    if intention == "incertain":
+        return "incertain"
+    return "reponse"
 
 
 def option_choisie(message_brut: str, demande: dict,
@@ -410,7 +419,8 @@ def option_choisie(message_brut: str, demande: dict,
 
     Jamais evaluee sur une liste: chaque demande ne connait que ses propres
     puces. Seule la puce exacte donne une option destructive; une reponse
-    libre ne donne au mieux que « annuler ».
+    libre ne donne au mieux que « annuler » (ou « confirmer » pour les motifs
+    non destructifs), lue par le juge.
 
     Exception: pour le motif « question_libre » (options sans effet), une
     question binaire oui/non accepte aussi un oui/non clair en texte libre.
@@ -434,10 +444,8 @@ def option_choisie(message_brut: str, demande: dict,
     if (choix is None and "confirmer" in ids
             and demande.get("motif") in MOTIFS_OUI_LIBRE and oui_clair(message_brut)):
         choix = "confirmer"
-    if (choix is None and "annuler" in ids
-            and demande.get("motif") in MOTIFS_LECTURE_LIBRE
-            and annulation_libre(message_brut, demande)):
-        choix = "annuler"
+    if choix is None:
+        choix = _choix_juge(message_brut, demande, ids)
     if choix is None and demande.get("motif") == "question_libre":
         choix = _oui_non_binaire(message_brut, demande)
     return choix if choix in ids else None
@@ -445,90 +453,67 @@ def option_choisie(message_brut: str, demande: dict,
 
 # -- reposer ou abandonner (D2): cette lecture n'autorise JAMAIS rien
 
-# Les mots qu'une reponse floue peut porter sans nommer autre chose que sa
-# cible: portee, politesse, hesitation, pronoms.
-_VOCABULAIRE_DE_REPONSE = _VOCABULAIRE_DE_GARDE | {
-    "oui", "ok", "okay", "ouais", "yes", "confirme", "confirmer", "vas", "go", "est", "bon",
-    "accord", "daccord", "parfait", "super", "bien", "sur", "vraiment", "absolument",
-    "fait", "exactement", "allez", "fais", "applique", "continue", "ajouts", "plan",
-    "certain", "certaine", "sure", "donc", "plutot", "seulement", "juste", "cette", "fois",
-    "celui", "celle", "cet", "mais", "ou", "et", "bof", "sais", "completement", "prochain",
-    "prochaine", "occurrence",
-    # Noms generiques et petits nombres: « Oui, supprime ces trois blocs. »
-    # ne nomme aucun AUTRE element; le oui en tete ne suffit plus (round 6).
-    "bloc", "blocs", "creneau", "creneaux", "element", "elements", "evenement",
-    "evenements", "ceux", "celles", "ci", "un", "une", "deux", "trois", "quatre", "cinq",
-}
-
-# Une reponse qui ouvre une AUTRE demande n'est pas une reponse floue a la
-# question en attente (revue du round 4: « c'est quoi mon horaire demain ? »,
-# « merci, bonne nuit »).
-_NOUVELLE_REQUETE = re.compile(
-    r"\b(?:ajout\w*|cree\w*|creer|mets|met|place\w*|planifi\w*|deplac\w*|bouge\w*|"
-    r"montre\w*|affiche\w*|horaire|planning|agenda|quoi|quel\w*|quand|combien|"
-    r"merci|bonne|bonjour|salut|allo)\b")
-# Round 8 (F6): « efface tout », « vide tout », « supprime tous mes blocs »,
-# « supprime tout ce jeudi » ouvrent une nouvelle demande destructive. AGIR la
-# sert, sous ses propres gardes; rien ne s'execute par cette lecture. « tous
-# les jeudis » reste une portee, donc une reponse floue.
-_NOUVELLE_DESTRUCTION = re.compile(
-    r"\b(?:supprim\w*|effac\w*|enlev\w*|retir\w*|vide[rz]?)\s+"
-    r"(?:tout\b|(?:tous|toutes)\s+(?!les\s+(?:" + "|".join(_JOURS) + r")s?\b))")
-
-
-def _nomme_rien_d_autre(plat: str, demande: dict | None) -> bool:
-    """La reponse ne nomme que sa cible: aucun titre ni jour d'un autre
-    element (« supprime mon gym tous les jeudis » repondu a la question sur
-    le quart est une nouvelle requete)."""
-    cible = (demande or {}).get("cible") or {}
-    titre = [m for m in _jetons(cible.get("titre") or "") if len(m) >= 3]
-    permis_jours = _jours_permis(cible.get("jour")) or (set(_JOURS) | {j + "s" for j in _JOURS})
-    for mot in _jetons(plat):
-        if mot in _VOCABULAIRE_DE_REPONSE or mot in permis_jours:
-            continue
-        if _VERBE_SUPPRESSION.fullmatch(mot) or re.fullmatch(r"annul\w*", mot):
-            continue
-        if any(_meme_mot(mot, t) for t in titre):
-            continue
-        return False
-    return True
-
 
 def reponse_plausible(message_brut, demande: dict) -> bool:
     """Le message peut-il etre une reponse, meme floue, a CETTE demande ?
 
     Ne sert qu'a choisir entre reposer la question et l'abandonner (D2), et a
     dire si le tour peut se passer d'AGIR (D6). Une erreur ici coute une
-    question reposee ou abandonnee, jamais une action.
+    question reposee ou abandonnee, jamais une action. Seule une nouvelle
+    requete tranchee par le juge rend Faux; un doute repose la question.
     """
-    plat = _plat(message_brut)
-    if not plat or _NOUVELLE_REQUETE.search(plat) or _NOUVELLE_DESTRUCTION.search(plat):
-        return False
-    # Revue du round 6: un oui ou un non en tete ne suffit plus. « non,
-    # supprime plutot mon gym » est une correction qui porte une nouvelle
-    # requete; lue comme reponse, elle faisait sauter AGIR (D6). Le message
-    # entier ne doit nommer que la cible.
-    return _nomme_rien_d_autre(plat, demande)
+    return classification_reponse(message_brut, demande) != "nouvelle_requete"
 
 
 # ------------------------------------------------------------- jours, heures
 
-_RE_JOUR_VISE = re.compile(
-    r"\b(" + "|".join(_JOURS) + r")s?\b"
-    r"|\bapres-demain\b|\bdemain\b|\baujourd'?hui\b|\bce soir\b"
-    r"|\b\d{4}-\d{2}-\d{2}\b"
-    r"|\b\d{1,2}(?:er)?\s+(?:" + _RE_MOIS + r")\w*"
-    r"|\b\d{1,2}/\d{1,2}\b"
-)
-
 
 def jour_vise(message_brut) -> bool:
-    """Le message nomme-t-il un jour (nom, demain, une date) ?"""
-    return bool(_RE_JOUR_VISE.search(sans_accents(message_brut)))
+    """Le message vise-t-il un jour precis (nom, demain, une date) ?
+
+    Juge par noul. En cas de doute (incertain/indisponible), rend Vrai: le
+    code pose la question de portee plutot que de supposer toute la serie.
+    """
+    valeur, _ = _noul(message_brut, "jour_vise", _jugement.q_jour_vise, True)
+    return valeur
+
+
+def jour_vise_tranche(message_brut) -> tuple[bool, bool]:
+    """(vise_un_jour, tranche). Tranche est Faux si le juge n'a pas decide."""
+    return _noul(message_brut, "jour_vise", _jugement.q_jour_vise, True)
 
 
 def suppression_demandee(message_brut) -> bool:
-    return bool(_LEXIQUE_SUPPRESSION.search(sans_accents(message_brut)))
+    """Le message demande-t-il de SUPPRIMER quelque chose ?
+
+    Juge par noul. En cas de doute (incertain/indisponible), rend Vrai: un
+    doute se traite comme une suppression possible, jamais comme un feu vert.
+    """
+    valeur, _ = _noul(message_brut, "suppression", _jugement.q_suppression,
+                      True)
+    return valeur
+
+
+def suppression_tranchee(message_brut) -> tuple[bool, bool]:
+    """(suppression_visee, tranche). Tranche est Faux si le juge n'a pas
+    decide: pour les comparateurs, qui ne comparent que du tranche."""
+    return _noul(message_brut, "suppression", _jugement.q_suppression, True)
+
+
+def saut_suspect(message_brut) -> bool:
+    """Un saut d'occurrence qui ressemble a une suppression large (« efface
+    tout jeudi »). Le saut unique explicite (« saute mon gym demain ») passe.
+
+    Juge par choice. En cas de doute (incertain/indisponible), rend Vrai: le
+    code pose la question de portee plutot que de laisser passer un saut
+    ambigu.
+    """
+    res = _jugement.juger(
+        {"message": message_brut},
+        {"saut": _jugement.q_saut_ou_suppression()}).get("saut") or {}
+    if res.get("statut") == _jugement.STATUT_DECISION:
+        return res.get("valeur") == "suppression_large"
+    return True
 
 
 def _dates_nommees(message_brut, aujourdhui: date) -> list[date]:

@@ -766,13 +766,19 @@ MAX_VALEUR_LIBRE = 200
 MAX_OPTIONS_LIBRE = 4
 MIN_OPTIONS_LIBRE = 2
 
+# Lexique local a l'agent v1: il detecte qu'une question du modele ressemble
+# a une confirmation de suppression, pour que ce soit le code qui la pose.
+# L'agent v2 n'utilise plus aucun lexique ecrit a la main pour lire
+# l'intention (2026-09-29): il est parti dans la couche de jugement.
+LEXIQUE_SUPPRESSION = (
+    r"\b(supprim\w*|effac\w*|enlev\w*|retir\w*|annul\w*|vide[rz]?|debarrasse\w*)\b"
+)
+
 
 def _confirmation_destructive(question: str, options: list) -> bool:
     """La question ressemble-t-elle a une confirmation de suppression ou
-    d'annulation ? Reutilise le lexique du code (demandes.py): une telle
-    confirmation ne se pose jamais par le modele, c'est le code qui la pose
-    quand le modele appelle l'outil vise."""
-    from services.agent_v2.demandes import LEXIQUE_SUPPRESSION
+    d'annulation ? Une telle confirmation ne se pose jamais par le modele,
+    c'est le code qui la pose quand le modele appelle l'outil vise."""
     destructif = re.compile(LEXIQUE_SUPPRESSION)
     textes = [question or ""]
     for option in options or []:

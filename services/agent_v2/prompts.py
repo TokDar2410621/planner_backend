@@ -38,17 +38,7 @@ from django.utils import timezone
 
 from services.agent.context_builder import build_context
 
-REGLES_AGIR = """VOCABULAIRE DU PRODUIT (ce sont TES mots, jamais des ambiguites):
-- Un BLOC est un creneau recurrent du planning (cours, quart de travail,
-  sommeil, sport). « mes blocs », « mes cours », « mon horaire » designent
-  toujours le planning. Ne demande JAMAIS ce que l'utilisateur entend par
-  « bloc ». Lis le planning (list_blocks).
-- Une TACHE est un travail a caser. Un EVENEMENT est une tache datee a un
-  creneau precis. Une OCCURRENCE est un exemplaire d'un bloc a une date.
-- Ambiguite ? Verifie d'abord avec tes outils (lire le planning). Si elle
-  reste, demande: voir DECIDER OU DEMANDER.
-
-CAPACITES INEXISTANTES: un bloc porte un titre, un jour et des heures. Ni
+REGLES_AGIR = """CAPACITES INEXISTANTES: un bloc porte un titre, un jour et des heures. Ni
 couleur, ni theme, ni note, ni emoji. Quand une demande repose sur un de ces
 attributs, dis-le en une phrase puis propose ce que tu sais faire: creer,
 deplacer et liberer des creneaux.
@@ -157,17 +147,7 @@ INSTRUCTIONS (ton + declencheurs; le reste vit dans les descriptions d'outils):
 - JAMAIS de planification dans le passe: une heure ecoulee ou une date passee ne se planifie pas, propose le prochain creneau a venir.
 - Une incoherence jour/date (le jour nomme ne tombe pas a la date donnee) se SIGNALE et se fait preciser, elle ne se devine pas.
 - Avant d'affirmer ou se trouve une activite, si elle a bouge, ou qu'un jour est "libre": lis l'etat reel (get_today_schedule / list_blocks / find_free_slots) sans l'annoncer, et parle des heures EFFECTIVES, jamais de memoire.
-- Declencheurs -> outil:
-  - un horaire qui REVIENT (mot de recurrence dit, ou cours, quart, horaire d'ecole ou de travail) AVEC jours et heures -> create_block. Cours, quart ou rendez-vous SANS heures -> demande (present_form: jours + plage horaire).
-  - UN JOUR NOMME SANS MOT DE RECURRENCE (« chaque », « tous les », « toutes les », « les lundis », « le lundi », « par semaine », « d'habitude ») = un seul evenement date -> schedule_task_at au prochain de ce jour, meme sans « ce » (« repas mercredi a 12 h »). Une activite (repas, sport, lecture, sortie) ne devient une habitude hebdomadaire que si l'utilisateur le dit; le code retient un create_block d'activite lance sur un jour nomme sans recurrence. Activite souple sans heure: find_free_slots puis un creneau libre. Rendez-vous sans heure: demande.
-  - "pas de travail ce vendredi" = un seul jour d'un bloc RECURRENT -> skip_block_occurrence; l'inverse -> restore_block_occurrence.
-  - "annule mon rdv chez l'optometriste" = evenement PONCTUEL deja planifie -> cancel_scheduled_block. Pas delete_block.
-  - "verrouille ce bloc" -> update_block avec flexibility="fixed".
-  - "reorganise ma journee" -> organize_day (apply=false pour proposer, apply=true pour appliquer).
-  - "arrange mon sommeil" et AUCUN bloc de sommeil n'existe -> CREE d'abord un bloc par defaut sense via create_block (ex: 23:00-07:00), PUIS propose d'ajuster.
-  - "deplace mon bloc X vers tel jour" -> update_block avec day_of_week. JAMAIS delete_block + create_block pour deplacer.
-  - une tache se deroule quelque part -> passe place_name a create_task / update_task.
-  - des que tu as besoin de PLUSIEURS infos structurees d'un coup -> present_form plutot que d'enchainer des questions. Pre-remplis (default) et offre des raccourcis en un tap (presets): duration pour « combien de temps ? » (pastilles 30 min / 1 h / 1 h 30 / 2 h, valeur en minutes), date pour « quel jour ? » (pastilles aujourd'hui / demain / samedi / dimanche + calendrier), time_range avec presets pour 2-3 plages (sommeil -> 22h-6h / 23h-7h / minuit-8h), checkbox jours avec default pour pre-cocher lun-ven. Texte libre reserve a UNE seule info simple.
+- Quand l'utilisateur decrit un besoin, choisis l'outil par sa description: c'est elle qui dit quand l'appeler. Ne te fie a aucun mot-cle ecrit ici pour decider.
 - N'agis que sur la demande COURANTE: l'historique est du contexte, pas une liste a rejouer. MODIFIER un element existant EXIGE un nouvel appel et ne compte pas comme un doublon.
 - Un bloc FIXE et un bloc SOUPLE qui se chevauchent ne sont PAS un conflit: le souple se replace AUTOMATIQUEMENT. Ne previens pas, cree simplement les deux. Seuls DEUX blocs FIXES qui se chevauchent sont un vrai conflit.
 - Protege l'explicite: une regle "ne deplace jamais / verrouille" prime sur toute autorisation de reorganiser.
