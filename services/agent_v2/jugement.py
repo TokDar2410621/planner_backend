@@ -466,6 +466,16 @@ def vider_cache() -> None:
 
 # -- entree publique -----------------------------------------------------------------
 
+def _journaliser(fournisseur: str, resultats: dict) -> None:
+    # Observabilite demandee le 2026-09-29 : une ligne INFO par jugement pour
+    # voir dans les logs Railway quel fournisseur a tranche ("jev",
+    # "repli_llm" ou "cache"). Ni la cle ni le contenu des messages ne sont
+    # journalises, seulement les qids et leurs statuts finaux.
+    statuts = ",".join(f"{qid}:{rep.get('statut')}"
+                       for qid, rep in resultats.items())
+    logger.info("jugement fournisseur=%s %s", fournisseur, statuts)
+
+
 def juger(etat: dict | str, questions: dict) -> dict:
     """Juge l'etat avec les questions typees.
 
@@ -487,9 +497,11 @@ def juger(etat: dict | str, questions: dict) -> dict:
                 raise _ReponseInvalide(f"question {qid!r} mal formee")
         cle = _cle_cache(etat, questions)
         if cle in _CACHE:
+            _journaliser("cache", _CACHE[cle])
             return _CACHE[cle]
-        brutes = _juger_sans_cache(etat, questions)
+        brutes, fournisseur = _juger_sans_cache(etat, questions)
         resultats = _appliquer_seuil(brutes)
+        _journaliser(fournisseur, resultats)
         if len(_CACHE) >= _CACHE_MAX:
             _CACHE.pop(next(iter(_CACHE)))
         _CACHE[cle] = resultats
@@ -499,11 +511,15 @@ def juger(etat: dict | str, questions: dict) -> dict:
         return _indisponibles(questions)
 
 
-def _juger_sans_cache(etat: dict, questions: dict) -> dict:
-    """Jev si la cle est configuree, sinon le repli LLM. Leve si indisponible."""
+def _juger_sans_cache(etat: dict, questions: dict) -> tuple[dict, str]:
+    """Jev si la cle est configuree, sinon le repli LLM. Leve si indisponible.
+
+    Rend (reponses brutes, fournisseur), fournisseur dans {"jev",
+    "repli_llm"}. La cle n'est jamais journalisee.
+    """
     if _cle_jev():
         try:
-            return _appeler_jev(etat, questions)
+            return _appeler_jev(etat, questions), "jev"
         except _ReponseInvalide as e:
             logger.warning("jugement: reponse Jev invalide (%s)", e)
         except Exception as e:  # noqa: BLE001 - timeout, 429, reseau...
@@ -511,5 +527,5 @@ def _juger_sans_cache(etat: dict, questions: dict) -> dict:
     if _repli_llm_actif():
         repli = _juger_llm(etat, questions)
         if repli is not None:
-            return repli
+            return repli, "repli_llm"
     raise _ReponseInvalide("aucun juge disponible")
