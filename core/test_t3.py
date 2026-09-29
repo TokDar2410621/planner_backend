@@ -14,9 +14,24 @@ from unittest.mock import patch
 
 import pytest
 from django.core.management import call_command
+from django.utils import timezone
 
 from core.models import UploadedDocument
 from services.document_processor import DocumentProcessor
+
+
+@pytest.fixture
+def user_consenti(user):
+    """L'utilisateur de test avec consentement IA.
+
+    La commande saute les documents des utilisateurs sans consentement
+    (gate Apple 5.1.2(i), core/ai_consent.py). Ces tests couvrent la
+    mecanique du backstop, pas le gate : le gate a ses propres tests
+    (core/test_ai_consent.py).
+    """
+    user.profile.ai_consent_at = timezone.now()
+    user.profile.save(update_fields=["ai_consent_at"])
+    return user
 
 
 def _make_pending(user, name):
@@ -39,8 +54,8 @@ def _mark_processed(document):
 
 
 @pytest.mark.django_db
-def test_command_marks_pending_document_processed(user):
-    doc = _make_pending(user, "horaire.pdf")
+def test_command_marks_pending_document_processed(user_consenti):
+    doc = _make_pending(user_consenti, "horaire.pdf")
 
     with patch.object(
         DocumentProcessor, "process_document", side_effect=_mark_processed
@@ -54,9 +69,9 @@ def test_command_marks_pending_document_processed(user):
 
 
 @pytest.mark.django_db
-def test_failing_document_does_not_abort_batch(user):
-    bad = _make_pending(user, "corrupt.pdf")
-    good = _make_pending(user, "valid.pdf")
+def test_failing_document_does_not_abort_batch(user_consenti):
+    bad = _make_pending(user_consenti, "corrupt.pdf")
+    good = _make_pending(user_consenti, "valid.pdf")
 
     def side_effect(document):
         if document.id == bad.id:

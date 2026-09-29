@@ -22,9 +22,10 @@ Ces tests verrouillent les trois proprietes qui rendent la lenteur bornee:
 Aucun appel reseau ici: on inspecte la configuration et la hierarchie
 d'exceptions.
 """
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, override_settings
 
 
+@override_settings(DEEPSEEK_API_KEY="cle-factice-test")
 class DelaiDuFournisseurTests(SimpleTestCase):
     def setUp(self):
         from services.agent_v2 import modeles
@@ -63,8 +64,13 @@ class DelaiDuFournisseurTests(SimpleTestCase):
         defaut = inspect.signature(FallbackModel.__init__).parameters["fallback_on"].default
         self.assertIn(ModelAPIError, defaut)
 
+    @override_settings(GEMINI_API_KEY="cle-factice-test")
     def test_la_chaine_a_bien_un_repli(self):
-        """Borner ne sert a rien si personne ne prend la releve."""
+        """Borner ne sert a rien si personne ne prend la releve.
+
+        Deux cles factices suffisent : on inspecte la configuration, aucun
+        appel reseau n'est fait.
+        """
         chaine = self.modeles._chaine()
         membres = getattr(chaine, "models", None)
         self.assertIsNotNone(

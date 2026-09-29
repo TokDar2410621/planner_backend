@@ -51,6 +51,7 @@ from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
 from core.models import ConversationMessage, RecurringBlock
 from core.serializers import ConversationMessageSerializer
+from core.test_agent_v2_jugement import juger_script
 from services.agent_v2 import demandes as dem
 from services.agent_v2 import lecture
 from services.agent_v2 import lecture_schema as schema
@@ -541,19 +542,35 @@ class AccordsTests(SimpleTestCase):
 
     def test_suppression(self):
         retrait = _lecture(_element(operation="supprimer"))
-        self.assertEqual(lecture.accord_suppression(retrait, "suprime mon gym"), "diff")
-        self.assertEqual(lecture.accord_suppression(retrait, "supprime mon gym"), "ok")
-        self.assertEqual(lecture.accord_suppression(_lecture(_element()), "ajoute gym"), "na")
+        # Le juge semantique comprend la coquille « suprime » (l'ancienne
+        # regex ne la voyait pas, d'ou le « diff » historique). Il s'accorde
+        # donc avec la lecture qui dit le retrait.
+        script = {"suprime mon gym": {"suppression": (True, 0.95)},
+                  "supprime mon gym": {"suppression": (True, 0.95)},
+                  "ajoute gym": {"suppression": (False, 0.95)}}
+        with patch("services.agent_v2.jugement.juger", juger_script(script)):
+            self.assertEqual(lecture.accord_suppression(retrait, "suprime mon gym"), "ok")
+            self.assertEqual(lecture.accord_suppression(retrait, "supprime mon gym"), "ok")
+            self.assertEqual(lecture.accord_suppression(_lecture(_element()), "ajoute gym"), "na")
 
     def test_jour_vise_ne_vaut_que_pour_un_retrait(self):
         faute = _lecture(_element(operation="supprimer",
                                   dates=[_ref("mercedi", "jour_semaine", jour_semaine="mercredi")]))
-        self.assertEqual(lecture.accord_jour_vise(faute, "efface mon gym de mercedi", LUNDI), "diff")
-        juste = _lecture(_element(operation="supprimer",
-                                  dates=[_ref("mercredi", "jour_semaine", jour_semaine="mercredi")]))
-        self.assertEqual(lecture.accord_jour_vise(juste, "efface mon gym de mercredi", LUNDI), "ok")
-        ajout = _lecture(_element(dates=[_ref("mercredi", "jour_semaine", jour_semaine="mercredi")]))
-        self.assertEqual(lecture.accord_jour_vise(ajout, "ajoute gym mercredi", LUNDI), "na")
+        # Meme logique que test_suppression : le juge semantique lit
+        # « mercedi » comme mercredi, donc accord, pas diff.
+        script = {"efface mon gym de mercedi": {"suppression": (True, 0.95),
+                                                "jour_vise": (True, 0.95)},
+                  "efface mon gym de mercredi": {"suppression": (True, 0.95),
+                                                 "jour_vise": (True, 0.95)},
+                  "ajoute gym mercredi": {"suppression": (False, 0.95),
+                                          "jour_vise": (True, 0.95)}}
+        with patch("services.agent_v2.jugement.juger", juger_script(script)):
+            self.assertEqual(lecture.accord_jour_vise(faute, "efface mon gym de mercedi", LUNDI), "ok")
+            juste = _lecture(_element(operation="supprimer",
+                                      dates=[_ref("mercredi", "jour_semaine", jour_semaine="mercredi")]))
+            self.assertEqual(lecture.accord_jour_vise(juste, "efface mon gym de mercredi", LUNDI), "ok")
+            ajout = _lecture(_element(dates=[_ref("mercredi", "jour_semaine", jour_semaine="mercredi")]))
+            self.assertEqual(lecture.accord_jour_vise(ajout, "ajoute gym mercredi", LUNDI), "na")
 
     def test_date_visee(self):
         refs = _prep("x", semaine=SEMAINE_GYM_MERCREDI).refs
@@ -638,10 +655,12 @@ class AccordsTests(SimpleTestCase):
                                dates=[_ref("mercredi", "jour_semaine", jour_semaine="mercredi")],
                                heures=[_heure("18h", "18:00")]))
         suivi = lecture.Suivi(preparation=prep)
-        with self.assertLogs(JOURNAL, "INFO") as journal:
-            lecture.journaliser(suivi, lecture.Resultat(
-                "erreur", lecture=lu, fournisseur="", ms=12, attente_ms=3,
-                erreur="deepseek:ModelHTTPError:400|gemini:ModelHTTPError:400"))
+        script = {message: {"suppression": (True, 0.95)}}
+        with patch("services.agent_v2.jugement.juger", juger_script(script)):
+            with self.assertLogs(JOURNAL, "INFO") as journal:
+                lecture.journaliser(suivi, lecture.Resultat(
+                    "erreur", lecture=lu, fournisseur="", ms=12, attente_ms=3,
+                    erreur="deepseek:ModelHTTPError:400|gemini:ModelHTTPError:400"))
         self.assertEqual(len(journal.records), 1)
         ligne = journal.records[0].getMessage()
         self.assertRegex(ligne, LIGNE_TOUR)

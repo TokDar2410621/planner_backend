@@ -19,6 +19,7 @@ from django.test import SimpleTestCase, TransactionTestCase
 
 from core.models import RecurringBlock, ScheduledBlock
 from core.test_agent_v2_gardes import HarnaisGardes, puces
+from core.test_agent_v2_jugement import juger_script
 from core.test_agent_v2_narrateur import NarrateurBase, demande
 from core.test_agent_v2_voix_r6 import LIGNE_ABANDON, abandonnee
 from services.agent.tools.base import ToolResult
@@ -117,16 +118,20 @@ class CheminRapideCorrectionTests(HarnaisGardes, TransactionTestCase):
 
     def test_une_correction_qui_nomme_un_autre_element_laisse_agir_tourner(self):
         self.bloc('Gym', 3, '17:00', '18:00', block_type='sport')
-        for reemissions in (0, 1):
-            for i, brut in enumerate(self.CORRECTIONS):
-                with self.subTest(brut=brut, reemissions=reemissions):
-                    RecurringBlock.all_objects.filter(pk=self.q.pk).update(active=True)
-                    dem = puces(self.demande_portee(tache=f'z:{reemissions}:{i}'))
-                    dem['reemissions'] = reemissions
-                    decide, codes = self._decide([dem], brut, f'z:{reemissions}:{i}')
-                    self.assertFalse(decide)
-                    self.assertNotIn('reposee', codes)
-                    self.assertActif(self.q)
+        # Une correction qui nomme un autre element est une nouvelle requete,
+        # pas une reponse a la question en attente.
+        script = {b: {'intention': ('nouvelle_requete', 0.95)} for b in self.CORRECTIONS}
+        with patch("services.agent_v2.jugement.juger", juger_script(script)):
+            for reemissions in (0, 1):
+                for i, brut in enumerate(self.CORRECTIONS):
+                    with self.subTest(brut=brut, reemissions=reemissions):
+                        RecurringBlock.all_objects.filter(pk=self.q.pk).update(active=True)
+                        dem = puces(self.demande_portee(tache=f'z:{reemissions}:{i}'))
+                        dem['reemissions'] = reemissions
+                        decide, codes = self._decide([dem], brut, f'z:{reemissions}:{i}')
+                        self.assertFalse(decide)
+                        self.assertNotIn('reposee', codes)
+                        self.assertActif(self.q)
 
     def test_un_oui_vague_reste_repose(self):
         dem = puces(self.demande_portee())

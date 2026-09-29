@@ -21,6 +21,7 @@ from django.utils import timezone
 from core.models import ScheduledBlock, UploadedDocument
 from core.test_agent_v2_gardes import HarnaisGardes, puces
 from core.test_agent_v2_gardes_r6 import ANNULER_EVENEMENT, DESTR, MASSE, PLAN, PORTEE
+from core.test_agent_v2_jugement import juger_script
 from core.test_agent_v2_voix_r6 import _TourDecideBase
 from services.agent_v2 import demandes as dem
 from services.agent_v2 import outils as outils_v2
@@ -110,10 +111,13 @@ class F2GarderNieTests(SimpleTestCase):
         self.assertIsNone(dem.option_choisie("n'arrête pas", MASSE))
 
     def test_garder_affirme_ferme_toujours(self):
-        for brut in ('non, garde-le', 'Non, garde tout', 'laisse-le', 'laisse tomber',
-                     'Je veux la garder chaque semaine', "n'efface rien, garde-le"):
-            with self.subTest(brut=brut):
-                self.assertEqual(dem.option_choisie(brut, PORTEE), 'annuler')
+        bruts = ('non, garde-le', 'Non, garde tout', 'laisse-le', 'laisse tomber',
+                 'Je veux la garder chaque semaine', "n'efface rien, garde-le")
+        script = {b: {'intention': ('refuse', 0.95)} for b in bruts}
+        with patch("services.agent_v2.jugement.juger", juger_script(script)):
+            for brut in bruts:
+                with self.subTest(brut=brut):
+                    self.assertEqual(dem.option_choisie(brut, PORTEE), 'annuler')
 
 
 # ── F3: mecanique d'interface seulement ─────────────────────────────────────
@@ -226,22 +230,28 @@ class F6NouvelleDestructionTests(HarnaisGardes, TransactionTestCase):
     NOUVELLES = ('efface tout', 'vide tout', 'supprime tous mes blocs', 'supprime tout ce jeudi')
 
     def test_ce_n_est_pas_une_reponse(self):
-        for brut in self.NOUVELLES:
-            with self.subTest(brut=brut):
-                self.assertFalse(dem.reponse_plausible(brut, PORTEE))
-        # Une portee dite en toutes lettres reste une reponse floue a reposer.
-        self.assertTrue(dem.reponse_plausible('supprime tous les jeudis', PORTEE))
+        # Une nouvelle destruction n'est pas une reponse a la question de
+        # portee en attente : le juge la lit « nouvelle_requete ».
+        script = {b: {'intention': ('nouvelle_requete', 0.95)} for b in self.NOUVELLES}
+        with patch("services.agent_v2.jugement.juger", juger_script(script)):
+            for brut in self.NOUVELLES:
+                with self.subTest(brut=brut):
+                    self.assertFalse(dem.reponse_plausible(brut, PORTEE))
+            # Une portee dite en toutes lettres reste une reponse floue a reposer.
+            self.assertTrue(dem.reponse_plausible('supprime tous les jeudis', PORTEE))
 
     def test_la_demande_est_abandonnee_et_rien_ne_s_execute(self):
-        for i, brut in enumerate(self.NOUVELLES):
-            with self.subTest(brut=brut):
-                demande = puces(self.demande_portee(tache=f'f6:{i}'))
-                self.attendre([demande], brut)
-                registre = Registre()
-                outils_v2.appliquer_choix_en_attente(self.user, registre, brut, f'f6:{i}')
-                codes = [a.donnees.get('decision_code') for a in registre.actions
-                         if (a.donnees or {}).get('decision_code')]
-                self.assertEqual(codes, ['abandonnee'])
-                self.assertFalse(any(a.succes for a in registre.actions))
-                self.assertFalse(outils_v2.tour_entierement_decide_par_le_code(registre, brut))
-                self.assertActif(self.q)
+        script = {b: {'intention': ('nouvelle_requete', 0.95)} for b in self.NOUVELLES}
+        with patch("services.agent_v2.jugement.juger", juger_script(script)):
+            for i, brut in enumerate(self.NOUVELLES):
+                with self.subTest(brut=brut):
+                    demande = puces(self.demande_portee(tache=f'f6:{i}'))
+                    self.attendre([demande], brut)
+                    registre = Registre()
+                    outils_v2.appliquer_choix_en_attente(self.user, registre, brut, f'f6:{i}')
+                    codes = [a.donnees.get('decision_code') for a in registre.actions
+                             if (a.donnees or {}).get('decision_code')]
+                    self.assertEqual(codes, ['abandonnee'])
+                    self.assertFalse(any(a.succes for a in registre.actions))
+                    self.assertFalse(outils_v2.tour_entierement_decide_par_le_code(registre, brut))
+                    self.assertActif(self.q)
