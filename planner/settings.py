@@ -15,6 +15,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 DEBUG = os.getenv('DEBUG', 'False').lower() in ('true', '1', 'yes')
 
+# Vrai sous `manage.py test` et sous pytest. Sert a couper tout appel sortant
+# par defaut dans la suite (un test qui veut exercer un client passe par
+# override_settings, jamais par les cles du poste) et a neutraliser les
+# reglages de transport qui n'ont aucun sens hors d'un vrai serveur.
+_EN_TEST = (len(sys.argv) > 1 and sys.argv[1] == 'test') or 'pytest' in sys.modules
+
 # SECRET_KEY (S1): never ship a hardcoded fallback in production.
 # Fail fast at boot when SECRET_KEY is missing and DEBUG is off; keep an
 # insecure default ONLY for local development (DEBUG=True).
@@ -207,7 +213,10 @@ CSRF_TRUSTED_ORIGINS = [
     if origin.strip()
 ]
 
-if not DEBUG:
+# Pas sous les tests: le client de test emet du http et recevrait un 301 sur
+# chaque requete. Mesure en CI le 2026-09-30, 203 assertions en echec, sur un
+# arbre propre.
+if not DEBUG and not _EN_TEST:
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
     SECURE_SSL_REDIRECT = True
     SESSION_COOKIE_SECURE = True
@@ -293,12 +302,6 @@ AGENT_V2_BUDGET_JETONS_JOUR = int(os.getenv('AGENT_V2_BUDGET_JETONS_JOUR', '2000
 # sans inscription). Quand il est epuise, le tour suggere la creation d'un
 # compte pour continuer (voir PROSE_BUDGET_JOUR_ANON dans agent.py).
 AGENT_V2_BUDGET_JETONS_JOUR_ANON = int(os.getenv('AGENT_V2_BUDGET_JETONS_JOUR_ANON', '400000'))
-
-# Vrai sous `manage.py test` et sous pytest. Sert a couper tout appel sortant
-# par defaut dans la suite: un test qui veut exercer un client passe par
-# override_settings, jamais par les cles du poste.
-_EN_TEST = (len(sys.argv) > 1 and sys.argv[1] == 'test') or 'pytest' in sys.modules
-
 
 # Couche de jugement (services/agent_v2/jugement.py): des decisions typees
 # (choice/score/noul) au lieu des regex d'intention ecrites a la main.

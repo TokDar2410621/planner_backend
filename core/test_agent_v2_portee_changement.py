@@ -242,3 +242,28 @@ class PorteeDuChangementTests(TransactionTestCase):
                                  location='B-210')
         effets = {o['id']: o.get('effet') for o in self._demandes(registre)[0]['options']}
         self.assertEqual(effets['serie']['parametres'].get('location'), 'B-210')
+
+
+class ReglagesDeTestTests(TransactionTestCase):
+    """Les reglages qui rendraient la suite rouge ou aveugle.
+
+    Mesure en CI le 2026-09-30: sans DEBUG dans l'environnement, DEBUG vaut
+    False, SECURE_SSL_REDIRECT s'active et le client de test recoit un 301 sur
+    chaque requete. 203 assertions en echec sur un arbre propre.
+    """
+
+    def test_la_redirection_https_est_neutralisee_sous_les_tests(self):
+        from django.conf import settings
+        self.assertTrue(getattr(settings, '_EN_TEST', False))
+        self.assertFalse(getattr(settings, 'SECURE_SSL_REDIRECT', False))
+
+    def test_une_requete_du_client_de_test_n_est_pas_redirigee(self):
+        """La preuve par l'usage, quel que soit DEBUG."""
+        reponse = self.client.get('/api/auth/me/')
+        self.assertNotEqual(reponse.status_code, 301)
+
+    def test_le_juge_est_coupe_du_reseau_sous_les_tests(self):
+        from django.conf import settings
+        self.assertEqual(settings.JEV_API_KEY, '')
+        self.assertEqual(settings.TYPESAFE_API_KEY, '')
+        self.assertEqual(settings.JUGEMENT_REPLI_LLM, '0')
