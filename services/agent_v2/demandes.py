@@ -502,6 +502,22 @@ def suppression_tranchee(message_brut) -> tuple[bool, bool]:
     return _noul(message_brut, "suppression", _jugement.q_suppression, True)
 
 
+def remplacant_annonce(message_brut) -> bool:
+    """Le message dit-il que quelque chose PREND LA PLACE d'autre chose ?
+
+    Prudent: sans decision claire du juge, on repond non, et l'appel du modele
+    passe comme avant. Un faux positif refuserait un renommage legitime.
+    """
+    message = str(message_brut or "").strip()
+    if not message:
+        return False
+    rep = _jugement.juger(
+        message, {"remplacant": _jugement.q_remplacant_annonce()}).get("remplacant") or {}
+    return (rep.get("statut") == _jugement.STATUT_DECISION
+            and rep.get("valeur") == "oui"
+            and float(rep.get("confiance") or 0) >= 0.9)
+
+
 def saut_suspect(message_brut) -> bool:
     """Un saut d'occurrence qui ressemble a une suppression large (« efface
     tout jeudi »). Le saut unique explicite (« saute mon gym demain ») passe.

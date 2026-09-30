@@ -54,6 +54,7 @@ from services.agent_v2.outils import outils_pour
 from services.agent_v2.prompts import prompt_agir
 from services.agent_v2.reconciliation import detecter_ecarts, reconcilier
 from services.agent_v2.importation import inscrire_import
+from services.agent_v2.rendu import plage
 from services.agent_v2.redaction import (LECTURES_RENDUES, ReponseDire,
                                          bloc_factuel, bloc_reste, composer,
                                          contient_question, marqueurs_bruts,
@@ -799,6 +800,14 @@ class PlannerAgentV2:
             # Round 6 (D5): « avant de toucher a ton horaire » serait faux
             # apres une mutation reussie; les faits parlent, puis la question.
             prose = "" if mutation_reussie else PROSE_REPRISE
+        if not question and not gagnant and mutation_reussie:
+            # Defaut B (prod du 2026-09-29): l'occurrence sautee, rien a la
+            # place, et la reponse souhaitait bonne chance. Le code demande.
+            manquant = self._remplacant_manquant(
+                user, self._message_brut or message, registre)
+            if manquant:
+                question, motif, chips = manquant, "remplacant_manquant", []
+
         annulee = (any(c.get("decision_code") == "annulee" for c in choix)
                    or any((a.donnees or {}).get("decision_code") == "annulee"
                           for a in registre.actions))
@@ -1203,6 +1212,40 @@ class PlannerAgentV2:
             return outil if action is not None and action.succes else ""
         except Exception:  # noqa: BLE001 - un filet ne casse pas un tour
             logger.warning("Lecture de secours illisible", exc_info=True)
+            return ""
+
+    def _remplacant_manquant(self, user: User, message: str,
+                             registre: Registre) -> str:
+        """Une occurrence sautee, rien a la place: quelle question poser ?
+
+        Rend la question, ou une chaine vide. La decision est SEMANTIQUE (juge
+        Jev): « annule mon cours de mardi » est un retrait legitime, et rien
+        ne doit etre demande. Seuil eleve, prudent dans le doute.
+        """
+        sauts = [a for a in registre.actions
+                 if a.succes and a.outil == "skip_block_occurrence"]
+        if not sauts:
+            return ""
+        if any(a.succes and a.outil in ("schedule_task_at",
+                                        "replace_block_occurrence",
+                                        "create_block")
+               for a in registre.actions):
+            return ""
+        try:
+            resultats = _jugement.juger(
+                message, {"remplacant": _jugement.q_remplacant_annonce()})
+            rep = (resultats or {}).get("remplacant") or {}
+            if (rep.get("statut") != _jugement.STATUT_DECISION
+                    or rep.get("valeur") != "oui"
+                    or float(rep.get("confiance") or 0) < 0.9):
+                return ""
+            donnees = sauts[-1].donnees or {}
+            debut, fin = donnees.get("start_time"), donnees.get("end_time")
+            if debut and fin:
+                return f"Tu mets quoi à la place, de {plage(debut, fin)} ?"
+            return "Tu mets quoi à la place ?"
+        except Exception:  # noqa: BLE001 - un filet ne casse pas un tour
+            logger.warning("Filet du remplacant illisible", exc_info=True)
             return ""
 
     def _reponse_rapide(self, user: User, message: str) -> str:

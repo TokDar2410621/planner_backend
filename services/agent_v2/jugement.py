@@ -195,6 +195,28 @@ def q_saut_ou_suppression() -> dict:
     }
 
 
+def q_remplacant_annonce() -> dict:
+    """Noul : le message annonce-t-il que quelque chose prend la place ?
+
+    Sert quand une occurrence vient d'etre sautee sans qu'aucun remplacant
+    soit place. Prudent: sans decision claire, le code ne demande rien, car
+    « annule mon cours de mardi » est un retrait legitime, sans remplacant.
+    """
+    return {
+        "type": TYPE_NOUL,
+        "instructions": (
+            "Ce message dit-il que quelque chose PREND LA PLACE de ce qui est "
+            "retire (un examen a la place du cours, une reunion a la place du "
+            "quart) ? Reponds non si la personne veut seulement retirer ou "
+            "annuler quelque chose, sans rien mettre a la place."
+        ),
+        "criteria": {
+            "oui": "quelque chose prend la place de ce qui est retire",
+            "non": "un simple retrait, rien a la place",
+        },
+    }
+
+
 def q_interaction_sociale() -> dict:
     """Noul : le message est-il une simple interaction sociale ?
 

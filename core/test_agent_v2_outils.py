@@ -66,7 +66,10 @@ class PariteDesOutilsTests(TestCase):
         # outils dont la description V2 differe de v1 est fige ici.
         self.assertEqual(
             set(outils_v2.DESCRIPTIONS_V2) | set(outils_v2.COMPLEMENTS_V2),
-            {"get_today_schedule", "optimize_week", "create_block", "update_block"},
+            {"get_today_schedule", "optimize_week", "create_block", "update_block",
+             # Les deux outils qu'on enchainait a la main pour un remplacement
+             # renvoient desormais vers replace_block_occurrence.
+             "skip_block_occurrence", "schedule_task_at"},
         )
 
     def test_chaque_schema_serialise_est_identique(self):

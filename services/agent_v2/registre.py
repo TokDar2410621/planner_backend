@@ -19,6 +19,7 @@ from services.agent.tools.base import ToolResult
 OUTILS_DE_MUTATION = {
     "create_block", "update_block", "delete_block", "clear_all_blocks",
     "skip_block_occurrence", "restore_block_occurrence",
+    "replace_block_occurrence",
     "create_task", "update_task", "delete_task", "complete_task",
     "schedule_task_at", "cancel_scheduled_block",
     "optimize_week", "organize_day",

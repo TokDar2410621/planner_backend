@@ -367,6 +367,7 @@ _FAMILLES = {
     "bloc_modifie": ("créneau modifié", "créneaux modifiés"),
     "bloc_supprime": ("créneau retiré de ton horaire", "créneaux retirés de ton horaire"),
     "occurrence_sautee": ("séance retirée pour une fois", "séances retirées pour une fois"),
+    "occurrence_remplacee": ("séance remplacée", "séances remplacées"),
     "occurrence_remise": ("séance remise", "séances remises"),
     "evenement_planifie": ("événement planifié", "événements planifiés"),
     "evenement_annule": ("événement annulé", "événements annulés"),
@@ -558,6 +559,26 @@ class _Narrateur:
         if jour_date is not None:
             texte += f", les autres {JOURS[jour_date.weekday()]}s restent"
         self.ajouter_fait(_Fait(texte + ".", "occurrence_sautee", titre))
+
+    def _ok_replace_block_occurrence(self, a, d, p):
+        """Un seul geste, une seule ligne: ce qui prend la place, et ce qui reste."""
+        remplace = _dict(d.get("remplace"))
+        sb = _dict(d.get("scheduled_block"))
+        nouveau = _txt(sb.get("title")) or _txt(p.get("replacement_title"))
+        ancien = _txt(remplace.get("title")) or _txt(p.get("title")) or "ce créneau"
+        iso = d.get("date") or p.get("date")
+        quand = self.quand(iso)
+        debut = sb.get("start_time") or p.get("start_time") or remplace.get("start_time")
+        fin = sb.get("end_time") or p.get("end_time") or remplace.get("end_time")
+        texte = f"{nouveau} prend la place de {ancien}"
+        if quand:
+            texte += f" {quand}"
+        if _hm(debut) and _hm(fin):
+            texte += f", de {plage(debut, fin)}"
+        jour_date = _date(iso)
+        if jour_date is not None:
+            texte += f". Les autres {JOURS[jour_date.weekday()]}s restent"
+        self.ajouter_fait(_Fait(texte + ".", "occurrence_remplacee", nouveau))
 
     def _ok_restore_block_occurrence(self, a, d, p):
         if d.get("restored") is False:
@@ -810,9 +831,11 @@ class _Narrateur:
                 self.sautes_create_block(a, d, p)
                 return
 
-        if outil == "schedule_task_at" and _dict(d.get("conflict")):
+        if outil in ("schedule_task_at", "replace_block_occurrence") \
+                and _dict(d.get("conflict")):
             c = _dict(d["conflict"])
-            titre = _txt(p.get("title")) or "cet événement"
+            titre = (_txt(p.get("title")) if outil == "schedule_task_at"
+                     else _txt(p.get("replacement_title"))) or "cet événement"
             texte = f"Je n'ai pas planifié {titre}"
             quand = self.quand(p.get("date"))
             if quand:
@@ -845,8 +868,10 @@ class _Narrateur:
             self.ajouter_refus(texte + ".")
             return
 
-        if outil in ("skip_block_occurrence", "restore_block_occurrence") and d.get("candidates"):
-            verbe = "retirer" if outil == "skip_block_occurrence" else "remettre"
+        if outil in ("skip_block_occurrence", "restore_block_occurrence",
+                     "replace_block_occurrence") and d.get("candidates"):
+            verbe = {"skip_block_occurrence": "retirer",
+                     "restore_block_occurrence": "remettre"}.get(outil, "remplacer")
             noms = [_txt(c.get("title")) for c in _dicts(d.get("candidates"))]
             quand = self.quand(p.get("date"))
             self.ajouter_refus(
@@ -955,7 +980,13 @@ class _Narrateur:
             if f.famille in vues:
                 continue
             vues.add(f.famille)
-            singulier, plurielle = _FAMILLES[f.famille]
+            formes = _FAMILLES.get(f.famille)
+            if formes is None:
+                # Une famille non declaree ne fait pas tomber la reponse
+                # entiere: ses faits restent detailles, ligne par ligne.
+                lignes.extend(g.texte for g in groupe)
+                continue
+            singulier, plurielle = formes
             total = sum(g.nombre for g in groupe)
             titres = []
             for g in groupe:
@@ -1040,6 +1071,7 @@ _VERBES_ECHEC = {
     "delete_block": ("supprimer", "ce créneau"),
     "clear_all_blocks": ("vider ton planning", ""),
     "skip_block_occurrence": ("retirer", "ce créneau pour une fois"),
+    "replace_block_occurrence": ("remplacer", "ce créneau pour une fois"),
     "restore_block_occurrence": ("remettre", "ce créneau"),
     "create_task": ("ajouter", "cette tâche"),
     "update_task": ("modifier", "cette tâche"),

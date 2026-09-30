@@ -690,8 +690,138 @@ class SkipBlockOccurrenceTool(BaseTool):
         )
         return ToolResult(
             success=True,
-            data={"date": target_date.isoformat(), "title": block.title, "block_type": block.block_type},
+            data={"date": target_date.isoformat(), "title": block.title,
+                  "block_type": block.block_type,
+                  # Le creneau libere: le code demande ce qui prend sa place
+                  # quand le message annoncait un remplacant.
+                  "start_time": block.start_time.strftime("%H:%M"),
+                  "end_time": block.end_time.strftime("%H:%M")},
             message=f"'{block.title}' ignoré le {DAY_NAMES[dow]} {target_date.isoformat()}. Le bloc récurrent reste actif les autres semaines.",
+        )
+
+
+class ReplaceBlockOccurrenceTool(BaseTool):
+    name = "replace_block_occurrence"
+    description = (
+        "Remplace UNE occurrence d'un bloc récurrent, à une date précise, par un "
+        "événement ponctuel : un examen à la place du cours, une réunion à la place "
+        "du quart, une sortie à la place du gym. Fait les DEUX gestes d'un coup et "
+        "dans le bon ordre : l'occurrence de ce jour-là est annulée (les autres "
+        "semaines restent en place), puis le remplaçant prend le créneau libéré. "
+        "Sans heures données, il reprend celles du bloc remplacé. N'enchaîne jamais "
+        "skip_block_occurrence puis schedule_task_at pour ça, et n'utilise jamais "
+        "update_block, qui renommerait ou déplacerait TOUTE la série. Résous "
+        "toi-même le bloc visé avec la date, le type et le titre; ne demande jamais "
+        "d'identifiant."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "date": {
+                "type": "string",
+                "description": "Date de l'occurrence remplacée (YYYY-MM-DD). Déduis-la de la DATE du jour.",
+            },
+            "replacement_title": {
+                "type": "string",
+                "description": "Titre de ce qui prend la place (ex: 'Examen').",
+            },
+            "block_type": {
+                "type": "string",
+                "enum": _BLOCK_TYPE_ENUM,
+                "description": "Type du bloc remplacé ce jour-là (ex: 'course'). Fortement recommandé pour cibler le bon bloc.",
+            },
+            "title": {
+                "type": "string",
+                "description": "Titre (ou fragment) du bloc REMPLACÉ, si plusieurs blocs partagent le même jour.",
+            },
+            "start_time": {
+                "type": "string",
+                "description": "Heure de début du remplaçant (HH:MM). Par défaut celle du bloc remplacé.",
+            },
+            "end_time": {
+                "type": "string",
+                "description": "Heure de fin du remplaçant (HH:MM). Par défaut celle du bloc remplacé.",
+            },
+        },
+        "required": ["date", "replacement_title"],
+    }
+
+    def execute(self, user: User, **kwargs) -> ToolResult:
+        from django.db import transaction
+
+        from .schedule import ScheduleTaskAtTool
+
+        remplacant = (kwargs.get("replacement_title") or "").strip()
+        if not remplacant:
+            return ToolResult(success=False, data={},
+                              message="Titre du remplaçant requis.")
+
+        target_date, err = _parse_occurrence(kwargs)
+        if err:
+            return err
+
+        dow = target_date.weekday()
+        block_type = kwargs.get("block_type")
+        matches = _resolve_day_blocks(user, target_date, block_type, kwargs.get("title"))
+        if not matches:
+            kind = f" '{block_type}'" if block_type else ""
+            return ToolResult(
+                success=False,
+                data={},
+                message=(f"Aucun bloc récurrent{kind} le {DAY_NAMES[dow]} "
+                         f"{target_date.isoformat()}. Rien à remplacer."),
+            )
+        if len(matches) > 1:
+            candidates = _candidates_payload(matches, dow)
+            listing = "; ".join(f"{c['title']} ({c['start_time']}-{c['end_time']})"
+                                for c in candidates)
+            return ToolResult(
+                success=False,
+                data={"candidates": candidates},
+                message=(f"Plusieurs blocs le {DAY_NAMES[dow]}: {listing}. "
+                         "Précise lequel (par titre)."),
+            )
+
+        block = matches[0]
+        debut = (kwargs.get("start_time") or "").strip() or block.start_time.strftime("%H:%M")
+        fin = (kwargs.get("end_time") or "").strip() or block.end_time.strftime("%H:%M")
+
+        # L'ordre compte: libérer AVANT de placer. Dans l'autre sens, le bloc
+        # qu'on remplace est lui-même compté comme un conflit et le placement
+        # échoue (parcours vécu le 2026-09-29).
+        with transaction.atomic():
+            RecurringBlockException.objects.get_or_create(
+                user=user, recurring_block=block, date=target_date)
+            place = ScheduleTaskAtTool().execute(
+                user, title=remplacant, date=target_date.isoformat(),
+                start_time=debut, end_time=fin,
+                description=kwargs.get("description", ""))
+            if not place.success:
+                # Tout ou rien: sans remplaçant placé, l'occurrence reste.
+                transaction.set_rollback(True)
+
+        if not place.success:
+            return ToolResult(
+                success=False,
+                data=dict(place.data or {}),
+                message=(f"{remplacant} n'a pas pu prendre la place de "
+                         f"'{block.title}': {place.message}"),
+            )
+
+        donnees = dict(place.data or {})
+        donnees["date"] = target_date.isoformat()
+        donnees["remplace"] = {
+            "title": block.title,
+            "block_type": block.block_type,
+            "start_time": block.start_time.strftime("%H:%M"),
+            "end_time": block.end_time.strftime("%H:%M"),
+        }
+        return ToolResult(
+            success=True,
+            data=donnees,
+            message=(f"'{remplacant}' prend la place de '{block.title}' le "
+                     f"{DAY_NAMES[dow]} {target_date.isoformat()} de {debut} à "
+                     f"{fin}. Le bloc récurrent reste actif les autres semaines."),
         )
 
 
