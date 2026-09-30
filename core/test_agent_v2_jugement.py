@@ -207,7 +207,7 @@ class JugementRepliTests(SimpleTestCase):
         jugement.vider_cache()
 
     def test_sans_cle_le_repli_llm_tranche(self):
-        with override_settings(JEV_API_KEY=""):
+        with override_settings(JEV_API_KEY="", JUGEMENT_REPLI_LLM="1"):
             with patch("services.agent_v2.jugement._juger_llm",
                        return_value={"s": {"valeur": True, "confiance": 0.9,
                                            "probabilites": None}}):

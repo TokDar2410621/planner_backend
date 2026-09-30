@@ -25,6 +25,7 @@ import logging
 import queue
 import re
 import time
+from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Optional
@@ -53,6 +54,7 @@ from services.agent_v2.outils import outils_pour
 from services.agent_v2.prompts import prompt_agir
 from services.agent_v2.reconciliation import detecter_ecarts, reconcilier
 from services.agent_v2.importation import inscrire_import
+from services.agent_v2.rendu import plage
 from services.agent_v2.redaction import (LECTURES_RENDUES, ReponseDire,
                                          bloc_factuel, bloc_reste, composer,
                                          contient_question, marqueurs_bruts,
@@ -175,6 +177,15 @@ CHIPS_MAX = 4
 REPLI_PROSE = "Voici ce qui a changé. Dis-moi si tu veux autre chose."
 REPLI_PROSE_LECTURE = "Dis-moi si tu veux autre chose."
 REPLI_QUESTION = "Je n'ai pas compris. Tu veux ajouter, déplacer ou voir quelque chose ?"
+# Quand la boucle a ANNONCE une liste sans la montrer et que le juge n'a pas
+# tranche ce qu'il fallait lire: on demande quoi voir, on ne dit pas qu'on n'a
+# pas compris (defaut A, prod du 2026-09-29).
+REPLI_LISTE = "Tu veux voir quoi : ta journée, ta semaine ou tes tâches ?"
+CHIPS_LISTE = [
+    {"label": "Ma journée", "value": "Montre-moi ma journée"},
+    {"label": "Ma semaine", "value": "Montre-moi ma semaine"},
+    {"label": "Mes tâches", "value": "Montre-moi mes tâches"},
+]
 PROSE_FORMULAIRE = "Il me manque quelques précisions."
 PROSE_REPRISE = "Il me faut juste cette précision avant de toucher à ton horaire."
 PROSE_ANNULEE = "D'accord, je ne change rien."
@@ -789,6 +800,14 @@ class PlannerAgentV2:
             # Round 6 (D5): « avant de toucher a ton horaire » serait faux
             # apres une mutation reussie; les faits parlent, puis la question.
             prose = "" if mutation_reussie else PROSE_REPRISE
+        if not question and not gagnant and mutation_reussie:
+            # Defaut B (prod du 2026-09-29): l'occurrence sautee, rien a la
+            # place, et la reponse souhaitait bonne chance. Le code demande.
+            manquant = self._remplacant_manquant(
+                user, self._message_brut or message, registre)
+            if manquant:
+                question, motif, chips = manquant, "remplacant_manquant", []
+
         annulee = (any(c.get("decision_code") == "annulee" for c in choix)
                    or any((a.donnees or {}).get("decision_code") == "annulee"
                           for a in registre.actions))
@@ -817,7 +836,27 @@ class PlannerAgentV2:
             else:
                 prose, motif = PROSE_BUDGET_JOUR, "budget_jour"
         elif not faits and not prose and not question and not formulaire:
-            question, motif, chips = REPLI_QUESTION, "dire", []
+            # La boucle a repondu mais n'a ni lu ni mute, et sa prose est
+            # tombee: avant de dire qu'on n'a pas compris, le code lit ce que
+            # la personne voulait voir (defaut A, prod du 2026-09-29).
+            rien_lu = not any(a.succes and (a.est_mutation
+                                            or a.outil in LECTURES_RENDUES)
+                              for a in registre.actions)
+            outil_secours = ""
+            if reponse_boucle is not None and rien_lu:
+                outil_secours = self._lecture_de_secours(
+                    user, self._message_brut or message, registre)
+            if outil_secours:
+                faits = sans_tiret_long(bloc_factuel(registre) or "")
+                motif = "lecture_secours"
+            if faits:
+                emis.append(faits)
+                yield {"type": "delta", "text": faits}
+            elif compo.lecture_sans_liste:
+                question, motif = REPLI_LISTE, "dire"
+                chips = [dict(c) for c in CHIPS_LISTE]
+            else:
+                question, motif, chips = REPLI_QUESTION, "dire", []
 
         if prose:
             morceau = ("\n\n" if emis else "") + prose
@@ -858,7 +897,8 @@ class PlannerAgentV2:
             logging.WARNING if anormal else logging.INFO,
             "agent_v2 tour actions=%d rejetees=%d fuites=%d supprimees=%d ecarts=%d%s"
             " boucle=%.1fs/%dep/%d->%dj/r%d/c%d verif=%.2fs"
-            " asked=%d form=%d choices=%d read_without_list=%d raw_marker_count=%d"
+            " asked=%d form=%d choices=%d read_without_list=%d redites=%d"
+            " raw_marker_count=%d"
             " motif=%s choix_code=%d chemin=%s tour=%.2fs",
             len(registre.actions),
             rejetees,
@@ -882,6 +922,7 @@ class PlannerAgentV2:
             1 if formulaire else 0,
             len(quick_replies),
             1 if lecture_sans_liste else 0,
+            compo.redites,
             len(marqueurs),
             motif or "-",
             choix_code,
@@ -919,6 +960,7 @@ class PlannerAgentV2:
             "faits_rendus": faits,
             "raw_markers": marqueurs,
             "lecture_sans_liste": lecture_sans_liste,
+            "redites": compo.redites,
             # Le nom que l'utilisateur a donne au cours du formulaire du code:
             # au tour de la reponse, create_block le garde (outils.py).
             "formulaire_nom": next((str((a.donnees or {}).get("nom") or "")
@@ -1133,6 +1175,78 @@ class PlannerAgentV2:
         except Exception:  # noqa: BLE001 - dans le doute, la boucle tourne
             logger.warning("Voie rapide sociale illisible", exc_info=True)
             return False
+
+    def _lecture_de_secours(self, user: User, message: str,
+                            registre: Registre) -> str:
+        """Le tour n'a rien lu ni mute: le code lit ce que la personne veut voir.
+
+        La decision est SEMANTIQUE (juge Jev, question typee), jamais une liste
+        de mots. Seuil eleve (0.9): afficher une liste que personne n'a
+        demandee est pire que poser la question. Rend le nom de l'outil
+        execute, ou une chaine vide.
+        """
+        from services.agent_v2 import outils as _outils
+        outil_de = {
+            "journee": ("get_today_schedule", {}),
+            "demain": ("get_today_schedule",
+                       {"date": (timezone.localdate()
+                                 + timedelta(days=1)).isoformat()}),
+            "semaine": ("get_week_schedule", {}),
+            "taches": ("list_tasks", {}),
+        }
+        try:
+            resultats = _jugement.juger(
+                message, {"consultation": _jugement.q_consultation()})
+            rep = (resultats or {}).get("consultation") or {}
+            if rep.get("statut") != _jugement.STATUT_DECISION:
+                return ""
+            if float(rep.get("confiance") or 0) < 0.9:
+                return ""
+            choix = outil_de.get(str(rep.get("valeur") or ""))
+            if choix is None:
+                return ""
+            outil, parametres = choix
+            action = _outils.executer_lecture_par_le_code(
+                user, registre, outil, tache=self._tache, message=message,
+                brut=message, **parametres)
+            return outil if action is not None and action.succes else ""
+        except Exception:  # noqa: BLE001 - un filet ne casse pas un tour
+            logger.warning("Lecture de secours illisible", exc_info=True)
+            return ""
+
+    def _remplacant_manquant(self, user: User, message: str,
+                             registre: Registre) -> str:
+        """Une occurrence sautee, rien a la place: quelle question poser ?
+
+        Rend la question, ou une chaine vide. La decision est SEMANTIQUE (juge
+        Jev): « annule mon cours de mardi » est un retrait legitime, et rien
+        ne doit etre demande. Seuil eleve, prudent dans le doute.
+        """
+        sauts = [a for a in registre.actions
+                 if a.succes and a.outil == "skip_block_occurrence"]
+        if not sauts:
+            return ""
+        if any(a.succes and a.outil in ("schedule_task_at",
+                                        "replace_block_occurrence",
+                                        "create_block")
+               for a in registre.actions):
+            return ""
+        try:
+            resultats = _jugement.juger(
+                message, {"remplacant": _jugement.q_remplacant_annonce()})
+            rep = (resultats or {}).get("remplacant") or {}
+            if (rep.get("statut") != _jugement.STATUT_DECISION
+                    or rep.get("valeur") != "oui"
+                    or float(rep.get("confiance") or 0) < 0.9):
+                return ""
+            donnees = sauts[-1].donnees or {}
+            debut, fin = donnees.get("start_time"), donnees.get("end_time")
+            if debut and fin:
+                return f"Tu mets quoi à la place, de {plage(debut, fin)} ?"
+            return "Tu mets quoi à la place ?"
+        except Exception:  # noqa: BLE001 - un filet ne casse pas un tour
+            logger.warning("Filet du remplacant illisible", exc_info=True)
+            return ""
 
     def _reponse_rapide(self, user: User, message: str) -> str:
         """Repond a une interaction sociale sans la boucle lourde.

@@ -93,7 +93,8 @@ MESSAGE_DEJA_TRANCHE = (
 DEJA_FAIT = "Deja fait par le code ce tour."
 
 DESTRUCTIFS = {"delete_block", "clear_all_blocks", "delete_task", "cancel_scheduled_block"}
-CREATEURS = {"create_block", "schedule_task_at", "create_task"}
+CREATEURS = {"create_block", "schedule_task_at", "create_task",
+             "replace_block_occurrence"}
 # Au-dela de cinq creations dans un tour, on demande avant de continuer.
 SEUIL_CREATIONS = 5
 
@@ -101,7 +102,9 @@ AUTORISANTES = {
     "destructif": {"confirmer"},
     "optimisation": {"confirmer"},
     "creation_en_masse": {"confirmer"},
-    "portee_jour": {"delete_block": {"serie"}, "skip_block_occurrence": {"occurrence"}},
+    "portee_jour": {"delete_block": {"serie"},
+                    "skip_block_occurrence": {"occurrence"},
+                    "replace_block_occurrence": {"occurrence"}},
 }
 MOTIFS_GARDES = {"portee_jour", "destructif", "creation_en_masse", "optimisation"}
 
@@ -1438,6 +1441,39 @@ def _date_passee(nom: str, kwargs: dict):
                  f"c'est le {aujourdhui.isoformat()}. Verifie le jour et l'annee, puis refais l'appel."))
 
 
+def _renommage_pour_un_remplacement(ctx: _Contexte, nom: str, kwargs: dict):
+    """Renommer la serie alors que le message parle d'un remplacement ponctuel.
+
+    update_block porte sur TOUTE la serie. Si le message dit que quelque chose
+    prend la place d'autre chose (« examen a la place du cours »), le geste
+    juste est replace_block_occurrence. La decision est SEMANTIQUE (juge Jev),
+    jamais une liste de mots; sans decision claire, l'appel passe comme avant.
+    """
+    from core.models import RecurringBlock
+
+    if nom != "update_block":
+        return None
+    titre = str(kwargs.get("title") or "").strip()
+    if not titre:
+        return None
+    bid = _entier(kwargs.get("block_id"))
+    if bid is None:
+        return None
+    block = RecurringBlock.objects.filter(id=bid, user=ctx.user, active=True).first()
+    if block is None or block.title == titre:
+        return None
+    if not dem.remplacant_annonce(ctx.texte):
+        return None
+    return ToolResult(
+        success=False,
+        data={"remplacement_ponctuel": True, "block_id": bid},
+        message=("Refuse par le code: update_block renommerait CHAQUE semaine, or "
+                 "le message parle d'un remplacement a une date. Utilise "
+                 "replace_block_occurrence (date, replacement_title, title du bloc "
+                 "remplace): il libere l'occurrence et place le remplacant, en "
+                 "gardant la serie intacte."))
+
+
 # --------------------------------------------------- echeance sans jour choisi
 
 _JOURS_RE = "lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche"
@@ -1698,7 +1734,7 @@ def _crees_ce_tour(registre: Registre) -> tuple[int, list[str]]:
                 if isinstance(cree, dict):
                     _noter(("bloc", cree.get("id"), a.id if cree.get("id") is None else None),
                            cree.get("title"))
-        elif a.outil == "schedule_task_at":
+        elif a.outil in ("schedule_task_at", "replace_block_occurrence"):
             sb = donnees.get("scheduled_block") or {}
             _noter(("evenement", sb.get("id") or a.id), sb.get("title"))
         elif a.outil == "create_task" and not donnees.get("deja_presente"):
@@ -2129,6 +2165,8 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
             if issue is None:
                 issue = _date_passee(nom, kwargs)
             if issue is None:
+                issue = _renommage_pour_un_remplacement(ctx, nom, kwargs)
+            if issue is None:
                 issue = _refus_heure_armee(ctx, nom, kwargs, prep)
             if issue is None:
                 issue = _heure_dite_ignoree(ctx, nom, kwargs, prep)
@@ -2345,18 +2383,20 @@ OUTILS_QUESTION = frozenset({"poser_question", "present_choices"})
 # d'origine pour les utilisateurs non migres. Les regles d'usage qui vivaient
 # dans REGLES_AGIR demenagent ici, sans vocabulaire declencheur.
 DESCRIPTIONS_V2 = {
-    # Remplacement complet: l'ancienne description ordonnait de consulter
-    # l'outil avant d'affirmer quoi que ce soit, ce qui le faisait appeler a
-    # chaque tour pour aujourd'hui alors que le planning du jour est deja
-    # dans le prompt.
+    # Remplacement complet, par USAGE et non par date (defaut mesure en prod
+    # le 2026-09-29): interdire cet outil pour aujourd'hui, alors que la prose
+    # n'a pas le droit de recopier le contexte, privait « montre-moi ma
+    # journee » de tout chemin et servait un repli « je n'ai pas compris ».
     "get_today_schedule": (
-        "Recupere le planning EFFECTIF d'un AUTRE jour qu'aujourd'hui "
-        "(blocs recurrents aux heures PLACEES, taches planifiees, creneaux "
-        "libres; parametre date, defaut = aujourd'hui, que tu ne dois jamais "
-        "utiliser). Le planning d'AUJOURD'HUI est deja dans ton prompt "
-        "(PLANNING AUJOURD'HUI), a l'etat effectif: fie-toi a lui tel quel et "
-        "ne rappelle jamais cet outil pour aujourd'hui. Consulte-le avant "
-        "d'affirmer ou se trouve une activite un autre jour ou si elle a "
+        "Lit le planning EFFECTIF d'UN jour (blocs recurrents aux heures "
+        "PLACEES, occurrences annulees exclues, taches planifiees, creneaux "
+        "libres; parametre date AAAA-MM-JJ, defaut = aujourd'hui). "
+        "APPELLE-LE des que la personne veut VOIR une journee, aujourd'hui "
+        "comprise: le systeme affiche la liste au-dessus de ta reponse et tu "
+        "ne la recris jamais. Pour seulement RAISONNER sur aujourd'hui "
+        "(placer quelque chose, verifier une heure), le PLANNING AUJOURD'HUI "
+        "de ton prompt suffit: inutile de le relire. Pour un AUTRE jour, "
+        "consulte-le avant d'affirmer ou se trouve une activite ou si elle a "
         "bouge, et parle des heures effectives, jamais de memoire ni d'apres "
         "l'historique (un bloc souple peut etre place a une autre heure que "
         "son heure habituelle)."
@@ -2364,6 +2404,17 @@ DESCRIPTIONS_V2 = {
 }
 
 COMPLEMENTS_V2 = {
+    "skip_block_occurrence": (
+        "Si quelque chose PREND LA PLACE de l'occurrence ce jour-la (examen a la "
+        "place du cours, reunion a la place du quart), n'utilise pas cet outil: "
+        "replace_block_occurrence libere le creneau ET place le remplacant en un "
+        "seul geste."
+    ),
+    "schedule_task_at": (
+        "Si l'evenement PREND LA PLACE de l'occurrence d'un bloc recurrent ce "
+        "jour-la, n'utilise pas cet outil seul: replace_block_occurrence libere le "
+        "creneau ET place l'evenement en un seul geste, dans le bon ordre."
+    ),
     "optimize_week": (
         "apply=true seulement apres confirmation explicite de l'utilisateur: "
         "propose toujours d'abord avec apply=false."
@@ -2437,6 +2488,32 @@ def _sans_boucle(fabrique):
     except RuntimeError:
         return asyncio.run(fabrique())
     return _POOL_CHOIX.submit(lambda: asyncio.run(fabrique())).result()
+
+
+# Les seules lectures que le code s'autorise a executer lui-meme (filet de
+# consultation, agent.py). Le code ne MUTE jamais a la place du modele.
+LECTURES_DU_CODE = frozenset({"get_today_schedule", "get_week_schedule",
+                              "list_tasks"})
+
+
+def executer_lecture_par_le_code(user: User, registre: Registre, outil: str,
+                                 tache: str = "", message: str = "",
+                                 brut: str = "", **kwargs):
+    """Execute une LECTURE au nom du code et l'inscrit au registre.
+
+    Toute ecriture faite hors de la boucle d'outils doit entrer au registre,
+    sinon la phase de rendu la nie; une lecture suit la meme regle, c'est elle
+    qui fera la liste affichee.
+    """
+    if outil not in LECTURES_DU_CODE:
+        raise ValueError(f"lecture refusee au code: {outil}")
+    par_nom = {t.name: t for t in outils_pour(
+        user, registre, message_du_tour=message, tache=tache, message_brut=brut)}
+    tool = par_nom.get(outil)
+    if tool is None:
+        return None
+    _sans_boucle(lambda: tool.function_schema.function(**kwargs))
+    return registre.actions[-1] if registre.actions else None
 
 
 def _effet_valide(demande: dict, option: str, effet: dict) -> bool:

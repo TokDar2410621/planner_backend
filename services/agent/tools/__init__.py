@@ -17,6 +17,7 @@ from .blocks import (
     DeleteBlockTool,
     ClearAllBlocksTool,
     SkipBlockOccurrenceTool,
+    ReplaceBlockOccurrenceTool,
     RestoreBlockOccurrenceTool,
 )
 from .tasks import ListTasksTool, CreateTaskTool, UpdateTaskTool, DeleteTaskTool, CompleteTaskTool
@@ -48,6 +49,7 @@ ALL_TOOLS: list[BaseTool] = [
     DeleteBlockTool(),
     ClearAllBlocksTool(),
     SkipBlockOccurrenceTool(),
+    ReplaceBlockOccurrenceTool(),
     RestoreBlockOccurrenceTool(),
     # Tasks
     ListTasksTool(),
@@ -92,7 +94,10 @@ TOOL_MAP: dict[str, BaseTool] = {tool.name: tool for tool in ALL_TOOLS}
 # done.quick_replies; v1 n'a pas ce relais et poserait une question sans
 # boutons. Ils restent dans ALL_TOOLS (v2 les expose via
 # services/agent_v2/outils.py) mais sortent de toute liste offerte a v1.
-V2_SEULEMENT = {"present_choices", "poser_question"}
+V2_SEULEMENT = {"present_choices", "poser_question",
+                # Outil compose ajoute pour la boucle unique: v2 le rend en une
+                # ligne de faits, v1 ne le connait pas.
+                "replace_block_occurrence"}
 
 
 def get_tools_for_claude() -> list[dict]:

@@ -26,6 +26,7 @@ LECTURES: dict[str, str] = {
     "delete_block": "list_blocks",
     "clear_all_blocks": "list_blocks",
     "skip_block_occurrence": "get_today_schedule",
+    "replace_block_occurrence": "get_today_schedule",
     "restore_block_occurrence": "get_today_schedule",
     "create_task": "list_tasks",
     "update_task": "list_tasks",
@@ -45,6 +46,10 @@ LECTURES: dict[str, str] = {
 CHEMINS_DATE: dict[str, tuple] = {
     "schedule_task_at": ("scheduled_block", "date"),
     "skip_block_occurrence": ("date",),
+    # Les heures et le titre se lisent a cote de la date (chemin de longueur
+    # 2): au premier niveau, l'ecart « cree dans le passe » sortirait sans
+    # heures ni titre.
+    "replace_block_occurrence": ("scheduled_block", "date"),
     "restore_block_occurrence": ("date",),
     "organize_day": ("date",),
     "optimize_week": ("start_date",),

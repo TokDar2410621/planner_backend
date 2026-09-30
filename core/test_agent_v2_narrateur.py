@@ -243,6 +243,78 @@ class ComposerTests(SimpleTestCase):
         self.assertEqual(compo.prose, "Voici ta semaine.")
         self.assertFalse(compo.lecture_sans_liste)
 
+    # ── (g) un seul narrateur des listes (defaut C, prod du 2026-09-29) ──
+
+    FAITS_MARDI = (
+        "**Mardi** (aujourd'hui)\n"
+        "- 8 h à 11 h · Conception d’applications\n"
+        "- 13 h à 16 h · L’entreprise et ses systèmes"
+    )
+
+    def _registre_lecture(self, outil="get_today_schedule"):
+        """Un tour de lecture pure. Les titres portent l'apostrophe courbe de
+        la base; la prose du modele ecrit l'apostrophe droite."""
+        r = Registre()
+        r.ajouter(outil, {}, ToolResult(success=True, message="ok", data={
+            "date": "2026-09-29",
+            "blocks": [
+                {"title": "Conception d’applications",
+                 "start_time": "08:00", "end_time": "11:00"},
+                {"title": "L’entreprise et ses systèmes",
+                 "start_time": "13:00", "end_time": "16:00"},
+            ]}))
+        return r
+
+    def test_liste_affichee_la_prose_ne_la_redit_pas(self):
+        """La reponse vue en prod: le code affiche la liste, la prose la redit."""
+        brut = ReponseDire(
+            ouverture="Voici ton mardi !",
+            suite=("Deux cours au programme, Conception d'applications de 8 h à "
+                   "11 h puis L'entreprise et ses systèmes de 13 h à 16 h. "
+                   "Pense à souper avant."))
+        compo = composer(brut, self._registre_lecture(), self.FAITS_MARDI, None)
+        self.assertEqual(compo.prose, "Pense à souper avant.")
+        self.assertEqual(compo.redites, 2)
+
+    def test_un_conseil_qui_nomme_un_element_sans_son_heure_survit(self):
+        brut = ReponseDire(
+            ouverture="Pense à souper avant L'entreprise et ses systèmes.")
+        compo = composer(brut, self._registre_lecture(), self.FAITS_MARDI, None)
+        self.assertEqual(compo.prose,
+                         "Pense à souper avant L'entreprise et ses systèmes.")
+        self.assertEqual(compo.redites, 0)
+
+    def test_l_apostrophe_courbe_de_la_base_rejoint_la_droite_de_la_prose(self):
+        """Sans la normalisation de _plat, le titre de la base et celui de la
+        prose ne se rapprochent pas, et la redite passe."""
+        brut = ReponseDire(ouverture="Conception d'applications de 8 h à 11 h.")
+        compo = composer(brut, self._registre_lecture(), self.FAITS_MARDI, None)
+        self.assertEqual(compo.prose, "")
+        self.assertEqual(compo.redites, 1)
+
+    def test_un_tour_qui_a_mute_garde_sa_prose(self):
+        """« Conception passe a 14 h » nomme un titre et une heure sans rien
+        redire: la regle (g) ne vaut que pour les tours de lecture pure."""
+        r = self._registre_lecture()
+        r.ajouter("update_block", {}, ToolResult(success=True, message="ok",
+                                                 data={"block_id": 7}))
+        brut = ReponseDire(
+            ouverture="Conception d'applications passe à 14 h.", refs=["a2"])
+        compo = composer(brut, r, self.FAITS_MARDI, None)
+        self.assertEqual(compo.prose, "Conception d'applications passe à 14 h.")
+        self.assertEqual(compo.redites, 0)
+
+    def test_creneaux_libres_affiches_la_prose_ne_les_annonce_pas(self):
+        r = Registre()
+        r.ajouter("find_free_slots", {}, ToolResult(
+            success=True, message="ok",
+            data={"date": "2026-09-29", "free_slots": []}))
+        brut = ReponseDire(ouverture="Voici tes créneaux libres.",
+                           suite="Le matin te laisse le plus de marge.")
+        compo = composer(brut, r, "Libre mardi : 11 h à 13 h", None)
+        self.assertEqual(compo.prose, "Le matin te laisse le plus de marge.")
+        self.assertEqual(compo.redites, 1)
+
     def test_un_compte_en_mots_est_aussi_un_compte(self):
         compo = composer(ReponseDire(ouverture="Tu as deux blocs demain."), Registre(), "", None)
         self.assertEqual(compo.prose, "")
@@ -616,7 +688,8 @@ class NarrateurUniqueTests(NarrateurBase):
 class MesureTests(NarrateurBase):
     LIGNE = re.compile(
         r"agent_v2 tour actions=\d+ rejetees=\d+ fuites=\d+ supprimees=\d+ ecarts=\d+.*"
-        r" asked=[01] form=[01] choices=\d read_without_list=[01] raw_marker_count=\d+"
+        r" asked=[01] form=[01] choices=\d read_without_list=[01] redites=\d+"
+        r" raw_marker_count=\d+"
         r" motif=\S+ choix_code=\d+")
 
     def test_metadonnees_et_compteurs(self):

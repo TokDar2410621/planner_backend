@@ -195,6 +195,28 @@ def q_saut_ou_suppression() -> dict:
     }
 
 
+def q_remplacant_annonce() -> dict:
+    """Noul : le message annonce-t-il que quelque chose prend la place ?
+
+    Sert quand une occurrence vient d'etre sautee sans qu'aucun remplacant
+    soit place. Prudent: sans decision claire, le code ne demande rien, car
+    « annule mon cours de mardi » est un retrait legitime, sans remplacant.
+    """
+    return {
+        "type": TYPE_NOUL,
+        "instructions": (
+            "Ce message dit-il que quelque chose PREND LA PLACE de ce qui est "
+            "retire (un examen a la place du cours, une reunion a la place du "
+            "quart) ? Reponds non si la personne veut seulement retirer ou "
+            "annuler quelque chose, sans rien mettre a la place."
+        ),
+        "criteria": {
+            "oui": "quelque chose prend la place de ce qui est retire",
+            "non": "un simple retrait, rien a la place",
+        },
+    }
+
+
 def q_interaction_sociale() -> dict:
     """Noul : le message est-il une simple interaction sociale ?
 
@@ -216,6 +238,32 @@ def q_interaction_sociale() -> dict:
         "criteria": {
             "oui": "simple interaction sociale, rien d'autre attendu",
             "non": "le message demande ou implique autre chose",
+        },
+    }
+
+
+def q_consultation() -> dict:
+    """Choice : la personne demande-t-elle a VOIR quelque chose, et quoi ?
+
+    Sert au filet de lecture (agent.py) quand la boucle n'a rien lu ni mute.
+    En cas de doute, le code pose une question plutot que d'afficher ce que
+    personne n'a demande.
+    """
+    return {
+        "type": TYPE_CHOICE,
+        "instructions": (
+            "La personne demande-t-elle a VOIR son horaire ou ses taches, et "
+            "quoi exactement ? Reponds 'aucune' si elle demande autre chose "
+            "(agir sur le planning, discuter, saluer). En cas de doute, "
+            "choisis incertain."
+        ),
+        "options": {
+            "journee": "voir sa journee d'aujourd'hui",
+            "demain": "voir la journee de demain",
+            "semaine": "voir sa semaine",
+            "taches": "voir ses taches",
+            "aucune": "elle ne demande pas a voir son horaire ni ses taches",
+            "incertain": "impossible a trancher",
         },
     }
 
