@@ -159,7 +159,7 @@ _COMPTE_NU = re.compile(
     re.IGNORECASE)
 OPTIONS_MAX = 4
 # Les questions du code apres lesquelles la prose de DIRE ne s'affiche pas.
-MOTIFS_CODE_SEUL = frozenset({"destructif", "portee_jour"})
+MOTIFS_CODE_SEUL = frozenset({"destructif", "portee_jour", "portee_changement"})
 
 
 @dataclass

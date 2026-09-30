@@ -157,7 +157,8 @@ def demandes_en_attente(user, maintenant=None) -> list[dict]:
 #    elle ne dit rien d'autre que garder ou annuler. Tout le reste ne donne
 #    aucune option: le code repose la question une fois, puis l'abandonne.
 
-MOTIFS_LECTURE_LIBRE = {"destructif", "creation_en_masse", "optimisation", "portee_jour"}
+MOTIFS_LECTURE_LIBRE = {"destructif", "creation_en_masse", "optimisation",
+                        "portee_jour", "portee_changement"}
 # Round 8 (F4): un oui clair confirme ce qui ne detruit rien. Seule la creation
 # en masse en fait partie. « heure_refusee » n'a pas d'option « confirmer »:
 # un oui ne dit pas QUEL creneau, et en choisir un changerait l'heure a la
@@ -502,19 +503,20 @@ def suppression_tranchee(message_brut) -> tuple[bool, bool]:
     return _noul(message_brut, "suppression", _jugement.q_suppression, True)
 
 
-def remplacant_annonce(message_brut) -> bool:
-    """Le message dit-il que quelque chose PREND LA PLACE d'autre chose ?
+def serie_entiere_visee(message_brut) -> bool:
+    """La personne vise-t-elle clairement TOUTE la serie ?
 
-    Prudent: sans decision claire du juge, on repond non, et l'appel du modele
-    passe comme avant. Un faux positif refuserait un renommage legitime.
+    Vrai seulement sur une decision nette du juge : c'est ce qui DISPENSE de
+    poser la question de portee. Juge muet ou incertain, on pose la question.
     """
     message = str(message_brut or "").strip()
     if not message:
         return False
     rep = _jugement.juger(
-        message, {"remplacant": _jugement.q_remplacant_annonce()}).get("remplacant") or {}
+        message,
+        {"portee": _jugement.q_portee_changement()}).get("portee") or {}
     return (rep.get("statut") == _jugement.STATUT_DECISION
-            and rep.get("valeur") == "oui"
+            and rep.get("valeur") == "serie"
             and float(rep.get("confiance") or 0) >= 0.9)
 
 

@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import logging
 from typing import Any, Optional
 
@@ -51,8 +50,11 @@ STATUT_INDISPONIBLE = "indisponible"  # Jev puis le repli ont echoue
 def _cle_jev() -> str:
     # Convention officielle des SDK TypeSafe: TYPESAFE_API_KEY. JEV_API_KEY
     # reste le nom historique du projet, prioritaire s'il est defini.
+    # Les deux noms passent par les REGLAGES, jamais par os.environ: une
+    # lecture directe contournait la coupure de test (settings._EN_TEST) et
+    # la suite repartait vers le fournisseur avec les cles du poste.
     return (getattr(settings, "JEV_API_KEY", "")
-            or os.environ.get("TYPESAFE_API_KEY", "") or "")
+            or getattr(settings, "TYPESAFE_API_KEY", "") or "")
 
 
 def _url_jev() -> str:
@@ -190,6 +192,29 @@ def q_saut_ou_suppression() -> dict:
         "options": {
             "saut_ponctuel": "sauter une seule occurrence, un jour precis",
             "suppression_large": "supprimer largement : tout, tous, la serie",
+            "incertain": "impossible a trancher",
+        },
+    }
+
+
+def q_portee_changement() -> dict:
+    """Choice : un changement sur une activite reguliere vise-t-il un jour ou la serie ?
+
+    Sert a EVITER une question inutile, jamais a trancher a la place de la
+    personne : seul « serie » avec une confiance elevee dispense de demander.
+    """
+    return {
+        "type": TYPE_CHOICE,
+        "instructions": (
+            "Le message demande de changer quelque chose (nom, heure) sur une "
+            "activite qui revient chaque semaine. Ce changement vaut-il pour "
+            "UNE SEULE fois (ce jour-la, exceptionnellement) ou pour TOUTE la "
+            "serie (chaque semaine, a partir de maintenant) ? En cas de doute, "
+            "choisis incertain."
+        ),
+        "options": {
+            "occurrence": "une seule fois, ce jour-la",
+            "serie": "toute la serie, chaque semaine",
             "incertain": "impossible a trancher",
         },
     }
