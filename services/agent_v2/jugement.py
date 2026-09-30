@@ -206,11 +206,14 @@ def q_portee_changement() -> dict:
     return {
         "type": TYPE_CHOICE,
         "instructions": (
-            "Le message demande de changer quelque chose (nom, heure) sur une "
-            "activite qui revient chaque semaine. Ce changement vaut-il pour "
-            "UNE SEULE fois (ce jour-la, exceptionnellement) ou pour TOUTE la "
-            "serie (chaque semaine, a partir de maintenant) ? En cas de doute, "
-            "choisis incertain."
+            "Le message demande de changer le nom ou le jour d'une activite "
+            "qui revient chaque semaine. Rattache-t-il ce changement a une "
+            "occasion ou a une date precise (ce jour-la seulement), ou le "
+            "presente-t-il comme la nouvelle realite de l'activite (chaque "
+            "semaine, a partir de maintenant) ? Un changement enonce sans "
+            "aucun repere temporel vaut pour la serie. Choisis incertain "
+            "seulement si le message porte les deux, ou s'il ne permet "
+            "vraiment pas de trancher."
         ),
         "options": {
             "occurrence": "une seule fois, ce jour-la",
