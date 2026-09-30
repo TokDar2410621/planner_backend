@@ -2345,18 +2345,20 @@ OUTILS_QUESTION = frozenset({"poser_question", "present_choices"})
 # d'origine pour les utilisateurs non migres. Les regles d'usage qui vivaient
 # dans REGLES_AGIR demenagent ici, sans vocabulaire declencheur.
 DESCRIPTIONS_V2 = {
-    # Remplacement complet: l'ancienne description ordonnait de consulter
-    # l'outil avant d'affirmer quoi que ce soit, ce qui le faisait appeler a
-    # chaque tour pour aujourd'hui alors que le planning du jour est deja
-    # dans le prompt.
+    # Remplacement complet, par USAGE et non par date (defaut mesure en prod
+    # le 2026-09-29): interdire cet outil pour aujourd'hui, alors que la prose
+    # n'a pas le droit de recopier le contexte, privait « montre-moi ma
+    # journee » de tout chemin et servait un repli « je n'ai pas compris ».
     "get_today_schedule": (
-        "Recupere le planning EFFECTIF d'un AUTRE jour qu'aujourd'hui "
-        "(blocs recurrents aux heures PLACEES, taches planifiees, creneaux "
-        "libres; parametre date, defaut = aujourd'hui, que tu ne dois jamais "
-        "utiliser). Le planning d'AUJOURD'HUI est deja dans ton prompt "
-        "(PLANNING AUJOURD'HUI), a l'etat effectif: fie-toi a lui tel quel et "
-        "ne rappelle jamais cet outil pour aujourd'hui. Consulte-le avant "
-        "d'affirmer ou se trouve une activite un autre jour ou si elle a "
+        "Lit le planning EFFECTIF d'UN jour (blocs recurrents aux heures "
+        "PLACEES, occurrences annulees exclues, taches planifiees, creneaux "
+        "libres; parametre date AAAA-MM-JJ, defaut = aujourd'hui). "
+        "APPELLE-LE des que la personne veut VOIR une journee, aujourd'hui "
+        "comprise: le systeme affiche la liste au-dessus de ta reponse et tu "
+        "ne la recris jamais. Pour seulement RAISONNER sur aujourd'hui "
+        "(placer quelque chose, verifier une heure), le PLANNING AUJOURD'HUI "
+        "de ton prompt suffit: inutile de le relire. Pour un AUTRE jour, "
+        "consulte-le avant d'affirmer ou se trouve une activite ou si elle a "
         "bouge, et parle des heures effectives, jamais de memoire ni d'apres "
         "l'historique (un bloc souple peut etre place a une autre heure que "
         "son heure habituelle)."
@@ -2437,6 +2439,32 @@ def _sans_boucle(fabrique):
     except RuntimeError:
         return asyncio.run(fabrique())
     return _POOL_CHOIX.submit(lambda: asyncio.run(fabrique())).result()
+
+
+# Les seules lectures que le code s'autorise a executer lui-meme (filet de
+# consultation, agent.py). Le code ne MUTE jamais a la place du modele.
+LECTURES_DU_CODE = frozenset({"get_today_schedule", "get_week_schedule",
+                              "list_tasks"})
+
+
+def executer_lecture_par_le_code(user: User, registre: Registre, outil: str,
+                                 tache: str = "", message: str = "",
+                                 brut: str = "", **kwargs):
+    """Execute une LECTURE au nom du code et l'inscrit au registre.
+
+    Toute ecriture faite hors de la boucle d'outils doit entrer au registre,
+    sinon la phase de rendu la nie; une lecture suit la meme regle, c'est elle
+    qui fera la liste affichee.
+    """
+    if outil not in LECTURES_DU_CODE:
+        raise ValueError(f"lecture refusee au code: {outil}")
+    par_nom = {t.name: t for t in outils_pour(
+        user, registre, message_du_tour=message, tache=tache, message_brut=brut)}
+    tool = par_nom.get(outil)
+    if tool is None:
+        return None
+    _sans_boucle(lambda: tool.function_schema.function(**kwargs))
+    return registre.actions[-1] if registre.actions else None
 
 
 def _effet_valide(demande: dict, option: str, effet: dict) -> bool:

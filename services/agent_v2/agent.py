@@ -25,6 +25,7 @@ import logging
 import queue
 import re
 import time
+from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Optional
@@ -175,6 +176,15 @@ CHIPS_MAX = 4
 REPLI_PROSE = "Voici ce qui a changé. Dis-moi si tu veux autre chose."
 REPLI_PROSE_LECTURE = "Dis-moi si tu veux autre chose."
 REPLI_QUESTION = "Je n'ai pas compris. Tu veux ajouter, déplacer ou voir quelque chose ?"
+# Quand la boucle a ANNONCE une liste sans la montrer et que le juge n'a pas
+# tranche ce qu'il fallait lire: on demande quoi voir, on ne dit pas qu'on n'a
+# pas compris (defaut A, prod du 2026-09-29).
+REPLI_LISTE = "Tu veux voir quoi : ta journée, ta semaine ou tes tâches ?"
+CHIPS_LISTE = [
+    {"label": "Ma journée", "value": "Montre-moi ma journée"},
+    {"label": "Ma semaine", "value": "Montre-moi ma semaine"},
+    {"label": "Mes tâches", "value": "Montre-moi mes tâches"},
+]
 PROSE_FORMULAIRE = "Il me manque quelques précisions."
 PROSE_REPRISE = "Il me faut juste cette précision avant de toucher à ton horaire."
 PROSE_ANNULEE = "D'accord, je ne change rien."
@@ -817,7 +827,27 @@ class PlannerAgentV2:
             else:
                 prose, motif = PROSE_BUDGET_JOUR, "budget_jour"
         elif not faits and not prose and not question and not formulaire:
-            question, motif, chips = REPLI_QUESTION, "dire", []
+            # La boucle a repondu mais n'a ni lu ni mute, et sa prose est
+            # tombee: avant de dire qu'on n'a pas compris, le code lit ce que
+            # la personne voulait voir (defaut A, prod du 2026-09-29).
+            rien_lu = not any(a.succes and (a.est_mutation
+                                            or a.outil in LECTURES_RENDUES)
+                              for a in registre.actions)
+            outil_secours = ""
+            if reponse_boucle is not None and rien_lu:
+                outil_secours = self._lecture_de_secours(
+                    user, self._message_brut or message, registre)
+            if outil_secours:
+                faits = sans_tiret_long(bloc_factuel(registre) or "")
+                motif = "lecture_secours"
+            if faits:
+                emis.append(faits)
+                yield {"type": "delta", "text": faits}
+            elif compo.lecture_sans_liste:
+                question, motif = REPLI_LISTE, "dire"
+                chips = [dict(c) for c in CHIPS_LISTE]
+            else:
+                question, motif, chips = REPLI_QUESTION, "dire", []
 
         if prose:
             morceau = ("\n\n" if emis else "") + prose
@@ -1136,6 +1166,44 @@ class PlannerAgentV2:
         except Exception:  # noqa: BLE001 - dans le doute, la boucle tourne
             logger.warning("Voie rapide sociale illisible", exc_info=True)
             return False
+
+    def _lecture_de_secours(self, user: User, message: str,
+                            registre: Registre) -> str:
+        """Le tour n'a rien lu ni mute: le code lit ce que la personne veut voir.
+
+        La decision est SEMANTIQUE (juge Jev, question typee), jamais une liste
+        de mots. Seuil eleve (0.9): afficher une liste que personne n'a
+        demandee est pire que poser la question. Rend le nom de l'outil
+        execute, ou une chaine vide.
+        """
+        from services.agent_v2 import outils as _outils
+        outil_de = {
+            "journee": ("get_today_schedule", {}),
+            "demain": ("get_today_schedule",
+                       {"date": (timezone.localdate()
+                                 + timedelta(days=1)).isoformat()}),
+            "semaine": ("get_week_schedule", {}),
+            "taches": ("list_tasks", {}),
+        }
+        try:
+            resultats = _jugement.juger(
+                message, {"consultation": _jugement.q_consultation()})
+            rep = (resultats or {}).get("consultation") or {}
+            if rep.get("statut") != _jugement.STATUT_DECISION:
+                return ""
+            if float(rep.get("confiance") or 0) < 0.9:
+                return ""
+            choix = outil_de.get(str(rep.get("valeur") or ""))
+            if choix is None:
+                return ""
+            outil, parametres = choix
+            action = _outils.executer_lecture_par_le_code(
+                user, registre, outil, tache=self._tache, message=message,
+                brut=message, **parametres)
+            return outil if action is not None and action.succes else ""
+        except Exception:  # noqa: BLE001 - un filet ne casse pas un tour
+            logger.warning("Lecture de secours illisible", exc_info=True)
+            return ""
 
     def _reponse_rapide(self, user: User, message: str) -> str:
         """Repond a une interaction sociale sans la boucle lourde.

@@ -220,6 +220,32 @@ def q_interaction_sociale() -> dict:
     }
 
 
+def q_consultation() -> dict:
+    """Choice : la personne demande-t-elle a VOIR quelque chose, et quoi ?
+
+    Sert au filet de lecture (agent.py) quand la boucle n'a rien lu ni mute.
+    En cas de doute, le code pose une question plutot que d'afficher ce que
+    personne n'a demande.
+    """
+    return {
+        "type": TYPE_CHOICE,
+        "instructions": (
+            "La personne demande-t-elle a VOIR son horaire ou ses taches, et "
+            "quoi exactement ? Reponds 'aucune' si elle demande autre chose "
+            "(agir sur le planning, discuter, saluer). En cas de doute, "
+            "choisis incertain."
+        ),
+        "options": {
+            "journee": "voir sa journee d'aujourd'hui",
+            "demain": "voir la journee de demain",
+            "semaine": "voir sa semaine",
+            "taches": "voir ses taches",
+            "aucune": "elle ne demande pas a voir son horaire ni ses taches",
+            "incertain": "impossible a trancher",
+        },
+    }
+
+
 def q_choix(options: dict[str, str]) -> dict:
     """Choice : quelle option l'utilisateur choisit-il, parmi celles-ci ?
 
