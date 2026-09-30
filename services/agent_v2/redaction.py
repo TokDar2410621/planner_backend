@@ -173,6 +173,7 @@ class Composition:
     cles_posees: list[str] = field(default_factory=list)
     rejetees: int = 0
     lecture_sans_liste: bool = False
+    redites: int = 0
 
     @property
     def sections(self) -> list[str]:
@@ -304,8 +305,14 @@ _BLOC_TEXTE = re.compile(r"^(.*\S)\s\(\d{1,2}:\d{2}-\d{1,2}:\d{2}\)$")
 
 
 def _plat(texte: str) -> str:
-    """Minuscules, sans accents ni ponctuation, espaces simples."""
-    sans_accents = unicodedata.normalize("NFKD", texte or "").encode("ascii", "ignore").decode("ascii")
+    """Minuscules, sans accents ni ponctuation, espaces simples.
+
+    Les apostrophes courbes des titres en base (« Conception d’applications »)
+    deviennent droites AVANT la normalisation: sinon NFKD les efface et
+    « d’applications » ne se rapproche plus de « d'applications ».
+    """
+    droit = (texte or "").replace("’", "'").replace("‘", "'")
+    sans_accents = unicodedata.normalize("NFKD", droit).encode("ascii", "ignore").decode("ascii")
     return " ".join(re.sub(r"[^a-z0-9]+", " ", sans_accents.lower()).split())
 
 
@@ -345,6 +352,31 @@ def _absence_contredite(phrase: str, titres: set[str]) -> bool:
     return any(f" {t} " in plate for t in titres)
 
 
+# Une heure dite par le modele: « 8 h », « 8 h 30 », « 13:00 ». « 2 heures »
+# n'en est pas une (pas de frontiere de mot apres le h).
+_HEURE_DITE = re.compile(r"\b\d{1,2}\s*h(?:\s*\d{2})?\b|\b\d{1,2}:\d{2}\b")
+
+
+def _redit_la_liste(phrase: str, titres: set[str]) -> bool:
+    """La phrase raconte-t-elle la liste que le code affiche deja ?
+
+    Trois formes, mesurees en prod le 2026-09-29 (« Voici ton mardi ! Deux
+    cours au programme, Conception d'applications de 8 h a 11 h puis... »):
+    l'annonce d'une liste qui la precede, un element nomme avec son heure, ou
+    deux elements nommes. Un conseil qui nomme UN element sans son heure
+    survit (« Pense a souper avant ton cours »).
+    """
+    if _VOICI.search(phrase or "") or _COMPTE_NU.search(phrase or ""):
+        return True
+    if not titres:
+        return False
+    plate = f" {_plat(phrase)} "
+    nommes = sum(1 for t in titres if f" {t} " in plate)
+    if not nommes:
+        return False
+    return nommes >= 2 or bool(_HEURE_DITE.search(phrase or ""))
+
+
 def _references_rejetees(brut, registre: Registre) -> int:
     rejetees = 0
     for ref in getattr(brut, "refs", None) or []:
@@ -367,6 +399,9 @@ def composer(brut: ReponseDire | None, registre: Registre, faits: str,
     (e) sans faits affiches, une phrase qui annonce une liste (« que voici »,
         « 3 créneaux ») est retiree: elle promettrait ce qui ne suit pas.
     (f) si le code pose deja une question, celle de DIRE est ecartee.
+    (g) sur un tour de lecture PURE, une phrase qui redit la liste affichee
+        (annonce, element nomme avec son heure, ou deux elements nommes)
+        tombe: le code est le seul narrateur des listes.
     Les phrases de `actions` ne sont jamais rendues (un seul narrateur).
     """
     faits = faits or ""
@@ -390,14 +425,34 @@ def composer(brut: ReponseDire | None, registre: Registre, faits: str,
     options = [o for o in options if not _VOCABULAIRE_INTERNE.search(str(o or ""))]
 
     lecture_sans_liste = False
+    redites = 0
     if not faits:
         ouverture, n1 = _sans_annonce_vide(ouverture)
         suite, n2 = _sans_annonce_vide(suite)
         lecture_sans_liste = bool(n1 or n2)
     elif any(a.succes and a.outil in LECTURES_RENDUES for a in registre.actions):
         titres = _titres_affiches(registre, faits)
-        ouverture = " ".join(p for p in _phrases(ouverture) if not _absence_contredite(p, titres))
-        suite = " ".join(p for p in _phrases(suite) if not _absence_contredite(p, titres))
+        # (g) Un tour de LECTURE PURE affiche sa liste par le code: une phrase
+        # qui la redit est un second narrateur (mesure prod du 2026-09-29).
+        # Un tour qui a mute garde sa prose: « je l'ai deplace a 14 h » nomme
+        # un titre et une heure sans rien redire.
+        lecture_pure = not any(a.succes and a.est_mutation for a in registre.actions)
+
+        def _garder(texte: str) -> tuple[str, int]:
+            gardees: list[str] = []
+            tombees = 0
+            for phrase in _phrases(texte):
+                if _absence_contredite(phrase, titres):
+                    continue
+                if lecture_pure and _redit_la_liste(phrase, titres):
+                    tombees += 1
+                    continue
+                gardees.append(phrase)
+            return " ".join(gardees), tombees
+
+        ouverture, r1 = _garder(ouverture)
+        suite, r2 = _garder(suite)
+        redites = r1 + r2
         if _absence_contredite(question, titres):
             question, options = "", []
 
@@ -443,6 +498,7 @@ def composer(brut: ReponseDire | None, registre: Registre, faits: str,
             cles_posees=list(question_code.get("cles_posees") or []),
             rejetees=rejetees,
             lecture_sans_liste=lecture_sans_liste,
+            redites=redites,
         )
 
     propres: list[str] = []
@@ -465,6 +521,7 @@ def composer(brut: ReponseDire | None, registre: Registre, faits: str,
         motif="dire" if question else "",
         rejetees=rejetees,
         lecture_sans_liste=lecture_sans_liste,
+        redites=redites,
     )
 
 

@@ -858,7 +858,8 @@ class PlannerAgentV2:
             logging.WARNING if anormal else logging.INFO,
             "agent_v2 tour actions=%d rejetees=%d fuites=%d supprimees=%d ecarts=%d%s"
             " boucle=%.1fs/%dep/%d->%dj/r%d/c%d verif=%.2fs"
-            " asked=%d form=%d choices=%d read_without_list=%d raw_marker_count=%d"
+            " asked=%d form=%d choices=%d read_without_list=%d redites=%d"
+            " raw_marker_count=%d"
             " motif=%s choix_code=%d chemin=%s tour=%.2fs",
             len(registre.actions),
             rejetees,
@@ -882,6 +883,7 @@ class PlannerAgentV2:
             1 if formulaire else 0,
             len(quick_replies),
             1 if lecture_sans_liste else 0,
+            compo.redites,
             len(marqueurs),
             motif or "-",
             choix_code,
@@ -919,6 +921,7 @@ class PlannerAgentV2:
             "faits_rendus": faits,
             "raw_markers": marqueurs,
             "lecture_sans_liste": lecture_sans_liste,
+            "redites": compo.redites,
             # Le nom que l'utilisateur a donne au cours du formulaire du code:
             # au tour de la reponse, create_block le garde (outils.py).
             "formulaire_nom": next((str((a.donnees or {}).get("nom") or "")
