@@ -168,7 +168,7 @@ _FIN_DE_PHRASE_STREAMEE = re.compile(r"[.!?…][\"'»)\]]*\s")
 # refus muet. Le formulaire passe avant le choix du modele, et DIRE ferme la
 # marche.
 PRIORITE = [
-    "portee_jour", "destructif", "heure_refusee", "creation_en_masse",
+    "portee_jour", "portee_changement", "destructif", "heure_refusee", "creation_en_masse",
     "optimisation", "formulaire", "choix_modele", "question_libre", "chevauchement",
     "fin_recurrence", "creneaux", "dire",
 ]

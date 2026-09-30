@@ -294,6 +294,12 @@ AGENT_V2_BUDGET_JETONS_JOUR = int(os.getenv('AGENT_V2_BUDGET_JETONS_JOUR', '2000
 # compte pour continuer (voir PROSE_BUDGET_JOUR_ANON dans agent.py).
 AGENT_V2_BUDGET_JETONS_JOUR_ANON = int(os.getenv('AGENT_V2_BUDGET_JETONS_JOUR_ANON', '400000'))
 
+# Vrai sous `manage.py test` et sous pytest. Sert a couper tout appel sortant
+# par defaut dans la suite: un test qui veut exercer un client passe par
+# override_settings, jamais par les cles du poste.
+_EN_TEST = (len(sys.argv) > 1 and sys.argv[1] == 'test') or 'pytest' in sys.modules
+
+
 # Couche de jugement (services/agent_v2/jugement.py): des decisions typees
 # (choice/score/noul) au lieu des regex d'intention ecrites a la main.
 # Fournisseur principal : Jev, un modele de decision non autoregressif.
@@ -305,14 +311,24 @@ AGENT_V2_BUDGET_JETONS_JOUR_ANON = int(os.getenv('AGENT_V2_BUDGET_JETONS_JOUR_AN
 # JUGEMENT_SEUIL_DECISION: confiance minimale pour qu'une reponse devienne
 # une decision exploitable par le code; en dessous c'est "incertain" et
 # l'appelant applique le comportement prudent (demander, jamais executer).
-JEV_API_KEY = os.getenv('JEV_API_KEY', '')
+# Coupes par defaut sous les tests, comme LIRE_OMBRE et pour la meme raison:
+# sans cela chaque tour de test appelait Jev (2,5 s de delai) puis son repli
+# LLM, la suite passait de 12 minutes a plusieurs heures et consommait du
+# credit reel (mesure du 2026-09-29). Juge indisponible = comportement prudent,
+# qui est justement ce que la suite doit verifier par defaut.
+JEV_API_KEY = '' if _EN_TEST else os.getenv('JEV_API_KEY', '')
+# Convention des SDK officiels, lue par jugement._cle_jev via ce reglage (et
+# non via os.environ): sinon la coupure de test serait contournee.
+TYPESAFE_API_KEY = '' if _EN_TEST else os.getenv('TYPESAFE_API_KEY', '')
 # Endpoint officiel verifie sur docs.typesafe.ai (quickstart + reference API).
 # thejevai.com est un tiers non affilie a TypeSafe: ne pas l'utiliser.
 JEV_API_URL = os.getenv('JEV_API_URL', 'https://api.typesafe.ai/v1/systemone')
 JEV_MODEL = os.getenv('JEV_MODEL', 'jev-latest')
 JEV_TIMEOUT = float(os.getenv('JEV_TIMEOUT', '2.5'))
 JUGEMENT_SEUIL_DECISION = float(os.getenv('JUGEMENT_SEUIL_DECISION', '0.8'))
-JUGEMENT_REPLI_LLM = os.getenv('JUGEMENT_REPLI_LLM', '1')
+# Force sous les tests, comme les deux cles: une variable d'environnement
+# rouvrirait sinon le repli et la suite repartirait vers un fournisseur.
+JUGEMENT_REPLI_LLM = '0' if _EN_TEST else os.getenv('JUGEMENT_REPLI_LLM', '1')
 
 # LIRE en mode ombre (services/agent_v2/lecture.py): une lecture typee du
 # message tape, journalisee a cote des lecteurs regex geles, qui ne decide rien.
@@ -321,7 +337,6 @@ JUGEMENT_REPLI_LLM = os.getenv('JUGEMENT_REPLI_LLM', '1')
 # de test partirait sinon vers le fournisseur avec les cles du poste. Les
 # valeurs restent des chaines, lues par lecture.py: une valeur mal formee ne
 # doit pas empecher le demarrage.
-_EN_TEST = (len(sys.argv) > 1 and sys.argv[1] == 'test') or 'pytest' in sys.modules
 LIRE_OMBRE = os.getenv('LIRE_OMBRE', '0' if _EN_TEST else '1')
 LIRE_MODELES = os.getenv('LIRE_MODELES', 'deepseek-flash,gemini-2.5-flash')
 LIRE_ATTENTE_S = os.getenv('LIRE_ATTENTE_S', '1.5')

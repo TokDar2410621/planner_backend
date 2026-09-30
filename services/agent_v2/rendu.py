@@ -37,14 +37,15 @@ _RELATIFS = {0: "aujourd'hui", 1: "demain", -1: "hier"}
 # pose que les motifs portes par une DEMANDE; les autres sont choisis par
 # l'agent.
 PRIORITE = [
-    "portee_jour", "destructif", "heure_refusee", "creation_en_masse",
+    "portee_jour", "portee_changement", "destructif", "heure_refusee", "creation_en_masse",
     "optimisation", "formulaire", "choix_modele", "question_libre", "chevauchement",
     "fin_recurrence", "creneaux", "dire",
 ]
 
 # Une action retenue par une garde n'a PAS eu lieu. Elle se tait quand la
 # question du tour la couvre, sinon une seule ligne dit qu'elle attend.
-MOTIFS_RETENUS = frozenset({"portee_jour", "destructif", "creation_en_masse", "optimisation"})
+MOTIFS_RETENUS = frozenset({"portee_jour", "portee_changement", "destructif",
+                            "creation_en_masse", "optimisation"})
 
 LECTURES_RENDUES = ("get_week_schedule", "get_today_schedule", "list_blocks",
                     "find_free_slots", "list_tasks")
@@ -822,7 +823,8 @@ class _Narrateur:
             self.retenue(a, demande)
             return
         if d.get("needs_confirmation") or d.get("requires_confirmation"):
-            objet = _objet_retenu(outil, _txt(p.get("title")))
+            objet = _objet_retenu(outil, _txt(p.get("title")),
+                                  _txt((d.get("demande") or {}).get("motif")))
             self.ajouter_refus(f"Je n'ai pas encore {objet} : il me faut ton accord d'abord.")
             return
 
@@ -912,7 +914,8 @@ class _Narrateur:
         elif motif == "creation_en_masse":
             objet = f"ajouté {titre}" if titre else "ajouté le reste"
         else:
-            objet = _objet_retenu(_txt(demande.get("outil")) or a.outil, titre)
+            objet = _objet_retenu(_txt(demande.get("outil")) or a.outil, titre,
+                                  _txt(demande.get("motif")))
         self.retenues.append(f"Je n'ai pas encore {objet} : redemande-le-moi après ta réponse.")
 
     def heure_refusee(self, a, demande) -> None:
@@ -1049,7 +1052,9 @@ def _objets_abandonnes(objets: list[str]) -> str:
     return ", ".join(objets[:-1]) + " et " + objets[-1]
 
 
-def _objet_retenu(outil: str, titre: str) -> str:
+def _objet_retenu(outil: str, titre: str, motif: str = "") -> str:
+    if motif == "portee_changement":
+        return f"changé {titre}" if titre else "changé ce créneau"
     if outil == "clear_all_blocks":
         return "vidé ton planning"
     if outil == "cancel_scheduled_block":
@@ -1782,8 +1787,39 @@ def _question_chevauchement(demandes, auj):
     return question, _garder(chips, _ids_options(demandes))
 
 
+def _question_portee_changement(demandes, auj):
+    """« Tu veux changer X seulement ce mercredi ou tous les mercredis ? »
+
+    Le geste n'est pas un retrait: la personne doit lire ce qu'elle arbitre.
+    """
+    titres = _titres(demandes)
+    cibles = [_dict(d.get("cible")) for d in demandes]
+    dows = {_dow_cible(c) for c in cibles}
+    dates = {_date(c.get("date")) for c in cibles if _date(c.get("date"))}
+    nommes = _liste(titres) or "ce créneau"
+    if len(dows) == 1 and None not in dows:
+        j = JOURS[next(iter(dows))]
+        date_txt = f" {_jour_mois(next(iter(dates)))}" if len(dates) == 1 else ""
+        question = (f"Tu veux changer {nommes} seulement ce {j}{date_txt} "
+                    f"ou tous les {j}s ?")
+        chips = [
+            _chip(f"Seulement ce {j}",
+                  f"Seulement ce {j}{date_txt}".rstrip('.') + ".", "occurrence"),
+            _chip(f"Tous les {j}s", f"Tous les {j}s (toute la série).", "serie"),
+        ]
+    else:
+        question = f"Tu veux changer {nommes} seulement cette fois ou chaque semaine ?"
+        chips = [
+            _chip("Seulement cette fois", "Seulement cette fois.", "occurrence"),
+            _chip("Chaque semaine", "Chaque semaine (toute la série).", "serie"),
+        ]
+    chips.append(_chip("Non, garde tout", "Non, ne change rien.", "annuler"))
+    return question, _garder(chips, _ids_options(demandes))
+
+
 _QUESTIONS = {
     "portee_jour": _question_portee_jour,
+    "portee_changement": _question_portee_changement,
     "destructif": _question_destructif,
     "heure_refusee": _question_heure_refusee,
     "creation_en_masse": _question_creation_en_masse,

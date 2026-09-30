@@ -208,6 +208,12 @@ class RenommageDeLaSerieTests(TransactionTestCase):
 
     Prod du 2026-09-29, un essai sur cinq: le bloc recurrent renomme
     « Examen - L'entreprise et ses systemes », pour tous les mardis.
+
+    Un premier correctif refusait l'appel en nommant le bon outil, mais il
+    DEPENDAIT du juge: juge muet, renommage silencieux. La garde de portee
+    (core/test_agent_v2_portee_changement.py) ne depend de lui que pour EVITER
+    la question. Ici on verifie l'essentiel: la serie ne change pas sans que
+    la portee soit tranchee.
     """
 
     def setUp(self):
@@ -228,33 +234,25 @@ class RenommageDeLaSerieTests(TransactionTestCase):
                 block_id=self.cours.id, title=titre))
         return registre.actions[-1]
 
-    def test_le_renommage_est_refuse_et_l_outil_juste_est_nomme(self):
+    def test_sans_juge_la_serie_n_est_pas_renommee_en_silence(self):
         from core.test_agent_v2_jugement import juger_script
         message = "J'ai examen à la place du cours d'entreprise"
-        action = self._appeler_update(message, juger_script(
-            {message: {"remplacant": ("oui", 0.95)}}))
+        action = self._appeler_update(message, juger_script({}))
         self.assertFalse(action.succes)
-        self.assertIn('replace_block_occurrence', action.message)
+        self.assertEqual((action.donnees or {}).get('demande', {}).get('motif'),
+                         'portee_changement')
         self.cours.refresh_from_db()
         self.assertEqual(self.cours.title, "L’entreprise et ses systèmes")
 
-    def test_un_vrai_renommage_passe(self):
-        """« Renomme mon cours »: aucun remplacement annonce, la serie change."""
+    def test_un_vrai_renommage_passe_quand_le_juge_voit_la_serie(self):
         from core.test_agent_v2_jugement import juger_script
         message = "Renomme mon cours d'entreprise en Systèmes d'entreprise"
         action = self._appeler_update(message, juger_script(
-            {message: {"remplacant": ("non", 0.95)}}),
+            {message: {"portee": ("serie", 0.95)}}),
             titre="Systèmes d'entreprise")
         self.assertTrue(action.succes, action.message)
         self.cours.refresh_from_db()
         self.assertEqual(self.cours.title, "Systèmes d'entreprise")
-
-    def test_sans_decision_du_juge_l_appel_passe(self):
-        """Prudent dans l'autre sens: un juge muet ne bloque pas un geste."""
-        from core.test_agent_v2_jugement import juger_script
-        action = self._appeler_update("change le titre", juger_script({}),
-                                      titre='Autre titre')
-        self.assertTrue(action.succes, action.message)
 
 
 class CandidatsDuRemplacementTests(RemplacementTests):

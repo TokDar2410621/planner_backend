@@ -105,8 +105,11 @@ AUTORISANTES = {
     "portee_jour": {"delete_block": {"serie"},
                     "skip_block_occurrence": {"occurrence"},
                     "replace_block_occurrence": {"occurrence"}},
+    "portee_changement": {"update_block": {"serie"},
+                          "replace_block_occurrence": {"occurrence"}},
 }
-MOTIFS_GARDES = {"portee_jour", "destructif", "creation_en_masse", "optimisation"}
+MOTIFS_GARDES = {"portee_jour", "portee_changement", "destructif",
+                 "creation_en_masse", "optimisation"}
 
 _SEMAINE = re.compile(r"\bcette semaine\b|\bpour la semaine\b")
 _SEMAINE_SANS_FIN = re.compile(
@@ -253,6 +256,24 @@ def _cle_portee(block_id, jour_iso: str) -> str:
     return dem.cle_demande("portee_jour", {"block_id": int(block_id), "date": jour_iso})
 
 
+# Tout ce qu'un update_block peut changer sur une serie, hors bornes de dates.
+# La cle et les deux options les portent toutes: sans cela le code annonçait
+# FAIT alors qu'une partie du geste etait tombee.
+CHAMPS_CHANGEABLES = ("title", "start_time", "end_time", "day_of_week",
+                      "block_type", "location", "flexibility")
+# Celles qui changent l'IDENTITE de la serie: elles valent pour toutes les
+# semaines, donc leur portee se demande.
+CHAMPS_IDENTITE = ("title", "day_of_week")
+
+
+def _cle_changement(block_id, params: dict) -> str:
+    """Cle d'une portee de CHANGEMENT. Les valeurs visees en font partie: une
+    puce qui accepte « midi » n'autorise pas ensuite « 14 h »."""
+    return dem.cle_demande("portee_changement", {
+        "block_id": int(block_id),
+        **{c: str(params.get(c) or "") for c in CHAMPS_CHANGEABLES}})
+
+
 def _cle_bornes(block_id, params: dict) -> str:
     """Cle d'une fin ou d'un depart de serie: les dates en font partie, pour
     qu'une puce confirmant le 15 octobre n'autorise pas le 1er decembre."""
@@ -395,7 +416,7 @@ def _cible_changee(user, demande: dict) -> bool:
     """Vrai quand la cible d'une demande destructive n'est plus celle de la
     question. Seuls les champs presents dans demande.cible sont compares: une
     demande d'avant le round 9 (sans « ids ») garde les autres."""
-    if demande.get("motif") not in ("portee_jour", "destructif"):
+    if demande.get("motif") not in ("portee_jour", "portee_changement", "destructif"):
         return False
     stockee = demande.get("cible") or {}
     actuelle = _cible_actuelle(user, demande)
@@ -488,6 +509,32 @@ def _options_portee(block, jour: date, cible: dict) -> list[dict]:
     ]
 
 
+def _options_changement(block, jour: date, cible: dict, params: dict) -> list[dict]:
+    """Une occurrence: le remplacant prend le creneau. La serie: update_block."""
+    titre = str(params.get("title") or "").strip() or block.title
+    remplacement = {"date": jour.isoformat(), "title": block.title,
+                    "block_type": block.block_type, "replacement_title": titre}
+    serie = {"block_id": block.id}
+    # Tout ce que l'appel portait suit l'option « serie »: un geste partiel
+    # annonce comme fait serait un mensonge. L'option « occurrence » ne prend
+    # que ce qui a un sens pour un evenement date.
+    for cle in CHAMPS_CHANGEABLES:
+        valeur = str(params.get(cle) or "").strip()
+        if valeur:
+            serie[cle] = valeur
+            if cle in ("start_time", "end_time"):
+                remplacement[cle] = valeur
+    return [
+        {"id": "occurrence",
+         "effet": {"outil": "replace_block_occurrence", "parametres": remplacement},
+         "cible": dict(cible)},
+        {"id": "serie",
+         "effet": {"outil": "update_block", "parametres": serie},
+         "cible": dict(cible)},
+        {"id": "annuler", "effet": None, "cible": dict(cible)},
+    ]
+
+
 def _saut_suspect(texte: str) -> bool:
     """Un saut d'occurrence qui ressemble a une suppression large (« efface
     tout jeudi »). Le saut unique explicite (« saute mon gym demain ») passe.
@@ -496,6 +543,69 @@ def _saut_suspect(texte: str) -> bool:
     doute, le saut est suspect et le code pose la question de portee.
     """
     return dem.saut_suspect(texte)
+
+
+def _appel_composite(nom: str, kwargs: dict):
+    """Un update_block qui change l'IDENTITE de la serie ET ses bornes.
+
+    Une seule question ne peut pas trancher les deux gestes: la question des
+    bornes ne parle que de la date, et celle de la portee ne parle que du
+    changement. Mesure du 2026-09-30: un end_date non destructif desarmait
+    toute garde, et une fin de serie confirmee renommait la serie au passage.
+    """
+    if nom != "update_block":
+        return None
+    identite = any(str(kwargs.get(c) or "").strip() for c in CHAMPS_IDENTITE)
+    bornes = any(str(kwargs.get(c) or "").strip() for c in ("end_date", "start_date"))
+    if not (identite and bornes):
+        return None
+    return ToolResult(
+        success=False,
+        data={"appel_composite": True},
+        message=("Refuse par le code: un meme appel change le nom ou le jour de "
+                 "la serie ET ses dates de debut ou de fin. Chacun a sa propre "
+                 "question a l'utilisateur. Fais deux appels separes."))
+
+
+def _garde_changement(ctx: _Contexte, kwargs: dict):
+    """La garde de portee d'un changement de titre ou d'heures, ou None."""
+    from core.models import RecurringBlock
+
+    # L'IDENTITE de la serie: son nom et son jour. Les HEURES ont deja leur
+    # garde (« heure dite », round r9): la doubler d'une question de portee
+    # masquerait un refus plus precis, et un tour ne pose qu'une question.
+    titre = str(kwargs.get("title") or "").strip()
+    jour_vise = str(kwargs.get("day_of_week") or "").strip()
+    if not titre and not jour_vise:
+        return None
+    bid = _entier(kwargs.get("block_id"))
+    if bid is None:
+        return None
+    block = RecurringBlock.objects.filter(id=bid, user=ctx.user, active=True).first()
+    if block is None:
+        return None
+    # Comparaison normalisee: une apostrophe courbe redressee par le modele
+    # n'est pas un changement de nom.
+    change_nom = bool(titre) and dem.normaliser(titre) != dem.normaliser(block.title)
+    change_jour = bool(jour_vise) and _entier(jour_vise) != block.day_of_week
+    if not (change_nom or change_jour):
+        return None
+    jour = dem.date_visee(ctx.texte, block.day_of_week, timezone.localdate())
+    cle = _cle_changement(bid, kwargs)
+    cible = _cible_bloc(block)  # noqa: E501
+    cible["date"] = jour.isoformat()
+    parametres = dict(kwargs)
+    parametres["block_id"] = bid
+    # Le juge ne tranche pas a la place de la personne: il EVITE la question
+    # quand la serie entiere est clairement visee. Muet ou incertain, on
+    # demande, et la garde reste active. Une question DEJA posee sur cette
+    # cible ne se tranche que par sa puce (round 6, D1): le juge ne la
+    # court-circuite pas au tour suivant.
+    en_attente = any(d.get("cle") == cle for d in _attente(ctx))
+    actif = en_attente or not dem.serie_entiere_visee(ctx.texte)
+    return _Garde("portee_changement", cle, {cle}, "update_block", parametres, cible,
+                  _options_changement(block, jour, cible, kwargs),
+                  actif=actif, type="choix")
 
 
 def _analyser(ctx: _Contexte, nom: str, kwargs: dict):
@@ -593,7 +703,11 @@ def _analyser(ctx: _Contexte, nom: str, kwargs: dict):
         fin = _date_iso(kwargs.get("end_date")) if str(kwargs.get("end_date") or "").strip() else None
         depart = _date_iso(kwargs.get("start_date")) if str(kwargs.get("start_date") or "").strip() else None
         if fin is None and depart is None:
-            return None
+            # PORTEE D'UN CHANGEMENT: le titre ou les heures d'une serie
+            # changent pour TOUTES les semaines. « J'ai examen a la place du
+            # cours » a renomme la serie en production le 2026-09-29. Le code
+            # demande, sauf quand le juge voit clairement la serie visee.
+            return _garde_changement(ctx, kwargs)
         bid = _entier(kwargs.get("block_id"))
         if bid is None:
             return None
@@ -661,6 +775,7 @@ def _garde_critique(nom: str, kwargs: dict) -> bool:
         or nom == "skip_block_occurrence"
         or (nom == "update_block" and bool(str(kwargs.get("end_date") or "").strip()))
         or (nom == "update_block" and bool(str(kwargs.get("start_date") or "").strip()))
+        or (nom == "update_block" and bool(str(kwargs.get("title") or "").strip()))
         or (nom == "optimize_week" and bool(kwargs.get("apply")))
     )
 
@@ -1441,39 +1556,6 @@ def _date_passee(nom: str, kwargs: dict):
                  f"c'est le {aujourdhui.isoformat()}. Verifie le jour et l'annee, puis refais l'appel."))
 
 
-def _renommage_pour_un_remplacement(ctx: _Contexte, nom: str, kwargs: dict):
-    """Renommer la serie alors que le message parle d'un remplacement ponctuel.
-
-    update_block porte sur TOUTE la serie. Si le message dit que quelque chose
-    prend la place d'autre chose (« examen a la place du cours »), le geste
-    juste est replace_block_occurrence. La decision est SEMANTIQUE (juge Jev),
-    jamais une liste de mots; sans decision claire, l'appel passe comme avant.
-    """
-    from core.models import RecurringBlock
-
-    if nom != "update_block":
-        return None
-    titre = str(kwargs.get("title") or "").strip()
-    if not titre:
-        return None
-    bid = _entier(kwargs.get("block_id"))
-    if bid is None:
-        return None
-    block = RecurringBlock.objects.filter(id=bid, user=ctx.user, active=True).first()
-    if block is None or block.title == titre:
-        return None
-    if not dem.remplacant_annonce(ctx.texte):
-        return None
-    return ToolResult(
-        success=False,
-        data={"remplacement_ponctuel": True, "block_id": bid},
-        message=("Refuse par le code: update_block renommerait CHAQUE semaine, or "
-                 "le message parle d'un remplacement a une date. Utilise "
-                 "replace_block_occurrence (date, replacement_title, title du bloc "
-                 "remplace): il libere l'occurrence et place le remplacant, en "
-                 "gardant la serie intacte."))
-
-
 # --------------------------------------------------- echeance sans jour choisi
 
 _JOURS_RE = "lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche"
@@ -2138,8 +2220,8 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
 
     if choix is None:
         try:
-            issue = None
-            if garde is not None and garde.actif:
+            issue = _appel_composite(nom, kwargs)
+            if issue is None and garde is not None and garde.actif:
                 if garde.motif == "optimisation":
                     issue = _garde_optimisation(ctx, outil, kwargs, garde)
                 elif garde.cles & (etat.attente.get("cibles_changees") or set()):
@@ -2164,8 +2246,6 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
                         issue = _refus(garde.demande(), destructif=True)
             if issue is None:
                 issue = _date_passee(nom, kwargs)
-            if issue is None:
-                issue = _renommage_pour_un_remplacement(ctx, nom, kwargs)
             if issue is None:
                 issue = _refus_heure_armee(ctx, nom, kwargs, prep)
             if issue is None:
@@ -2534,6 +2614,31 @@ def _effet_valide(demande: dict, option: str, effet: dict) -> bool:
         if option == "serie":
             return outil == "delete_block" and _entier(parametres.get("block_id")) == bid
         return False
+    if motif == "portee_changement":
+        bid = _bloc_de_demande(demande)
+        jour = (demande.get("cible") or {}).get("date")
+        if bid is None or not jour:
+            return False
+        if _cle_changement(bid, demande.get("parametres") or {}) != cle:
+            return False
+        if option == "occurrence":
+            return (outil == "replace_block_occurrence"
+                    and parametres.get("date") == jour)
+        if option == "serie":
+            if outil != "update_block" or _entier(parametres.get("block_id")) != bid:
+                return False
+            # Aucun parametre clandestin: l'effet ne porte que ce que la
+            # demande stockait, aux memes valeurs.
+            stockes = demande.get("parametres") or {}
+            for cle_param, valeur in parametres.items():
+                if cle_param == "block_id":
+                    continue
+                if cle_param not in CHAMPS_CHANGEABLES:
+                    return False
+                if str(stockes.get(cle_param) or "") != str(valeur or ""):
+                    return False
+            return True
+        return False
     if motif == "destructif":
         return (option == "confirmer" and outil in DESTRUCTIFS | {"update_block"}
                 and _cle_destructive(outil, parametres) == cle)
@@ -2550,6 +2655,11 @@ def _sujet(demande: dict) -> str:
         jour = cible.get("jour")
         nom_jour = _NOMS_JOURS[jour] if isinstance(jour, int) and 0 <= jour <= 6 else ""
         return f"portee de la suppression de {titre} ({nom_jour} {cible.get('date') or ''})".replace("  ", " ")
+    if motif == "portee_changement":
+        jour = cible.get("jour")
+        nom_jour = _NOMS_JOURS[jour] if isinstance(jour, int) and 0 <= jour <= 6 else ""
+        return (f"portee du changement de {titre} ({nom_jour} "
+                f"{cible.get('date') or ''})").replace("  ", " ")
     if motif == "creation_en_masse":
         return "ajouts en serie"
     if motif == "optimisation":

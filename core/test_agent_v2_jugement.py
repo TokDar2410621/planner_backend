@@ -217,7 +217,9 @@ class JugementRepliTests(SimpleTestCase):
         self.assertTrue(res["s"]["valeur"])
 
     def test_repli_llm_invalide_rend_indisponible(self):
-        with override_settings(JEV_API_KEY=""):
+        # Sous les tests le repli est coupe par defaut: sans ce reglage, le
+        # double patche n'etait jamais appele et le test ne testait plus rien.
+        with override_settings(JEV_API_KEY="", JUGEMENT_REPLI_LLM="1"):
             with patch("services.agent_v2.jugement._juger_llm",
                        return_value=None):
                 res = jugement.juger("supprime mon cours",

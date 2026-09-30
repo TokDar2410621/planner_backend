@@ -1,0 +1,64 @@
+name: Tests
+
+# Une PR mergee sur signal rouge a coute deux pannes de production cette
+# semaine (28 septembre: build frontend en erreur, puis 502 pendant 11 h sur
+# des migrations en conflit). Ce job rend le signal visible AVANT le merge.
+# Pour qu'il BLOQUE le merge, le cocher dans Settings, Branches, protection
+# de main, « Require status checks to pass ».
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  suite:
+    name: Suite Django
+    runs-on: ubuntu-latest
+    # La suite prend 11 a 14 minutes sur un poste rapide; un runner a deux
+    # coeurs est plus lent, et l installation des dependances compte aussi.
+    timeout-minutes: 45
+
+    env:
+      # Aucun appel sortant depuis la CI. Les reglages coupent deja le juge
+      # sous `manage.py test` (planner/settings.py, _EN_TEST); ces valeurs le
+      # disent explicitement pour qui lit les logs du job.
+      JEV_API_KEY: ""
+      TYPESAFE_API_KEY: ""
+      JUGEMENT_REPLI_LLM: "0"
+      SECRET_KEY: "ci-not-a-secret"
+      # PAS de DEBUG="0" ici: settings l.210 activerait SECURE_SSL_REDIRECT et
+      # le client de test, qui emet du http, recevrait un 301 sur chaque
+      # requete. La CI serait rouge sur un arbre propre, donc ignoree.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Installer les dependances
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Migrations sans conflit ni oubli
+        # Deux migrations concurrentes ont mis la production a 502 pendant
+        # 11 h le 28 septembre: --check echoue si un modele a change sans sa
+        # migration, ou si deux tetes coexistent.
+        run: python manage.py makemigrations --check --dry-run
+
+      - name: Suite unittest
+        # Tout le depot, pas seulement core: services/scheduling a ses propres
+        # tests, et c'est lui qui calcule les chevauchements qu'update_block
+        # interroge.
+        run: python manage.py test -v 1 --noinput
+
+      - name: Suite pytest
+        # Treize modules de core/ ecrivent leurs tests en FONCTIONS: la
+        # decouverte unittest les importe sans les collecter, et le job
+        # resterait vert en les ignorant.
+        run: python -m pytest -q
