@@ -54,6 +54,7 @@ from pydantic_ai.tools import Tool
 from services.agent.tools import ALL_TOOLS, TOOL_MAP
 from services.agent.tools.base import ToolResult
 from services.agent_v2 import demandes as dem
+from services.agent_v2 import chargeur
 from services.agent_v2.registre import (OUTILS_DE_MUTATION, Registre,
                                         _empreinte, boucle_detectee)
 
@@ -2454,6 +2455,69 @@ def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
 # voit la demande de la premiere dans le registre et est refusee avec une
 # consigne. Ce ne sont pas des mutations (pas de verrou du tour, pas de
 # traitement « mutation » dans le rendu): seulement l'ordre d'execution.
+# Les outils toujours exposes au modele. Tires de la mesure du 2026-10-01 sur
+# 600 tours reels: ceux qui servent, plus les trois outils de question (le code
+# relaie leurs puces) et le remplacement d'occurrence, trop recent pour
+# apparaitre dans un echantillon retrospectif. Les autres passent derriere
+# chercher_outils, qui rend leur schema a la demande.
+OUTILS_EXPOSES = frozenset({
+    # lectures du quotidien
+    "get_today_schedule", "get_week_schedule", "find_free_slots",
+    "list_tasks", "list_blocks",
+    # ecritures du quotidien
+    "create_block", "update_block", "schedule_task_at",
+    "skip_block_occurrence", "replace_block_occurrence",
+    "cancel_scheduled_block", "create_task", "complete_task",
+    # questions posees par le modele, relayees par le code
+    "present_form", "present_choices", "poser_question",
+})
+NOM_CHERCHEUR = "chercher_outils"
+NOM_APPEL = "appeler_outil"
+
+SCHEMA_CHERCHEUR = {
+    "type": "object",
+    "properties": {
+        "besoin": {
+            "type": "string",
+            "description": ("Ce que tu cherches a faire, en quelques mots "
+                            "(ex: « supprimer une tache », « envoyer une "
+                            "notification », « reorganiser la journee »)."),
+        },
+    },
+    "required": ["besoin"],
+}
+DESCRIPTION_CHERCHEUR = (
+    "Cherche un outil que tu n'as pas sous la main. Tes outils courants "
+    "(lire le planning, creer, deplacer, liberer, planifier, cocher, poser "
+    "une question) sont deja la: ne passe PAS par ici pour eux. Pour tout le "
+    "reste (supprimer, restaurer, vider, reorganiser, optimiser, objectifs, "
+    "preferences, notification, faisabilite, statistiques), appelle cet outil "
+    "avec ton besoin: il rend les outils qui correspondent et leurs "
+    "parametres, que tu lances ensuite avec appeler_outil."
+)
+
+SCHEMA_APPEL = {
+    "type": "object",
+    "properties": {
+        "nom": {
+            "type": "string",
+            "description": "Le nom exact rendu par chercher_outils.",
+        },
+        "parametres": {
+            "type": "object",
+            "description": ("Les parametres de cet outil, en objet "
+                            "(ex: {\"task_id\": 12})."),
+        },
+    },
+    "required": ["nom"],
+}
+DESCRIPTION_APPEL = (
+    "Lance un outil trouve par chercher_outils, avec ses parametres. "
+    "Reserve a ces outils-la: tes outils courants s'appellent directement, "
+    "par leur nom. Le code applique les memes gardes que pour un appel "
+    "direct: une suppression demande toujours sa confirmation."
+)
+
 OUTILS_QUESTION = frozenset({"poser_question", "present_choices"})
 
 
@@ -2542,21 +2606,81 @@ def outils_pour(user: User, registre: Registre, message_du_tour: str = "",
     message (portee d'une suppression, confirmation, heures dites, « cette
     semaine ») le lit, jamais le message enrichi du document ou de l'import.
     """
-    return [
-        Tool.from_schema(
-            _fabriquer(outil, user, registre, message_du_tour, tache, None,
-                       signaler, message_brut, tap),
-            outil.name,
-            description_v2(outil),
-            outil.parameters,
-            # Une mutation dans le batch force TOUT le batch en sequentiel
-            # (pydantic-ai): les lectures pures, elles, partent en parallele.
-            # Les outils de question aussi (voir OUTILS_QUESTION): deux
-            # questions du modele ne doivent jamais s'executer en parallele.
-            sequential=(outil.name in OUTILS_DE_MUTATION
-                        or outil.name in OUTILS_QUESTION),
-        )
-        for outil in ALL_TOOLS
+    return [_outil_pydantic(outil, user, registre, message_du_tour, tache,
+                            signaler, message_brut, tap)
+            for outil in ALL_TOOLS]
+
+
+def _outil_pydantic(outil, user, registre, message_du_tour, tache,
+                    signaler, message_brut, tap) -> Tool:
+    return Tool.from_schema(
+        _fabriquer(outil, user, registre, message_du_tour, tache, None,
+                   signaler, message_brut, tap),
+        outil.name,
+        description_v2(outil),
+        outil.parameters,
+        # Une mutation dans le batch force TOUT le batch en sequentiel
+        # (pydantic-ai): les lectures pures, elles, partent en parallele.
+        # Les outils de question aussi (voir OUTILS_QUESTION): deux
+        # questions du modele ne doivent jamais s'executer en parallele.
+        sequential=(outil.name in OUTILS_DE_MUTATION
+                    or outil.name in OUTILS_QUESTION),
+    )
+
+
+def outils_pour_le_modele(user: User, registre: Registre, message_du_tour: str = "",
+                          tache: str = "", signaler=None,
+                          message_brut: str | None = None,
+                          tap: dict | None = None) -> list[Tool]:
+    """Ce que la BOUCLE voit: les outils exposes, plus le chargeur.
+
+    Mesure du 2026-10-01 sur 600 tours: 75 % des tours n'appellent aucun outil
+    et les 33 outils pesaient 10 400 jetons a chaque tour. Les 17 rares passent
+    derriere `chercher_outils` et `appeler_outil`, qui rendent leur schema a la
+    demande.
+
+    `outils_pour` garde son contrat (TOUS les outils) pour les tests et pour
+    les executions par le code.
+    """
+    caches = [o for o in ALL_TOOLS if o.name not in OUTILS_EXPOSES]
+
+    async def chercher_outils(besoin: str = "") -> str:
+        return chargeur.chercher(besoin, caches, description_v2)
+
+    async def appeler_outil(nom: str = "", parametres=None) -> str:
+        """Lance un outil cache par le MEME chemin que les appels directs."""
+        vise = str(nom or "").strip()
+        outil = TOOL_MAP.get(vise)
+        if outil is None:
+            connus = ", ".join(sorted(o.name for o in caches))
+            return (f"Outil inconnu: {vise!r}. Cherche-le d'abord avec "
+                    f"{NOM_CHERCHEUR}. Disponibles ici: {connus}.")
+        if vise in OUTILS_EXPOSES:
+            return (f"{vise} est deja dans tes outils: appelle-le directement, "
+                    f"pas par {NOM_APPEL}.")
+        lus, erreur = chargeur.lire_parametres(parametres)
+        if erreur:
+            return f"Refuse par le code: {erreur}"
+        manque = chargeur.requis_manquants(outil.parameters, lus)
+        if manque:
+            return (f"Refuse par le code: {vise} exige "
+                    f"{', '.join(manque)}. Relance avec ces parametres.")
+        # Le MEME executeur que pour un appel direct: verrou du tour, gardes,
+        # registre, idempotence. Aucun chemin parallele.
+        executer = _fabriquer(outil, user, registre, message_du_tour, tache,
+                              None, signaler, message_brut, tap)
+        return await executer(**lus)
+
+    exposes = [_outil_pydantic(o, user, registre, message_du_tour, tache,
+                               signaler, message_brut, tap)
+               for o in ALL_TOOLS if o.name in OUTILS_EXPOSES]
+    return exposes + [
+        Tool.from_schema(chercher_outils, NOM_CHERCHEUR, DESCRIPTION_CHERCHEUR,
+                         SCHEMA_CHERCHEUR),
+        # Sequentiel: il peut muter, et deux mutations en parallele
+        # contourneraient le verrou du tour.
+        Tool.from_schema(appeler_outil, NOM_APPEL, DESCRIPTION_APPEL,
+                         SCHEMA_APPEL, sequential=True),
     ]
 
 

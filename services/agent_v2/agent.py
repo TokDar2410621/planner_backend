@@ -50,7 +50,7 @@ from services.agent_v2 import jugement as _jugement
 from services.agent_v2.mesure import verifier_prose
 from services.agent_v2.modeles import (REGLAGES_BOUCLE_SANS_RAISONNEMENT,
                                        modele_agir)
-from services.agent_v2.outils import outils_pour
+from services.agent_v2.outils import outils_pour, outils_pour_le_modele
 from services.agent_v2.prompts import prompt_agir
 from services.agent_v2.reconciliation import detecter_ecarts, reconcilier
 from services.agent_v2.importation import inscrire_import
@@ -465,9 +465,9 @@ class PlannerAgentV2:
         # Les regles de la garde (confirmation, heure dite, portee d'un jour)
         # lisent le message TAPE, jamais sa version enrichie du document.
         brut = self._message_brut if self._message_brut is not None else message
-        outils = outils_pour(user, registre, message_du_tour=message,
-                             tache=self._tache, signaler=self.signaler_outil,
-                             message_brut=brut, tap=self._tap)
+        outils = outils_pour_le_modele(
+            user, registre, message_du_tour=message, tache=self._tache,
+            signaler=self.signaler_outil, message_brut=brut, tap=self._tap)
         # instructions= et non system_prompt=: pydantic-ai n'ajoute les system
         # prompts QUE si l'historique est vide. Sur tout tour de suivi, la
         # boucle tournait sans date, sans table de decision ni semaine type,
