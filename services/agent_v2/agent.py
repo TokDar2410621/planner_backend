@@ -548,6 +548,11 @@ class PlannerAgentV2:
         # garde et les boutons forces.
         self._message_brut = message
         self._tap = tap if isinstance(tap, dict) and tap.get("demande") and tap.get("option") else None
+        # Verdict du juge plombe en pre-boucle (voie rapide sociale): la question
+        # consultation, consultee a un autre moment du tour, decide si une
+        # lecture reussie s'affiche. Reinitialise a chaque tour: sans verdict
+        # frais, jamais de masquage.
+        self._verdict_consultation = {}
         self._journaliser_reponse_formulaire(user, message)
 
         # Persiste d'abord, puis exclut CETTE ligne de l'historique par son id.
@@ -758,6 +763,15 @@ class PlannerAgentV2:
             faits = f"{faits}\n{reste}" if faits else reste
         faits = sans_tiret_long(faits or "")
 
+        # LIRE n'est pas MONTRER. Une lecture reussie pour raisonner (le
+        # modele a lu sans que personne ne demande a voir) ne s'affiche
+        # pas; seule une lecture qui repond a une demande est rendue. Le
+        # registre garde les faits: seul l'affichage est coupe.
+        lecture_masquee = self._lecture_sans_demande(registre)
+        if lecture_masquee:
+            logger.info("agent_v2 lecture masquee: rien de demande a voir")
+            faits = ""
+
         # Les faits partent AVANT la redaction: ils sont deja vrais, et
         # l'utilisateur n'a pas a attendre l'enrobage pour les voir.
         emis: list[str] = []
@@ -874,7 +888,10 @@ class PlannerAgentV2:
         question_posee = bool(gagnant) or bool(question) or contient_question(prose)
         lecture_reussie = any(a.succes and a.outil in LECTURES_RENDUES
                               for a in registre.actions)
-        lecture_sans_liste = compo.lecture_sans_liste or (lecture_reussie and not faits)
+        # Un masquage voulu n'est pas le defaut « lu sans rien montrer »:
+        # il a son compteur propre, sinon la metrique deviendrait aveugle.
+        lecture_sans_liste = (compo.lecture_sans_liste
+                              or (lecture_reussie and not faits)) and not lecture_masquee
         try:
             marqueurs = list(marqueurs_bruts(response))
         except Exception:  # noqa: BLE001 - une mesure ne casse pas un tour
@@ -897,7 +914,7 @@ class PlannerAgentV2:
             logging.WARNING if anormal else logging.INFO,
             "agent_v2 tour actions=%d rejetees=%d fuites=%d supprimees=%d ecarts=%d%s"
             " boucle=%.1fs/%dep/%d->%dj/r%d/c%d verif=%.2fs"
-            " asked=%d form=%d choices=%d read_without_list=%d redites=%d"
+            " asked=%d form=%d choices=%d read_without_list=%d masques=%d redites=%d"
             " raw_marker_count=%d"
             " motif=%s choix_code=%d chemin=%s tour=%.2fs",
             len(registre.actions),
@@ -922,6 +939,7 @@ class PlannerAgentV2:
             1 if formulaire else 0,
             len(quick_replies),
             1 if lecture_sans_liste else 0,
+            1 if lecture_masquee else 0,
             compo.redites,
             len(marqueurs),
             motif or "-",
@@ -960,6 +978,7 @@ class PlannerAgentV2:
             "faits_rendus": faits,
             "raw_markers": marqueurs,
             "lecture_sans_liste": lecture_sans_liste,
+            "lecture_masquee": lecture_masquee,
             "redites": compo.redites,
             # Le nom que l'utilisateur a donne au cours du formulaire du code:
             # au tour de la reponse, create_block le garde (outils.py).
@@ -1181,10 +1200,16 @@ class PlannerAgentV2:
             # Le JUGE tranche, pas une liste de mots.
             # Le message ET ce qui le precede: une reponse a une question
             # n'est pas une simple politesse, meme avec les memes mots.
+            # Deux questions, UN appel: le juge traite le dict en une fois. La
+            # seconde (consultation) ne sert pas la voie rapide; elle est
+            # plombee pour le rendu, ou elle decide si une lecture reussie
+            # s'affiche. Le cout marginal est nul: l'appel etait deja paye.
             resultats = _jugement.juger(
                 {"message": message,
                  "agent_a_dit": self._dernier_mot_de_l_agent(user)},
-                {"sociale": _jugement.q_interaction_sociale()})
+                {"sociale": _jugement.q_interaction_sociale(),
+                 "consultation": _jugement.q_consultation()})
+            self._verdict_consultation = (resultats or {}).get("consultation") or {}
             rep = (resultats or {}).get("sociale") or {}
             return (
                 rep.get("statut") == _jugement.STATUT_DECISION
@@ -1197,6 +1222,28 @@ class PlannerAgentV2:
         except Exception:  # noqa: BLE001 - dans le doute, la boucle tourne
             logger.warning("Voie rapide sociale illisible", exc_info=True)
             return False
+
+    def _lecture_sans_demande(self, registre: Registre) -> bool:
+        """Une lecture reussie qu'aucune demande ne justifie: a masquer.
+
+        Garde de rendu, separee de la voie rapide: la question consultation
+        du juge (plombee en pre-boucle) dit si la personne demandait a VOIR
+        quelque chose. « aucune » a >= 0,9 masque; l'incertitude ne masque
+        jamais: une demande sans reponse est pire qu'un affichage non
+        demande. Les mutations ne sont jamais masquees: leur recu est du.
+        Sans verdict pre-boucle (gardes, par_le_code), pas de masquage.
+        """
+        if not any(a.succes and a.outil in LECTURES_RENDUES
+                   for a in registre.actions):
+            return False
+        if any(a.succes and a.est_mutation for a in registre.actions):
+            return False
+        verdict = getattr(self, "_verdict_consultation", None) or {}
+        return (
+            verdict.get("statut") == _jugement.STATUT_DECISION
+            and verdict.get("valeur") == "aucune"
+            and float(verdict.get("confiance") or 0) >= 0.9
+        )
 
     def _lecture_de_secours(self, user: User, message: str,
                             registre: Registre) -> str:

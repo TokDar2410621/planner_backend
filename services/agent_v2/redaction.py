@@ -34,7 +34,9 @@ except Exception:  # noqa: BLE001 - schema indisponible dans le portage seul
 
 # Les cinq lectures dont le resultat merite une liste rendue par le code. Un
 # tour ou l'une d'elles a reussi sans que rien ne s'affiche est compte dans
-# read_without_list: c'est le defaut « que voici » suivi de rien.
+# read_without_list: c'est le defaut « que voici » suivi de rien. Un
+# masquage VOULU (lecture sans demande, garde de rendu) n'y entre pas: il
+# a son compteur propre, masques.
 LECTURES_RENDUES = ("get_week_schedule", "get_today_schedule", "list_blocks",
                     "find_free_slots", "list_tasks")
 

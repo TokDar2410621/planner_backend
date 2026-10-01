@@ -691,7 +691,7 @@ class NarrateurUniqueTests(NarrateurBase):
 class MesureTests(NarrateurBase):
     LIGNE = re.compile(
         r"agent_v2 tour actions=\d+ rejetees=\d+ fuites=\d+ supprimees=\d+ ecarts=\d+.*"
-        r" asked=[01] form=[01] choices=\d read_without_list=[01] redites=\d+"
+        r" asked=[01] form=[01] choices=\d read_without_list=[01] masques=[01] redites=\d+"
         r" raw_marker_count=\d+"
         r" motif=\S+ choix_code=\d+")
 
@@ -701,7 +701,7 @@ class MesureTests(NarrateurBase):
         meta = self.metadonnees()
         for cle in ("agent", "en_reponse_a", "quick_replies", "interactive_inputs", "question_posee",
                     "question", "question_motif", "demandes", "faits_rendus", "raw_markers",
-                    "lecture_sans_liste", "actions"):
+                    "lecture_sans_liste", "lecture_masquee", "actions"):
             self.assertIn(cle, meta)
         self.assertEqual(meta["agent"], "v2")
         lignes = [ligne for ligne in logs.output if "agent_v2 tour" in ligne]

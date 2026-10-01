@@ -19,7 +19,7 @@ qu'un autre contexte lit la table.
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
-from django.test import TransactionTestCase
+from django.test import SimpleTestCase, TransactionTestCase
 from django.utils import timezone
 
 from core.models import RecurringBlock
@@ -34,6 +34,24 @@ PROSE_QUI_ANNONCE = ("Voici ton planning d'aujourd'hui : Conception "
 def _boucle_muette(reponse):
     """Une boucle qui repond sans appeler le moindre outil (le cas de prod)."""
     def _boucle(self_agent, user, message, registre):
+        return reponse
+    return _boucle
+
+
+SALUT = "Salut !"
+
+
+def _boucle_qui_lit(reponse):
+    """Une boucle qui lit vraiment (au registre) puis repond: le cas de
+    prod ou le modele appelle get_today_schedule sans qu'on le lui demande."""
+    def _boucle(self_agent, user, message, registre):
+        from services.agent.tools.base import ToolResult
+        registre.ajouter(
+            "get_today_schedule", {},
+            ToolResult(success=True, message="ok", data={
+                "blocks": [{"title": "Conception d'applications",
+                            "start_time": "08:00", "end_time": "11:00",
+                            "block_type": "course"}]}))
         return reponse
     return _boucle
 
@@ -308,3 +326,142 @@ class ContexteDuJugeTests(TransactionTestCase):
         instructions = j.q_interaction_sociale()['instructions']
         self.assertIn('agent_a_dit', instructions)
         self.assertIn('repond a ce que l\'assistant vient de dire', instructions)
+
+
+class LectureSansDemandeTests(TransactionTestCase):
+    """LIRE n'est pas MONTRER.
+
+    Une lecture reussie pour raisonner (le modele a lu sans que personne ne
+    demande a voir) ne s'affiche pas; seule une lecture qui repond a une
+    demande est rendue. Le signal n'est PAS la question sociale: mesuree le
+    2026-10-01, elle ne separe rien (« Ma journee » sociale 0,60 contre
+    « Je suis la » sociale 0,63, chevauchement complet). C'est la question
+    consultation, qui demande ce que la personne veut VOIR: « aucune » a
+    >= 0,9 masque, l'incertitude ne masque jamais (une demande sans reponse
+    est pire qu'un affichage non demande).
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='sansdemande', password='x')
+        from services.agent_v2 import PlannerAgentV2
+        self.Agent = PlannerAgentV2
+
+    def _tour_qui_lit(self, message, juge):
+        with patch('services.agent_v2.jugement.juger', juge), \
+                patch.object(self.Agent, '_boucle',
+                             _boucle_qui_lit(ReponseDire(ouverture=SALUT))):
+            return self.Agent().process_message(self.user, message)
+
+    def _metadonnees(self):
+        from core.models import ConversationMessage
+        return ConversationMessage.objects.filter(
+            user=self.user, role='assistant').latest('pk').metadata
+
+    def test_lecture_masquee_quand_rien_n_est_demande(self):
+        message = "Je suis la"
+        with self.assertLogs("services.agent_v2.agent", level="INFO") as logs:
+            res = self._tour_qui_lit(message, juger_script(
+                {message: {"sociale": ("oui", 0.63),
+                           "consultation": ("aucune", 0.93)}}))
+        self.assertNotIn("Conception", res["response"])
+        self.assertIn("Salut", res["response"])
+        self.assertTrue(any("masques=1" in ligne for ligne in logs.output),
+                        logs.output)
+        # Un masquage voulu n'est pas le defaut « lu sans rien montrer ».
+        self.assertFalse(any("read_without_list=1" in ligne
+                             for ligne in logs.output))
+        self.assertTrue(self._metadonnees()["lecture_masquee"])
+
+    def test_pas_de_masquage_quand_le_juge_doute(self):
+        """Le cas qui tuait le seuil social: « Ma journee » (sociale 0,60)
+        est une vraie demande. La consultation dit « incertain » a 0,54:
+        pas de masquage, la journee s'affiche."""
+        message = "Ma journee"
+        res = self._tour_qui_lit(message, juger_script(
+            {message: {"sociale": ("non", 0.60),
+                       "consultation": ("incertain", 0.54)}}))
+        self.assertIn("Conception", res["response"])
+
+    def test_demande_reelle_affichee(self):
+        message = "Mes taches"
+        res = self._tour_qui_lit(message, juger_script(
+            {message: {"consultation": ("taches", 0.98)}}))
+        self.assertIn("Conception", res["response"])
+
+    def test_pas_de_masquage_sans_verdict_pre_boucle(self):
+        """Message long: les gardes sautent le pre-jugement, et un message
+        long est presque toujours une demande. Sans verdict, pas de
+        masquage (et aucun appel frais n'est paye au rendu)."""
+        message = ("je voulais juste te dire que je suis bien arrive "
+                   "a la maison ce soir")
+        self.assertGreater(len(message.split()), 8)
+        res = self._tour_qui_lit(message, juger_script(
+            {message: {"consultation": ("aucune", 0.95)}}))
+        self.assertIn("Conception", res["response"])
+
+    def test_le_juge_n_est_pas_reinterroge_au_rendu(self):
+        """Les deux questions partent en UN appel pre-boucle; le rendu
+        reutilise le verdict plombe, sans appel frais."""
+        message = "Je suis la"
+        appels = []
+        juge = juger_script(
+            {message: {"sociale": ("oui", 0.63),
+                       "consultation": ("aucune", 0.93)}})
+
+        def compteur(etat, questions):
+            appels.append(set(questions))
+            return juge(etat, questions)
+
+        res = self._tour_qui_lit(message, compteur)
+        self.assertEqual(appels, [{"sociale", "consultation"}])
+        self.assertNotIn("Conception", res["response"])
+
+
+class GardeLectureSansDemandeTests(SimpleTestCase):
+    """Le garde de rendu, isole: qui est masque, qui ne l'est jamais."""
+
+    def _registre(self, *outils):
+        from services.agent_v2.registre import Registre
+        from services.agent.tools.base import ToolResult
+        registre = Registre()
+        for outil in outils:
+            registre.ajouter(outil, {},
+                             ToolResult(success=True, message="ok", data={}))
+        return registre
+
+    def _garde(self, registre, verdict):
+        from services.agent_v2 import PlannerAgentV2
+        agent = PlannerAgentV2()
+        agent._verdict_consultation = verdict
+        return agent._lecture_sans_demande(registre)
+
+    def test_masque_sur_aucune_a_09(self):
+        self.assertTrue(self._garde(
+            self._registre("get_today_schedule"),
+            {"valeur": "aucune", "confiance": 0.93, "statut": "decision"}))
+
+    def test_pas_de_masquage_sur_doute(self):
+        self.assertFalse(self._garde(
+            self._registre("get_today_schedule"),
+            {"valeur": "incertain", "confiance": 0.54, "statut": "incertain"}))
+
+    def test_pas_de_masquage_sous_le_seuil(self):
+        self.assertFalse(self._garde(
+            self._registre("get_today_schedule"),
+            {"valeur": "aucune", "confiance": 0.85, "statut": "decision"}))
+
+    def test_mutation_jamais_masquee(self):
+        """Une ecriture reussie garde toujours son recu, meme si le juge
+        dit qu'on ne demandait rien a voir."""
+        self.assertFalse(self._garde(
+            self._registre("get_today_schedule", "create_block"),
+            {"valeur": "aucune", "confiance": 0.95, "statut": "decision"}))
+
+    def test_sans_verdict_pas_de_masquage(self):
+        self.assertFalse(self._garde(
+            self._registre("get_today_schedule"), {}))
+
+    def test_sans_lecture_pas_de_masquage(self):
+        self.assertFalse(self._garde(
+            self._registre(),
+            {"valeur": "aucune", "confiance": 0.95, "statut": "decision"}))
