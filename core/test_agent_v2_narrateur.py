@@ -358,11 +358,14 @@ class MessageBrutTests(NarrateurBase):
             start_time="14:00", end_time="16:00", source_document=doc)
 
     def _vraie_boucle(self, outils_pour, reponse=None):
+        """`outils_pour` surveille ce que la BOUCLE demande. Depuis le chargeur
+        d'outils (2026-10-01), elle appelle outils_pour_le_modele: les outils
+        exposes, plus chercher_outils et appeler_outil."""
         AgentFactice.sortie = reponse or ReponseDire(ouverture="Ok.")
         with patch.object(module_agent, "Agent", AgentFactice), \
              patch.object(module_agent, "modele_agir", return_value=None), \
              patch.object(module_agent, "prompt_agir", return_value=""), \
-             patch.object(module_agent, "outils_pour", outils_pour), \
+             patch.object(module_agent, "outils_pour_le_modele", outils_pour), \
              patch.object(PlannerAgentV2, "_historique", return_value=[]):
             return PlannerAgentV2().process_message(self.user, "c'est bon ?")
 
