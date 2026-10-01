@@ -8,6 +8,7 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.utils import timezone
 
 from core.models import RecurringBlock, ScheduledBlock, Task, Goal
+from services.scheduling.placement import skipped_block_ids
 
 DAY_NAMES = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
 
@@ -55,9 +56,17 @@ def build_context(user: User) -> dict:
     today_blocks = RecurringBlock.objects.filter(
         user=user, day_of_week=day_of_week, active=True
     ).order_by("start_time")
+    # Les occurrences annulees ce jour-la ne sont PAS au programme. Le prompt
+    # presente ce bloc comme l'etat EFFECTIF: sans ce filtre il mentait, et le
+    # modele refusait de placer quelque chose sur un creneau libere (mesure le
+    # 2026-10-01 sur le compte de Darius, « Conception d'applications » saute
+    # et pourtant affiche).
+    sautes = skipped_block_ids(user, today)
 
     today_entries = []
     for b in today_blocks:
+        if b.id in sautes:
+            continue
         today_entries.append((
             b.start_time,
             f"  {b.start_time.strftime('%H:%M')}-{b.end_time.strftime('%H:%M')} {b.title} ({b.get_block_type_display()})",
