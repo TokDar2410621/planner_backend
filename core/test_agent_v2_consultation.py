@@ -92,3 +92,98 @@ class ConsultationTests(TransactionTestCase):
         res = self._tour(message, juger_script(
             {message: {"consultation": ("journee", 0.7)}}))
         self.assertNotIn('Conception', res['response'])
+
+
+class SalutationSansLectureTests(TransactionTestCase):
+    """Une salutation ne declenche aucune lecture, meme avec un historique.
+
+    Mesure en production le 2026-09-30, apres le lot 2: sur un compte neuf,
+    « Hey » est propre 6 fois sur 6; apres un tour qui a affiche le planning,
+    « Hey » le redeballe 3 fois sur 3. Le contrat de prose l interdisait deja,
+    mais trop tard: la liste est rendue par le code des qu une lecture reussit,
+    donc l interdiction doit vivre la ou le modele DECIDE d appeler l outil.
+
+    Ces tests verrouillent le contrat (les descriptions et le prompt), seul
+    levier sur un choix d outil: aucun test ne peut forcer la decision d un
+    modele. La mesure vit au banc de production.
+    """
+
+    def test_la_description_de_la_lecture_exclut_les_salutations(self):
+        from services.agent_v2 import outils as outils_v2
+        d = outils_v2.DESCRIPTIONS_V2['get_today_schedule']
+        self.assertIn("salutation", d)
+        self.assertIn("ne DEMANDE rien a voir", d)
+        self.assertIn("AUCUNE lecture", d)
+        # La notion suffit: pas d'exemples de mots, qui feraient decider le
+        # modele sur un vocabulaire au lieu du sens.
+        for mot in ('« hey »', '« salut »', '« merci »'):
+            self.assertNotIn(mot, d)
+
+    def test_le_prompt_dit_la_meme_regle(self):
+        from services.agent_v2.prompts import REGLES_AGIR
+        self.assertIn("ne DEMANDE rien a voir", REGLES_AGIR)
+        self.assertIn("aucune lecture", REGLES_AGIR)
+
+    def test_la_regle_vit_aussi_la_ou_le_modele_choisit_l_outil(self):
+        """Le contrat de prose seul ne suffit pas: il arrive apres l appel."""
+        from services.agent_v2 import outils as outils_v2
+        from services.agent_v2.prompts import PROSE_BOUCLE
+        self.assertIn('salut', PROSE_BOUCLE.lower())
+        self.assertIn('salutation', outils_v2.DESCRIPTIONS_V2['get_today_schedule'])
+
+
+class VoieRapideSocialeTests(TransactionTestCase):
+    """La voie rapide repond a une salutation SANS la boucle.
+
+    Question de Darius le 2026-09-30: « pourquoi il reflechit encore sur
+    hey ? ». Mesure directe du juge en production: valeur=True, confiance 0.94
+    a 0.96 sur « Hey », « Salut », « Merci ». Le juge disait oui, mais le code
+    comparait a la CHAINE « oui » alors qu'une reponse noul est un BOOLEEN
+    (jugement.py l.507): la voie etait morte, et chaque salutation payait un
+    tour complet de la boucle.
+
+    Les tests ne pouvaient pas le voir: le faux juge rendait la chaine
+    scriptee. Il respecte desormais le contrat du vrai.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='voie-rapide', password='x')
+        aujourdhui = timezone.localdate().weekday()
+        RecurringBlock.objects.create(
+            user=self.user, title="Conception d’applications", block_type='course',
+            day_of_week=aujourdhui, start_time='08:00', end_time='11:00')
+        from services.agent_v2 import PlannerAgentV2
+        self.Agent = PlannerAgentV2
+
+    def test_une_salutation_prend_la_voie_rapide(self):
+        """La boucle ne tourne pas: on la remplace par une bombe."""
+        def _boucle_interdite(self_agent, user, message, registre):
+            raise AssertionError('la boucle a tourne sur une salutation')
+
+        with patch('services.agent_v2.jugement.juger',
+                   juger_script({'Hey': {'sociale': ('oui', 0.94)}})), \
+                patch.object(self.Agent, '_boucle', _boucle_interdite), \
+                patch.object(self.Agent, '_reponse_rapide',
+                             lambda s, u, m: 'Salut !'):
+            res = self.Agent().process_message(self.user, 'Hey')
+        self.assertEqual(res['response'], 'Salut !')
+        self.assertNotIn('Conception', res['response'])
+
+    def test_une_vraie_demande_ne_prend_pas_la_voie_rapide(self):
+        message = "Montre-moi ma journée"
+        with patch('services.agent_v2.jugement.juger',
+                   juger_script({message: {'sociale': ('non', 0.94)}})), \
+                patch.object(self.Agent, '_boucle',
+                             _boucle_muette(ReponseDire(ouverture='Voilà.'))):
+            res = self.Agent().process_message(self.user, message)
+        self.assertTrue(res['response'])
+
+    def test_le_faux_juge_rend_un_booleen_comme_le_vrai(self):
+        """Le piege qui a laisse passer le bug: un double trop permissif."""
+        from services.agent_v2 import jugement as j
+        faux = juger_script({'Hey': {'sociale': ('oui', 0.94)}})
+        rep = faux('Hey', {'sociale': j.q_interaction_sociale()})['sociale']
+        self.assertIs(rep['valeur'], True)
+        choix = juger_script({'m': {'portee': ('serie', 0.95)}})
+        rep2 = choix('m', {'portee': j.q_portee_changement()})['portee']
+        self.assertEqual(rep2['valeur'], 'serie')
