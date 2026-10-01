@@ -79,6 +79,15 @@ def juger_script(par_message: dict):
                                "probabilites": None, "statut": "indisponible"}
                 continue
             valeur, confiance = cas[qid]
+            # Le VRAI juge convertit une reponse noul en booleen
+            # (jugement.py l.507). Un double qui rendrait la chaine « oui »
+            # validerait du code mort: la voie rapide sociale a vecu des
+            # semaines sans jamais pouvoir se declencher, tests verts.
+            if (questions.get(qid) or {}).get("type") == jugement.TYPE_NOUL:
+                if valeur == "oui":
+                    valeur = True
+                elif valeur == "non":
+                    valeur = False
             sortie[qid] = {"valeur": valeur, "confiance": float(confiance),
                            "probabilites": None,
                            "statut": ("decision" if confiance >= 0.8

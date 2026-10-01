@@ -1169,7 +1169,10 @@ class PlannerAgentV2:
             rep = (resultats or {}).get("sociale") or {}
             return (
                 rep.get("statut") == _jugement.STATUT_DECISION
-                and rep.get("valeur") == "oui"
+                # Une reponse noul est un BOOLEEN (jugement.py l.507), pas la
+                # chaine « oui »: la comparer a « oui » rendait cette voie
+                # morte, et chaque salutation payait un tour complet.
+                and rep.get("valeur") is True
                 and float(rep.get("confiance") or 0) >= 0.9
             )
         except Exception:  # noqa: BLE001 - dans le doute, la boucle tourne
@@ -1236,7 +1239,7 @@ class PlannerAgentV2:
                 message, {"remplacant": _jugement.q_remplacant_annonce()})
             rep = (resultats or {}).get("remplacant") or {}
             if (rep.get("statut") != _jugement.STATUT_DECISION
-                    or rep.get("valeur") != "oui"
+                    or rep.get("valeur") is not True
                     or float(rep.get("confiance") or 0) < 0.9):
                 return ""
             donnees = sauts[-1].donnees or {}
