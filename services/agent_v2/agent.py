@@ -1142,6 +1142,21 @@ class PlannerAgentV2:
             logger.error("Decision du code illisible", exc_info=True)
             return False
 
+    @staticmethod
+    def _dernier_mot_de_l_agent(user: User) -> str:
+        """Ce que l'assistant vient de dire, pour juger ce qui lui repond.
+
+        Un message n'a pas le meme sens seul ou apres une question. Borne a
+        400 caracteres: le juge a besoin du sens, pas de la liste affichee.
+        """
+        from core.models import ConversationMessage
+        dernier = (ConversationMessage.objects
+                   .filter(user=user, role="assistant")
+                   .order_by("-pk")
+                   .values_list("content", flat=True)
+                   .first())
+        return (dernier or "")[:400]
+
     def _voie_rapide_sociale(self, user: User, message: str, attachment) -> bool:
         """Le message merite-t-il la voie rapide (simple interaction sociale) ?
 
@@ -1164,8 +1179,12 @@ class PlannerAgentV2:
             if _demandes.demandes_en_attente(user):
                 return False
             # Le JUGE tranche, pas une liste de mots.
+            # Le message ET ce qui le precede: une reponse a une question
+            # n'est pas une simple politesse, meme avec les memes mots.
             resultats = _jugement.juger(
-                message, {"sociale": _jugement.q_interaction_sociale()})
+                {"message": message,
+                 "agent_a_dit": self._dernier_mot_de_l_agent(user)},
+                {"sociale": _jugement.q_interaction_sociale()})
             rep = (resultats or {}).get("sociale") or {}
             return (
                 rep.get("statut") == _jugement.STATUT_DECISION

@@ -246,26 +246,33 @@ def q_remplacant_annonce() -> dict:
 
 
 def q_interaction_sociale() -> dict:
-    """Noul : le message est-il une simple interaction sociale ?
+    """Noul : le message exprime-t-il une demande, vu ce qui le precede ?
 
-    Une salutation, un remerciement, un acquiescement, une formule de
-    politesse : rien qui demande une action sur le planning, une
-    information du planning, ou une reponse qui necessite le contexte.
-    Reponds oui seulement si le message n'attend rien d'autre qu'une
-    reponse sociale breve.
+    Oui quand il n'en exprime aucune et qu'une reponse breve suffit. La
+    question porte sur ce que la personne ATTEND, jamais sur les mots qu'elle
+    emploie: une enumeration de formules de politesse laisse passer tout ce
+    qu'elle n'a pas prevu. Mesure du 2026-10-01: « Je suis la » tombait a 0.65
+    de confiance, sous le seuil, la boucle tournait et la journee s'affichait
+    sans que rien ne l'ait demandee.
+
+    L'etat porte `agent_a_dit`: le meme message n'a pas le meme sens seul ou
+    apres une question. « Je suis la » apres rien est une presence; apres « tu
+    veux voir ta journee ? » c'est une reponse, et elle attend une suite.
     """
     return {
         "type": TYPE_NOUL,
         "instructions": (
-            "Ce message est-il une simple interaction sociale (salutation, "
-            "remerciement, acquiescement, formule de politesse), sans "
-            "demande d'action sur le planning ni demande d'information du "
-            "planning ? Reponds oui seulement si le message n'attend rien "
-            "d'autre qu'une reponse sociale breve."
+            "Ce message exprime-t-il une DEMANDE, dans le contexte de ce que "
+            "l'assistant vient de dire (champ agent_a_dit) ? Reponds oui quand "
+            "il n'en exprime AUCUNE et qu'une reponse breve et humaine suffit. "
+            "Reponds non des qu'il demande une action ou une information, et "
+            "des qu'il repond a ce que l'assistant vient de dire: une reponse "
+            "attend une suite, meme quand elle est brève. Juge ce que la "
+            "personne attend, pas les mots qu'elle emploie."
         ),
         "criteria": {
-            "oui": "simple interaction sociale, rien d'autre attendu",
-            "non": "le message demande ou implique autre chose",
+            "oui": "aucune demande, une reponse breve suffit",
+            "non": "le message demande une action ou une information",
         },
     }
 
