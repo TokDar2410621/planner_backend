@@ -235,16 +235,21 @@ class PlanningDuJourEffectifTests(TransactionTestCase):
             date=self.jour + timedelta(days=7))
         self.assertTrue(any('Conception' in l for l in self._lignes()))
 
-    def test_le_prompt_ne_montre_pas_un_cours_annule(self):
-        from core.models import RecurringBlockException
+    def test_le_planning_du_jour_n_est_plus_dans_le_prompt(self):
+        """Sorti le 2026-10-01: le modele lit la journee, il ne la recoit plus.
+
+        Le filtrage des occurrences annulees reste teste ci-dessus: d'autres
+        lecteurs du contexte (agent v1) s'en servent encore.
+        """
         from services.agent_v2.prompts import prompt_agir
-        RecurringBlockException.objects.create(
-            user=self.user, recurring_block=self.cours, date=self.jour)
         prompt = prompt_agir(self.user)
-        debut = prompt.index("PLANNING AUJOURD'HUI")
-        section = prompt[debut:prompt.index('SEMAINE TYPE', debut)]
-        self.assertNotIn('Conception', section)
-        self.assertIn('Entreprise', section)
+        self.assertNotIn("PLANNING AUJOURD'HUI", prompt)
+        # Aucune ligne d'horaire du jour: le format du contexte etait
+        # «   08:00-11:00 Titre (Cours) », celui de la semaine type est
+        # « - Titre: jeu 08:00-11:00 ». Seul le second doit rester.
+        self.assertNotIn('08:00-11:00 Conception', prompt)
+        self.assertIn('SEMAINE TYPE', prompt)
+        self.assertIn('- Conception: jeu 08:00-11:00', prompt)
 
 
 class ContexteDuJugeTests(TransactionTestCase):
