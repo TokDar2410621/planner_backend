@@ -144,14 +144,16 @@ class P2RegleTests(SimpleTestCase):
         # La vieille regle attrapait tout jour + heure pour create_block.
         self.assertNotIn("l'utilisateur decrit ses horaires habituels AVEC jours et heures -> create_block.",
                          REGLES_AGIR)
-        # Le planning du jour, deja dans le prompt, sert a RAISONNER. Pour
-        # MONTRER une journee, l'outil est le SEUL chemin: l'interdire alors
-        # que la prose ne peut pas recopier le contexte privait
-        # « montre-moi ma journee » de toute issue (defaut mesure en prod le
-        # 2026-09-29, 2 tours sur 3 en repli « je n'ai pas compris »).
-        self.assertIn("il te sert a RAISONNER", REGLES_AGIR)
+        # Le planning du jour est SORTI du prompt le 2026-10-01: tant qu'il y
+        # etait, il fallait une regle pour dire quand le relire, et chaque
+        # formulation de cette regle a produit un defaut (l'interdire privait
+        # « montre-moi ma journee » de tout chemin; l'autoriser affichait la
+        # journee sur « Je suis la »). Le modele lit, donc la question ne se
+        # pose plus.
+        self.assertIn("Tu ne connais PAS le contenu d'une journee", REGLES_AGIR)
         self.assertIn("appelle get_today_schedule", REGLES_AGIR)
         self.assertNotIn("Ne le relis JAMAIS avec", REGLES_AGIR)
+        self.assertNotIn("PLANNING AUJOURD'HUI", REGLES_AGIR)
 
     def test_les_descriptions_disent_la_regle(self):
         from services.agent.tools import TOOL_MAP
