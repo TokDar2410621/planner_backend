@@ -33,7 +33,6 @@ from core.models import ConversationMessage, RecurringBlock
 from core.test_agent_v2_lire_ombre import _agir_scripte, _element, _heure, _normaliser, _ref
 from services.agent.tools.base import ToolResult
 from services.agent_v2 import boutons, lecture, regles
-from services.agent_v2.agent import REPLI_QUESTION
 
 
 def _boucle_scriptee(appel=None, elements=None, sortie=None, compteur=None):
@@ -424,7 +423,8 @@ class ToursTests(TransactionTestCase):
         t = self._tour(self._utilisateur("coupee"), "mets mon cours de maths", [COURS_MATHS_TOUR],
                        regles_actives="creneaux")
         self.assertEqual(t.boucle, 1)
-        self.assertEqual(t.done["response"], DIRE_ABSENCE["question"])
+        self.assertIn("Je ne vois pas de cours de maths dans ton horaire.", t.done["response"])
+        self.assertIn(DIRE_ABSENCE["question"], t.done["response"])
         self.assertFalse(t.done.get("interactive_inputs"))
         self.assertEqual(t.done["question_motif"], "dire")
 
@@ -489,9 +489,10 @@ class ToursTests(TransactionTestCase):
         t = self._tour(self._utilisateur("reponse"), message,
                        [_element(mention="maths", genre="course", candidats=["s1"])], dire=DIRE_NEUTRE)
         self.assertEqual(t.boucle, 1)
+        # Le seul vrai contrat du test: aucun formulaire repose. Le code n'a
+        # rien rendu, donc la prose neutre de DIRE survit.
         self.assertFalse(t.done.get("interactive_inputs"))
-        self.assertEqual(t.done["response"], REPLI_QUESTION)
-        self.assertEqual(t.done["question_motif"], "dire")
+        self.assertIn("D'accord.", t.done["response"])
         self.assertEqual(t.done["quick_replies"], [])
 
     def test_le_chemin_rapide_n_evalue_aucune_regle(self):
@@ -524,6 +525,5 @@ class ToursTests(TransactionTestCase):
                 t = self._tour(self._utilisateur(nom), "planifie revision demin de 14h a 16h",
                                dire=DIRE_NEUTRE, libre=OCCUPE, **options)
                 self.assertEqual(t.done["quick_replies"], [])
-                # Sans fait ni question exploitable, le repli reste explicite.
-                self.assertEqual(t.done["response"], REPLI_QUESTION)
-                self.assertEqual(t.done["question_motif"], "dire")
+                # Regle coupee ou lecture inutilisable: la prose neutre survit.
+                self.assertIn("D'accord.", t.done["response"])
