@@ -12,8 +12,21 @@ from django.contrib.auth.models import User
 from django.test import TestCase
 
 from services.agent.tools.base import ToolResult
-from services.agent_v2.reconciliation import LECTURES, detecter_ecarts, reconcilier
-from services.agent_v2.registre import OUTILS_DE_MUTATION, Registre
+from services.agent_v2.reconciliation import LECTURES, detecter_ecarts as _detecter_ecarts, reconcilier
+from services.agent_v2.registre import OUTILS_DE_MUTATION, Postcondition, Registre
+
+
+def detecter_ecarts(registre):
+    """Fixture du détecteur : résultats déjà relus, sans simuler une base.
+
+    Ces tests vérifient la mise en forme des écarts. Les refus de confirmation
+    et les vraies relectures sont exercés séparément dans test_refonte_verite.
+    """
+    for action in registre.mutations():
+        if action.succes:
+            registre.verifier(action.id, 1, [Postcondition(
+                'fixture', {'id': action.id}, action.donnees, action.donnees, True)])
+    _detecter_ecarts(registre)
 
 
 class TableDeLectureTests(TestCase):
@@ -76,7 +89,7 @@ class SuccesSansMutationTests(TestCase):
         r = Registre()
         r.ajouter('create_task', {'title': 'Reviser'},
                   ToolResult(success=True, message='Tache deja presente (non dupliquee)',
-                             data={'task': {'id': 1, 'title': 'Reviser'}}))
+                             data={'task': {'id': 1, 'title': 'Reviser'}, 'deja_presente': True}))
         detecter_ecarts(r)
         self.assertEqual(len(r.ecarts), 1)
         self.assertIn('deja', r.ecarts[0].description.lower())
@@ -127,7 +140,7 @@ class GenresDEcartTests(TestCase):
         r = Registre()
         r.ajouter('create_task', {'title': 'Reviser'},
                   ToolResult(success=True, message='Tache deja presente (non dupliquee)',
-                             data={'task': {'id': 1, 'title': 'Reviser'}}))
+                             data={'task': {'id': 1, 'title': 'Reviser'}, 'deja_presente': True}))
         detecter_ecarts(r)
         self.assertEqual([e.genre for e in r.ecarts], ['tache_existante'])
         self.assertEqual(r.ecarts[0].description, "tache deja presente, rien n'a ete cree")
@@ -168,8 +181,10 @@ class ReconciliationTests(TestCase):
         r.ajouter('list_blocks', {}, ToolResult(success=True))
         self.assertEqual(reconcilier(self.user, r), {})
 
-    def test_un_tour_avec_mutation_relit_le_bon_outil(self):
+    def test_succes_sans_identite_ne_devient_pas_confirmation(self):
         r = Registre()
         r.ajouter('create_block', {'title': 'Maths'}, ToolResult(success=True))
         etat = reconcilier(self.user, r)
-        self.assertIn('list_blocks', etat)
+        self.assertIn('a1', etat)
+        self.assertEqual(etat['a1']['statut'], 'a_verifier')
+        self.assertEqual(r.recus_confirmes(), [])

@@ -39,6 +39,7 @@ import json
 import logging
 import re
 import threading
+import time
 import unicodedata
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -47,7 +48,7 @@ from datetime import date, datetime, timedelta
 
 from asgiref.sync import sync_to_async
 from django.contrib.auth.models import User
-from django.db import close_old_connections
+from django.db import close_old_connections, transaction
 from django.utils import timezone
 from pydantic_ai.tools import Tool
 
@@ -95,7 +96,7 @@ DEJA_FAIT = "Deja fait par le code ce tour."
 
 DESTRUCTIFS = {"delete_block", "clear_all_blocks", "delete_task", "cancel_scheduled_block"}
 CREATEURS = {"create_block", "schedule_task_at", "create_task",
-             "replace_block_occurrence"}
+             "replace_block_occurrence", "resolve_document_entry"}
 # Au-dela de cinq creations dans un tour, on demande avant de continuer.
 SEUIL_CREATIONS = 5
 
@@ -306,8 +307,8 @@ def _cle_destructive(nom: str, params: dict):
         return dem.cle_demande("cancel_scheduled_block", {"date": jour.isoformat(), "title": titre})
     if nom == "clear_all_blocks":
         return "clear_all_blocks"
-    if nom == "optimize_week":
-        return "optimize_week:apply"
+    if nom in {"optimize_week", "organize_day"}:
+        return f"{nom}:apply"
     return None
 
 
@@ -556,7 +557,7 @@ def _appel_composite(nom: str, kwargs: dict):
     """
     if nom != "update_block":
         return None
-    identite = any(str(kwargs.get(c) or "").strip() for c in CHAMPS_IDENTITE)
+    identite = any(kwargs.get(c) is not None and str(kwargs[c]).strip() for c in CHAMPS_IDENTITE)
     bornes = any(str(kwargs.get(c) or "").strip() for c in ("end_date", "start_date"))
     if not (identite and bornes):
         return None
@@ -576,7 +577,7 @@ def _garde_changement(ctx: _Contexte, kwargs: dict):
     # garde (« heure dite », round r9): la doubler d'une question de portee
     # masquerait un refus plus precis, et un tour ne pose qu'une question.
     titre = str(kwargs.get("title") or "").strip()
-    jour_vise = str(kwargs.get("day_of_week") or "").strip()
+    jour_vise = str(kwargs['day_of_week']).strip() if kwargs.get('day_of_week') is not None else ''
     if not titre and not jour_vise:
         return None
     bid = _entier(kwargs.get("block_id"))
@@ -732,8 +733,8 @@ def _analyser(ctx: _Contexte, nom: str, kwargs: dict):
         return _Garde("destructif", cle, {cle}, nom, parametres, cible,
                       _options_confirmer(nom, parametres, cible))
 
-    if nom == "optimize_week" and kwargs.get("apply"):
-        cle = "optimize_week:apply"
+    if nom in {"optimize_week", "organize_day"} and kwargs.get("apply"):
+        cle = f"{nom}:apply"
         return _Garde("optimisation", cle, {cle}, nom, dict(kwargs))
     return None
 
@@ -777,7 +778,7 @@ def _garde_critique(nom: str, kwargs: dict) -> bool:
         or (nom == "update_block" and bool(str(kwargs.get("end_date") or "").strip()))
         or (nom == "update_block" and bool(str(kwargs.get("start_date") or "").strip()))
         or (nom == "update_block" and bool(str(kwargs.get("title") or "").strip()))
-        or (nom == "optimize_week" and bool(kwargs.get("apply")))
+        or (nom in {"optimize_week", "organize_day"} and bool(kwargs.get("apply")))
     )
 
 
@@ -883,7 +884,7 @@ _PLAN_SEMAINE_TTL = 1800  # 30 min: une confirmation arrive vite; au-dela on re-
 
 
 def _cle_plan_semaine(user_id: int, start_iso: str) -> str:
-    return f"agentv2:plan_semaine:v1:{user_id}:{start_iso}"
+    return f"agentv2:plan_semaine:v2:{user_id}:{start_iso}"
 
 
 def _plan_propose(outil, user, kwargs: dict):
@@ -921,7 +922,7 @@ def _plan_propose(outil, user, kwargs: dict):
     days_data, lines, skipped_total, arrangements = _resoudre_semaine(user, start)
     proposition = _resultat_semaine(apply=False, start=start, days_data=days_data,
                                     lines=lines, moved_total=0, skipped_total=skipped_total)
-    empreinte = _empreinte_plan(proposition.data or {})
+    empreinte = hashlib.sha1(f"{entrees}:{_empreinte_plan(proposition.data or {})}".encode()).hexdigest()[:12]
     cache.set(cle, {"entrees": entrees, "empreinte": empreinte,
                     "data": proposition.data, "message": proposition.message,
                     "arrangements": arrangements},
@@ -933,7 +934,7 @@ _PLAN_JOUR_TTL = 1800  # 30 min: meme logique que le plan semaine.
 
 
 def _cle_plan_jour(user_id: int, date_iso: str) -> str:
-    return f"agentv2:plan_jour:v1:{user_id}:{date_iso}"
+    return f"agentv2:plan_jour:v2:{user_id}:{date_iso}"
 
 
 def _jour_organize(raw):
@@ -995,34 +996,55 @@ def _plan_propose_jour(outil, user, kwargs: dict):
     return proposition, entrees, arrangement
 
 
-def _demande_optimisation(kwargs: dict, empreinte: str, proposition: ToolResult) -> dict:
+def _proposition_optimisation(outil, user, kwargs):
+    """Plan, identité confirmable et entrées vérifiées au moment de l'écriture."""
+    from services.scheduling.solve_day import empreinte_entrees_semaine
+
+    if outil.name == "organize_day":
+        proposition, entrees, arrangement = _plan_propose_jour(outil, user, kwargs)
+        empreinte = (hashlib.sha1(f"{kwargs.get('date')}:{entrees}:{_empreinte_plan(proposition.data or {})}".encode()).hexdigest()[:12]
+                     if entrees is not None else None)
+        return proposition, empreinte, arrangement, entrees
+    raw = kwargs.get("start_date")
+    try:
+        start = datetime.strptime(raw, "%Y-%m-%d").date() if raw else timezone.localdate()
+    except (ValueError, TypeError):
+        return (*_plan_propose(outil, user, kwargs), None)
+    entrees = empreinte_entrees_semaine(user, start)
+    return (*_plan_propose(outil, user, kwargs), entrees)
+
+
+def _demande_optimisation(kwargs: dict, empreinte: str, proposition: ToolResult, nom="optimize_week") -> dict:
     # Les kwargs prives (prefixe _) ne font jamais partie d'une demande
     # persistee: ce sont des hints d'execution, pas l'intention metier.
     parametres = {k: v for k, v in kwargs.items() if k != "plan_hash" and not k.startswith("_")}
+    date_key = "date" if nom == "organize_day" else "start_date"
+    parametres[date_key] = proposition.data.get(date_key)
     effet = dict(parametres)
     effet["apply"] = True
-    cible = {"date": (proposition.data or {}).get("start_date")}
-    options = _options_confirmer("optimize_week", effet, cible)
+    cible = {"date": (proposition.data or {}).get("start_date") or (proposition.data or {}).get("date")}
+    options = _options_confirmer(nom, effet, cible)
     options[0]["effet"]["parametres"] = effet
     return dem.construire_demande(
-        "confirmation", "optimisation", "optimize_week",
+        "confirmation", "optimisation", nom,
         {**parametres, "apply": True, "plan_hash": empreinte}, cible, options,
-        "optimize_week:apply")
+        f"{nom}:apply")
 
 
 def _garde_optimisation(ctx: _Contexte, outil, kwargs: dict, garde: _Garde):
     autorise, demande, _en_suspens = _reponse(ctx, garde.cles, outil.name)
-    proposition, empreinte, arrangements = _plan_propose(outil, ctx.user, kwargs)
+    proposition, empreinte, arrangements, entrees = _proposition_optimisation(outil, ctx.user, kwargs)
     if empreinte is None:
         return None  # l'outil echouera de lui-meme, rien a proteger
     if autorise and (demande.get("parametres") or {}).get("plan_hash") == empreinte:
         # Plan confirme a l'identique: l'execution reutilise l'arrangement
         # valide au lieu de re-resoudre (kwarg prive, retire apres l'appel).
-        kwargs["_arrangements"] = arrangements
+        kwargs["_arrangement" if outil.name == "organize_day" else "_arrangements"] = arrangements
+        kwargs["_expected_entries"] = entrees
         return None
     if demande is not None and not autorise:
         return MESSAGE_DEJA_TRANCHE
-    return _refus(_demande_optimisation(kwargs, empreinte, proposition), destructif=False)
+    return _refus(_demande_optimisation(kwargs, empreinte, proposition, outil.name), destructif=False)
 
 
 # ----------------------------------------------------------- heure refusee
@@ -1823,6 +1845,12 @@ def _crees_ce_tour(registre: Registre) -> tuple[int, list[str]]:
         elif a.outil == "create_task" and not donnees.get("deja_presente"):
             tache = donnees.get("task") or {}
             _noter(("tache", tache.get("id") or a.id), tache.get("title"))
+        elif a.outil == "resolve_document_entry" and not donnees.get("already_resolved"):
+            for cible in (donnees.get("resolution") or {}).get("targets", []):
+                genre = "bloc" if cible.get("model") == "RecurringBlock" else "evenement"
+                ident = ((genre, cible.get("id"), None) if genre == "bloc"
+                         else (genre, cible.get("id")))
+                _noter(ident, cible.get("title"))
     return len(vus), titres
 
 
@@ -1897,6 +1925,21 @@ def _garde_creations(ctx: _Contexte, nom: str, kwargs: dict):
         return None
     deja, titres = _crees_ce_tour(ctx.registre)
     prospectif = len(normaliser_jours(kwargs.get("days"))) if nom == "create_block" else 1
+    titre = str(kwargs.get("title") or "").strip()
+    if nom == "resolve_document_entry":
+        from services.agent_v2.importation import resume_precision
+        from services.document_processor import DocumentProcessor
+        precision = resume_precision(ctx.user, kwargs.get("document_id"),
+                                     kwargs.get("source"), kwargs.get("index"))
+        if not precision or not precision["pending"]:
+            return None
+        entree = {**precision["entry"], **{k: v for k, v in kwargs.items()
+                  if k in {"date", "day", "start_time", "end_time"}}}
+        donnees = {kwargs["source"]: [entree]}
+        DocumentProcessor.__new__(DocumentProcessor)._validated_entries(donnees, [])
+        if donnees["_pending_entries"]:
+            return None  # Une précision partielle ne crée aucun créneau.
+        titre = str(entree.get("title") or entree.get("name") or entree.get("role") or "").strip()
     if deja + prospectif <= SEUIL_CREATIONS:
         return None
     for demande in _attente(ctx):
@@ -1907,7 +1950,6 @@ def _garde_creations(ctx: _Contexte, nom: str, kwargs: dict):
             return None
         if option is not None:
             return MESSAGE_DEJA_TRANCHE
-    titre = str(kwargs.get("title") or "").strip()
     # « titres » ne nomme que ce qui est RETENU: la question « Je continue
     # avec X ? » ne doit jamais lister ce qui vient d'etre ajoute (revue du
     # 2026-09-14). Les titres deja crees vivent a part, pour le compte.
@@ -2145,6 +2187,12 @@ def _reconcilier(ctx: _Contexte, nom: str, kwargs: dict, cle: str) -> str | None
     return resultat.to_string()
 
 
+def _tour_expire(registre):
+    return (registre.delai_depasse or
+            (getattr(registre, 'echeance', None) is not None
+             and time.monotonic() >= registre.echeance))
+
+
 def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = None) -> str:
     """Le chemin UNIQUE de tout appel d'outil du tour, qu'il vienne du modele
     ou d'un choix de l'utilisateur execute par le code (choix non nul).
@@ -2156,6 +2204,14 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
     etat = ctx.etat
     prep = _Preparation()
     garde = None
+
+    if _tour_expire(registre):
+        return 'Le tour est termine. Aucun nouvel outil ne peut etre execute.'
+
+    if getattr(registre, 'lecture_seule', False) and nom in OUTILS_DE_MUTATION | {'send_notification'}:
+        refus = ToolResult(success=False, message='Ce tour autorise seulement une consultation.')
+        _consigner(ctx, nom, kwargs, refus)
+        return refus.to_string()
 
     if choix is None:
         try:
@@ -2273,13 +2329,13 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
         if issue is not None:
             _consigner(ctx, nom, kwargs, issue)
             return issue.to_string()
-    elif nom == "optimize_week" and kwargs.get("apply"):
+    elif nom in {"optimize_week", "organize_day"} and kwargs.get("apply"):
         # Le plan confirme doit etre CELUI qu'on applique: s'il a change
         # depuis la question, on redemande au lieu d'appliquer autre chose.
         # _plan_propose sert le plan en cache quand les entrees sont
         # inchangees (0 s de solveur), re-resout sinon.
         try:
-            proposition, empreinte, arrangements = _plan_propose(outil, ctx.user, kwargs)
+            proposition, empreinte, arrangements, entrees = _proposition_optimisation(outil, ctx.user, kwargs)
         except Exception as e:  # noqa: BLE001
             logger.error("Proposition de plan en panne: %s", e, exc_info=True)
             proposition, empreinte, arrangements = (
@@ -2288,7 +2344,7 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
             donnees = {"cle_demande": choix.get("cle"), "par_le_code": True,
                        "decision_code": DECISION_EXECUTE}
             if empreinte is not None:
-                donnees["demande"] = _demande_optimisation(kwargs, empreinte, proposition)
+                donnees["demande"] = _demande_optimisation(kwargs, empreinte, proposition, nom)
                 message = MESSAGE_RETENUE
             else:
                 message = proposition.message or MESSAGE_RETENUE
@@ -2298,21 +2354,8 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
         # Niveau 3: l'apply reutilise l'arrangement valide au lieu de
         # re-resoudre (kwarg prive, retire apres l'execution pour ne pas
         # polluer le registre).
-        kwargs["_arrangements"] = arrangements
-
-    if nom == "organize_day" and kwargs.get("apply"):
-        # Niveau 3 (jour): l'apply reutilise l'arrangement valide quand les
-        # entrees sont inchangees, au lieu de re-resoudre (kwarg prive,
-        # retire apres l'execution pour ne pas polluer le registre).
-        # Pas de garde dediee pour organize_day: le chemin est direct.
-        try:
-            jour = _jour_organize(kwargs.get("date"))
-            if jour is not None:
-                arrangement, _ = _arrangement_jour_cache(ctx.user, jour)
-                if arrangement is not None:
-                    kwargs["_arrangement"] = arrangement
-        except Exception:  # noqa: BLE001
-            logger.error("Cache plan jour en panne", exc_info=True)
+        kwargs["_arrangement" if nom == "organize_day" else "_arrangements"] = arrangements
+        kwargs["_expected_entries"] = entrees
 
     # Meme marqueur que v1: le banc capte les appels d'outils par le
     # logger parent « services », et cette ligne est ce qu'il cherche.
@@ -2334,7 +2377,17 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
             # a l'execution directe (memes helpers de mise en forme).
             resultat, _, _ = _plan_propose_jour(outil, ctx.user, kwargs)
         else:
-            resultat = outil.execute(ctx.user, **kwargs)
+            if _tour_expire(registre):
+                raise TimeoutError('Tour expire avant execution')
+            if nom in OUTILS_DE_MUTATION:
+                with transaction.atomic():
+                    resultat = outil.execute(ctx.user, **kwargs)
+                    # Un outil synchrone peut continuer apres annulation asyncio.
+                    # Ses ecritures restent dans cette transaction et sont annulees.
+                    if _tour_expire(registre):
+                        raise TimeoutError('Tour expire pendant execution')
+            else:
+                resultat = outil.execute(ctx.user, **kwargs)
     except Exception as e:  # noqa: BLE001
         # v1 degrade une exception d'outil en ToolResult d'echec. Sans
         # cela, l'exception avorterait le run ET le registre ne garderait
@@ -2442,10 +2495,27 @@ def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
     executer_sync = sync_to_async(_appel_ferme, thread_sensitive=False)
 
     async def executer(**kwargs) -> str:
-        return await executer_sync(kwargs)
+        resultat = await executer_sync(kwargs)
+        return borner_resultat_modele(resultat)
 
     executer.__name__ = outil.name
     return executer
+
+
+def borner_resultat_modele(resultat: str, maximum: int = 12000) -> str:
+    """Le registre garde le resultat complet; le contexte ne le recopie pas sans limite."""
+    if len(resultat) <= maximum:
+        return resultat
+    charge = {
+        'resultat_tronque': True,
+        'consigne': 'Resultat incomplet. Affine les filtres pour lire une cible; ne conclus pas sur les elements absents.',
+        'extrait': resultat[:maximum // 2],
+    }
+    rendu = json.dumps(charge, ensure_ascii=False)
+    while len(rendu) > maximum:
+        charge['extrait'] = charge['extrait'][:len(charge['extrait']) // 2]
+        rendu = json.dumps(charge, ensure_ascii=False)
+    return rendu
 
 
 # poser_question et present_choices forcent eux aussi le batch en sequentiel
@@ -2568,12 +2638,16 @@ COMPLEMENTS_V2 = {
         "apply=true seulement apres confirmation explicite de l'utilisateur: "
         "propose toujours d'abord avec apply=false."
     ),
+    "organize_day": (
+        "apply=true seulement apres confirmation explicite de l'utilisateur. "
+        "Propose avec apply=false; l'application modifie cette date seulement."
+    ),
     "create_block": (
-        "Avant de creer, verifie la SEMAINE TYPE deja dans ton prompt: si le "
+        "Avant de creer, lis les blocs existants avec list_blocks: si le "
         "bloc y figure deja, modifie-le (update_block) au lieu de le recreer. "
         "Un ajout avec jours et heures, y compris en reponse a ta propre "
         "question: si ces jours et heures ne sont pas deja ceux d'un cours de "
-        "la SEMAINE TYPE, c'est un nouveau cours: create_block dans ce tour, "
+        "la liste lue, c'est un nouveau cours: create_block dans ce tour, "
         "avec le nom que l'utilisateur a dit. Ne demande ni lequel, ni de "
         "confirmer la recurrence: un cours revient chaque semaine par defaut."
     ),
@@ -2643,7 +2717,10 @@ def outils_pour_le_modele(user: User, registre: Registre, message_du_tour: str =
     `outils_pour` garde son contrat (TOUS les outils) pour les tests et pour
     les executions par le code.
     """
-    caches = [o for o in ALL_TOOLS if o.name not in OUTILS_EXPOSES]
+    lecture_seule = getattr(registre, 'lecture_seule', False)
+    interdits = OUTILS_DE_MUTATION | {'send_notification'} if lecture_seule else set()
+    autorises = [o for o in ALL_TOOLS if o.name not in interdits]
+    caches = [o for o in autorises if o.name not in OUTILS_EXPOSES]
 
     async def chercher_outils(besoin: str = "") -> str:
         return chargeur.chercher(besoin, caches, description_v2)
@@ -2651,6 +2728,8 @@ def outils_pour_le_modele(user: User, registre: Registre, message_du_tour: str =
     async def appeler_outil(nom: str = "", parametres=None) -> str:
         """Lance un outil cache par le MEME chemin que les appels directs."""
         vise = str(nom or "").strip()
+        if vise in interdits:
+            return 'Ce tour autorise seulement une consultation.'
         outil = TOOL_MAP.get(vise)
         if outil is None:
             connus = ", ".join(sorted(o.name for o in caches))
@@ -2674,7 +2753,7 @@ def outils_pour_le_modele(user: User, registre: Registre, message_du_tour: str =
 
     exposes = [_outil_pydantic(o, user, registre, message_du_tour, tache,
                                signaler, message_brut, tap)
-               for o in ALL_TOOLS if o.name in OUTILS_EXPOSES]
+               for o in autorises if o.name in OUTILS_EXPOSES]
     return exposes + [
         Tool.from_schema(chercher_outils, NOM_CHERCHEUR, DESCRIPTION_CHERCHEUR,
                          SCHEMA_CHERCHEUR),
@@ -2772,7 +2851,8 @@ def _effet_valide(demande: dict, option: str, effet: dict) -> bool:
         return (option == "confirmer" and outil in DESTRUCTIFS | {"update_block"}
                 and _cle_destructive(outil, parametres) == cle)
     if motif == "optimisation":
-        return option == "confirmer" and outil == "optimize_week" and cle == "optimize_week:apply"
+        return (option == "confirmer" and outil in {"optimize_week", "organize_day"}
+                and cle == f"{outil}:apply")
     return False
 
 
@@ -2792,7 +2872,7 @@ def _sujet(demande: dict) -> str:
     if motif == "creation_en_masse":
         return "ajouts en serie"
     if motif == "optimisation":
-        return "application du plan de la semaine"
+        return "application du plan de la journée" if demande.get("outil") == "organize_day" else "application du plan de la semaine"
     return f"{demande.get('outil') or ''} {titre}".strip()
 
 
@@ -2849,7 +2929,8 @@ def _appliquer(ctx: _Contexte) -> list[dict]:
     # aucune option choisie) abandonne; un doute (« incertain ») repose la
     # question au lieu d'abandonner. Cette lecture choisit seulement entre
     # reposer et abandonner; elle n'autorise jamais rien.
-    classes = {id(d): dem.classification_reponse(ctx.texte, d) for d in attente}
+    classes = {id(d): ('choix' if options[id(d)] is not None
+                       else dem.classification_reponse(ctx.texte, d)) for d in attente}
     nouvelle = bool(attente) and not any(options.values()) and all(
         c == "nouvelle_requete" for c in classes.values())
     decisions: dict = {}

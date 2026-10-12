@@ -18,12 +18,14 @@ Degrades silently if push is not configured.
 from datetime import datetime, time as dt_time, timedelta
 
 from django.core.management.base import BaseCommand
+from django.contrib.auth import get_user_model
 from django.utils import timezone
 
 from core.models import PushSendLog, PushSubscription, RecurringBlock, ScheduledBlock
 from services.commute import commute_window
 from services.apns import rattraper_tous_les_reveils
 from services.push import push_configured, send_to_user
+from services.scheduling.occurrences import recurring_occurrences
 
 # Rétro-regard: assez large pour couvrir la dérive des ticks (durée d'exécution
 # qui s'ajoute au sleep), plus courte que l'intervalle de deux ticks + lead.
@@ -92,19 +94,14 @@ class Command(BaseCommand):
         user_ids = list(
             PushSubscription.objects.values_list("user_id", flat=True).distinct()
         )
+        users = list(get_user_model().objects.filter(pk__in=user_ids).select_related('profile'))
 
         # --- Pass 1: "Bientôt" reminders (block starting within the window) ----
         matched = 0
         sent = 0
         for occ_date, seg_start, seg_end in _window_segments(now, lead):
-            blocks = RecurringBlock.objects.filter(
-                RecurringBlock.bounds_filter(occ_date),
-                user_id__in=user_ids,
-                active=True,
-                day_of_week=occ_date.weekday(),
-                start_time__gte=seg_start,
-                start_time__lte=seg_end,
-            ).select_related("user")
+            blocks = [block for user in users for block in recurring_occurrences(user, occ_date)
+                      if seg_start <= block.start_time <= seg_end]
 
             for block in blocks:
                 matched += 1
@@ -125,13 +122,8 @@ class Command(BaseCommand):
 
         # --- Pass 2: departure alerts for blocks tied to a place --------------
         prep_alerts = leave_alerts = 0
-        placed_blocks = RecurringBlock.objects.filter(
-            RecurringBlock.bounds_filter(now.date()),
-            user_id__in=user_ids,
-            active=True,
-            day_of_week=now.weekday(),
-            place__isnull=False,
-        ).select_related("user", "user__profile", "place")
+        placed_blocks = [block for user in users for block in recurring_occurrences(user, now.date())
+                         if block.place_id is not None]
 
         for block in placed_blocks:
             travel = block.place.travel_minutes or 0

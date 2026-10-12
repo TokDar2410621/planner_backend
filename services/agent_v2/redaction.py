@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from copy import copy
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -49,12 +50,10 @@ class ActionCitee(BaseModel):
 class ReponseDire(BaseModel):
     ouverture: str = Field(
         default="",
-        description="Facultative, au plus 12 mots. Répond d'abord. Une action "
-                    "affirmée exige sa ref dans `refs`, sinon la phrase est coupée.")
+        description="Laisse vide sur un tour outillé : le code rend les faits vérifiés.")
     suite: str = Field(
         default="",
-        description="Facultative, une phrase. Une action affirmée exige sa ref "
-                    "dans `refs`. Pas de question ici.")
+        description="Laisse vide sur un tour outillé : le code rend les faits vérifiés.")
     question: str = Field(
         default="",
         description="Au plus UNE question, finit par '?'. Vide si le code pose déjà une question.")
@@ -64,8 +63,8 @@ class ReponseDire(BaseModel):
                     "entités du registre (créneaux, blocs, jours).")
     refs: list[str] = Field(
         default_factory=list,
-        description="Ids EXACTS du registre (a1, a2, ...) dont ouverture ou suite "
-                    "affirment une action. Sans ref vérifiée, l'affirmation est coupée.")
+        description="Ids EXACTS des reçus de mutation vérifiés (a1, a2, ...). "
+                    "Ces références n'autorisent jamais une affirmation en prose.")
     # Garde pour compatibilite: un modele qui la remplit encore voit ses
     # references verifiees, mais ses phrases ne sont JAMAIS rendues.
     actions: list[ActionCitee] = Field(
@@ -103,7 +102,20 @@ def bloc_factuel(registre: Registre, aujourdhui=None, cles_posees=None,
     choix, elle ne se deverse pas au-dessus (banc du round 4, s02-1).
     """
     r = _charger_rendu()
-    faits = r.rendre_faits(registre, aujourdhui, cles_posees)
+    # Le narrateur historique reçoit seulement les réussites relues. Une
+    # proposition structurée ne confirme aucune écriture et reste affichable.
+    incertaines = {a.id for a in registre.mutations() if a.succes and not a.etat_verifie
+                   and not (a.outil in ("optimize_week", "organize_day")
+                            and a.donnees.get("applied") is False)
+                   and not (a.outil == "update_preferences"
+                            and a.donnees.get("updated_fields") == [])}
+    verifie = copy(registre)
+    verifie.actions = [a for a in registre.actions if a.id not in incertaines]
+    verifie.ecarts = [e for e in registre.ecarts if e.action_id not in incertaines]
+    faits = r.rendre_faits(verifie, aujourdhui, cles_posees)
+    if incertaines:
+        avertissement = "Je ne peux pas confirmer les changements : la relecture ne les a pas vérifiés."
+        faits = f"{faits}\n\n{avertissement}" if faits else avertissement
     if faits and not sans_lecture and _abandons_seuls(registre):
         # Revue du round 6: la ligne d'abandon (D2) remplacait la lecture que
         # le message demandait (« c'est quoi mon horaire demain ? »). Elle la
@@ -619,7 +631,7 @@ def _creations_du_tour(registre: Registre) -> tuple[int, int]:
     compte = 0
     minutes = 0
     for a in registre.actions:
-        if not a.succes or a.outil not in _CREATEURS:
+        if not a.etat_verifie or a.outil not in _CREATEURS:
             continue
         donnees = a.donnees or {}
         entrees = list(donnees.get("created") or [])

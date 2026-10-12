@@ -4,25 +4,39 @@ tombe, un PDF texte doit quand meme etre structure (DeepSeek est texte-only
 mais cette etape n'exige pas la vision).
 """
 from unittest.mock import patch, MagicMock
+from types import SimpleNamespace
 
+from django.contrib.auth import get_user_model
 from django.test import TestCase
 
 from services.document_processor import DocumentProcessor
-from services.llm.base import LLMResponse
+from services.llm.deepseek import DeepSeekProvider
+from services.agent_v2.budget_tour import ouvrir_trace, fermer_trace
+from services.agent_v2.trace_tour import trace_courante
 
 
-class _FakeDeepSeek:
-    def __init__(self, response):
-        self._response = response
-
-    def is_available(self):
-        return True
-
-    def generate_with_history(self, messages, tools, system_prompt):
-        return self._response
+def _provider(text):
+    provider = DeepSeekProvider()
+    provider.api_key = 'fixture'
+    provider._client = MagicMock()
+    provider._client.with_options.return_value = provider._client
+    provider._client.chat.completions.create.return_value = SimpleNamespace(
+        usage=SimpleNamespace(prompt_tokens=12, completion_tokens=8, total_tokens=20),
+        choices=[SimpleNamespace(finish_reason='stop', message=SimpleNamespace(
+            content=text, tool_calls=[], reasoning_content=None))])
+    return provider
 
 
 class DocTextFallbackTest(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(username='fallback-doc')
+        self.trace = ouvrir_trace(self.user)
+        self.token = trace_courante.set(self.trace)
+
+    def tearDown(self):
+        trace_courante.reset(self.token)
+        fermer_trace(self.trace)
+
     def _processor_with_failing_gemini(self):
         proc = DocumentProcessor.__new__(DocumentProcessor)
         proc.gemini_client = MagicMock()
@@ -33,15 +47,17 @@ class DocTextFallbackTest(TestCase):
 
     def test_deepseek_rescues_text_structuring_when_gemini_fails(self):
         proc = self._processor_with_failing_gemini()
-        ok = LLMResponse(text='{"courses": []}', is_error=False)
-        with patch('services.llm.get_provider', return_value=_FakeDeepSeek(ok)):
+        provider = _provider('{"courses": []}')
+        with patch('services.llm.get_provider', return_value=provider):
             out = proc._structure_text_with_llm("Lundi 9h cours de maths")
         self.assertEqual(out, '{"courses": []}')
+        self.assertEqual(self.trace.usages[-1]['total'], 20)
+        self.assertEqual(provider._client.with_options.call_args.kwargs['max_retries'], 0)
 
     def test_raises_when_both_fail(self):
         proc = self._processor_with_failing_gemini()
-        err = LLMResponse(text="", is_error=True)
-        with patch('services.llm.get_provider', return_value=_FakeDeepSeek(err)):
+        provider = _provider('')
+        with patch('services.llm.get_provider', return_value=provider):
             with self.assertRaises(RuntimeError):
                 proc._structure_text_with_llm("Lundi 9h cours de maths")
 
@@ -50,7 +66,6 @@ class DocTextFallbackTest(TestCase):
         proc.gemini_client = None
         proc.hf_client = None
         proc.hf_model = None
-        ok = LLMResponse(text='{"shifts": []}', is_error=False)
-        with patch('services.llm.get_provider', return_value=_FakeDeepSeek(ok)):
+        with patch('services.llm.get_provider', return_value=_provider('{"shifts": []}')):
             out = proc._structure_text_with_llm("vendredi 18h resto")
         self.assertEqual(out, '{"shifts": []}')

@@ -8,6 +8,7 @@ import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import date, timedelta
 from typing import AsyncGenerator, Iterator
 
@@ -75,6 +76,7 @@ from services import DocumentProcessor, AIScheduler
 from services.ai_insights import AIInsightsService
 from services.agent import PlannerAgent
 from core.ai_consent import ai_consent_denied
+from core import chat_turns
 
 logger = logging.getLogger(__name__)
 
@@ -88,8 +90,8 @@ def _agent_pour(user):
     une dependance.
     """
     if getattr(getattr(user, 'profile', None), 'agent_v2', False):
-        from services.agent_v2 import PlannerAgentV2
-        return PlannerAgentV2()
+        from services.agent_v2.conversation import AgentConversation
+        return AgentConversation()
     return PlannerAgent()
 
 
@@ -1011,6 +1013,80 @@ class OnboardingStatusView(APIView):
 
 # ============== Chat View ==============
 
+@contextmanager
+def _contexte_budget(trace):
+    from services.agent_v2.trace_tour import trace_courante
+    jeton = trace_courante.set(trace)
+    try:
+        yield
+    finally:
+        trace_courante.reset(jeton)
+
+
+class _FermetureBudget:
+    """Ferme après la requête et ses futurs, au plus tard à l'échéance commune."""
+
+    def __init__(self, trace):
+        self.trace = trace
+        self._verrou = threading.Lock()
+        self._futurs = set()
+        self._requete_terminee = False
+        self._fermee = False
+        self._minuteur = threading.Timer(trace.restant(), self._echeance)
+        self._minuteur.daemon = True
+        try:
+            self._minuteur.start()
+        except BaseException:
+            self._terminer(force=True)
+            raise
+
+    def suivre(self, futur):
+        if not isinstance(futur, concurrent.futures.Future):
+            return
+        with self._verrou:
+            if self._fermee:
+                return
+            self._futurs.add(futur)
+        # Le callback peut s'exécuter ici si le travail est déjà terminé.
+        futur.add_done_callback(lambda termine: self._terminer(futur=termine))
+
+    def terminer_requete(self):
+        self._terminer(requete=True)
+
+    def _terminer(self, *, futur=None, requete=False, force=False):
+        from services.agent_v2.budget_tour import fermer_trace
+        with self._verrou:
+            if futur is not None:
+                self._futurs.discard(futur)
+            self._requete_terminee |= requete
+            if self._fermee or (not force and (not self._requete_terminee or self._futurs)):
+                return
+            self._fermee = True
+            self._minuteur.cancel()
+        fermer_trace(self.trace)
+
+    def _echeance(self):
+        # Ce thread n'appartient à aucun cycle de requête Django.
+        from django.db import connections
+        close_old_connections()
+        try:
+            self._terminer(force=True)
+        finally:
+            connections.close_all()
+
+
+def _ouvrir_budget_chat(user, turn):
+    from services.agent_v2.budget_tour import ouvrir_trace, BudgetEpuise, BudgetIndisponible
+    try:
+        return ouvrir_trace(user), None
+    except BudgetIndisponible as exc:
+        code = 429 if isinstance(exc, BudgetEpuise) else 503
+        texte = ("Ton budget de traitement est atteint. Réessaie plus tard."
+                 if code == 429 else "Le contrôle du budget est indisponible. Réessaie plus tard.")
+        payload = chat_turns.finish(turn, {'error': texte, 'code': 'budget_unavailable'}, code)
+        return None, Response(payload, status=code)
+
+
 def _create_chat_attachment(request, attachment_file):
     """Validate + persist a chat upload and kick off async processing.
 
@@ -1052,10 +1128,12 @@ def _create_chat_attachment(request, attachment_file):
     # Process document ASYNCHRONOUSLY to avoid timeout
     try:
         processor = DocumentProcessor()
-        processor.process_document_async(doc.id)
+        doc._processing_future = processor.process_document_async(doc.id)
         logger.debug("Chat async processing started for doc %s", doc.id)
     except Exception as e:
-        logger.error(f"Document processing error: {e}")
+        logger.error("Document processing error type=%s", type(e).__name__)
+        doc.processing_error = "Le traitement du document n'a pas pu démarrer."
+        doc.save(update_fields=['processing_error'])
     return doc, None
 
 
@@ -1247,8 +1325,27 @@ class ChatView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        attachment, error_response = _create_chat_attachment(request, attachment_file)
+        turn, prior_response = chat_turns.admit(request)
+        if prior_response is not None:
+            return prior_response
+        trace, budget_error = _ouvrir_budget_chat(request.user, turn)
+        if budget_error is not None:
+            return budget_error
+        fermeture = _FermetureBudget(trace)
+        try:
+            with _contexte_budget(trace):
+                return self._post_admis(request, turn, message, attachment_file, fermeture)
+        finally:
+            fermeture.terminer_requete()
+
+    def _post_admis(self, request, turn, message, attachment_file, fermeture):
+        try:
+            attachment, error_response = _create_chat_attachment(request, attachment_file)
+            fermeture.suivre(getattr(attachment, '_processing_future', None))
+        except Exception:
+            return Response(chat_turns.fail(turn), status=500)
         if error_response is not None:
+            error_response.data = chat_turns.finish(turn, error_response.data, error_response.status_code)
             return error_response
 
         # When the client fetches quick replies out-of-band (deferred endpoint),
@@ -1275,10 +1372,7 @@ class ChatView(APIView):
             # Log the detail server-side; never leak the raw exception string
             # (paths, provider errors, tokens) to the client.
             logger.error(f"PlannerAgent error: {e}", exc_info=True)
-            return Response(
-                {'error': 'Erreur interne lors du traitement du message.'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            return Response(chat_turns.fail(turn), status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         response_data = {
             'response': result['response'],
@@ -1294,11 +1388,21 @@ class ChatView(APIView):
         # Relayes des qu'ils sont presents, meme faux ou vides: une question
         # vide est celle d'un formulaire, et le client doit savoir qu'une
         # question a ete posee pour ne pas demander de suggestions par-dessus.
-        for cle in ('question_posee', 'question', 'question_motif'):
+        for cle in ('question_posee', 'question', 'question_motif', 'assistant_message_id'):
             if cle in result:
                 response_data[cle] = result[cle]
 
-        return Response(response_data)
+        return Response(chat_turns.finish(turn, response_data))
+
+
+class ChatTurnView(APIView):
+    """Récupération par identité exacte, sans relancer le traitement."""
+
+    def get(self, request, turn_id):
+        turn = chat_turns.ChatTurn.objects.filter(user=request.user, turn_id=turn_id).first()
+        if turn is None:
+            return Response({'code': 'turn_not_found', 'error': 'Demande introuvable.'}, status=404)
+        return Response(chat_turns.snapshot(turn))
 
 
 class ChatQuickRepliesView(APIView):
@@ -1382,23 +1486,56 @@ class ChatStreamView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        attachment, error_response = _create_chat_attachment(request, attachment_file)
+        turn, prior_response = chat_turns.admit(request)
+        if prior_response is not None:
+            return prior_response
+        trace, budget_error = _ouvrir_budget_chat(request.user, turn)
+        if budget_error is not None:
+            return budget_error
+        fermeture = _FermetureBudget(trace)
+        try:
+            with _contexte_budget(trace):
+                attachment, error_response = _create_chat_attachment(request, attachment_file)
+                fermeture.suivre(getattr(attachment, '_processing_future', None))
+            tap = _tap_de(request)
+        except Exception:
+            fermeture.terminer_requete()
+            return Response(chat_turns.fail(turn), status=500)
         if error_response is not None:
+            fermeture.terminer_requete()
+            error_response.data = chat_turns.finish(turn, error_response.data, error_response.status_code)
             return error_response
 
         user = request.user
         final_message = message or "J'ai uploadé un document."
         # Lu ICI, dans le thread de la requete: le drain tourne detache et ne
         # doit plus toucher request.data.
-        tap = _tap_de(request)
 
         def evenements():
             # Execute dans le thread du drain, pas dans la requete: une panne
             # ici (agent introuvable, crash du flux) devient la trame
             # d'erreur habituelle, posee par lancer_flux.
-            agent = _agent_pour(user)
-            extra = {'tap': tap} if tap and getattr(agent, 'accepte_tap', False) else {}
-            yield from agent.process_message_stream(user, final_message, attachment, **extra)
+            if chat_turns.refresh_turn(turn).status != 'running':
+                yield {'type': 'error', 'turn_id': str(turn.turn_id),
+                       'error': 'Cette demande a été interrompue avant son exécution.'}
+                return
+            completed = False
+            try:
+                agent = _agent_pour(user)
+                extra = {'tap': tap} if tap and getattr(agent, 'accepte_tap', False) else {}
+                for event in agent.process_message_stream(user, final_message, attachment, **extra):
+                    if event.get('type') == 'done':
+                        if not isinstance(event.get('response'), str):
+                            raise ValueError('Invalid terminal event')
+                        # Sauver AVANT d'émettre : une coupure ne perd pas le résultat.
+                        event = chat_turns.finish(turn, event)
+                        completed = True
+                        yield event
+                        return
+                    yield {**event, 'turn_id': str(turn.turn_id)}
+            finally:
+                if not completed:
+                    chat_turns.fail(turn)
 
         # ITERATEUR ASYNCHRONE, et ce n'est pas un detail de style.
         #
@@ -1416,7 +1553,21 @@ class ChatStreamView(APIView):
         # lancer_flux garde cette propriete (chaque trame part des qu'elle est
         # dans la file) ET detache le tour du client: voir le bloc « Flux de
         # chat detache » plus haut.
-        flux, _futur = lancer_flux(evenements(), user.id)
+        def evenements_admis():
+            try:
+                with _contexte_budget(trace):
+                    yield from evenements()
+            finally:
+                fermeture.terminer_requete()
+
+        try:
+            flux, _futur = lancer_flux(evenements_admis(), user.id)
+            # Couvre aussi un futur annulé avant le premier pas du générateur.
+            if isinstance(_futur, concurrent.futures.Future):
+                _futur.add_done_callback(lambda _termine: fermeture.terminer_requete())
+        except Exception:
+            fermeture.terminer_requete()
+            return Response(chat_turns.fail(turn), status=500)
 
         response = StreamingHttpResponse(flux, content_type='text/event-stream')
         response['Cache-Control'] = 'no-cache'
@@ -1485,7 +1636,21 @@ class DocumentViewSet(viewsets.ModelViewSet):
         denied = ai_consent_denied(request.user)
         if denied is not None:
             return denied
-        return super().create(request, *args, **kwargs)
+        from services.agent_v2.budget_tour import (ouvrir_trace,
+                                                  BudgetIndisponible, BudgetEpuise)
+        try:
+            trace = ouvrir_trace(request.user)
+        except BudgetIndisponible as exc:
+            return Response({'error': 'Le budget de traitement est indisponible. Réessaie plus tard.'},
+                            status=429 if isinstance(exc, BudgetEpuise) else 503)
+        self._document_future = None
+        fermeture = _FermetureBudget(trace)
+        try:
+            with _contexte_budget(trace):
+                return super().create(request, *args, **kwargs)
+        finally:
+            fermeture.suivre(self._document_future)
+            fermeture.terminer_requete()
 
     def perform_create(self, serializer):
         uploaded = serializer.validated_data.get('file')
@@ -1495,9 +1660,11 @@ class DocumentViewSet(viewsets.ModelViewSet):
         # Process document ASYNCHRONOUSLY after upload
         try:
             processor = DocumentProcessor()
-            processor.process_document_async(doc.id)
+            self._document_future = processor.process_document_async(doc.id)
         except Exception as e:
-            logger.error(f"Document processing error: {e}")
+            logger.error("Document processing error type=%s", type(e).__name__)
+            doc.processing_error = "Le traitement du document n'a pas pu démarrer."
+            doc.save(update_fields=['processing_error'])
 
 
 # ============== UserPlace Views ==============

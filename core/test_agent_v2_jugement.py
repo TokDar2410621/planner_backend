@@ -8,7 +8,7 @@ le comportement prudent.
 import json
 from unittest.mock import MagicMock, patch
 
-from django.test import SimpleTestCase, override_settings
+from django.test import SimpleTestCase, TransactionTestCase, override_settings
 
 from services.agent_v2 import demandes as dem
 from services.agent_v2 import jugement
@@ -96,11 +96,15 @@ def juger_script(par_message: dict):
     return faux
 
 
-class JugementJevTests(SimpleTestCase):
+class JugementJevTests(TransactionTestCase):
     """Le contrat Jev, valide strictement au bord reseau."""
 
     def setUp(self):
         jugement.vider_cache()
+        from core.test_refonte_jugements import trace_pour
+        self.trace = trace_pour()
+        self.trace.__enter__()
+        self.addCleanup(self.trace.__exit__, None, None, None)
 
     def _juger_jev(self, questions, answers):
         with override_settings(JEV_API_KEY="cle-test"):

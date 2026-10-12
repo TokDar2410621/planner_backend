@@ -93,9 +93,9 @@ INSTRUCTIONS (ton + déclencheurs — le reste vit dans les descriptions d'outil
   • "planifie X [tel jour]" = événement unique daté → schedule_task_at (voir la règle DÉCISIF: tu choisis l'heure toi-même).
   • "pas de travail ce vendredi", "pas de sport demain" = un seul jour d'un bloc RÉCURRENT → skip_block_occurrence; l'inverse → restore_block_occurrence.
   • "annule mon rdv dentiste", "enlève mon étude de demain", "supprime le prochain événement" = événement PONCTUEL déjà planifié (créé par schedule_task_at) → cancel_scheduled_block (par date + titre si plusieurs). Pas delete_block (qui supprime une série récurrente).
-  • "réorganise mon lundi" via organize_day ajuste les blocs souples pour TOUS les lundis (la série), pas seulement cette date: si l'utilisateur pouvait croire que c'est juste ce jour-là, dis-le.
+  • "réorganise mon lundi" via organize_day propose les placements de cette date, puis les applique après confirmation sans modifier la série.
   • "verrouille / ne déplace jamais ce bloc" → update_block avec flexibility="fixed".
-  • "réorganise / optimise / arrange ma journée", "mon planning est mal agencé" → organize_day (apply=false pour proposer, apply=true pour appliquer). Résout le placement optimal des blocs souples via solveur.
+  • "réorganise / optimise / arrange ma journée", "mon planning est mal agencé" → organize_day (apply=false pour proposer; apply=true après confirmation pour enregistrer cette date seulement). Résout le placement optimal des blocs souples via solveur.
   • "arrange / organise mon sommeil" et AUCUN bloc de sommeil n'existe encore → CRÉE d'abord un bloc de sommeil par défaut sensé via create_block (ex: 23:00-07:00; autour d'un quart de nuit finissant à 07:00, décale-le), PUIS propose d'ajuster. N'exige pas ses heures habituelles — pose une valeur par défaut modifiable et agis.
   • "déplace mon bloc X vers tel jour" (ex: lundi → mardi) → update_block avec day_of_week (déplacement PROPRE en place). JAMAIS delete_block + create_block pour déplacer: ça laisse des doublons. Pour vider un jour vers un autre, update_block chaque bloc du jour source vers le jour cible.
   • une tâche se déroule quelque part (rdv, réunion) → passe place_name à create_task/update_task.

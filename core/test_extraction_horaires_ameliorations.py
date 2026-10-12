@@ -152,7 +152,7 @@ class LoadImageTests(TestCase):
             os.unlink(chemin)
 
     def test_version_extraction_bump(self):
-        self.assertEqual(DocumentProcessor.EXTRACTION_VERSION, 3)
+        self.assertEqual(DocumentProcessor.EXTRACTION_VERSION, 4)
 
 
 class ExtractionWarningsTests(TestCase):
@@ -197,17 +197,17 @@ class ExtractionWarningsTests(TestCase):
         warnings = doc.extracted_data.get("_warnings", [])
         self.assertTrue(any("ambigu" in w for w in warnings))
 
-    def test_heure_defaut_avec_avertissement(self):
+    def test_heure_manquante_demande_precision(self):
         doc = self._doc()
         data = {"courses": [
             {"name": "Bio", "day": "lundi", "start_time": "n/a", "end_time": "10:00"},
         ]}
         self.proc._create_recurring_blocks(doc, data)
-        bloc = RecurringBlock.all_objects.get(source_document=doc, title="Bio")
-        self.assertEqual(bloc.start_time, dt_time(9, 0))
+        self.assertFalse(RecurringBlock.all_objects.filter(source_document=doc).exists())
         doc.refresh_from_db()
         warnings = doc.extracted_data.get("_warnings", [])
-        self.assertTrue(any("09:00 par défaut" in w for w in warnings))
+        self.assertTrue(any("heure de début" in w for w in warnings))
+        self.assertEqual(doc.extracted_data['_pending_entries'][0]['missing_fields'], ['start_time'])
 
 
 class AttachmentFailureContextTests(TestCase):

@@ -16,8 +16,7 @@ MONDAY = date(2026, 7, 27)
 
 
 class OrganizeDayToolTests(TestCase):
-    """organize_day: le moteur de résolution que l'agent appelle au besoin —
-    propose (rien changé) ou applique (déplace les souples), déterministe."""
+    """Proposition déterministe et application ponctuelle sans modifier la série."""
 
     def _setup(self, u):
         for d in range(7):
@@ -45,12 +44,14 @@ class OrganizeDayToolTests(TestCase):
         self.assertEqual(s.start_time, time(7, 30))
         self.assertEqual(r.start_time, time(7, 0))
 
-    def test_apply_moves_flexibles_keeps_fixed(self):
+    def test_apply_preserves_series_and_records_occurrences(self):
         u = User.objects.create_user("org_apply", password="pw")
         self._setup(u)
+        before = list(RecurringBlock.objects.filter(user=u).values())
         res = OrganizeDayTool().execute(u, date=MONDAY.isoformat(), apply=True)
-        self.assertTrue(res.success)
+        self.assertTrue(res.success, res.message)
         self.assertTrue(res.data["applied"])
+        self.assertEqual(list(RecurringBlock.objects.filter(user=u).values()), before)
         self.assertEqual(len(res.data["placed"]), 2)  # les 2 souples placés
         cours = RecurringBlock.objects.get(user=u, title="Cours")
         self.assertEqual(cours.start_time, time(10, 0))  # le fixe n'a pas bougé

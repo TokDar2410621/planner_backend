@@ -20,7 +20,7 @@ from services.agent_v2.redaction import (
     ActionCitee, ReponseDire, assembler, bloc_factuel, bloc_lecture,
     question_code,
 )
-from services.agent_v2.registre import Registre
+from services.agent_v2.registre import Postcondition, Registre
 
 
 def _deux_creations() -> Registre:
@@ -32,6 +32,9 @@ def _deux_creations() -> Registre:
                                             'end_time': '12:00'}]}))
     r.ajouter('create_block', {'title': 'Sport'},
               ToolResult(success=False, message="Chevauchement avec 'Travail' (09:00-17:00)"))
+    # Couture unitaire : la vérification ORM est testée dans test_refonte_verite.
+    r.verifier('a1', 1, [Postcondition('RecurringBlock', {'id': 1},
+                                      {'title': 'Maths'}, {'title': 'Maths'}, True)])
     return r
 
 

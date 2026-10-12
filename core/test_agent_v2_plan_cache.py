@@ -156,7 +156,7 @@ class PlanCacheTests(TestCase):
     def test_apply_reutilise_arrangements_sans_resoudre(self):
         # L'arrangement place le bloc a 08:00 alors qu'il est a 06:00:
         # l'apply doit deplacer sans appeler le solveur.
-        arrangements = [_arrangement_fixe(self.bloc.id, start_min=480) for _ in range(7)]
+        arrangements = [_arrangement_fixe(self.bloc.id, start_min=480)] + [[] for _ in range(6)]
         with mock.patch(
             "services.agent.tools.schedule.solve_placement",
             side_effect=AssertionError("re-solve inattendu a l'apply"),
@@ -167,13 +167,15 @@ class PlanCacheTests(TestCase):
         self.assertTrue(resultat.data["applied"])
         self.assertEqual(resultat.data["moved_count"], 1)
         self.bloc.refresh_from_db()
-        self.assertEqual((self.bloc.start_time, self.bloc.end_time), (time(8, 0), time(9, 0)))
+        self.assertEqual((self.bloc.start_time, self.bloc.end_time), (time(6, 0), time(7, 0)))
+        override = self.bloc.overrides.get(date=LUNDI)
+        self.assertEqual((override.start_time, override.end_time), (time(8), time(9)))
 
     def test_apply_sans_arrangements_resout_comme_avant(self):
         """v1 et tout appelant historique: sans _arrangements, on resout."""
         with mock.patch(
             "services.agent.tools.schedule.solve_placement",
-            side_effect=[_arrangement_fixe(self.bloc.id) for _ in range(7)],
+            side_effect=[_arrangement_fixe(self.bloc.id)] + [[] for _ in range(6)],
         ) as spy:
             resultat = self.outil.execute(self.user, start_date=LUNDI, apply=True)
         self.assertTrue(resultat.success)

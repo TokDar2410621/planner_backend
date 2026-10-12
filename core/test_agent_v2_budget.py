@@ -47,6 +47,9 @@ class _FauxAgent:
         self.run_kwargs = kwargs
         return _FauxResultat()
 
+    async def run(self, *args, **kwargs):
+        return self.run_sync(*args, **kwargs)
+
 
 def _effet_muet(self_agent, user, message, registre):
     return None
@@ -73,7 +76,7 @@ class DelaiDuTourTests(TestCase):
         """Meme en fin de tour, un appel borne a le temps de tenter."""
         agent = PlannerAgentV2()
         agent._depart_tour = time.perf_counter() - 10_000
-        self.assertGreaterEqual(agent._delai_restant(), 1.0)
+        self.assertEqual(agent._delai_restant(), 0)
 
     def test_delai_restant_hors_tour(self):
         """Hors process_message_stream (tests directs), deadline entiere."""
@@ -120,7 +123,8 @@ class DelaiDuTourTests(TestCase):
 
         with patch.object(PlannerAgentV2, '_boucle', _boucle):
             res = PlannerAgentV2().process_message(self.user, "ajoute maths")
-        self.assertIn('Maths', res['response'])
+        self.assertIn('relecture', res['response'])
+        self.assertNotIn('Ajouté', res['response'])
         self.assertIn('trop de temps', res['response'])
 
     def test_registre_connait_le_delai(self):
@@ -133,8 +137,9 @@ class BudgetJetonsTests(TestCase):
 
     def test_boucle_recoit_le_budget_jetons(self):
         faux = _FauxAgent()
+        from pydantic_ai.models.test import TestModel
         with patch.object(module_agent, 'Agent', return_value=faux), \
-             patch.object(module_agent, 'modele_agir', return_value=object()), \
+             patch.object(module_agent, 'modele_agir', return_value=TestModel()), \
              patch.object(module_agent, 'outils_pour', return_value=[]), \
              patch.object(module_agent, 'prompt_agir', return_value=""):
             PlannerAgentV2()._boucle(self.user, "bonjour", Registre())
@@ -149,7 +154,7 @@ class BudgetJetonsTests(TestCase):
 
     def test_jetons_phase_additionne(self):
         cout = {"entree": 100, "sortie": 50, "raisonnement": 25, "duree": 1.0}
-        self.assertEqual(module_agent._jetons_phase(cout), 175)
+        self.assertEqual(module_agent._jetons_phase(cout), 150)
         self.assertEqual(module_agent._jetons_phase({}), 0)
         self.assertEqual(module_agent._jetons_phase(None), 0)
 
@@ -173,18 +178,18 @@ class BudgetJetonsTests(TestCase):
             res = PlannerAgentV2().process_message(self.user, "bonjour")
         self.assertIn("limite d'IA", res['response'])
 
-    def test_budget_jour_zero_desactive(self):
-        """Plafond a zero = garde coupee, meme avec un compteur sature."""
+    def test_budget_jour_zero_interdit_les_appels(self):
+        """Une mauvaise configuration ne crée pas un budget illimité."""
         BudgetJetonsJournalier.objects.create(
             user=self.user, jour=timezone.localdate(), jetons=999999999)
         with override_settings(AGENT_V2_BUDGET_JETONS_JOUR=0):
-            self.assertFalse(module_agent._budget_jour_epuise(self.user))
+            self.assertTrue(module_agent._budget_jour_epuise(self.user))
 
-    def test_compteur_illisible_ne_bloque_pas(self):
-        """Une garde qui casse les tours serait pire que pas de garde."""
+    def test_compteur_illisible_bloque_appels_payants(self):
+        """La panne garde les réponses locales, pas un accès fournisseur illimité."""
         with patch.object(module_agent.BudgetJetonsJournalier.objects,
                           'filter', side_effect=RuntimeError("db en vrac")):
-            self.assertFalse(module_agent._budget_jour_epuise(self.user))
+            self.assertTrue(module_agent._budget_jour_epuise(self.user))
 
     def test_le_rendu_dit_le_delai(self):
         """Le bloc factuel nomme la troncature, comme pour budget_epuise."""

@@ -37,6 +37,7 @@ from .planning import SuggestOptimizationTool, DetectConflictsTool
 from .analytics import GetProductivityStatsTool
 from .interactive import PresentChoicesTool, PresentFormTool, PoserQuestionTool
 from .notify import SendNotificationTool
+from .documents import ProcessUploadedDocumentTool, ResolveDocumentEntryTool
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,9 @@ ALL_TOOLS: list[BaseTool] = [
     GetProductivityStatsTool(),
     # Notifications
     SendNotificationTool(),
+    # Documents : lecture et clôture des précisions d'un import.
+    ProcessUploadedDocumentTool(),
+    ResolveDocumentEntryTool(),
     # Interactive UI
     PresentFormTool(),
     PresentChoicesTool(),
@@ -97,7 +101,7 @@ TOOL_MAP: dict[str, BaseTool] = {tool.name: tool for tool in ALL_TOOLS}
 V2_SEULEMENT = {"present_choices", "poser_question",
                 # Outil compose ajoute pour la boucle unique: v2 le rend en une
                 # ligne de faits, v1 ne le connait pas.
-                "replace_block_occurrence"}
+                "replace_block_occurrence", "resolve_document_entry"}
 
 
 def get_tools_for_claude() -> list[dict]:

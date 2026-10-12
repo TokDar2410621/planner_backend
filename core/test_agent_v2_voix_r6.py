@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 from django.test import SimpleTestCase
 
+from core.models import RecurringBlock
 from core.test_agent_v2_narrateur import (QUESTION_PORTEE, NarrateurBase, demande, ok)
 from services.agent.tools.base import ToolResult
 from services.agent_v2 import agent as module_agent
@@ -46,11 +47,6 @@ def abandonnee(dem):
     return ToolResult(success=False, message="abandonnee",
                       data={"demande": dem, "abandonnee_par_le_code": True,
                             "decision_code": "abandonnee"})
-
-
-def executee():
-    return ToolResult(success=True, message="ok",
-                      data={"par_le_code": True, "decision_code": "execute"})
 
 
 # ── D2: la ligne d'abandon ─────────────────────────────────────────────────
@@ -177,13 +173,16 @@ class D5ProseDeRepriseTests(_TourDecideBase):
         self.assertEqual([d["cle"] for d in self.metadonnees()["demandes"]], ["p1"])
 
     def test_reprise_avec_mutation_montre_les_faits_puis_la_question(self):
-        self.inscrire = [("delete_block", {"block_id": 9}, executee()),
+        bloc = self.bloc_reel()
+        self.inscrire = [self.action_reelle("delete_block", {"block_id": bloc.pk},
+                                            par_le_code=True, decision_code="execute"),
                          ("delete_block", {"block_id": 5}, reposee(demande("portee_jour", "p1")))]
         _, done = self.tour(message="ouais",
                             dire=ReponseDire(ouverture="D'accord, je garde ton quart."))
         self.assertNotIn(PROSE_REPRISE, done["response"])
         self.assertNotIn("je garde", done["response"])
         self.assertEqual(done["response"], f"FAITS\n\n{QUESTION_PORTEE}")
+        self.assertFalse(RecurringBlock.all_objects.get(pk=bloc.pk).active)
 
 
 class D6CheminRapideTests(_TourDecideBase):
@@ -207,10 +206,13 @@ class D6CheminRapideTests(_TourDecideBase):
         return done
 
     def test_execute_rend_les_faits_seuls(self):
-        self.inscrire = [("delete_block", {"block_id": 5}, executee())]
+        bloc = self.bloc_reel()
+        self.inscrire = [self.action_reelle("delete_block", {"block_id": bloc.pk},
+                                           par_le_code=True, decision_code="execute")]
         done = self._tour_rapide("Tous les jeudis (supprimer la série).")
         self.assertEqual(done["response"], "FAITS")
         self.assertFalse(done["question_posee"])
+        self.assertFalse(RecurringBlock.all_objects.get(pk=bloc.pk).active)
         self.assertLess(self.duree, 5.0)
 
     def test_reposee_rend_la_reprise_et_la_question(self):

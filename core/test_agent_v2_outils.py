@@ -67,6 +67,8 @@ class PariteDesOutilsTests(TestCase):
         self.assertEqual(
             set(outils_v2.DESCRIPTIONS_V2) | set(outils_v2.COMPLEMENTS_V2),
             {"get_today_schedule", "optimize_week", "create_block", "update_block",
+             # Confirmation du plan daté avant son application, comme la semaine.
+             "organize_day",
              # Les deux outils qu'on enchainait a la main pour un remplacement
              # renvoient desormais vers replace_block_occurrence.
              "skip_block_occurrence", "schedule_task_at"},

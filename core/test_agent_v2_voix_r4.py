@@ -77,6 +77,8 @@ class TiretLongTests(NarrateurBase):
             options=[f"Matin {TIRET_LONG} 7 h", "Soir"]))
         self.assertNotIn(TIRET_LONG, done["response"])
         self.assertIn("vendredi : une heure", done["response"])
+        self.assertEqual(done["quick_replies"][0],
+                         {"label": "Matin : 7 h", "value": "Matin : 7 h"})
         for chip in done["quick_replies"]:
             self.assertNotIn(TIRET_LONG, chip["label"])
             self.assertNotIn(TIRET_LONG, chip["value"])

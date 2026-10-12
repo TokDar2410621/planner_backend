@@ -46,37 +46,9 @@ _DURABLE = re.compile(
     re.IGNORECASE,
 )
 
-_MOTS_VIDES = frozenset(
-    "le la les un une des du de d au aux et ou que qui quoi dont ne pas "
-    "plus mon ma mes ton ta tes son sa ses notre votre leur ce cette ces "
-    "dans sur pour avec sans sous entre vers chez est sont ete avoir faire "
-    "comme tout toute tous toutes aussi tres trop peu bien encore deja "
-    "donc car mais or ni je tu il elle nous vous ils elles on me te se y en "
-    "a ai as avons avez ont suis es est sommes etes sont etait etaient "
-    "mon prefere deteste".split()
-)
-
-
 def _normaliser(texte: str) -> str:
     decompose = unicodedata.normalize("NFKD", texte or "")
     return "".join(c for c in decompose if not unicodedata.combining(c)).lower()
-
-
-def _mots_significatifs(texte: str) -> set:
-    mots = {m for m in re.findall(r"[a-z]+", _normaliser(texte))
-            if len(m) >= 4 and m not in _MOTS_VIDES}
-    # Racine naive du pluriel francais: « réunions » et « réunion »
-    # doivent se recouvrir, sinon « oublie les réunions du matin » rate
-    # « pas de réunion avant 9h ».
-    return {m[:-1] if m.endswith("s") and len(m) > 4 else m for m in mots}
-
-
-def chevauchement(a: str, b: str) -> float:
-    """Similarite 0..1 par recouvrement des mots significatifs."""
-    ma, mb = _mots_significatifs(a), _mots_significatifs(b)
-    if not ma or not mb:
-        return 0.0
-    return len(ma & mb) / min(len(ma), len(mb))
 
 
 # -- Interpretation ----------------------------------------------------------
@@ -144,50 +116,59 @@ def _actives(user):
                 .order_by("-updated_at"))
 
 
-def memoriser(user, enonce: str, source: str = "dite",
-              confiance: float = 1.0) -> str:
-    """Stocke la preference; remplace les doublons proches (soft delete).
+def _cle_exacte(enonce: str) -> str:
+    """Normalisation de forme seulement : conserve jours, nombres et négation."""
+    return " ".join(unicodedata.normalize("NFC", enonce or "").casefold().split()).rstrip(".!?")
 
-    Rend la phrase inscrite au registre du tour pour DIRE.
+
+def memoriser(user, enonce: str, source: str = "dite",
+              confiance: float = 1.0, *, remplace_id: int | None = None) -> str:
+    """Ajoute une préférence ; seul un ID explicite autorise un remplacement.
+
+    Le recouvrement lexical ne prouve ni identité ni contradiction. À la
+    limite de stockage, demande un choix au lieu de désactiver une donnée.
     """
+    from django.contrib.auth import get_user_model
+    from django.db import transaction
     from core.models import PreferenceUtilisateur
     enonce = " ".join(enonce.split())
     if not enonce:
         return "Rien a memoriser: la preference est vide."
-    remplacees = []
-    for existante in _actives(user):
-        if chevauchement(existante.enonce, enonce) >= 0.4:
-            existante.actif = False
-            existante.save(update_fields=["actif", "updated_at"])
-            remplacees.append(existante.enonce)
-    PreferenceUtilisateur.objects.create(
-        user=user, enonce=enonce[:500], categorie=_categorie(enonce),
-        source=source, confiance=confiance)
-    total = PreferenceUtilisateur.objects.filter(user=user, actif=True).count()
-    if total > LIMITE_STOCKAGE:
-        # Les plus anciennes d'abord: la memoire reste bornee sans surprise.
-        vieilles = (PreferenceUtilisateur.objects
-                    .filter(user=user, actif=True)
-                    .order_by("updated_at")[:total - LIMITE_STOCKAGE])
-        for v in vieilles:
-            v.actif = False
-            v.save(update_fields=["actif", "updated_at"])
-    if remplacees:
+    if len(enonce) > 500:
+        return "Cette préférence dépasse 500 caractères. Raccourcis-la avant de la mémoriser."
+    with transaction.atomic():
+        # Une ligne utilisateur existe même quand sa mémoire est vide.
+        get_user_model().objects.select_for_update().get(pk=user.pk)
+        actives = _actives(user)
+        cible = next((p for p in actives if p.pk == remplace_id), None)
+        if remplace_id is not None and cible is None:
+            return "Préférence à remplacer introuvable. Rien n'a changé."
+        doublon = next((p for p in actives if _cle_exacte(p.enonce) == _cle_exacte(enonce)), None)
+        if doublon is not None:
+            return f"Déjà mémorisé : « {doublon.enonce} »."
+        if len(actives) >= LIMITE_STOCKAGE and cible is None:
+            return "La mémoire a atteint sa limite. Choisis une préférence à oublier ou à remplacer."
+        PreferenceUtilisateur.objects.create(
+            user=user, enonce=enonce, categorie=_categorie(enonce), source=source, confiance=confiance)
+        if cible is not None:
+            cible.actif = False
+            cible.save(update_fields=["actif", "updated_at"])
+    if cible is not None:
         return (f"Preference memorisee: « {enonce} ». "
-                f"Remplace: « {remplacees[0][:80]} ».")
+                f"Remplace: « {cible.enonce[:80]} ».")
     return f"Preference memorisee: « {enonce} »."
 
 
-def oublier(user, recherche: str) -> str:
-    """Desactive la preference visee. Rend la phrase pour DIRE."""
+def oublier(user, recherche: str = "", *, preference_id: int | None = None) -> str:
+    """Désactive un ID ou un énoncé exact, jamais une proximité de vocabulaire."""
     recherche = " ".join((recherche or "").split())
-    if not recherche:
+    if not recherche and preference_id is None:
         return "Precise ce que je dois oublier."
     candidates = [p for p in _actives(user)
-                  if chevauchement(p.enonce, recherche) >= 0.4
-                  or _normaliser(recherche) in _normaliser(p.enonce)]
+                  if (p.pk == preference_id if preference_id is not None
+                      else _cle_exacte(p.enonce) == _cle_exacte(recherche))]
     if not candidates:
-        return f"Je n'ai rien memorise au sujet de « {recherche} »."
+        return "Précise l'énoncé exact de la préférence à oublier. Rien n'a changé."
     if len(candidates) > 1:
         liste = "; ".join(f"« {c.enonce[:60]} »" for c in candidates[:4])
         return (f"J'ai plusieurs souvenirs proches: {liste}. "
@@ -223,7 +204,7 @@ def section_memoire(user, limite: int = LIMITE_INJECTION) -> str:
 
 def deja_connue(user, message: str) -> bool:
     """La preference est-elle deja en memoire ? Evite les chips redondantes."""
-    return any(chevauchement(p.enonce, message) >= 0.4 for p in _actives(user))
+    return any(_cle_exacte(p.enonce) == _cle_exacte(message) for p in _actives(user))
 
 
 def chip_inference(user, message: str) -> "dict | None":

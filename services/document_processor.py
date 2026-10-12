@@ -10,13 +10,21 @@ import logging
 import os
 import re
 import tempfile
+import time as time_module
+from copy import copy, deepcopy
+from concurrent.futures import Future
+from contextvars import copy_context
+from math import ceil
+from functools import wraps
 from io import BytesIO
 from typing import Optional, Tuple
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import fitz  # PyMuPDF
 from PIL import Image
 from django.conf import settings
+from django.db import transaction
+from django.utils import timezone
 
 # Import our new PDF text extractor + resource-cap guards (S4 hardening)
 from services.pdf_extractor import (
@@ -42,6 +50,10 @@ GENERIC_PROCESSING_ERROR = (
     "Le traitement du document a échoué. "
     "Vérifiez le fichier et réessayez, ou contactez le support."
 )
+
+
+class DocumentResolutionError(ValueError):
+    """Refus métier sûr à afficher lors d'une précision documentaire."""
 
 try:
     from google import genai
@@ -69,9 +81,34 @@ from datetime import time as dt_time
 from core.models import UploadedDocument, RecurringBlock
 from services.schedule_intent import has_schedule_signal
 from services.scheduling.overlap import find_recurring_conflicts
-from utils.helpers import retry_with_backoff, run_in_background
+from utils.helpers import is_retryable_error, run_in_background
+from services.agent_v2.trace_tour import trace_courante
+from services.agent_v2.budget_tour import appel_fournisseur, borne_texte, ouvrir_trace, fermer_trace
 
 logger = logging.getLogger(__name__)
+
+
+def _retry_extraction(max_retries, base_delay):
+    """Chaque tentative reste dans le délai et ne journalise aucun secret."""
+    def decorate(func):
+        @wraps(func)
+        def call(self, *args, **kwargs):
+            for attempt in range(max_retries + 1):
+                self._verifier_echeance()
+                try:
+                    return func(self, *args, **kwargs)
+                except Exception as exc:
+                    if attempt == max_retries or not is_retryable_error(exc):
+                        raise
+                    delay = min(base_delay * (2 ** attempt), 30)
+                    trace = trace_courante.get()
+                    if trace is None or trace.restant() <= delay:
+                        raise TimeoutError('Délai insuffisant pour réessayer') from None
+                    logger.warning('Nouvelle tentative %s pour %s (%s)',
+                                   attempt + 1, func.__name__, type(exc).__name__)
+                    time_module.sleep(delay)
+        return call
+    return decorate
 
 # Below this extraction confidence, a block is created as 'pending' (hidden from
 # the planning until the user confirms it) instead of activated silently.
@@ -188,7 +225,7 @@ class DocumentProcessor:
     # matchs re-importee resservait l'extraction SANS dates d'avant le fix).
     # v3 (2026-09-27): prompt durci (M seul positionnel, heures exactes),
     # parse_time_string sans arrondi, _resolve_day, canal d'avertissements.
-    EXTRACTION_VERSION = 3
+    EXTRACTION_VERSION = 4
 
     # Unified extraction prompt that extracts all types of schedule data
     UNIFIED_EXTRACTION_PROMPT = """Tu es un expert en extraction de données d'emploi du temps. Analyse cette image avec une EXTRÊME PRÉCISION.
@@ -284,7 +321,7 @@ TOUJOURS format HH:MM (24h), avec les minutes EXACTES, JAMAIS arrondies :
 === RÈGLES ABSOLUES ===
 1. UN BLOC = UNE ENTRÉE (si "Math" apparaît lundi ET mercredi = 2 entrées séparées)
 2. Si un bloc s'étend sur plusieurs heures, calcule la durée totale (ex: bloc de 8h à 10h = start 08:00, end 10:00)
-3. Si l'heure de fin n'est pas visible, estime selon la taille du bloc ou ajoute 1h30 par défaut
+3. Si une heure est absente ou illisible, renvoie null. N'invente aucune heure ni durée.
 4. Extrait TOUS les blocs visibles, même partiellement lisibles
 5. Arrays vides [] si aucune donnée de ce type
 6. UNIQUEMENT le JSON, aucun texte avant/après
@@ -383,7 +420,7 @@ Je te donne le TEXTE BRUT extrait d'un PDF d'horaire. Analyse-le et structure le
 3. Extraire TOUS les cours/shifts visibles
 4. Si "Cours inclus à l'horaire" ou légende présente, utiliser les VRAIS NOMS des cours
 5. DATES CALENDAIRES = EVENEMENTS DATES: un tableau avec des dates explicites
-   (matchs, rendez-vous, tournois) va dans "events" avec le champ "date" —
+   (matchs, rendez-vous, tournois) va dans "events" avec le champ "date" :
    JAMAIS dans courses/shifts (ce ne sont PAS des habitudes hebdomadaires)
 6. BORNES DE RÉCURRENCE: si le document précise un début ou une fin pour une
    activité hebdomadaire ("(24 août début)", "à partir du...", "jusqu'au...",
@@ -395,7 +432,8 @@ Je te donne le TEXTE BRUT extrait d'un PDF d'horaire. Analyse-le et structure le
    l'an prochain), une date à venir = cette année ou la suivante. JAMAIS une
    année lointaine: "29 août" sans année vu un 5 août = le 29 août qui vient;
    "26 juillet" vu un 5 août = le 26 juillet d'il y a 10 jours
-8. UNIQUEMENT le JSON, aucun texte avant/après
+8. Si une heure est absente ou illisible, renvoie null. N'invente aucune heure ni durée.
+9. UNIQUEMENT le JSON, aucun texte avant/après
 
 === TEXTE EXTRAIT DU PDF ===
 {text}
@@ -506,7 +544,7 @@ Analyse ce texte et retourne le JSON structuré:"""
         # Remote storage (Cloudinary) - download to temp file
         logger.info(f"Downloading file from remote storage: {document.file.name}")
         file_url = document.file.url if hasattr(document.file, 'url') else None
-        logger.info(f"File URL: {file_url}")
+        logger.debug("Remote file URL available: %s", bool(file_url))
 
         # Determine file extension
         file_name = document.file.name
@@ -526,7 +564,7 @@ Analyse ce texte et retourne le JSON structuré:"""
                     try:
                         document.file.seek(0)
                     except Exception as e:
-                        logger.warning(f"Could not seek file: {e}")
+                        logger.warning("Could not seek file (%s)", type(e).__name__)
 
                     for chunk in document.file.chunks():
                         total_bytes += len(chunk)
@@ -539,7 +577,7 @@ Analyse ce texte et retourne le JSON structuré:"""
                     # Size-cap breach: do not fall back, re-raise to abort.
                     raise
                 except Exception as chunks_error:
-                    logger.warning(f"chunks() failed: {chunks_error}, trying URL download...")
+                    logger.warning("chunks() failed (%s), trying URL download", type(chunks_error).__name__)
 
                     # Fallback: stream download from URL with a size cap so a
                     # "bomb" file cannot be read entirely into memory.
@@ -625,7 +663,7 @@ Analyse ce texte et retourne le JSON structuré:"""
         logger.info(f"Cache MISS: No cached document found for hash {content_hash[:16]}...")
         return None
 
-    @retry_with_backoff(max_retries=3, base_delay=2.0, max_delay=30.0)
+    @_retry_extraction(max_retries=3, base_delay=2.0)
     def _call_gemini(self, contents):
         """
         Call Gemini API with retry logic for rate limits.
@@ -636,12 +674,38 @@ Analyse ce texte et retourne le JSON structuré:"""
         Returns:
             Response from Gemini
         """
-        return self.gemini_client.models.generate_content(
-            model=self.gemini_model,
-            contents=contents
-        )
+        parts = [contents] if isinstance(contents, str) else contents
+        entree = 1024
+        for part in parts:
+            if isinstance(part, str):
+                entree += len(part.encode('utf-8'))
+            elif getattr(part, 'inline_data', None) is not None:
+                with Image.open(BytesIO(part.inline_data.data)) as img:
+                    # Google documente des tuiles de 258 jetons. Marge conservatrice
+                    # pour le découpage, y compris les images très allongées.
+                    unit = max(1, int(min(img.size) / 1.5))
+                    entree += max(8192, 516 * ceil(img.width / unit) * ceil(img.height / unit))
+            else:
+                raise ValueError('Format multimodal sans borne de jetons')
+        with appel_fournisseur(phase='extraction', fournisseur='gemini',
+                               jetons_entree=entree, max_sortie=4096) as appel:
+            response = self.gemini_client.models.generate_content(
+                model=self.gemini_model, contents=contents,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=appel.max_sortie,
+                    http_options=types.HttpOptions(timeout=max(1, int(appel.delai * 1000)),
+                        retry_options=types.HttpRetryOptions(attempts=1)),
+                ),
+            )
+            usage = getattr(response, 'usage_metadata', None)
+            appel.terminer(usage={
+                'entree': getattr(usage, 'prompt_token_count', None),
+                'sortie': getattr(usage, 'candidates_token_count', None),
+                'total': getattr(usage, 'total_token_count', None),
+            }, succes=True)
+            return response
 
-    @retry_with_backoff(max_retries=2, base_delay=3.0, max_delay=30.0)
+    @_retry_extraction(max_retries=2, base_delay=3.0)
     def _call_hf_vision(self, prompt: str, images: list) -> str:
         """
         Call Hugging Face vision model as fallback.
@@ -671,22 +735,42 @@ Analyse ce texte et retourne le JSON structuré:"""
 
         messages = [{"role": "user", "content": content}]
 
-        response = self.hf_client.chat_completion(
-            model=self.hf_model,
-            messages=messages,
-            max_tokens=4096,
-        )
+        # Le modèle HF est configurable : provision prudente sur le contenu
+        # transmis plutôt qu'une formule d'image propre à un autre fournisseur.
+        with appel_fournisseur(phase='extraction', fournisseur='huggingface',
+                               jetons_entree=borne_texte(messages), max_sortie=4096) as appel:
+            client = copy(self.hf_client)
+            client.timeout = appel.delai
+            response = client.chat_completion(
+                model=self.hf_model, messages=messages, max_tokens=appel.max_sortie,
+            )
+            usage = getattr(response, 'usage', None)
+            appel.terminer(usage={
+                'entree': getattr(usage, 'prompt_tokens', None),
+                'sortie': getattr(usage, 'completion_tokens', None),
+                'total': getattr(usage, 'total_tokens', None),
+            }, succes=True)
 
         return response.choices[0].message.content
 
-    def process_document_async(self, document_id: int) -> None:
+    def process_document_async(self, document_id: int) -> Future:
         """
         Process a document asynchronously in background.
 
         Args:
             document_id: ID of the UploadedDocument to process
         """
-        run_in_background(self._process_document_by_id, document_id)
+        context = copy_context()
+        future = Future()
+        def execute():
+            if not future.set_running_or_notify_cancel():
+                return
+            try:
+                future.set_result(context.run(self._process_document_by_id, document_id))
+            except Exception as exc:
+                future.set_exception(exc)
+        run_in_background(execute)
+        return future
 
     def _process_document_by_id(self, document_id: int) -> dict:
         """
@@ -710,6 +794,31 @@ Analyse ce texte et retourne le JSON structuré:"""
         return self.process_document(document)
 
     def process_document(self, document: UploadedDocument) -> dict:
+        """Réutilise le budget du chat ou réserve celui d'un import autonome."""
+        document.refresh_from_db()
+        if document.processed:
+            return document.extracted_data
+        trace = trace_courante.get()
+        owns_trace = trace is None
+        token = None
+        try:
+            if owns_trace:
+                trace = ouvrir_trace(document.user)
+                token = trace_courante.set(trace)
+            return self._process_document(document)
+        except Exception as exc:
+            logger.error('Import %s échoué (%s)', document.pk, type(exc).__name__)
+            UploadedDocument.objects.filter(pk=document.pk, processed=False).update(
+                processing_error=GENERIC_PROCESSING_ERROR)
+            document.refresh_from_db()
+            raise RuntimeError(GENERIC_PROCESSING_ERROR) from None
+        finally:
+            if owns_trace and trace is not None:
+                fermer_trace(trace)
+                if token is not None:
+                    trace_courante.reset(token)
+
+    def _process_document(self, document: UploadedDocument) -> dict:
         """
         Process an uploaded document and extract schedule data.
 
@@ -725,6 +834,11 @@ Analyse ce texte et retourne le JSON structuré:"""
         Returns:
             dict: Extracted data from the document
         """
+        # Une nouvelle requête pour un document terminé ne relance ni le
+        # fournisseur ni la matérialisation. L'état en mémoire peut être périmé.
+        document.refresh_from_db()
+        if document.processed:
+            return document.extracted_data
         try:
             # Use context manager to handle both local and remote (Cloudinary) storage
             with self._get_local_file(document) as file_path:
@@ -747,20 +861,11 @@ Analyse ce texte et retourne le JSON structuré:"""
                 cached_data = self._check_cache(document.user, content_hash)
                 if cached_data:
                     # Use cached result - much faster!
-                    extracted_data = cached_data.copy()
+                    extracted_data = deepcopy(cached_data)
                     extracted_data['from_cache'] = True
                     logger.info(f"Using cached extraction for document {document.id}")
 
-                    # Update document with cached data
-                    document.extracted_data = extracted_data
-                    document.processed = True
-                    document.processing_error = None
-                    document.save()
-
-                    # Still create recurring blocks from cached data
-                    self._create_recurring_blocks(document, extracted_data)
-
-                    return extracted_data
+                    return self._materialize_document(document, extracted_data)
 
                 response_text = None
                 extraction_method = None
@@ -795,35 +900,135 @@ Analyse ce texte et retourne le JSON structuré:"""
                     if 'parse_error' in extracted_data:
                         logger.error(f"Parse error in response: {extracted_data.get('raw_response', '')[:300]}")
 
-                # Update document
-                document.extracted_data = extracted_data
-                document.processed = True
-                document.processing_error = None
-                document.save()
-                logger.info(
-                    f"Document {document.id} saved with extracted_data keys: "
-                    f"{list(extracted_data.keys())} "
-                    f"(courses={len(extracted_data.get('courses', []))}, "
-                    f"shifts={len(extracted_data.get('shifts', []))})"
-                )
-
-                # Create recurring blocks from extracted data (idempotent: skips
-                # creation when blocks already exist for this document).
-                blocks = self._create_recurring_blocks(document, extracted_data)
-                logger.info(f"Created {len(blocks)} blocks for doc {document.id}")
-
-                return extracted_data
+                return self._materialize_document(document, extracted_data)
 
         except Exception as e:
             # Log the real cause server-side, but never persist/return the raw
             # exception string to the client (may leak paths, config, internals).
-            logger.error(
-                f"Error processing document {document.id}: {str(e)}", exc_info=True
-            )
-            document.processing_error = GENERIC_PROCESSING_ERROR
-            document.processed = False
-            document.save()
-            raise
+            logger.error("Document %s : traitement échoué (%s)", document.id, type(e).__name__)
+            # Une tentative concurrente réussie garde son résultat.
+            UploadedDocument.objects.filter(pk=document.pk, processed=False).update(
+                processing_error=GENERIC_PROCESSING_ERROR)
+            document.refresh_from_db()
+            raise RuntimeError(GENERIC_PROCESSING_ERROR) from None
+
+    def _materialize_document(self, document, data):
+        trace = trace_courante.get()
+        reservation = getattr(trace, 'reservation', None)
+        # Le coordinateur ne peut fermer la réservation entre le contrôle du
+        # délai et le commit. Le verrou local couvre la sortie de transaction.
+        with getattr(reservation, 'verrou', nullcontext()):
+            return self._persist_document(document, data)
+
+    @transaction.atomic
+    def _persist_document(self, document, data):
+        """Valide le lot, puis publie son succès dans la même transaction."""
+        # Sérialise les imports d'un utilisateur, y compris les copies du même
+        # fichier, pour rendre le contrôle de doublons et les créations atomiques.
+        type(document.user).objects.select_for_update().get(pk=document.user_id)
+        current = UploadedDocument.objects.select_for_update().get(pk=document.pk)
+        if current.processed:
+            document.refresh_from_db()
+            return current.extracted_data
+        if not isinstance(data, dict) or data.get('parse_error'):
+            raise ValueError('Extraction invalide')
+        # Les reçus d'une résolution humaine ne viennent jamais du modèle
+        # ou d'un autre document réutilisé comme cache d'extraction.
+        data.pop('_resolved_entries', None)
+        self._verifier_echeance()
+        self._create_recurring_blocks(current, data)
+        self._verifier_echeance()
+        current.extracted_data = data
+        current.processing_error = None
+        current.processed = True
+        current.save(update_fields=['extracted_data', 'processing_error', 'processed'])
+        document.refresh_from_db()
+        self._verifier_echeance()
+        return data
+
+    def resolve_entry(self, user, document_id, source, index, values):
+        """Complète une seule entrée, avec provenance et clôture atomiques."""
+        trace = trace_courante.get()
+        reservation = getattr(trace, 'reservation', None)
+        with getattr(reservation, 'verrou', nullcontext()):
+            return self._resolve_entry(user, document_id, source, index, values)
+
+    @transaction.atomic
+    def _resolve_entry(self, user, document_id, source, index, values):
+        from services.agent_v2.importation import resume_precision, message_precision
+        type(user).objects.select_for_update().get(pk=user.pk)
+        doc = UploadedDocument.objects.select_for_update().filter(pk=document_id, user=user).first()
+        if doc is None:
+            raise DocumentResolutionError('Document introuvable.')
+        if not doc.processed or doc.processing_error:
+            raise DocumentResolutionError("L'analyse du document doit être terminée avant cette précision.")
+        if source not in ('courses', 'shifts', 'events') or isinstance(index, bool) or not isinstance(index, int):
+            raise DocumentResolutionError('Référence de précision invalide.')
+        data = deepcopy(doc.extracted_data or {})
+        entries = data.get(source) or []
+        if not 0 <= index < len(entries) or not isinstance(entries[index], dict):
+            raise DocumentResolutionError('Entrée documentaire introuvable.')
+        if not values or set(values) - {'date', 'day', 'start_time', 'end_time'}:
+            raise DocumentResolutionError('Fournis au moins un champ manquant de cette entrée.')
+        key = f'{source}:{index}'
+        pending = next((p for p in data.get('_pending_entries', [])
+                        if p.get('source') == source and p.get('index') == index), None)
+        entry = deepcopy(entries[index])
+        if pending is None:
+            ledger = (data.get('_resolved_entries') or {}).get(key)
+            current = resume_precision(user, document_id, source, index)
+            if not ledger or current is None or current['targets'] != ledger.get('targets'):
+                raise DocumentResolutionError('Cette entrée ne possède plus de résolution vérifiable.')
+            if any(entry.get(k) != value for k, value in values.items()):
+                raise DocumentResolutionError('Cette précision est déjà résolue. Demande une modification du créneau.')
+            return {'resolution': current, 'already_resolved': True}
+        for field, value in values.items():
+            if not isinstance(value, str) or not value.strip():
+                raise DocumentResolutionError('Chaque précision doit contenir une valeur explicite.')
+            date_au_lieu_du_jour = (field == 'date' and not entry.get('date')
+                                   and 'day' in pending.get('missing_fields', []))
+            if field not in pending.get('missing_fields', []) and not date_au_lieu_du_jour and entry.get(field) != value:
+                raise DocumentResolutionError('Cet outil complète seulement les champs manquants.')
+            entry[field] = value
+        single = {source: [entry]}
+        validated = self._validated_entries(single, [])
+        remaining = single['_pending_entries']
+        if remaining and any(k in remaining[0]['missing_fields'] for k in values):
+            raise DocumentResolutionError('La précision fournie est invalide ou reste ambiguë.')
+        self._verifier_echeance()
+        data[source][index] = entry
+        if remaining:
+            pending['entry'] = entry
+            pending['missing_fields'] = remaining[0]['missing_fields']
+        else:
+            created = self._create_recurring_blocks(doc, {source: validated[source]}, exact_dates=True)
+            if not created:
+                # Un doublon d'un autre import garde sa provenance. Un conflit
+                # ne clôt pas la demande et ne confirme aucune nouvelle création.
+                raise DocumentResolutionError("Ce créneau existe déjà ou chevauche un bloc. Aucune précision n'a été appliquée.")
+            targets = [{'model': 'ScheduledBlock' if isinstance(b, dict) else 'RecurringBlock',
+                        'id': b['id'] if isinstance(b, dict) else b.pk} for b in created]
+            data['_pending_entries'] = [p for p in data.get('_pending_entries', [])
+                                        if not (p.get('source') == source and p.get('index') == index)]
+            data.setdefault('_resolved_entries', {})[key] = {'targets': targets}
+        data['_warnings'] = [message_precision(p) for p in data.get('_pending_entries', [])]
+        doc.extracted_data = data
+        doc.save(update_fields=['extracted_data'])
+        current = resume_precision(user, document_id, source, index)
+        if current is None:
+            raise DocumentResolutionError('La résolution ne peut pas être vérifiée.')
+        if not current['pending']:
+            data['_resolved_entries'][key]['targets'] = current['targets']
+            doc.save(update_fields=['extracted_data'])
+        self._verifier_echeance()
+        return {'resolution': current, 'already_resolved': False}
+
+    @staticmethod
+    def _verifier_echeance():
+        trace = trace_courante.get()
+        if trace is not None and (trace.restant() <= 0 or
+                getattr(trace.reservation, 'fermee', False)):
+            raise TimeoutError('Import hors délai')
 
     def _process_pdf_smart(self, file_path: str, doc_type: str) -> Tuple[Optional[str], str]:
         """
@@ -895,7 +1100,7 @@ Analyse ce texte et retourne le JSON structuré:"""
                 # Structurer du TEXTE n'exige pas la vision: DeepSeek (cle deja
                 # en prod) peut sauver le coup quand Gemini tombe. On ne laisse
                 # tomber qu'apres avoir essaye les deux.
-                logger.error(f"Gemini text structuring failed: {e}; trying DeepSeek")
+                logger.error("Gemini text structuring failed (%s); trying DeepSeek", type(e).__name__)
                 fallback = self._structure_text_with_deepseek(prompt)
                 if fallback:
                     return fallback
@@ -914,17 +1119,25 @@ Analyse ce texte et retourne le JSON structuré:"""
             provider = get_provider('deepseek')
             if not provider.is_available():
                 return None
-            response = provider.generate_with_history(
-                messages=[{"role": "user", "content": prompt}],
-                tools=None,
-                system_prompt=None,
-            )
-            if response.is_error or not (response.text or "").strip():
-                return None
+            with appel_fournisseur(phase='extraction', fournisseur='deepseek',
+                                   jetons_entree=borne_texte(prompt), max_sortie=4096) as appel:
+                provider.max_tokens = appel.max_sortie
+                client = provider._client.with_options(timeout=appel.delai, max_retries=0)
+                raw = client.chat.completions.create(**provider._request_kwargs(
+                    [{'role': 'user', 'content': prompt}], None))
+                usage = getattr(raw, 'usage', None)
+                appel.terminer(usage={
+                    'entree': getattr(usage, 'prompt_tokens', None),
+                    'sortie': getattr(usage, 'completion_tokens', None),
+                    'total': getattr(usage, 'total_tokens', None),
+                }, succes=True)
+                response = provider._parse_response(raw)
+                if response.is_error or not (response.text or '').strip():
+                    return None
             logger.info("DeepSeek text structuring fallback succeeded")
             return response.text
         except Exception as e:  # noqa: BLE001 - fallback must never crash the pipeline
-            logger.error(f"DeepSeek text structuring fallback failed: {e}")
+            logger.error('DeepSeek text structuring fallback failed (%s)', type(e).__name__)
             return None
 
     def _process_pdf_vision(self, file_path: str, doc_type: str) -> Optional[str]:
@@ -970,7 +1183,7 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                 response = self._call_gemini(parts)
                 return response.text
             except Exception as e:
-                logger.warning(f"Gemini vision failed: {e}")
+                logger.warning("Gemini vision failed (%s)", type(e).__name__)
                 # Try HF fallback
                 if self.hf_client:
                     return self._call_hf_vision(full_prompt, images)
@@ -1006,7 +1219,7 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                 ])
                 return response.text, "vision_gemini"
             except Exception as e:
-                logger.warning(f"Gemini vision failed: {e}")
+                logger.warning("Gemini vision failed (%s)", type(e).__name__)
                 if self.hf_client:
                     return self._call_hf_vision(prompt, [image]), "vision_hf"
                 raise
@@ -1225,7 +1438,8 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
         return (DocumentProcessor._normalize_future_date(out[0]),
                 DocumentProcessor._normalize_future_date(out[1]))
 
-    def _create_dated_entry(self, user, entry: dict, fallback_title: str, created_blocks: list) -> bool:
+    def _create_dated_entry(self, document, entry: dict, fallback_title: str, created_blocks: list,
+                            *, exact_dates=False) -> bool:
         """Materialise une ligne portant une DATE calendaire en entree
         PONCTUELLE (Task + ScheduledBlock verrouille). Retourne True si la
         ligne etait datee (creee ou deja presente), False sinon.
@@ -1234,8 +1448,9 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
         course/shift (vecu: matchs extraits comme 'courses' avec course_code),
         la date PRIME sur la recurrence.
         """
-        from datetime import date as dt_date
+        from datetime import date as dt_date, datetime, time
         from core.models import Task, ScheduledBlock
+        user = document.user
 
         date_str = str(entry.get('date') or '').strip()
         if not date_str:
@@ -1244,7 +1459,8 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
             event_date = dt_date.fromisoformat(date_str[:10])
         except ValueError:
             return False
-        event_date = self._normalize_future_date(event_date)
+        if not exact_dates:
+            event_date = self._normalize_future_date(event_date)
 
         raw_title = (entry.get('title') or entry.get('name') or '').strip()
         title = raw_title if raw_title and raw_title.lower() not in ('none', 'n/a', 'null', '-') else fallback_title
@@ -1252,35 +1468,93 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
         if location.lower() in ('none', 'n/a', 'null', '-'):
             location = ''
 
-        start_time = parse_time_string(entry.get('start_time', '')) or dt_time(9, 0)
+        start_time = parse_time_string(entry.get('start_time', ''))
         end_time = parse_time_string(entry.get('end_time', ''))
-        if end_time is None:
-            end_time = dt_time((start_time.hour + 2) % 24, start_time.minute)
+        if start_time is None or end_time is None:
+            raise ValueError('Heures requises pour matérialiser une entrée datée')
 
         # idempotence inter-documents: re-importer le meme horaire ne duplique rien
-        if ScheduledBlock.objects.filter(
-            user=user, date=event_date, start_time=start_time, task__title=title,
-        ).exists():
+        existing = ScheduledBlock.objects.filter(
+            user=user, task__user=user, date=event_date, start_time=start_time,
+            end_time=end_time, task__title=title,
+        ).first()
+        if existing is not None:
+            if existing.source_document_id != document.pk:
+                self._record_ignored(document.extracted_data, entry, title, 'duplicate')
             return True
 
         task = Task.objects.create(
             user=user, title=title,
             description=(f"📍 {location}" if location else ''),
-            task_type='errand', priority=6, deadline=event_date,
+            task_type='errand', priority=6,
+            deadline=timezone.make_aware(datetime.combine(event_date, time.min)),
         )
-        ScheduledBlock.objects.create(
+        block = ScheduledBlock.objects.create(
             user=user, task=task, date=event_date,
             start_time=start_time, end_time=end_time,
+            source_document=document,
             locked=True,  # sanctuaire: la replanification ne bouge pas un evenement date
         )
         created_blocks.append({
+            'id': block.pk,
             'type': 'event', 'title': title, 'date': event_date.isoformat(),
             'start': start_time.strftime('%H:%M'), 'end': end_time.strftime('%H:%M'),
         })
         logger.info("Created dated entry '%s' on %s", title, event_date)
         return True
 
-    def _create_recurring_blocks(self, document: UploadedDocument, data: dict) -> list:
+    @staticmethod
+    def _record_ignored(data, entry, title, reason):
+        data.setdefault('_ignored_entries', []).append({
+            'titre': title, 'jour': str(entry.get('date') or entry.get('day') or '?'),
+            'debut': str(entry.get('start_time') or '?'),
+            'fin': str(entry.get('end_time') or '?'), 'reason': reason,
+        })
+
+    def _validated_entries(self, data, warnings):
+        """Les champs requis manquants restent des précisions, sans créneau."""
+        from datetime import date
+        valid = {}
+        data['_pending_entries'] = []
+        data['_ignored_entries'] = []
+        data['_import_receipt_version'] = 1
+        labels = {'date': 'date', 'day': 'jour', 'start_time': 'heure de début',
+                  'end_time': 'heure de fin'}
+        sibling_days = [entry.get('day') for section in ('courses', 'shifts', 'events')
+                        for entry in (data.get(section) or []) if isinstance(entry, dict)]
+        for section in ('courses', 'shifts', 'events'):
+            entries = data.get(section) or []
+            if not isinstance(entries, list) or any(not isinstance(e, dict) for e in entries):
+                raise ValueError('Structure des entrées invalide')
+            valid[section] = []
+            for index, entry in enumerate(entries):
+                missing = []
+                raw_date = str(entry.get('date') or '').strip()
+                if raw_date:
+                    try:
+                        date.fromisoformat(raw_date)
+                    except ValueError:
+                        missing.append('date')
+                elif self._resolve_day(entry.get('day'), sibling_days)[0] is None:
+                    missing.append('day')
+                for key in ('start_time', 'end_time'):
+                    if parse_time_string(entry.get(key)) is None:
+                        missing.append(key)
+                if missing:
+                    data['_pending_entries'].append({
+                        'source': section, 'index': index, 'entry': deepcopy(entry),
+                        'missing_fields': missing,
+                    })
+                    title = entry.get('title') or entry.get('name') or entry.get('role') or 'Entrée'
+                    detail = f" (jour lu : {entry.get('day')})" if 'day' in missing and entry.get('day') else ''
+                    warnings.append(f"« {title} » : précise {', '.join(labels[k] for k in missing)}{detail}.")
+                else:
+                    valid[section].append(entry)
+        return valid
+
+    @transaction.atomic
+    def _create_recurring_blocks(self, document: UploadedDocument, data: dict,
+                                 *, exact_dates=False) -> list:
         """
         Create RecurringBlock instances from ALL extracted data types.
 
@@ -1298,21 +1572,17 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
         created_blocks = []
         warnings = []
         user = document.user
+        entries = self._validated_entries(data, warnings)
+        # Les reçus sont propres à ce document, même si l'extraction vient du cache.
+        document.extracted_data = data
 
         # Tous les tokens de jour du document: sert a desambiguiser le "M"
         # seul (mardi/mercredi) par le contexte.
         sibling_days = (
-            [c.get('day') for c in data.get('courses', [])]
-            + [s.get('day') for s in data.get('shifts', [])]
-            + [e.get('day') for e in data.get('events', [])]
+            [c.get('day') for c in entries['courses']]
+            + [s.get('day') for s in entries['shifts']]
+            + [e.get('day') for e in entries['events']]
         )
-
-        # Check if blocks already exist for this document (prevent duplicates).
-        # Use all_objects so pending blocks from a prior run also count.
-        existing_blocks = RecurringBlock.all_objects.filter(source_document=document)
-        if existing_blocks.exists():
-            logger.info(f"Blocks already exist for document {document.id}, skipping creation")
-            return list(existing_blocks)
 
         # Update document type based on detected type
         if 'detected_type' in data:
@@ -1323,10 +1593,10 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
 
         # Create blocks from courses
         logger.info(f"Creating blocks from extracted data: courses={len(data.get('courses', []))}, shifts={len(data.get('shifts', []))}")
-        if 'courses' in data and data['courses']:
-            for idx, course in enumerate(data['courses']):
+        if entries['courses']:
+            for idx, course in enumerate(entries['courses']):
                 logger.info(f"Processing course {idx}: {course}")
-                if self._create_dated_entry(user, course, 'Cours', created_blocks):
+                if self._create_dated_entry(document, course, 'Cours', created_blocks, exact_dates=exact_dates):
                     continue
                 day_str = course.get('day', '')
                 day, day_ambiguous = self._resolve_day(day_str, sibling_days)
@@ -1350,75 +1620,64 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                 start_defaulted = start_time is None
                 end_defaulted = end_time is None
 
-                if start_time is None:
-                    start_time = dt_time(9, 0)  # Default 09:00
-                    msg = (f"Heure de début illisible pour « {course.get('name', 'Cours')} » "
-                           ": 09:00 par défaut")
-                    logger.warning(msg)
-                    warnings.append(msg)
-                if end_time is None:
-                    end_time = dt_time(10, 0)  # Default 10:00
-                    msg = (f"Heure de fin illisible pour « {course.get('name', 'Cours')} » "
-                           ": 10:00 par défaut")
-                    logger.warning(msg)
-                    warnings.append(msg)
+                # Handle None values from JSON (including string "None" from Gemini)
+                location = course.get('location') or ''
+                if location.lower() in ('none', 'n/a', 'null', '-'):
+                    location = ''
 
-                try:
-                    # Handle None values from JSON (including string "None" from Gemini)
-                    location = course.get('location') or ''
-                    if location.lower() in ('none', 'n/a', 'null', '-'):
-                        location = ''
+                # Anti-doublon EXACT inter-documents: find_recurring_conflicts
+                # ne voit que les blocs 'fixed', or les blocs d'import naissent
+                # 'flexible' -> un re-upload dupliquait tout (vecu: 19->43 blocs).
+                course_title = course.get('name') or 'Cours'
+                existing = RecurringBlock.all_objects.filter(
+                    user=user, title=course_title, day_of_week=day, start_time=start_time,
+                ).first()
+                if existing is not None:
+                    if existing.source_document_id != document.pk:
+                        self._record_ignored(data, course, course_title, 'duplicate')
+                    logger.info("Skip duplicate course '%s' day %s", course_title, day)
+                    continue
 
-                    # Anti-doublon EXACT inter-documents: find_recurring_conflicts
-                    # ne voit que les blocs 'fixed', or les blocs d'import naissent
-                    # 'flexible' -> un re-upload dupliquait tout (vecu: 19->43 blocs).
-                    course_title = course.get('name') or 'Cours'
-                    if RecurringBlock.all_objects.filter(
-                        user=user, title=course_title, day_of_week=day, start_time=start_time,
-                    ).exists():
-                        logger.info("Skip duplicate course '%s' day %s", course_title, day)
-                        continue
+                # Skip a course that overlaps an existing block (prevents
+                # duplicates on re-upload and internal overlaps).
+                if find_recurring_conflicts(
+                    user, day, start_time, end_time, night_flag=(end_time <= start_time)
+                ):
+                    self._record_ignored(data, course, course_title, 'overlap')
+                    logger.info("Skip overlapping course '%s' day %s", course.get('name'), day)
+                    continue
 
-                    # Skip a course that overlaps an existing block (prevents
-                    # duplicates on re-upload and internal overlaps).
-                    if find_recurring_conflicts(
-                        user, day, start_time, end_time, night_flag=(end_time <= start_time)
-                    ):
-                        logger.info("Skip overlapping course '%s' day %s", course.get('name'), day)
-                        continue
+                confidence, block_status = self._confidence_status(
+                    start_defaulted=start_defaulted,
+                    end_defaulted=end_defaulted,
+                    title_generic=not (course.get('name') or '').strip(),
+                    llm_confidence=course.get('confidence'),
+                    day_ambiguous=day_ambiguous,
+                )
 
-                    confidence, block_status = self._confidence_status(
-                        start_defaulted=start_defaulted,
-                        end_defaulted=end_defaulted,
-                        title_generic=not (course.get('name') or '').strip(),
-                        llm_confidence=course.get('confidence'),
-                        day_ambiguous=day_ambiguous,
-                    )
+                course_start, course_end = self._entry_bounds(course)
+                block = RecurringBlock.objects.create(
+                    user=user,
+                    title=course_title,
+                    block_type='course',
+                    day_of_week=day,
+                    start_time=start_time,
+                    end_time=end_time,
+                    location=location,
+                    source_document=document,
+                    confidence=confidence,
+                    status=block_status,
+                    start_date=course_start,
+                    end_date=course_end,
+                )
+                created_blocks.append(block)
+                logger.info(f"Created course block: {block.title} (conf={confidence}, {block_status}) on day {day}")
 
-                    course_start, course_end = self._entry_bounds(course)
-                    block = RecurringBlock.objects.create(
-                        user=user,
-                        title=course_title,
-                        block_type='course',
-                        day_of_week=day,
-                        start_time=start_time,
-                        end_time=end_time,
-                        location=location,
-                        source_document=document,
-                        confidence=confidence,
-                        status=block_status,
-                        start_date=course_start,
-                        end_date=course_end,
-                    )
-                    created_blocks.append(block)
-                    logger.info(f"Created course block: {block.title} (conf={confidence}, {block_status}) on day {day}")
-                except Exception as e:
-                    logger.error(f"Error creating course block '{course.get('name', 'Unknown')}': {e}")
 
         # Create blocks from work shifts
-        if 'shifts' in data and data['shifts']:
-            for shift in data['shifts']:
-                if self._create_dated_entry(user, shift, 'Travail', created_blocks):
+        if entries['shifts']:
+            for shift in entries['shifts']:
+                if self._create_dated_entry(document, shift, 'Travail', created_blocks, exact_dates=exact_dates):
                     continue
                 day_str = shift.get('day', '')
                 day, day_ambiguous = self._resolve_day(day_str, sibling_days)
@@ -1442,75 +1701,66 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                 start_defaulted = start_time is None
                 end_defaulted = end_time is None
 
-                if start_time is None:
-                    start_time = dt_time(9, 0)
-                    msg = "Heure de début illisible pour un shift : 09:00 par défaut"
-                    logger.warning(msg)
-                    warnings.append(msg)
-                if end_time is None:
-                    end_time = dt_time(17, 0)
-                    msg = "Heure de fin illisible pour un shift : 17:00 par défaut"
-                    logger.warning(msg)
-                    warnings.append(msg)
+                # Handle None values from JSON (including string "None" from Gemini)
+                role = shift.get('role') or ''
+                if role.lower() in ('none', 'n/a', 'null', '-'):
+                    role = ''
+                title = f"Travail - {role}" if role else 'Travail'
 
-                try:
-                    # Handle None values from JSON (including string "None" from Gemini)
-                    role = shift.get('role') or ''
-                    if role.lower() in ('none', 'n/a', 'null', '-'):
-                        role = ''
-                    title = f"Travail - {role}" if role else 'Travail'
+                existing = RecurringBlock.all_objects.filter(
+                    user=user, title=title, day_of_week=day, start_time=start_time,
+                ).first()
+                if existing is not None:
+                    if existing.source_document_id != document.pk:
+                        self._record_ignored(data, shift, title, 'duplicate')
+                    logger.info("Skip duplicate shift '%s' day %s", title, day)
+                    continue
 
-                    if RecurringBlock.all_objects.filter(
-                        user=user, title=title, day_of_week=day, start_time=start_time,
-                    ).exists():
-                        logger.info("Skip duplicate shift '%s' day %s", title, day)
-                        continue
+                # Auto-detect night shift based on times (more reliable than Gemini)
+                is_night = is_night_shift(start_time, end_time)
+                if is_night:
+                    logger.info(f"Auto-detected night shift: {start_time}-{end_time}")
 
-                    # Auto-detect night shift based on times (more reliable than Gemini)
-                    is_night = is_night_shift(start_time, end_time)
-                    if is_night:
-                        logger.info(f"Auto-detected night shift: {start_time}-{end_time}")
+                if find_recurring_conflicts(user, day, start_time, end_time, night_flag=is_night):
+                    self._record_ignored(data, shift, title, 'overlap')
+                    logger.info("Skip overlapping shift day %s", day)
+                    continue
 
-                    if find_recurring_conflicts(user, day, start_time, end_time, night_flag=is_night):
-                        logger.info("Skip overlapping shift day %s", day)
-                        continue
+                confidence, block_status = self._confidence_status(
+                    start_defaulted=start_defaulted,
+                    end_defaulted=end_defaulted,
+                    title_generic=not role,
+                    llm_confidence=shift.get('confidence'),
+                    day_ambiguous=day_ambiguous,
+                )
 
-                    confidence, block_status = self._confidence_status(
-                        start_defaulted=start_defaulted,
-                        end_defaulted=end_defaulted,
-                        title_generic=not role,
-                        llm_confidence=shift.get('confidence'),
-                        day_ambiguous=day_ambiguous,
-                    )
+                block = RecurringBlock.objects.create(
+                    user=user,
+                    title=title,
+                    block_type='work',
+                    day_of_week=day,
+                    start_time=start_time,
+                    end_time=end_time,
+                    is_night_shift=is_night,
+                    source_document=document,
+                    confidence=confidence,
+                    status=block_status,
+                    start_date=self._entry_bounds(shift)[0],
+                    end_date=self._entry_bounds(shift)[1],
+                )
+                created_blocks.append(block)
+                logger.info(f"Created work block: {title} (conf={confidence}, {block_status}) on day {day}")
 
-                    block = RecurringBlock.objects.create(
-                        user=user,
-                        title=title,
-                        block_type='work',
-                        day_of_week=day,
-                        start_time=start_time,
-                        end_time=end_time,
-                        is_night_shift=is_night,
-                        source_document=document,
-                        confidence=confidence,
-                        status=block_status,
-                        start_date=self._entry_bounds(shift)[0],
-                        end_date=self._entry_bounds(shift)[1],
-                    )
-                    created_blocks.append(block)
-                    logger.info(f"Created work block: {title} (conf={confidence}, {block_status}) on day {day}")
-                except Exception as e:
-                    logger.error(f"Error creating work block: {e}")
 
         # Create blocks from events. DEUX cas radicalement differents:
         #  - evenement DATE (match, rendez-vous): une entree PONCTUELLE a cette
         #    date (Task + ScheduledBlock). L'ancien code en faisait un bloc
-        #    HEBDOMADAIRE A VIE ("Événement" anonyme repete chaque semaine —
+        #    HEBDOMADAIRE A VIE ("Événement" anonyme repete chaque semaine :
         #    faille vecue: l'horaire de matchs de l'ami de Darius).
         #  - evenement sans date (hebdomadaire assume): bloc recurrent 'other'.
-        if 'events' in data and data['events']:
-            for event in data['events']:
-                if self._create_dated_entry(user, event, 'Événement', created_blocks):
+        if entries['events']:
+            for event in entries['events']:
+                if self._create_dated_entry(document, event, 'Événement', created_blocks, exact_dates=exact_dates):
                     continue
 
                 raw_title = event.get('title') or event.get('name') or ''
@@ -1539,67 +1789,56 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                 start_defaulted = start_time is None
                 end_defaulted = end_time is None
 
-                if start_time is None:
-                    start_time = dt_time(9, 0)
-                    msg = (f"Heure de début illisible pour « {raw_title or 'Événement'} » "
-                           ": 09:00 par défaut")
-                    logger.warning(msg)
-                    warnings.append(msg)
-                if end_time is None:
-                    end_time = dt_time(10, 0)
-                    msg = (f"Heure de fin illisible pour « {raw_title or 'Événement'} » "
-                           ": 10:00 par défaut")
-                    logger.warning(msg)
-                    warnings.append(msg)
+                # Handle None values from JSON (including string "None" from Gemini)
+                # titre deja resolu plus haut (title/name)
 
-                try:
-                    # Handle None values from JSON (including string "None" from Gemini)
-                    # titre deja resolu plus haut (title/name)
+                existing = RecurringBlock.all_objects.filter(
+                    user=user, title=title, day_of_week=day, start_time=start_time,
+                ).first()
+                if existing is not None:
+                    if existing.source_document_id != document.pk:
+                        self._record_ignored(data, event, title, 'duplicate')
+                    logger.info("Skip duplicate event '%s' day %s", title, day)
+                    continue
 
-                    if RecurringBlock.all_objects.filter(
-                        user=user, title=title, day_of_week=day, start_time=start_time,
-                    ).exists():
-                        logger.info("Skip duplicate event '%s' day %s", title, day)
-                        continue
+                if find_recurring_conflicts(user, day, start_time, end_time, night_flag=(end_time <= start_time)):
+                    self._record_ignored(data, event, title, 'overlap')
+                    logger.info("Skip overlapping event '%s' day %s", raw_title, day)
+                    continue
 
-                    if find_recurring_conflicts(user, day, start_time, end_time, night_flag=(end_time <= start_time)):
-                        logger.info("Skip overlapping event '%s' day %s", raw_title, day)
-                        continue
+                confidence, block_status = self._confidence_status(
+                    start_defaulted=start_defaulted,
+                    end_defaulted=end_defaulted,
+                    title_generic=title_generic,
+                    llm_confidence=event.get('confidence'),
+                    day_ambiguous=day_ambiguous,
+                )
 
-                    confidence, block_status = self._confidence_status(
-                        start_defaulted=start_defaulted,
-                        end_defaulted=end_defaulted,
-                        title_generic=title_generic,
-                        llm_confidence=event.get('confidence'),
-                        day_ambiguous=day_ambiguous,
-                    )
+                ev_start, ev_end = self._entry_bounds(event)
+                block = RecurringBlock.objects.create(
+                    user=user,
+                    title=title,
+                    block_type='other',
+                    day_of_week=day,
+                    start_time=start_time,
+                    end_time=end_time,
+                    source_document=document,
+                    confidence=confidence,
+                    status=block_status,
+                    start_date=ev_start,
+                    end_date=ev_end,
+                )
+                created_blocks.append(block)
+                logger.info(f"Created event block: {block.title} (conf={confidence}, {block_status}) on day {day}")
 
-                    ev_start, ev_end = self._entry_bounds(event)
-                    block = RecurringBlock.objects.create(
-                        user=user,
-                        title=title,
-                        block_type='other',
-                        day_of_week=day,
-                        start_time=start_time,
-                        end_time=end_time,
-                        source_document=document,
-                        confidence=confidence,
-                        status=block_status,
-                        start_date=ev_start,
-                        end_date=ev_end,
-                    )
-                    created_blocks.append(block)
-                    logger.info(f"Created event block: {block.title} (conf={confidence}, {block_status}) on day {day}")
-                except Exception as e:
-                    logger.error(f"Error creating event block '{event.get('title', 'Unknown')}': {e}")
 
         # Canal d'avertissements: ce qui a ete ignore ou approxime est
         # persisté dans extracted_data pour que l'agent le voie (il dump ce
         # JSON dans son contexte) au lieu de croire a une extraction parfaite.
+        data['_warnings'] = warnings
+        document.extracted_data = data
+        document.save(update_fields=['extracted_data'])
         if warnings:
-            data['_warnings'] = warnings
-            document.extracted_data = data
-            document.save(update_fields=['extracted_data'])
             logger.info(f"Document {document.id}: {len(warnings)} extraction warning(s)")
 
         return created_blocks

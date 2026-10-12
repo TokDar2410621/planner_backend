@@ -267,7 +267,8 @@ class PlanningDuJourEffectifTests(TransactionTestCase):
         # « - Titre: jeu 08:00-11:00 ». Seul le second doit rester.
         self.assertNotIn('08:00-11:00 Conception', prompt)
         self.assertIn('SEMAINE TYPE', prompt)
-        self.assertIn('- Conception: jeu 08:00-11:00', prompt)
+        jour = ('lun', 'mar', 'mer', 'jeu', 'ven', 'sam', 'dim')[timezone.localdate().weekday()]
+        self.assertIn(f'- Conception: {jour} 08:00-11:00', prompt)
 
 
 class ContexteDuJugeTests(TransactionTestCase):

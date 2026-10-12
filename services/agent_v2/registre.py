@@ -8,7 +8,8 @@ de parler d'une action.
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+from typing import Literal, TypedDict
 
 from services.agent.tools.base import ToolResult
 
@@ -28,7 +29,27 @@ OUTILS_DE_MUTATION = {
     # systeme et inscrit par importation.py. C'est une ecriture en base
     # comme une autre, et le bloc factuel doit la raconter.
     "import_document",
+    "resolve_document_entry",
 }
+
+
+@dataclass(frozen=True)
+class Postcondition:
+    """Comparaison exécutée par le runtime sur une cible de l'utilisateur."""
+
+    entite: str
+    cible: dict
+    attendu: dict
+    observe: dict | None
+    conforme: bool
+
+
+class RecuMutation(TypedDict, total=False):
+    cle_operation: str
+    statut: Literal["a_verifier", "pending_confirmation", "confirme", "sans_mutation", "contradictoire", "echec"]
+    user_id: int
+    source: Literal["base"]
+    postconditions: list[dict]
 
 
 @dataclass(frozen=True)
@@ -46,7 +67,7 @@ class Action:
     # elle est `pending_confirmation` et doit etre reconciliee par requete
     # avant toute reemission. Le modele ne reexecute jamais a l'aveugle.
     cle_operation: str = ""
-    recu: dict = field(default_factory=dict)
+    recu: RecuMutation = field(default_factory=dict)
 
     @property
     def est_mutation(self) -> bool:
@@ -55,6 +76,15 @@ class Action:
     @property
     def en_attente_confirmation(self) -> bool:
         return bool((self.donnees or {}).get("pending_confirmation"))
+
+    @property
+    def etat_verifie(self) -> bool:
+        """Un résultat déclaré réussi ne constitue pas une relecture."""
+        preuves = self.recu.get("postconditions", [])
+        return bool(self.succes and self.recu.get("source") == "base"
+                    and self.recu.get("user_id") is not None
+                    and self.recu.get("statut") in ("confirme", "sans_mutation")
+                    and preuves and all(p.get("conforme") is True for p in preuves))
 
 
 @dataclass(frozen=True)
@@ -112,6 +142,7 @@ class Registre:
         self.actions: list[Action] = []
         self.ecarts: list[Ecart] = []
         self.budget_epuise: bool = False
+        self.motif_budget: str = "etapes"
         self.delai_depasse: bool = False
         self.boucle_interrompue: bool = False
         self._index: dict = {}
@@ -128,14 +159,13 @@ class Registre:
             donnees = dict(resultat.data or {})
             recu = {}
             if outil in OUTILS_DE_MUTATION:
-                # Le recu est la preuve verifiable d'une ecriture: la phase
-                # de rendu n'a le droit d'affirmer une action que contre un
-                # recu confirme (verifier-puis-rendre).
+                # L'exécution ouvre une demande de vérification. Seule la
+                # réconciliation peut y joindre les postconditions relues.
                 recu = {
                     "cle_operation": cle_operation or "",
                     "statut": ("pending_confirmation"
                                if donnees.get("pending_confirmation")
-                               else ("confirme" if resultat.success else "echec")),
+                               else ("a_verifier" if resultat.success else "echec")),
                 }
                 objet_id = donnees.get("block_id") or donnees.get("task_id")
                 if objet_id is not None:
@@ -171,8 +201,26 @@ class Registre:
         """Les ecritures prouvees: succes + recu confirme. Seule source de
         verite de la phase de rendu."""
         return [a for a in self.actions
-                if a.est_mutation and a.succes
-                and (a.recu or {}).get("statut") == "confirme"]
+                if a.est_mutation and a.etat_verifie
+                and a.recu.get("statut") == "confirme"]
+
+    def verifier(self, action_id: str, user_id: int,
+                 preuves: list[Postcondition], *, sans_mutation: bool = False) -> None:
+        """Consigne les seules preuves structurées issues de la relecture."""
+        with self._verrou:
+            action = self._index.get(action_id)
+            if not isinstance(action, Action) or not action.est_mutation:
+                return
+            statut = "a_verifier"
+            if preuves:
+                statut = ("sans_mutation" if sans_mutation else "confirme") \
+                    if all(p.conforme for p in preuves) else "contradictoire"
+            recu = RecuMutation(cle_operation=action.cle_operation, statut=statut,
+                                user_id=user_id, source="base",
+                                postconditions=[asdict(p) for p in preuves])
+            nouvelle = replace(action, recu=recu)
+            self.actions[self.actions.index(action)] = nouvelle
+            self._index[action.id] = nouvelle
 
     def en_attente(self, cle_operation: str) -> Action | None:
         """Une tentative ambigue (pending_confirmation) pour cette cle ?"""

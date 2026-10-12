@@ -22,6 +22,7 @@ from datetime import date, time as heure, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from django.conf import settings
 from django.contrib.auth.models import User
 from django.test import SimpleTestCase, TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
@@ -423,41 +424,76 @@ class ToursTests(TransactionTestCase):
                        regles_actives="creneaux")
         self.assertEqual(t.boucle, 1)
         self.assertIn("Je ne vois pas de cours de maths dans ton horaire.", t.done["response"])
+        self.assertIn(DIRE_ABSENCE["question"], t.done["response"])
+        self.assertFalse(t.done.get("interactive_inputs"))
+        self.assertEqual(t.done["question_motif"], "dire")
 
     def test_sans_lecture_utilisable_le_tour_est_celui_de_main(self):
         message = "mets mon cours de maths"
         reference = self._tour(self._utilisateur("main"), message, lire="0")
 
         def sans_lire(assistant):
-            return _normaliser({k: v for k, v in assistant.metadata.items() if k not in lecture.CLES_METADONNEES})
+            meta = {k: v for k, v in assistant.metadata.items() if k not in lecture.CLES_METADONNEES}
+            usages = meta["usage"]
+            self.assertEqual(len(usages), 1)
+            self.assertEqual(usages[0]["phase"], "planning")
+            self.assertTrue(usages[0]["usage_connu"])
+            self.assertGreater(usages[0]["entree"], 0)
+            self.assertGreater(usages[0]["sortie"], 0)
+            self.assertEqual(usages[0]["total"], usages[0]["entree"] + usages[0]["sortie"])
+            self.assertEqual(usages[0]["jetons_factures"], usages[0]["total"])
+            self.assertGreaterEqual(usages[0]["jetons_provisionnes"], usages[0]["total"])
+            self.assertLessEqual(usages[0]["jetons_provisionnes"],
+                                 int(getattr(settings, "AGENT_MAX_JETONS_APPEL", 120000)))
+            self.assertGreaterEqual(usages[0]["duree"], 0)
+            # Le modele factice emet plus de jetons avec une lecture typee.
+            # Les identifiants propres au compte changent aussi la taille du
+            # contexte et sa provision, sans changer les reponses ni actions.
+            volatils = {"sortie", "total", "jetons_factures", "jetons_provisionnes", "duree"}
+            meta["usage"] = [{k: "<mesure>" if k in volatils else v
+                              for k, v in usages[0].items()}]
+            return _normaliser(meta)
+
+        def sans_identifiant_assistant(tour):
+            # L'identifiant pointe la vraie ligne propre a chaque compte;
+            # seule sa valeur differe, les autres champs restent compares.
+            self.assertEqual(tour.done["assistant_message_id"], tour.assistant.pk)
+            return _normaliser({**tour.done, "assistant_message_id": "<volatil>"})
 
         for nom, options in (("regles-coupees", dict(elements=[COURS_MATHS_TOUR], regles_actives="")),
                              ("lecture-tardive", dict(elements=[COURS_MATHS_TOUR], statut=lecture.HORS_BUDGET)),
                              ("lecture-absente", dict(statut=lecture.ABSENTE))):
             with self.subTest(cas=nom):
                 t = self._tour(self._utilisateur(nom), message, **options)
-                self.assertEqual(json.dumps(_normaliser(t.done), sort_keys=True, ensure_ascii=False),
-                                 json.dumps(_normaliser(reference.done), sort_keys=True, ensure_ascii=False))
+                self.assertEqual(json.dumps(sans_identifiant_assistant(t), sort_keys=True, ensure_ascii=False),
+                                 json.dumps(sans_identifiant_assistant(reference), sort_keys=True, ensure_ascii=False))
                 self.assertEqual(t.assistant.content, reference.assistant.content)
                 self.assertEqual(sans_lire(t.assistant), sans_lire(reference.assistant))
 
-    def test_une_creation_reussie_ce_tour_garde_dire(self):
+    def test_une_creation_reussie_ce_tour_rend_les_faits_sans_formulaire(self):
         appel = ("create_block", {"title": "Maths", "block_type": "course", "days": ["mardi"],
                                   "start_time": "09:00", "end_time": "10:00"})
         t = self._tour(self._utilisateur("creation"), "mets mon cours de maths", [COURS_MATHS_TOUR],
                        appel=appel, dire=DIRE_NEUTRE)
-        # Boucle unique: 2 passages (appel d'outil puis ReponseDire), prose gardee.
+        # Deux passages: outil puis sortie. Le code raconte la creation relue.
         self.assertEqual(t.boucle, 2)
         self.assertFalse(t.done.get("interactive_inputs"))
-        self.assertIn("D'accord.", t.done["response"])
+        self.assertIn("Ajouté : Maths, les mardis de 9 h à 10 h.", t.done["response"])
+        self.assertNotIn("D'accord.", t.done["response"])
+        bloc = RecurringBlock.objects.get(user=t.assistant.user, title="Maths")
+        self.assertEqual((bloc.day_of_week, bloc.start_time, bloc.end_time),
+                         (1, heure(9, 0), heure(10, 0)))
 
-    def test_une_reponse_de_formulaire_garde_dire(self):
+    def test_une_reponse_de_formulaire_ne_repose_pas_un_formulaire(self):
         message = "Voici mes réponses :\nCours: maths"
         t = self._tour(self._utilisateur("reponse"), message,
                        [_element(mention="maths", genre="course", candidats=["s1"])], dire=DIRE_NEUTRE)
         self.assertEqual(t.boucle, 1)
+        # Le seul vrai contrat du test: aucun formulaire repose. Le code n'a
+        # rien rendu, donc la prose neutre de DIRE survit.
         self.assertFalse(t.done.get("interactive_inputs"))
         self.assertIn("D'accord.", t.done["response"])
+        self.assertEqual(t.done["quick_replies"], [])
 
     def test_le_chemin_rapide_n_evalue_aucune_regle(self):
         t = self._tour(self._utilisateur("rapide"), "oui", [COURS_MATHS_TOUR], rapide=True)

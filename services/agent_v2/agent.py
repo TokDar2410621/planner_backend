@@ -20,14 +20,17 @@ cle manquante rend un 500 a l'utilisateur.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import queue
 import re
 import time
+from copy import copy
 from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from contextvars import copy_context
 from typing import Optional
 from types import SimpleNamespace
 
@@ -41,7 +44,7 @@ from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (ModelRequest, ModelResponse, PartDeltaEvent,
                                   PartStartEvent, TextPart,
                                   ThinkingPart, ThinkingPartDelta, UserPromptPart)
-from pydantic_ai.usage import UsageLimits
+from pydantic_ai.usage import RunUsage, UsageLimits
 
 from core.models import BudgetJetonsJournalier, ConversationMessage, UploadedDocument
 from services.agent_v2 import lecture, regles
@@ -51,7 +54,7 @@ from services.agent_v2.mesure import verifier_prose
 from services.agent_v2.modeles import (REGLAGES_BOUCLE_SANS_RAISONNEMENT,
                                        modele_agir)
 from services.agent_v2.outils import outils_pour, outils_pour_le_modele
-from services.agent_v2.prompts import prompt_agir
+from services.agent_v2.prompts import prompt_agir, prompt_planification
 from services.agent_v2.reconciliation import detecter_ecarts, reconcilier
 from services.agent_v2.importation import inscrire_import
 from services.agent_v2.rendu import plage
@@ -130,23 +133,24 @@ def _jetons_phase(cout: dict) -> int:
     """Jetons consommes par une phase, depuis son dict _cout."""
     if not isinstance(cout, dict):
         return 0
-    return sum(int(cout.get(k, 0) or 0) for k in ("entree", "sortie", "raisonnement"))
+    # Les jetons de raisonnement sont deja inclus dans les jetons de sortie.
+    return sum(int(cout.get(k, 0) or 0) for k in ("entree", "sortie"))
 
 
 def _budget_jour_epuise(user) -> bool:
-    """Le compteur journalier de l'utilisateur a-t-il atteint le plafond ?
-
-    Un compteur illisible (table absente, DB en vrac) ne bloque jamais un
-    tour: la garde est un coupe-circuit, pas un verrou.
-    """
+    """Sans lecture du compteur, aucun nouvel appel payant n'est admis."""
+    from services.agent_v2.trace_tour import trace_courante
+    reservation = getattr(trace_courante.get(), 'reservation', None)
+    if reservation is not None and reservation.user_id == user.pk:
+        return reservation.fermee
     if _budget_jetons_jour(user) <= 0:
-        return False
+        return True
     try:
         ligne = BudgetJetonsJournalier.objects.filter(
             user=user, jour=timezone.localdate()).first()
     except Exception:  # noqa: BLE001
-        return False
-    return ligne is not None and (ligne.jetons or 0) >= _budget_jetons_jour(user)
+        return True
+    return ligne is not None and (ligne.jetons + ligne.jetons_reserves) >= _budget_jetons_jour(user)
 
 
 def _enregistrer_jetons(user, total: int) -> None:
@@ -196,6 +200,11 @@ PROSE_BUDGET_JOUR = ("J'ai atteint ma limite d'IA pour aujourd'hui, "
 # Compte anonyme au plafond resserre : on suggere la sortie, pas l'attente.
 PROSE_BUDGET_JOUR_ANON = ("J'ai atteint ma limite d'IA pour aujourd'hui. "
                           "Crée un compte gratuit pour continuer sans limite.")
+
+
+def prose_budget_jour(user):
+    from core.anonyme import est_anonyme
+    return PROSE_BUDGET_JOUR_ANON if est_anonyme(user) else PROSE_BUDGET_JOUR
 
 # POOL DE THREADS REUTILISES, et le mot « reutilises » porte tout le poids.
 #
@@ -286,11 +295,11 @@ def _brouillon_interdit(registre: Registre) -> bool:
 def _cout(resultat, duree: float) -> dict:
     """Ce qu'une phase a reellement coute: allers-retours, jetons, secondes.
 
-    `usage()` peut manquer selon le fournisseur. On ne fait alors pas semblant
-    de savoir: zero, et la ligne de log le montrera tel quel.
+    `usage()` peut manquer selon le fournisseur : les compteurs restent alors
+    inconnus (None), avec usage_connu=False dans les metadonnees.
     """
-    vide = {"etapes": 0, "entree": 0, "sortie": 0, "raisonnement": 0,
-            "cache": 0, "duree": duree}
+    vide = {"etapes": 0, "entree": None, "sortie": None, "raisonnement": None,
+            "cache": None, "duree": duree, "usage_connu": False}
     try:
         u = resultat.usage()
     except Exception:  # noqa: BLE001
@@ -298,20 +307,17 @@ def _cout(resultat, duree: float) -> dict:
     # `details` porte ce que le fournisseur ajoute. Sur DeepSeek: les jetons de
     # RAISONNEMENT, et le partage entre succes et echecs de cache de prefixe.
     #
-    # Ces deux nombres repondent a la question ouverte. Sonde du 2026-08-29:
-    # au deuxieme appel d'une conversation, 7680 jetons d'entree sur 7781
-    # etaient des succes de cache. Les trente schemas d'outils sont donc bien
-    # renvoyes a chaque etape, mais ni refactures ni retraites: la piste du
-    # contexte qui gonfle ne tient pas, et c'est le raisonnement qu'il faut
-    # regarder.
+    # Un succes de cache ne prouve ni gratuite ni faible latence. Le compteur
+    # standard du SDK prime ; les details fournisseur restent un secours.
     details = getattr(u, "details", None) or {}
     return {
         "etapes": getattr(u, "requests", 0) or 0,
         "entree": getattr(u, "input_tokens", 0) or 0,
         "sortie": getattr(u, "output_tokens", 0) or 0,
         "raisonnement": details.get("reasoning_tokens", 0) or 0,
-        "cache": details.get("prompt_cache_hit_tokens", 0) or 0,
+        "cache": getattr(u, 'cache_read_tokens', 0) or details.get("prompt_cache_hit_tokens", 0) or 0,
         "duree": duree,
+        "usage_connu": True,
     }
 # Une lecture de semaine chargee depasse largement ce volume; on tronque plutot
 # que de laisser un seul outil manger le contexte de la redaction.
@@ -452,7 +458,7 @@ class PlannerAgentV2:
                     self.pousser_pensee(evenement.delta.content_delta)
 
     def _boucle(self, user: User, message: str, registre: Registre) -> ReponseDire | None:
-        """Boucle unique (2026-09-29): UN SEUL appel modele par tour.
+        """Une boucle outillee : plusieurs requetes modele peuvent se succeder.
 
         Le modele comprend, outille et rend une reponse STRUCTUREE
         (ReponseDire): prose + refs vers le registre + lecture typee pour les
@@ -465,6 +471,7 @@ class PlannerAgentV2:
         # Les regles de la garde (confirmation, heure dite, portee d'un jour)
         # lisent le message TAPE, jamais sa version enrichie du document.
         brut = self._message_brut if self._message_brut is not None else message
+        decision = getattr(self, '_decision_tour', None)
         outils = outils_pour_le_modele(
             user, registre, message_du_tour=message, tache=self._tache,
             signaler=self.signaler_outil, message_brut=brut, tap=self._tap)
@@ -473,9 +480,10 @@ class PlannerAgentV2:
         # boucle tournait sans date, sans table de decision ni semaine type,
         # et a place une revision en 2025 (banc du 2026-09-14). Les
         # instructions partent a chaque requete.
+        from services.agent_v2.budget_tour import modele_borne, BudgetEpuise
         agent = Agent(
-            modele_agir(),
-            instructions=prompt_agir(user),
+            modele_borne(modele_agir(), 'planning'),
+            instructions=prompt_planification(user, decision) if decision else prompt_agir(user),
             tools=outils,
             output_type=ReponseDire,
             # DeepSeek refuse tool_choice=required (la sortie structuree)
@@ -485,23 +493,38 @@ class PlannerAgentV2:
         )
 
         depart = time.perf_counter()
+        usage = RunUsage()
+        resultat = None
         try:
             resultat = self._executer_boucle(
                 agent, message,
+                usage=usage,
+                delai=self._delai_restant(),
                 message_history=self._historique(user),
                 usage_limits=UsageLimits(request_limit=BUDGET_ETAPES,
                                          **_limites_jetons(_budget_jetons_agir())),
                 event_stream_handler=self._sur_evenements,
             )
-            self._cout_boucle = _cout(resultat, time.perf_counter() - depart)
+        except BudgetEpuise:
+            registre.budget_epuise = True
+            registre.motif_budget = "jetons"
+            return None
         except UsageLimitExceeded:
             # Le tour est tronque, pas rate: les outils deja executes ont
             # ecrit. Le bloc factuel le dira, c'est tout l'interet du registre.
             # Declenche par le budget d'etapes OU le budget jetons.
             registre.budget_epuise = True
-            self._cout_boucle = {"etapes": BUDGET_ETAPES, "entree": 0, "sortie": 0,
-                                 "duree": time.perf_counter() - depart}
+            registre.motif_budget = "etapes" if usage.requests >= BUDGET_ETAPES else "jetons"
             return None
+        except asyncio.TimeoutError:
+            registre.delai_depasse = True
+            return None
+        finally:
+            self._cout_boucle = _cout(resultat or SimpleNamespace(usage=lambda: usage),
+                                     time.perf_counter() - depart)
+            if resultat is None and not usage.total_tokens:
+                self._cout_boucle.update(usage_connu=False, entree=None, sortie=None,
+                                        raisonnement=None, cache=None)
         sortie = getattr(resultat, "output", None)
         return sortie if isinstance(sortie, ReponseDire) else None
 
@@ -514,6 +537,21 @@ class PlannerAgentV2:
         le tour meurt sans action. Un seul reessai, pas d'acharnement: la
         resilience reste assuree par la chaine de repli (FallbackModel).
         """
+        delai = kwargs.pop('delai', None)
+        if delai is not None:
+            async def executer():
+                # Meme compteur et meme deadline y compris en cas de reprise.
+                try:
+                    try:
+                        return await agent.run(message, **kwargs)
+                    except Exception as exc:
+                        if 'without content or tool calls' not in str(exc):
+                            raise
+                        return await agent.run(message, **kwargs)
+                finally:
+                    from services.agent_v2.modeles import fermer_modele
+                    await fermer_modele(getattr(agent, 'model', None))
+            return asyncio.run(asyncio.wait_for(executer(), timeout=max(0.0, delai)))
         try:
             return agent.run_sync(message, **kwargs)
         except Exception as e:  # noqa: BLE001
@@ -523,6 +561,37 @@ class PlannerAgentV2:
             return agent.run_sync(message, **kwargs)
 
     def process_message_stream(
+        self, user, message, attachment=None, *, use_streaming=True,
+        generate_quick_replies=False, tap=None,
+    ):
+        from services.agent_v2.trace_tour import trace_courante
+        from services.agent_v2.budget_tour import ouvrir_trace, fermer_trace, BudgetIndisponible
+        trace = trace_courante.get()
+        proprietaire = trace is None
+        if proprietaire:
+            try:
+                trace = ouvrir_trace(user)
+            except BudgetIndisponible:
+                prose = prose_budget_jour(user)
+                yield {'type': 'delta', 'text': prose}
+                yield {'type': 'done', 'response': prose, 'quick_replies': [],
+                       'blocks_created': [], 'tasks_created': [], 'raisonnement': ''}
+                return
+        if trace.reservation is None or trace.reservation.user_id != user.pk:
+            raise BudgetIndisponible('réservation étrangère au tour')
+        self._trace = trace
+        jeton = trace_courante.set(trace)
+        try:
+            yield from self._process_message_stream(user, message, attachment,
+                use_streaming=use_streaming, generate_quick_replies=generate_quick_replies, tap=tap)
+        finally:
+            try:
+                if proprietaire:
+                    fermer_trace(trace)
+            finally:
+                trace_courante.reset(jeton)
+
+    def _process_message_stream(
         self,
         user: User,
         message: str,
@@ -541,7 +610,7 @@ class PlannerAgentV2:
         attente qui porte cette cle (memes gardes, meme fenetre); tout le
         reste du tour lit le message comme avant."""
         self.user = user
-        depart_tour = time.perf_counter()
+        depart_tour = getattr(self, '_depart_admission', None) or time.perf_counter()
         self._depart_tour = depart_tour  # lu par _delai_restant (deadline du tour)
         self._cout_boucle = {}
         # Le message TAPE, avant tout enrichissement: c'est lui que lisent la
@@ -552,7 +621,10 @@ class PlannerAgentV2:
         # consultation, consultee a un autre moment du tour, decide si une
         # lecture reussie s'affiche. Reinitialise a chaque tour: sans verdict
         # frais, jamais de masquage.
-        self._verdict_consultation = {}
+        decision = getattr(self, '_decision_tour', None)
+        self._verdict_consultation = ({'statut': _jugement.STATUT_DECISION,
+                                      'valeur': decision.consultation, 'confiance': 1.0}
+                                     if decision else {})
         self._journaliser_reponse_formulaire(user, message)
 
         # Persiste d'abord, puis exclut CETTE ligne de l'historique par son id.
@@ -569,6 +641,8 @@ class PlannerAgentV2:
         self._tache = f"{user.pk}:{courant.pk}"
 
         registre = Registre()
+        registre.lecture_seule = bool(decision and not decision.autoriser_modifications)
+        registre.echeance = time.monotonic() + self._delai_restant()
         self._registre_courant = registre
 
         # Le document et l'import recent DOIVENT entrer dans le message vu par
@@ -606,8 +680,13 @@ class PlannerAgentV2:
         # Un tap structure (chip d'une question en attente) n'est jamais une
         # commande memoire.
         try:
-            commande_memoire = (memoire_prefs.interpreter(message)
-                                if self._tap is None else None)
+            if decision:
+                commande_memoire = (memoire_prefs.CommandeMemoire(
+                    decision.memoire_action, decision.enonce, decision.objectif)
+                    if decision.memoire_action else None)
+            else:
+                commande_memoire = (memoire_prefs.interpreter(message)
+                                    if self._tap is None else None)
         except Exception:  # noqa: BLE001 - une commande illisible ne casse pas le tour
             commande_memoire = None
             logger.error("Interpretation memoire impossible", exc_info=True)
@@ -682,7 +761,7 @@ class PlannerAgentV2:
         # tranche, jamais une liste de mots. La reponse breve entre dans un
         # ReponseDire pour suivre le chemin de composition normal.
         voie_rapide = (
-            not par_le_code and not budget_jour_epuise
+            decision is None and not par_le_code and not budget_jour_epuise
             and self._voie_rapide_sociale(user, message, attachment)
         )
         if voie_rapide:
@@ -707,7 +786,9 @@ class PlannerAgentV2:
         if panne is not None:
             # Une panne de la boucle ne doit pas effacer ce que les outils
             # ont deja ecrit: le registre survit et le tour continue.
-            logger.error("Boucle a echoue: %s", panne, exc_info=panne)
+            logger.error("Boucle a echoue type=%s", type(panne).__name__)
+        if not isinstance(reponse_boucle, ReponseDire):
+            reponse_boucle = None
 
         etat: dict = {}
         if registre.mutations():
@@ -753,7 +834,11 @@ class PlannerAgentV2:
         ) and not any(a.succes and a.est_mutation for a in registre.actions)
         titres_vises = [((d or {}).get("cible") or {}).get("titre")
                         for d in (gagnant.get("demandes") or [])] if par_demande else []
-        faits = bloc_factuel(registre, cles_posees=cles_posees, sans_lecture=sans_lecture,
+        affichage = self._assurer_consultation(user, message, registre)
+        if affichage is not registre and any(a.succes and a.outil in LECTURES_RENDUES
+                                             for a in affichage.actions):
+            sans_lecture = False
+        faits = bloc_factuel(affichage, cles_posees=cles_posees, sans_lecture=sans_lecture,
                              titres_vises=[t for t in titres_vises if t])
         # La section RESTE: demande contre place, une soustraction rendue par
         # du code. Elle rejoint les faits AVANT la redaction et le flux: le
@@ -792,7 +877,9 @@ class PlannerAgentV2:
             # tour de reprise, le code parle seul (PROSE_REPRISE plus bas).
             brut = (reponse_boucle.model_copy(update={"ouverture": "", "suite": ""})
                     if reemises else reponse_boucle)
-            brut, supprimees, fuites = verifier_prose(brut, registre)
+            brut, supprimees, fuites = verifier_prose(
+                brut, registre, autoriser_conversation=voie_rapide,
+                sans_faits=not faits)
             compo = composer(brut, registre, faits, gagnant)
         else:
             # La boucle n'a rien rendu (panne, budget d'etapes): les faits
@@ -930,8 +1017,8 @@ class PlannerAgentV2:
             # a atteint 397 s sans qu'aucun log ne dise ou passait le temps: on
             # ne pouvait qu'inferer des ecarts entre lignes httpx.
             cout.get("duree", 0.0), cout.get("etapes", 0),
-            cout.get("entree", 0), cout.get("sortie", 0),
-            cout.get("raisonnement", 0), cout.get("cache", 0),
+            cout.get("entree") or 0, cout.get("sortie") or 0,
+            cout.get("raisonnement") or 0, cout.get("cache") or 0,
             duree_verif,
             # MESURE DES QUESTIONS (lot 3g): a-t-on demande, par quel canal,
             # combien de boutons, une lecture sans liste, du texte machine.
@@ -951,17 +1038,13 @@ class PlannerAgentV2:
 
         question_affichee = "" if motif == "formulaire" else question
 
-        # Compteur journalier (garde-fou facture): son echec ne doit jamais
-        # casser un tour qui vient de reussir.
-        try:
-            total_jetons = _jetons_phase(cout)
-            if total_jetons > 0:
-                _enregistrer_jetons(user, total_jetons)
-        except Exception:  # noqa: BLE001
-            logger.error("Compteur de jetons non enregistre", exc_info=True)
+        # Les appels réconcilient leur propre provision. Aucun second débit par phase.
 
         metadonnees = {
             "agent": "v2",
+            "contrat_tour": decision.mode if decision else 'legacy',
+            "usage": list(getattr(getattr(self, '_trace', None), 'usages', []))
+                     or [{**cout, 'phase': 'planning'}],
             "en_reponse_a": self._exclu,
             "quick_replies": quick_replies,
             "interactive_inputs": formulaire or [],
@@ -993,12 +1076,17 @@ class PlannerAgentV2:
             ],
         }
         metadonnees.update(metadonnees_lire)
-        ConversationMessage.objects.create(
+        if decision:
+            metadonnees['consultation'] = decision.consultation
+            metadonnees['date_consultation'] = (
+                decision.date_consultation.isoformat() if decision.date_consultation else None)
+        assistant = ConversationMessage.objects.create(
             user=user, role="assistant", content=response,
             metadata=_json_sur(metadonnees))
 
         evenement = {
             "type": "done",
+            "assistant_message_id": assistant.pk,
             "response": response,
             "quick_replies": quick_replies,
             "blocks_created": self._crees(registre, "create_block", "created"),
@@ -1043,14 +1131,17 @@ class PlannerAgentV2:
     def _delai_restant(self) -> float:
         """Secondes restantes avant la deadline du tour.
 
-        Plancher a 1 s: un appel borne doit toujours avoir le temps de
-        tenter quelque chose, meme en fin de tour. Hors tour (tests qui
-        appellent _dire directement), c'est la deadline entiere.
+        Apres l'echeance, aucun temps supplementaire n'est accorde. Hors tour,
+        le delai complet est disponible pour les appels directs.
         """
         depart = getattr(self, "_depart_tour", None)
+        from services.agent_v2.trace_tour import trace_courante
+        trace = trace_courante.get()
+        if trace is not None:
+            return trace.restant()
         if depart is None:
             return _delai_tour()
-        return max(1.0, _delai_tour() - (time.perf_counter() - depart))
+        return max(0.0, _delai_tour() - (time.perf_counter() - depart))
 
     def _boucle_en_fond(self, user: User, message_enrichi: str, registre: Registre):
         """La boucle dans le pool, ses pensees streamees.
@@ -1069,10 +1160,9 @@ class PlannerAgentV2:
         file_agir = self._file_pensees
         # Deadline murale du tour: le drainage s'interrompt quand elle est
         # depassee au lieu de tenir la connexion SSE ouverte indefiniment
-        # (397 s en prod le 2026-08-29). Le thread orphelin finit seul en
-        # tache de fond: ses ecritures hors registre sont sans effet
-        # (signaler_outil est neutre sans file, et l'instance est jettee a
-        # la fin de la requete).
+        # L'appel asynchrone recoit la meme echeance. Les outils synchrones
+        # verifient aussi la deadline ; une mutation DB tardive est annulee
+        # avant commit. Une requete externe deja envoyee n'est pas retractable.
         echeance = time.monotonic() + self._delai_restant()
 
         def travailler():
@@ -1088,12 +1178,14 @@ class PlannerAgentV2:
                 close_old_connections()
                 file_agir.put(None)  # sentinelle de fin
 
-        futur = _POOL_AGIR.submit(travailler)
+        contexte = copy_context()
+        futur = _POOL_AGIR.submit(contexte.run, travailler)
         fragments = 0
         while True:
             restant = echeance - time.monotonic()
             if restant <= 0:
                 registre.delai_depasse = True
+                futur.cancel()
                 panne = panne or TimeoutError("delai du tour depasse pendant la boucle")
                 logger.warning("agent_v2 delai depasse pendant la boucle user=%s", user.pk)
                 break
@@ -1125,6 +1217,11 @@ class PlannerAgentV2:
                 logger.warning("agent_v2 la boucle ne rend pas la main user=%s", user.pk)
         self._file_pensees = None
 
+        if registre.delai_depasse and not futur.done():
+            try:
+                futur.result(timeout=0.25)
+            except FuturesTimeoutError:
+                pass
         return reponse, panne, "".join(pensees)
 
     @staticmethod
@@ -1245,6 +1342,49 @@ class PlannerAgentV2:
             and float(verdict.get("confiance") or 0) >= 0.9
         )
 
+    def _cible_consultation(self):
+        """Traduit uniquement le contrat typé en outil et paramètres de lecture."""
+        decision = getattr(self, '_decision_tour', None)
+        if decision is None:
+            return None
+        genre = decision.consultation
+        if genre == 'taches':
+            return 'list_tasks', {}
+        jour = decision.date_consultation
+        if genre == 'demain' and jour is None:
+            jour = timezone.localdate() + timedelta(days=1)
+        if jour is None:
+            return None
+        if genre in ('journee', 'demain'):
+            return 'get_today_schedule', {'date': jour.isoformat()}
+        if genre == 'semaine':
+            return 'get_week_schedule', {'start_date': jour.isoformat()}
+        return None
+
+    def _assurer_consultation(self, user: User, message: str, registre: Registre) -> Registre:
+        """La vue demandée prime sur une lecture auxiliaire, sans effacer l'audit."""
+        cible = self._cible_consultation()
+        if cible is None or any(a.succes and a.est_mutation for a in registre.actions):
+            return registre
+        outil, parametres = cible
+        cle_date = 'week_start' if outil == 'get_week_schedule' else 'date'
+        jour = parametres.get('start_date') or parametres.get('date')
+
+        def correspond(action):
+            return (action.succes and action.outil == outil
+                    and (jour is None or (action.donnees or {}).get(cle_date) == jour))
+
+        choisie = next((a for a in reversed(registre.actions) if correspond(a)), None)
+        if choisie is None:
+            # Une lecture réussie d'autre chose ou d'une autre date ne remplit
+            # pas le contrat. Le même chemin borné exécute la lecture manquante.
+            self._lecture_de_secours(user, message, registre)
+            choisie = next((a for a in reversed(registre.actions) if correspond(a)), None)
+        affichage = copy(registre)
+        affichage.actions = [a for a in registre.actions
+                             if a.outil not in LECTURES_RENDUES or a is choisie]
+        return affichage
+
     def _lecture_de_secours(self, user: User, message: str,
                             registre: Registre) -> str:
         """Le tour n'a rien lu ni mute: le code lit ce que la personne veut voir.
@@ -1264,14 +1404,17 @@ class PlannerAgentV2:
             "taches": ("list_tasks", {}),
         }
         try:
-            resultats = _jugement.juger(
-                message, {"consultation": _jugement.q_consultation()})
-            rep = (resultats or {}).get("consultation") or {}
-            if rep.get("statut") != _jugement.STATUT_DECISION:
-                return ""
-            if float(rep.get("confiance") or 0) < 0.9:
-                return ""
-            choix = outil_de.get(str(rep.get("valeur") or ""))
+            if getattr(self, '_decision_tour', None):
+                choix = self._cible_consultation()
+            else:
+                resultats = _jugement.juger(
+                    message, {"consultation": _jugement.q_consultation()})
+                rep = (resultats or {}).get("consultation") or {}
+                if rep.get("statut") != _jugement.STATUT_DECISION:
+                    return ""
+                if float(rep.get("confiance") or 0) < 0.9:
+                    return ""
+                choix = outil_de.get(str(rep.get("valeur") or ""))
             if choix is None:
                 return ""
             outil, parametres = choix
@@ -1336,7 +1479,7 @@ class PlannerAgentV2:
                     "rien demande."
                 ),
             )
-            resultat = agent.run_sync(message)
+            resultat = self._executer_boucle(agent, message, delai=self._delai_restant())
             texte = (getattr(resultat, "output", "") or "").strip()
             return texte if isinstance(texte, str) else ""
         except Exception:  # noqa: BLE001 - la boucle normale prend le relais
@@ -1573,10 +1716,10 @@ class PlannerAgentV2:
                   .filter(user=user).exclude(pk=getattr(self, "_exclu", None))
                   .order_by("-created_at")[:HISTORIQUE_MAX])
         messages = []
-        for ligne in reversed(list(lignes)):
-            if ligne.role == "user":
-                messages.append(ModelRequest(parts=[UserPromptPart(content=ligne.content)]))
-                continue
+        restant = 16000
+        for ligne in lignes:
+            if restant <= 0:
+                break
             texte = ligne.content
             # Les boutons ne sont plus colles au texte: sans cette ligne, le
             # modele ne saurait pas que « 15 h 50 à 17 h 20 » repond a un choix
@@ -1584,10 +1727,18 @@ class PlannerAgentV2:
             proposes = (ligne.metadata or {}).get("quick_replies") or []
             libelles = [str(c.get("label")) for c in proposes
                         if isinstance(c, dict) and c.get("label")]
-            if libelles:
+            if libelles and ligne.role != 'user':
                 texte = f"{texte}\n[Choix proposés : {' | '.join(libelles)}]"
-            messages.append(ModelResponse(parts=[TextPart(content=texte)]))
-        return messages
+            limite = min(4000, restant)
+            if len(texte) > limite:
+                marque = '\n[message tronque]'
+                texte = texte[:max(0, limite-len(marque))] + marque[:limite]
+            restant -= len(texte)
+            if ligne.role == 'user':
+                messages.append(ModelRequest(parts=[UserPromptPart(content=texte)]))
+            else:
+                messages.append(ModelResponse(parts=[TextPart(content=texte)]))
+        return list(reversed(messages))
 
     @staticmethod
     def _raisonnement(resultat) -> str:
@@ -1614,7 +1765,7 @@ class PlannerAgentV2:
     def _crees(registre: Registre, outil: str, cle: str) -> list:
         sortie: list = []
         for action in registre.actions:
-            if action.outil != outil or not action.succes:
+            if action.outil != outil or not action.succes or (action.est_mutation and not action.etat_verifie):
                 continue
             valeur = action.donnees.get(cle)
             if isinstance(valeur, list):

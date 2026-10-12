@@ -4,10 +4,12 @@ Schedule query tools for the Planner AI agent.
 from datetime import date, datetime, time, timedelta
 
 from django.contrib.auth.models import User
+from django.db import transaction
 from django.utils import timezone
 
 from core.models import RecurringBlock, ScheduledBlock, Task
-from services.scheduling.exceptions import skipped_block_ids
+from services.scheduling.day_view import effective_day_entries
+from services.scheduling.occurrences import recurring_occurrences
 from services.scheduling.overlap import parse_time
 from services.scheduling.placement import (
     fixed_busy_intervals,
@@ -16,7 +18,9 @@ from services.scheduling.placement import (
     open_intervals,
     place_day,
 )
-from services.scheduling.solve_day import solve_day, solve_placement
+from services.scheduling.solve_day import (
+    empreinte_entrees_jour, empreinte_entrees_semaine, solve_day, solve_placement,
+)
 from .base import BaseTool, ToolResult, validate_choice
 
 DAY_NAMES = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
@@ -53,7 +57,7 @@ def _free_slots_from_intervals(intervals, min_duration: int) -> list:
 
 class GetTodayScheduleTool(BaseTool):
     name = "get_today_schedule"
-    description = "Récupère le planning EFFECTIF d'un jour (blocs récurrents aux heures PLACÉES, tâches planifiées, créneaux libres). Consulte-le avant d'affirmer où se trouve une activité ou si elle a bougé, et parle des heures effectives — jamais de mémoire ni d'après l'historique (un bloc souple peut être placé à une autre heure que son heure habituelle)."
+    description = "Récupère le planning EFFECTIF d'un jour (blocs récurrents aux heures PLACÉES, tâches planifiées, créneaux libres). Consulte-le avant d'affirmer où se trouve une activité ou si elle a bougé, et parle des heures effectives, jamais de mémoire ni d'après l'historique (un bloc souple peut être placé à une autre heure que son heure habituelle)."
     parameters = {
         "type": "object",
         "properties": {
@@ -79,56 +83,7 @@ class GetTodayScheduleTool(BaseTool):
         day_of_week = target_date.weekday()
         day_name = DAY_NAMES[day_of_week]
 
-        # Recurring blocks for this day (moins les occurrences ignorées ce jour-là)
-        recurring = RecurringBlock.objects.filter(
-            user=user, day_of_week=day_of_week, active=True
-        ).exclude(
-            id__in=skipped_block_ids(user, target_date)
-        ).order_by("start_time")
-
-        placements = {
-            p["block_id"]: p
-            for p in place_day(user, target_date)
-        }
-        blocks = []
-        for b in recurring:
-            start_time = b.start_time.strftime("%H:%M")
-            end_time = b.end_time.strftime("%H:%M")
-            if b.is_flexible:
-                placement = placements.get(b.id)
-                if placement is None or placement["skipped"]:
-                    continue
-                start_time = placement["start_time"]
-                end_time = placement["end_time"]
-
-            blocks.append({
-                "id": b.id,
-                "title": b.title,
-                "type": "recurring",
-                "block_type": b.block_type,
-                "start_time": start_time,
-                "end_time": end_time,
-                "location": b.location or None,
-            })
-
-        # Scheduled tasks for this day
-        scheduled = ScheduledBlock.objects.filter(
-            user=user, date=target_date
-        ).select_related("task").order_by("start_time")
-
-        for sb in scheduled:
-            blocks.append({
-                "id": sb.id,
-                "title": sb.task.title,
-                "type": "scheduled_task",
-                "task_type": sb.task.task_type,
-                "start_time": sb.start_time.strftime("%H:%M"),
-                "end_time": sb.end_time.strftime("%H:%M"),
-                "completed": sb.actually_completed,
-            })
-
-        # Sort all blocks by start time
-        blocks.sort(key=lambda x: x["start_time"])
+        blocks = effective_day_entries(user, target_date)
 
         # Créneaux libres 7h-23h via la logique unique overnight-aware (compte
         # correctement un quart de nuit du jour ET le débordement de la veille,
@@ -189,34 +144,25 @@ class GetWeekScheduleTool(BaseTool):
             day = start + timedelta(days=i)
             day_of_week = day.weekday()
 
-            blocks = RecurringBlock.objects.filter(
-                user=user, day_of_week=day_of_week, active=True
-            ).exclude(id__in=skipped_block_ids(user, day))
+            detail = effective_day_entries(user, day)
 
             day_minutes = 0
             block_list = []
-            detail = []
-            for b in blocks:
-                start_min = _time_to_minutes(b.start_time)
-                end_min = _time_to_minutes(b.end_time)
+            for b in detail:
+                start_h, start_m = map(int, b["start_time"].split(":"))
+                end_h, end_m = map(int, b["end_time"].split(":"))
+                start_min = start_h * 60 + start_m
+                end_min = end_h * 60 + end_m
                 duration = end_min - start_min if end_min > start_min else (24 * 60 - start_min + end_min)
                 day_minutes += duration
-                block_list.append(f"{b.title} ({b.start_time.strftime('%H:%M')}-{b.end_time.strftime('%H:%M')})")
-                # Forme structuree pour le rendu (la chaine "blocks" reste).
-                detail.append({
-                    "title": b.title,
-                    "start_time": b.start_time.strftime('%H:%M'),
-                    "end_time": b.end_time.strftime('%H:%M'),
-                    "block_type": b.block_type,
-                    "is_flexible": b.is_flexible,
-                })
+                block_list.append(f"{b['title']} ({b['start_time']}-{b['end_time']})")
 
             total_hours += day_minutes / 60
 
             days_summary.append({
                 "date": day.isoformat(),
                 "day_name": DAY_NAMES[day_of_week],
-                "block_count": blocks.count(),
+                "block_count": len(detail),
                 "occupied_hours": round(day_minutes / 60, 1),
                 "blocks": block_list,
                 "detail": detail,
@@ -310,11 +256,9 @@ def _first_conflicting_item(user, target_date, s, e, exclude_scheduled_id=None):
         if be <= bs:
             be = 24 * 60
         items.append((sb.task.title, bs, be))
-    for b in RecurringBlock.objects.filter(
-        RecurringBlock.bounds_filter(target_date),
-        user=user, active=True, flexibility='fixed',
-        day_of_week=target_date.weekday(),
-    ):
+    for b in recurring_occurrences(user, target_date):
+        if b.is_flexible and not b.occurrence_override:
+            continue
         bs = b.start_time.hour * 60 + b.start_time.minute
         be = b.end_time.hour * 60 + b.end_time.minute
         if be <= bs:
@@ -373,6 +317,8 @@ def _window_conflict(user, target_date, s, e, exclude_scheduled_id=None):
             )
     for placement in place_day(user, target_date):
         if placement["skipped"] or placement["block_type"] != "sleep":
+            continue
+        if placement.get("occurrence_override"):
             continue
         ps = placement["start_min"]
         pe = placement["end_min"]
@@ -670,46 +616,36 @@ def _mettre_en_forme_jour(arrangement):
     return placed, overnight, skipped, listing
 
 
-def _appliquer_jour(user, arrangement):
-    """Applique UN arrangement: ajuste les heures des blocs souples."""
-    moved = []
-    for r in arrangement:
-        if r["skipped"] or r["overnight_kept"]:
-            continue
-        block = RecurringBlock.objects.filter(id=r["block_id"], user=user).first()
-        if block is None:
-            continue
-        new_start = time(r["start_min"] // 60, r["start_min"] % 60)
-        new_end = time(r["end_min"] // 60, r["end_min"] % 60)
-        if block.start_time != new_start or block.end_time != new_end:
-            block.start_time = new_start
-            block.end_time = new_end
-            block.save(update_fields=["start_time", "end_time"])
-            moved.append({"title": block.title, "start_time": r["start_time"], "end_time": r["end_time"]})
-    return moved
-
-
-def _executer_organize_day(user, target_date, apply, arrangement):
+def _executer_organize_day(user, target_date, apply, arrangement, expected_entries=None):
     """Corps d'OrganizeDayTool sur un arrangement (deja resolu par l'appelant).
 
-    Separe du solveur pour que l'agent v2 puisse appliquer un arrangement
-    valide sans re-resoudre.
+    Séparé du solveur pour réutiliser la proposition mise en cache.
     """
     placed, overnight, skipped, listing = _mettre_en_forme_jour(arrangement)
-    moved = _appliquer_jour(user, arrangement) if apply else []
-    head = "J'ai réorganisé" if apply else "Proposition (rien changé)"
+    head = "Proposition (rien changé)"
     msg = f"{head} le {DAY_NAMES[target_date.weekday()]} {target_date.isoformat()}: {listing}."
     if skipped:
         msg += " Non placé (journée trop pleine): " + ", ".join(r["title"] for r in skipped) + "."
+    moved = []
+    if apply:
+        try:
+            moved = _appliquer_periode(user, target_date, [arrangement], expected_entries)[0]
+        except ValueError as exc:
+            return ToolResult(success=False, data={"applied": False, "reason": str(exc),
+                                                   "date": target_date.isoformat()},
+                              message="Cet arrangement ne peut plus être appliqué tel quel. Rien n'a changé. Demande une nouvelle proposition.")
+        placed, overnight, skipped, listing = _mettre_en_forme_jour(arrangement)
+        msg = f"Journée réorganisée le {target_date.isoformat()}: {listing}."
     return ToolResult(
         success=True,
         data={
             "applied": apply,
             "date": target_date.isoformat(),
-            "placed": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in placed],
-            "overnight_kept": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in overnight],
+            "placed": [{"block_id": r["block_id"], "title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in placed],
+            "overnight_kept": [{"block_id": r["block_id"], "title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in overnight],
             "skipped": [{"title": r["title"]} for r in skipped],
             "moved": moved,
+            "moved_count": len(moved),
         },
         message=msg,
     )
@@ -718,19 +654,19 @@ def _executer_organize_day(user, target_date, apply, arrangement):
 class OrganizeDayTool(BaseTool):
     name = "organize_day"
     description = (
-        "Résout et RÉORGANISE de façon OPTIMALE le placement des blocs SOUPLES "
+        "Propose un placement des blocs SOUPLES "
         "d'une journée (sport, révision, repas, sommeil...) autour des murs fixes "
         "(cours, travail) et du sommeil protégé, via un solveur exact. À utiliser "
         "quand l'utilisateur demande d'optimiser / réorganiser / mieux agencer sa "
         "journée, ou quand le placement laisse des trous. apply=false PROPOSE "
-        "l'arrangement sans rien changer (défaut); apply=true l'APPLIQUE en ajustant "
-        "les heures des blocs souples. Ne touche jamais aux blocs fixes."
+        "l'arrangement sans rien changer (défaut). Après confirmation, apply=true "
+        "enregistre ces horaires pour cette date seulement et conserve la série."
     )
     parameters = {
         "type": "object",
         "properties": {
             "date": {"type": "string", "description": "Jour à réorganiser (YYYY-MM-DD). Déduis-le de la DATE du jour."},
-            "apply": {"type": "boolean", "description": "true = appliquer (déplacer les blocs); false = proposer seulement (défaut)."},
+            "apply": {"type": "boolean", "description": "false = proposer (défaut). true = appliquer à cette date après confirmation."},
         },
         "required": ["date"],
     }
@@ -741,13 +677,14 @@ class OrganizeDayTool(BaseTool):
         except (ValueError, KeyError, TypeError):
             return ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.")
         apply = bool(kwargs.get("apply", False))
+        expected_entries = kwargs.pop("_expected_entries", None) or empreinte_entrees_jour(user, target_date)
         # Kwarg PRIVE (agent v2): arrangement deja resolu et valide. Evite de
         # re-resoudre a l'apply quand le plan vient d'etre verifie a
         # l'identique. Jamais fourni par le modele ni v1.
         arrangement = kwargs.pop("_arrangement", None)
         if arrangement is None:
             arrangement = solve_placement(user, target_date)  # fenêtre pleine journée
-        return _executer_organize_day(user, target_date, apply, arrangement)
+        return _executer_organize_day(user, target_date, apply, arrangement, expected_entries)
 
 
 def _mettre_en_forme_semaine(user, start, arrangements):
@@ -768,13 +705,13 @@ def _mettre_en_forme_semaine(user, start, arrangements):
         skipped_total += len(skipped)
         days_data.append({
             "date": day.isoformat(),
-            "placed": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in placed],
-            "overnight_kept": [{"title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in overnight],
+            "placed": [{"block_id": r["block_id"], "title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in placed],
+            "overnight_kept": [{"block_id": r["block_id"], "title": r["title"], "start_time": r["start_time"], "end_time": r["end_time"]} for r in overnight],
             "skipped": [{"title": r["title"]} for r in skipped],
             "moved": [],
         })
         if placed or skipped:
-            seg = ", ".join(f"{r['title']} {r['start_time']}-{r['end_time']}" for r in placed) or "—"
+            seg = ", ".join(f"{r['title']} {r['start_time']}-{r['end_time']}" for r in placed) or "aucun bloc"
             line = f"{DAY_NAMES[day.weekday()]} {seg}"
             if skipped:
                 line += " (non placé: " + ", ".join(r["title"] for r in skipped) + ")"
@@ -794,23 +731,72 @@ def _resoudre_semaine(user, start):
     return days_data, lines, skipped_total, arrangements
 
 
-def _appliquer_arrangement(user, arrangement):
-    """Applique UN jour d'arrangement: ajuste les heures des blocs souples."""
-    moved = []
-    for r in arrangement:
-        if r["skipped"] or r["overnight_kept"]:
-            continue
-        block = RecurringBlock.objects.filter(id=r["block_id"], user=user).first()
-        if block is None:
-            continue
-        new_start = time(r["start_min"] // 60, r["start_min"] % 60)
-        new_end = time(r["end_min"] // 60, r["end_min"] % 60)
-        if block.start_time != new_start or block.end_time != new_end:
-            block.start_time = new_start
-            block.end_time = new_end
-            block.save(update_fields=["start_time", "end_time"])
-            moved.append({"title": block.title, "start_time": r["start_time"], "end_time": r["end_time"]})
-    return moved
+def _appliquer_periode(user, start, arrangements, expected_entries=None):
+    """Valide puis écrit atomiquement les occurrences, et relit le résultat."""
+    from core.models import RecurringBlockOverride
+
+    if len(arrangements) not in (1, 7):
+        raise ValueError("invalid_period")
+    with transaction.atomic():
+        User.objects.select_for_update().get(pk=user.pk)
+        list(RecurringBlock.objects.select_for_update().filter(user=user))
+        fingerprint = empreinte_entrees_jour if len(arrangements) == 1 else empreinte_entrees_semaine
+        if expected_entries is not None and expected_entries != fingerprint(user, start):
+            raise ValueError("stale_plan")
+        pending, moved_days = [], []
+        for offset, arrangement in enumerate(arrangements):
+            day = start + timedelta(days=offset)
+            blocks = {b.pk: b for b in recurring_occurrences(user, day) if b.is_flexible}
+            if {r.get("block_id") for r in arrangement} != set(blocks) or len(arrangement) != len(blocks):
+                raise ValueError("invalid_occurrences")
+            before = {b["id"]: b for b in effective_day_entries(user, day) if b["type"] == "recurring"}
+            busy = list(fixed_busy_intervals(user, day)) + list(intervalles_sommeil_reporte(user, day))
+            for row in arrangement:
+                if row.get("overnight_kept") and not row.get("occurrence_override"):
+                    busy.extend([(row["start_min"], 1440), (0, row["end_min"])])
+            moved = []
+            for row in arrangement:
+                block = blocks[row["block_id"]]
+                if row.get("skipped"):
+                    if row.get("reporte_au_lendemain"):
+                        continue
+                    raise ValueError("unplaced_occurrences")
+                if row.get("overnight_kept") or block.occurrence_override:
+                    if (row.get("start_time"), row.get("end_time")) != (block.start_time.strftime("%H:%M"), block.end_time.strftime("%H:%M")):
+                        raise ValueError("invalid_occurrence_times")
+                    continue
+                s, e = row.get("start_min"), row.get("end_min")
+                if not isinstance(s, int) or not isinstance(e, int) or not 0 <= s < e <= 1440:
+                    raise ValueError("invalid_occurrence_times")
+                if e - s != block.effective_duration_minutes():
+                    raise ValueError("invalid_occurrence_duration")
+                if any(s < be and bs < e for bs, be in busy):
+                    raise ValueError("occurrence_conflict")
+                busy.append((s, e))
+                new_start, new_end = time(s // 60, s % 60), time((e // 60) % 24, e % 60)
+                if row["start_time"] != _minutes_to_str(s) or row["end_time"] not in {_minutes_to_str(e), new_end.strftime("%H:%M")}:
+                    raise ValueError("invalid_occurrence_times")
+                row["end_time"] = new_end.strftime("%H:%M")
+                pending.append((block.pk, day, new_start, new_end))
+                previous = before.get(block.pk) or {}
+                if (previous.get("start_time"), previous.get("end_time")) != (row["start_time"], row["end_time"]):
+                    moved.append({k: row[k] for k in ("block_id", "title", "start_time", "end_time")})
+            moved_days.append(moved)
+        for block_id, day, new_start, new_end in pending:
+            RecurringBlockOverride.objects.update_or_create(
+                recurring_block_id=block_id, date=day,
+                defaults={"user": user, "start_time": new_start, "end_time": new_end},
+            )
+        for offset, arrangement in enumerate(arrangements):
+            effective = {b["id"]: b for b in effective_day_entries(user, start + timedelta(days=offset))
+                         if b["type"] == "recurring"}
+            for row in arrangement:
+                if row.get("skipped"):
+                    continue
+                observed = effective.get(row["block_id"])
+                if observed is None or any(observed[key] != row[key] for key in ("title", "start_time", "end_time")):
+                    raise ValueError("occurrence_postcondition_failed")
+        return moved_days
 
 
 def _resultat_semaine(*, apply, start, days_data, lines, moved_total, skipped_total):
@@ -835,9 +821,8 @@ class OptimizeWeekTool(BaseTool):
         "quand l'utilisateur demande d'optimiser / réorganiser / mieux agencer sa "
         "SEMAINE (pour UN seul jour → organize_day). apply=false PROPOSE le plan "
         "sans rien changer (défaut); apply=true l'APPLIQUE en ajustant les heures "
-        "des blocs souples. PORTÉE: chaque bloc récurrent vit sur SON jour de "
-        "semaine et la passe hebdo le traite une seule fois; ajuster son heure "
-        "vaut pour toutes les semaines suivantes. Ne touche jamais aux blocs fixes."
+        "des occurrences souples sur ces 7 dates seulement. Les horaires des "
+        "séries et des semaines suivantes restent les mêmes. Ne touche jamais aux blocs fixes."
     )
     parameters = {
         "type": "object",
@@ -858,6 +843,7 @@ class OptimizeWeekTool(BaseTool):
         else:
             start = timezone.localdate()
         apply = bool(kwargs.get("apply", False))
+        expected_entries = kwargs.pop("_expected_entries", None) or empreinte_entrees_semaine(user, start)
         # Kwarg PRIVE (agent v2): arrangement deja resolu et valide par la
         # garde. Evite de re-resoudre 7 jours a l'apply quand le plan vient
         # d'etre verifie a l'identique. Jamais fourni par le modele ni v1.
@@ -869,8 +855,14 @@ class OptimizeWeekTool(BaseTool):
 
         moved_total = 0
         if apply:
-            for jour, arrangement in zip(days_data, arrangements):
-                moved = _appliquer_arrangement(user, arrangement)
+            try:
+                moved_days = _appliquer_periode(user, start, arrangements, expected_entries)
+            except ValueError as exc:
+                return ToolResult(success=False, data={"applied": False, "reason": str(exc),
+                                                       "start_date": start.isoformat()},
+                                  message="Ce plan ne peut plus être appliqué tel quel. Rien n'a changé. Demande une nouvelle proposition.")
+            days_data, lines, skipped_total = _mettre_en_forme_semaine(user, start, arrangements)
+            for jour, moved in zip(days_data, moved_days):
                 jour["moved"] = moved
                 moved_total += len(moved)
 

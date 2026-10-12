@@ -15,14 +15,14 @@ from core.lecture_flux import corps_du_flux
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
 from core.models import ConversationMessage
 
 
-class AiguillageTests(TestCase):
+class AiguillageTests(TransactionTestCase):
     def setUp(self):
         self.client = APIClient()
         self.user = User.objects.create_user(username='bascule', password='x')
@@ -51,7 +51,7 @@ class AiguillageTests(TestCase):
 
     def test_avec_drapeau_chat_utilise_v2(self):
         self._basculer(True)
-        with patch('services.agent_v2.PlannerAgentV2') as v2, \
+        with patch('services.agent_v2.conversation.AgentConversation') as v2, \
              patch('core.views.PlannerAgent') as v1:
             v2.return_value.process_message.return_value = {'response': 'ok'}
             self.client.post('/api/chat/', {'message': 'salut'})
@@ -60,7 +60,7 @@ class AiguillageTests(TestCase):
 
     def test_avec_drapeau_quick_replies_utilise_v2(self):
         self._basculer(True)
-        with patch('services.agent_v2.PlannerAgentV2') as v2, \
+        with patch('services.agent_v2.conversation.AgentConversation') as v2, \
              patch('core.views.PlannerAgent') as v1:
             v2.return_value.quick_replies_for.return_value = []
             self.client.post('/api/chat/quick-replies/',
@@ -70,7 +70,7 @@ class AiguillageTests(TestCase):
 
     def test_avec_drapeau_le_flux_utilise_v2(self):
         self._basculer(True)
-        with patch('services.agent_v2.PlannerAgentV2') as v2, \
+        with patch('services.agent_v2.conversation.AgentConversation') as v2, \
              patch('core.views.PlannerAgent') as v1:
             v2.return_value.process_message_stream.return_value = iter(
                 [{'type': 'done', 'response': 'ok'}])

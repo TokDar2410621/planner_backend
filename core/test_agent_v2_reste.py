@@ -11,7 +11,7 @@ from django.test import SimpleTestCase
 
 from services.agent.tools.base import ToolResult
 from services.agent_v2.redaction import bloc_reste
-from services.agent_v2.registre import Registre
+from services.agent_v2.registre import Postcondition, Registre
 
 
 def _registre_cree(*entrees, outil="create_block"):
@@ -23,6 +23,11 @@ def _registre_cree(*entrees, outil="create_block"):
     else:
         r.ajouter(outil, {}, ToolResult(success=True, message="ok",
                                         data={"created": list(entrees)}))
+    # Ici le reçu est une fixture explicite du rendu arithmétique.
+    # La réconciliation réelle est exercée par test_refonte_verite.
+    for action in r.actions:
+        r.verifier(action.id, 1, [Postcondition('fixture', {'id': action.id},
+                                                action.donnees, action.donnees, True)])
     return r
 
 
@@ -72,6 +77,7 @@ class ResteTests(SimpleTestCase):
         r = _registre_cree(UN_BLOC_2H)
         r.ajouter("create_block", {}, ToolResult(success=True, message="ok",
                                                  data={"created": [UN_BLOC_2H]}))
+        r.verifier('a2', 1, [Postcondition('fixture', {'id': 1}, UN_BLOC_2H, UN_BLOC_2H, True)])
         ligne = bloc_reste("Ajoute 6 h de révision", r)
         self.assertIn("Placé : 2 h", ligne)
 

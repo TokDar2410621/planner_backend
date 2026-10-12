@@ -29,9 +29,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import asyncio
+import time
 from typing import Any, Optional
 
 from django.conf import settings
+
+from services.agent_v2.trace_tour import trace_courante
 
 logger = logging.getLogger(__name__)
 
@@ -326,6 +330,33 @@ class _ReponseInvalide(Exception):
     """La reponse Jev ne respecte pas le contrat : on la jette entiere."""
 
 
+def _delai_borne(configure: float) -> float:
+    trace = trace_courante.get()
+    restant = min(configure, trace.restant()) if trace is not None else configure
+    if restant <= 0:
+        raise TimeoutError("échéance du tour atteinte")
+    return restant
+
+
+def _jetons(valeur):
+    return valeur if isinstance(valeur, int) and not isinstance(valeur, bool) and valeur >= 0 else None
+
+
+def _usage_jev(usage, *, duree, succes):
+    usage = usage if isinstance(usage, dict) else {}
+    entree = _jetons(usage.get("input_tokens", usage.get("prompt_tokens")))
+    sortie = _jetons(usage.get("output_tokens", usage.get("completion_tokens")))
+    total = _jetons(usage.get("total_tokens"))
+    connu = total is not None or (entree is not None and sortie is not None)
+    if total is None and entree is not None and sortie is not None:
+        total = entree + sortie
+    return {"phase": "jugement", "fournisseur": "jev", "etapes": 1,
+            "entree": entree, "sortie": sortie, "total": total,
+            "raisonnement": _jetons(usage.get("reasoning_tokens")),
+            "cache": _jetons(usage.get("cache_read_tokens")),
+            "usage_connu": connu, "duree": duree, "succes": succes}
+
+
 def _question_jev(question: dict) -> dict:
     """La question au format fil de Jev."""
     qtype = question.get("type")
@@ -423,15 +454,27 @@ def _appeler_jev(etat: dict, questions: dict) -> dict:
         "state": etat,
         "questions": {qid: _question_jev(q) for qid, q in questions.items()},
     }
-    # La cle ne sort que dans l'en-tete Authorization, jamais dans les logs.
-    reponse = requests.post(
-        _url_jev(), json=corps,
-        headers={"Authorization": f"Bearer {_cle_jev()}",
-                 "Content-Type": "application/json"},
-        timeout=_delai_jev(),
-    )
-    reponse.raise_for_status()
-    return _valider_reponse(reponse.json(), questions)
+    delai = _delai_borne(_delai_jev())
+    trace = trace_courante.get()
+    from services.agent_v2.budget_tour import appel_fournisseur, borne_texte
+    depart, usage, succes = time.monotonic(), None, False
+    with appel_fournisseur(phase='jugement', fournisseur='jev',
+                          jetons_entree=borne_texte(corps), max_sortie=1024) as appel:
+        # La clé ne sort que dans l'en-tête Authorization.
+        try:
+            reponse = requests.post(
+                _url_jev(), json=corps,
+                headers={"Authorization": f"Bearer {_cle_jev()}",
+                         "Content-Type": "application/json"}, timeout=min(delai, appel.delai))
+            reponse.raise_for_status()
+            donnees = reponse.json()
+            usage = donnees.get("usage") if isinstance(donnees, dict) else None
+            valide = _valider_reponse(donnees, questions)
+            _delai_borne(_delai_jev())  # Une réponse tardive ne devient pas une décision.
+            succes = True
+            return valide
+        finally:
+            appel.terminer(_usage_jev(usage, duree=time.monotonic() - depart, succes=succes), succes)
 
 
 # -- repli LLM ------------------------------------------------------------------
@@ -469,7 +512,7 @@ def _juger_llm(etat: dict, questions: dict) -> Optional[dict]:
     """Le repli sans cle Jev. Rend None si indisponible."""
     from pydantic import BaseModel, Field
 
-    from services.agent_v2.modeles import modele_agir
+    from services.agent_v2.modeles import modele_agir, REGLAGES_BOUCLE_SANS_RAISONNEMENT
 
     class _Une(BaseModel):
         valeur: str
@@ -485,18 +528,65 @@ def _juger_llm(etat: dict, questions: dict) -> Optional[dict]:
         return None
 
     from pydantic_ai import Agent
-    agent = Agent(modele, output_type=_Reponses, output_retries=0)
+    from pydantic_ai.usage import RunUsage, UsageLimits
+    from services.agent_v2.budget_tour import modele_borne
+    agent = Agent(modele_borne(modele, 'jugement'), output_type=_Reponses, output_retries=0)
     etat_texte = json.dumps(etat, ensure_ascii=False, sort_keys=True,
                             default=str)
+    usage = RunUsage()
+    trace = trace_courante.get()
+    depart, succes, tentative = time.monotonic(), False, False
+    index_usages = len(trace.usages) if trace else 0
     try:
-        resultat = agent.run_sync(
-            f"ETAT:\n{etat_texte}\n\nQUESTIONS:\n{_questions_texte(questions)}",
-            instructions=_PROMPT_REPLI,
-        )
+        delai_configure = max(0.01, float(getattr(settings, "JUGEMENT_REPLI_TIMEOUT", 8.0)))
+    except (ValueError, TypeError):
+        delai_configure = 8.0
+
+    async def executer():
+        nonlocal tentative
+        delai = _delai_borne(delai_configure)
+        tentative = True
+        try:
+            return await asyncio.wait_for(agent.run(
+                f"ETAT:\n{etat_texte}\n\nQUESTIONS:\n{_questions_texte(questions)}",
+                instructions=_PROMPT_REPLI, usage=usage,
+                model_settings={**REGLAGES_BOUCLE_SANS_RAISONNEMENT,
+                                "timeout": delai, "max_tokens": 1024},
+                usage_limits=UsageLimits(request_limit=1, total_tokens_limit=12000)),
+                timeout=delai)
+        finally:
+            from services.agent_v2.modeles import fermer_modele
+            await fermer_modele(agent.model)
+
+    try:
+        resultat = asyncio.run(executer())
+        sortie = _valider_sortie_llm(resultat, questions)
+        _delai_borne(delai_configure)
+        succes = sortie is not None
+        return sortie
     except Exception as e:  # noqa: BLE001 - le repli ne casse jamais un tour
         logger.warning("jugement: repli LLM echoue (%s)", type(e).__name__)
         return None
+    finally:
+        if trace is not None and not succes:
+            with trace._verrou:
+                for mesure in trace.usages[index_usages:]:
+                    if mesure.get('phase') == 'jugement':
+                        mesure['succes'] = False
+        if trace is not None and tentative and not getattr(trace, 'reservation', None):
+            connu = succes or bool(usage.total_tokens)
+            details = usage.details or {}
+            trace.ajouter({"phase": "jugement", "fournisseur": "repli_llm",
+                          "etapes": max(1, usage.requests), "entree": usage.input_tokens if connu else None,
+                          "sortie": usage.output_tokens if connu else None,
+                          "total": usage.total_tokens if connu else None,
+                          "raisonnement": details.get("reasoning_tokens") if connu else None,
+                          "cache": usage.cache_read_tokens if connu else None,
+                          "duree": time.monotonic() - depart, "usage_connu": connu,
+                          "succes": succes})
 
+
+def _valider_sortie_llm(resultat, questions):
     sortie = {}
     try:
         donnees = resultat.output
@@ -529,7 +619,7 @@ def _juger_llm(etat: dict, questions: dict) -> Optional[dict]:
                            "confiance": float(une.confiance),
                            "probabilites": None}
     except _ReponseInvalide as e:
-        logger.warning("jugement: repli LLM invalide (%s)", e)
+        logger.warning("jugement: repli LLM invalide (%s)", type(e).__name__)
         return None
     return sortie
 
@@ -604,9 +694,18 @@ def juger(etat: dict | str, questions: dict) -> dict:
             if not isinstance(q, dict) or q.get("type") not in TYPES_QUESTION:
                 raise _ReponseInvalide(f"question {qid!r} mal formee")
         cle = _cle_cache(etat, questions)
+        trace = trace_courante.get()
+        if trace is not None and trace.restant() <= 0:
+            return _indisponibles(questions)
         if cle in _CACHE:
+            if trace is not None:
+                trace.ajouter({"phase": "jugement", "fournisseur": "cache", "etapes": 0,
+                              "entree": 0, "sortie": 0, "total": 0, "duree": 0.0,
+                              "usage_connu": True, "succes": True, "cache_decision": True})
             _journaliser("cache", _CACHE[cle])
             return _CACHE[cle]
+        if trace is not None and not trace.admettre_jugement():
+            return _indisponibles(questions)
         brutes, fournisseur = _juger_sans_cache(etat, questions)
         resultats = _appliquer_seuil(brutes)
         _journaliser(fournisseur, resultats)
@@ -629,10 +728,11 @@ def _juger_sans_cache(etat: dict, questions: dict) -> tuple[dict, str]:
         try:
             return _appeler_jev(etat, questions), "jev"
         except _ReponseInvalide as e:
-            logger.warning("jugement: reponse Jev invalide (%s)", e)
+            logger.warning("jugement: reponse Jev invalide (%s)", type(e).__name__)
         except Exception as e:  # noqa: BLE001 - timeout, 429, reseau...
             logger.warning("jugement: Jev injoignable (%s)", type(e).__name__)
     if _repli_llm_actif():
+        _delai_borne(8.0)
         repli = _juger_llm(etat, questions)
         if repli is not None:
             return repli, "repli_llm"

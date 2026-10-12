@@ -8,11 +8,12 @@ from unittest.mock import patch
 from django.contrib.auth.models import User
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from rest_framework.test import APIClient
 
 from core.models import UploadedDocument
 from services.agent.agent import PlannerAgent
+from services.agent_v2.conversation import AgentConversation
 
 
 class AIConsentEndpointTests(TestCase):
@@ -73,6 +74,8 @@ class AIGateTests(TestCase):
     def test_sans_consentement_403_partout_et_agent_jamais_appele(self):
         with patch.object(PlannerAgent, '__init__', side_effect=AssertionError(
             'PlannerAgent instancié malgré le refus de consentement'
+        )), patch.object(AgentConversation, '__init__', side_effect=AssertionError(
+            'AgentConversation instancié malgré le refus de consentement'
         )):
             for url, payload in self.ENDPOINTS_POST:
                 res = self.client.post(url, payload, format='multipart'
@@ -95,11 +98,12 @@ class AIGateTests(TestCase):
 
     def test_avec_consentement_le_chat_passe(self):
         self._consent()
-        with patch.object(PlannerAgent, 'process_message', return_value={
+        with patch.object(AgentConversation, 'process_message', return_value={
             'response': 'Bonjour !', 'quick_replies': [],
-        }):
+        }) as process:
             res = self.client.post('/api/chat/', {'message': 'salut'}, format='multipart')
         self.assertEqual(res.status_code, 200)
+        process.assert_called_once()
 
     def test_la_revocation_referme_la_porte(self):
         self._consent()
@@ -108,8 +112,8 @@ class AIGateTests(TestCase):
         self.assertEqual(res.status_code, 403)
 
 
-class CronConsentTests(TestCase):
-    """Le worker de documents ne traite jamais un utilisateur non consentant."""
+class CronConsentTests(TransactionTestCase):
+    """Le worker ferme ses connexions : aucun atomic de TestCase autour du cron."""
 
     def _doc(self, user):
         return UploadedDocument.objects.create(

@@ -81,12 +81,18 @@ class NarrateurIntegrationTests(TransactionTestCase):
             user=self.user, role="assistant").latest("pk").metadata
 
     def test_question_menteuse_supprimee(self):
+        quart = self._quart()
         done = self._tour("bonjour", dire=ReponseDire(
             ouverture="Salut.", question="J'ai supprimé ton cours, autre chose ?",
             options=["Oui", "Non"]))
         self.assertEqual(done["question"], "")
         self.assertEqual(done["quick_replies"], [])
         self.assertFalse(done["question_posee"])
+        # La question qui mentait part avec ses options; l'ouverture innocente
+        # reste, et rien n'a ete supprime en base.
+        self.assertNotIn("supprimé", done["response"])
+        self.assertEqual(done["response"], "Salut.")
+        self.assertTrue(RecurringBlock.all_objects.get(pk=quart.pk).active)
 
     def test_chips_reelles_portee_jour(self):
         q = self._quart()

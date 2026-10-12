@@ -665,6 +665,10 @@ class ScheduledBlock(models.Model):
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='scheduled_blocks')
     task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name='scheduled_blocks')
+    source_document = models.ForeignKey(
+        UploadedDocument, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='scheduled_blocks',
+    )
     date = models.DateField()
     start_time = models.TimeField()
     end_time = models.TimeField()
@@ -800,6 +804,26 @@ class RecurringBlockException(models.Model):
         indexes = [models.Index(fields=['user', 'date'])]
 
 
+class RecurringBlockOverride(models.Model):
+    """Horaire effectif d'une occurrence, sans modifier sa série."""
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='recurring_overrides')
+    recurring_block = models.ForeignKey(
+        RecurringBlock, on_delete=models.CASCADE, related_name='overrides',
+    )
+    date = models.DateField()
+    start_time = models.TimeField()
+    end_time = models.TimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(
+            fields=['recurring_block', 'date'], name='recurring_override_block_date_uniq',
+        )]
+        indexes = [models.Index(fields=['user', 'date'], name='rec_override_user_date_idx')]
+        ordering = ['date', 'start_time']
+
+
 class TaskHistory(models.Model):
     """Historical data for completed tasks - used for AI predictions."""
 
@@ -826,6 +850,28 @@ class TaskHistory(models.Model):
 
     def __str__(self):
         return f"{self.task_title} - {self.actual_duration_minutes}min"
+
+
+class ChatTurn(models.Model):
+    """Admission durable HTTP, avant tout document ou appel d'agent.
+
+    Un tour interrompu n'est jamais repris automatiquement : des effets peuvent
+    déjà exister même si le processus n'a pas eu le temps de sauver sa réponse.
+    """
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='chat_turns')
+    turn_id = models.UUIDField()
+    payload_hash = models.CharField(max_length=64)
+    status = models.CharField(max_length=16, default='accepted', choices=[
+        ('accepted', 'Accepté'), ('running', 'En cours'),
+        ('completed', 'Terminé'), ('failed', 'Échec'), ('interrupted', 'Interrompu'),
+    ])
+    result = models.JSONField(default=dict, blank=True)
+    http_status = models.PositiveSmallIntegerField(default=200)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['user', 'turn_id'], name='unique_user_chat_turn')]
 
 
 class ConversationMessage(models.Model):
@@ -1258,6 +1304,7 @@ class BudgetJetonsJournalier(models.Model):
     )
     jour = models.DateField()
     jetons = models.PositiveIntegerField(default=0)
+    jetons_reserves = models.PositiveIntegerField(default=0)
     mis_a_jour = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -1266,3 +1313,16 @@ class BudgetJetonsJournalier(models.Model):
 
     def __str__(self):
         return f"BudgetJetons {self.user.username} {self.jour}: {self.jetons}"
+
+
+class ReservationBudgetJetons(models.Model):
+    """Enveloppe admise avant les appels payants d'un tour."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    budget = models.ForeignKey(
+        BudgetJetonsJournalier, on_delete=models.CASCADE, related_name='reservations',
+    )
+    jetons_reserves = models.PositiveIntegerField(default=0)
+    jetons_factures = models.PositiveIntegerField(default=0)
+    cloturee = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)

@@ -256,12 +256,12 @@ class BudgetAnonymeTest(APITestCase):
         self.assertTrue(module_agent._budget_jour_epuise(anon))
         self.assertFalse(module_agent._budget_jour_epuise(normal))
 
-    def test_plafond_anonyme_zero_desactive(self):
+    def test_plafond_anonyme_zero_ferme_les_appels_payants(self):
         anon = _creer_anonyme('device-budget-03')
         BudgetJetonsJournalier.objects.create(
             user=anon, jour=timezone.localdate(), jetons=999999999)
         with override_settings(AGENT_V2_BUDGET_JETONS_JOUR_ANON=0):
-            self.assertFalse(module_agent._budget_jour_epuise(anon))
+            self.assertTrue(module_agent._budget_jour_epuise(anon))
 
     def test_message_suggere_le_compte(self):
         """Budget anonyme epuise : le tour propose de creer un compte."""
@@ -272,6 +272,16 @@ class BudgetAnonymeTest(APITestCase):
                           side_effect=AssertionError("la boucle ne doit pas tourner")):
             res = PlannerAgentV2().process_message(anon, "bonjour")
         self.assertIn("Crée un compte", res['response'])
+
+    def test_coordinateur_suggere_aussi_le_compte(self):
+        from services.agent_v2.conversation import AgentConversation
+        anon = _creer_anonyme('device-budget-conversation')
+        BudgetJetonsJournalier.objects.create(
+            user=anon, jour=timezone.localdate(), jetons=400000)
+        with patch('services.agent_v2.conversation.modele_agir',
+                   side_effect=AssertionError('aucun appel payant')):
+            res = AgentConversation().process_message(anon, 'bonjour')
+        self.assertIn('Crée un compte', res['response'])
 
 
 class SuppressionAnonymeTest(APITestCase):
