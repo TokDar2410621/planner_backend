@@ -15,11 +15,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth.models import User
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from rest_framework.test import APIClient
 
 from services.agent.agent import PlannerAgent
 from services.agent_v2 import PlannerAgentV2
+from services.agent_v2.conversation import AgentConversation
 from services.llm.base import FunctionCall, LLMResponse
 from services.llm.deepseek import DeepSeekProvider
 from services.llm.gemini import GeminiProvider
@@ -160,7 +161,7 @@ class AgentStreamTests(TestCase):
         self.assertIn("quick_replies", result)
 
 
-class ChatStreamViewTests(TestCase):
+class ChatStreamViewTests(TransactionTestCase):
     def setUp(self):
         self.user = User.objects.create_user("sse", password="pw-123456")
         # Gate Apple 5.1.2(i): sans consentement IA, la vue répond 403 avant
@@ -178,7 +179,7 @@ class ChatStreamViewTests(TestCase):
             {"type": "delta", "text": "là."},
             {"type": "done", "response": "Voilà.", "quick_replies": []},
         ]
-        with patch.object(PlannerAgentV2, "process_message_stream",
+        with patch.object(AgentConversation, "process_message_stream",
                           return_value=iter(events)):
             resp = self.client_api.post("/api/chat/stream/", {"message": "salut"})
             # streaming_content est PARESSEUX: consommer DANS le patch, sinon
@@ -188,6 +189,8 @@ class ChatStreamViewTests(TestCase):
         self.assertEqual(resp["Content-Type"], "text/event-stream")
         frames = [json.loads(line[len("data: "):])
                   for line in body.split("\n\n") if line.startswith("data: ")]
+        turn_ids = {frame.pop("turn_id") for frame in frames}
+        self.assertEqual(len(turn_ids), 1)
         self.assertEqual(frames, events)
 
     def test_requires_message_or_file(self):
@@ -195,7 +198,7 @@ class ChatStreamViewTests(TestCase):
         self.assertEqual(resp.status_code, 400)
 
     def test_agent_crash_yields_error_frame(self):
-        with patch.object(PlannerAgentV2, "process_message_stream",
+        with patch.object(AgentConversation, "process_message_stream",
                           side_effect=RuntimeError("boom")):
             resp = self.client_api.post("/api/chat/stream/", {"message": "salut"})
             body = corps_du_flux(resp)

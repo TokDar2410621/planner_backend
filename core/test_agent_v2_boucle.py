@@ -12,8 +12,8 @@ from unittest.mock import patch
 from django.contrib.auth.models import User
 from django.test import TestCase, TransactionTestCase, override_settings
 
-from core.models import ConversationMessage
-from services.agent.tools.base import ToolResult
+from core.models import ConversationMessage, RecurringBlock
+from services.agent.tools import execute_tool
 from services.agent_v2.redaction import ActionCitee, ReponseDire
 
 
@@ -22,14 +22,13 @@ def _effet_muet(self_agent, user, message, registre):
 
 
 def _effet_qui_cree(self_agent, user, message, registre):
-    # Les donnees ont la forme que rend create_block: le rendu des faits lit
-    # les donnees, jamais le message ecrit pour le modele.
-    registre.ajouter('create_block', {'title': 'Maths'},
-                     ToolResult(success=True, message="Bloc 'Maths' cree",
-                                data={'created': [{
-                                    'title': 'Maths', 'day_of_week': 0,
-                                    'day_name': 'Lundi', 'start_time': '09:00',
-                                    'end_time': '12:00'}]}))
+    # Le recu doit correspondre a une mutation relue dans la base du test.
+    params = {'title': 'Maths', 'block_type': 'course', 'days': ['lundi'],
+              'start_time': '09:00', 'end_time': '12:00'}
+    resultat = execute_tool('create_block', user, params)
+    if not resultat.success:
+        raise AssertionError(resultat.message)
+    registre.ajouter('create_block', params, resultat)
 
 
 def _boucle_simulee(effet, reponse):
@@ -41,7 +40,7 @@ def _boucle_simulee(effet, reponse):
     return _boucle
 
 
-class BoucleTests(TestCase):
+class BoucleTests(TransactionTestCase):
     def setUp(self):
         self.user = User.objects.create_user(username='boucle', password='x')
         from services.agent_v2 import PlannerAgentV2
@@ -79,6 +78,9 @@ class BoucleTests(TestCase):
             res = self.Agent().process_message(self.user, "ajoute maths")
         self.assertIn('Maths', res['response'])
         self.assertNotIn('Maths est cale', res['response'])
+        bloc = RecurringBlock.objects.get(user=self.user, title='Maths')
+        self.assertEqual((bloc.day_of_week, bloc.start_time.strftime('%H:%M'),
+                          bloc.end_time.strftime('%H:%M')), (0, '09:00', '12:00'))
 
     def test_les_quatre_cles_du_contrat_sont_presentes(self):
         """views.py:861 lit result['response'] par indexation DIRECTE: une cle
@@ -183,6 +185,7 @@ class ReglagesTests(TestCase):
     def test_la_boucle_construit_son_agent_avec_le_reglage_qui_coupe_le_raisonnement(self):
         from services.agent_v2 import agent as module_agent
         from services.agent_v2.modeles import REGLAGES_BOUCLE_SANS_RAISONNEMENT
+        from pydantic_ai.models.test import TestModel
 
         vus = {}
 
@@ -194,17 +197,40 @@ class ReglagesTests(TestCase):
             output = ReponseDire(ouverture="Salut.")
 
         with patch.object(module_agent, 'Agent', AgentEspion), \
-             patch.object(module_agent, 'modele_agir', return_value=object()), \
+             patch.object(module_agent, 'modele_agir', return_value=TestModel()), \
              patch.object(self.Agent, '_executer_boucle', return_value=Resultat()):
             self.Agent().process_message(self.user, "bonjour")
 
         self.assertEqual(vus.get('model_settings'), REGLAGES_BOUCLE_SANS_RAISONNEMENT)
 
-class ResilienceTests(TestCase):
+class ResilienceTests(TransactionTestCase):
     def setUp(self):
         self.user = User.objects.create_user(username='resilience', password='x')
         from services.agent_v2 import PlannerAgentV2
         self.Agent = PlannerAgentV2
+
+    def test_arret_budget_jetons_ne_pretend_pas_avoir_trop_etapes(self):
+        from services.agent_v2 import agent as module_agent
+        from services.agent_v2.budget_tour import BudgetEpuise
+        from pydantic_ai.models.test import TestModel
+        with patch.object(module_agent, 'modele_agir', return_value=TestModel()), \
+             patch.object(self.Agent, '_executer_boucle', side_effect=BudgetEpuise):
+            res = self.Agent().process_message(self.user, 'fais tout')
+        self.assertIn('limite de jetons', res['response'])
+        self.assertNotIn("trop d'étapes", res['response'])
+
+    def test_arret_budget_sdk_identifie_les_etapes(self):
+        from services.agent_v2 import agent as module_agent
+        from pydantic_ai.exceptions import UsageLimitExceeded
+        from pydantic_ai.models.test import TestModel
+        def epuiser(*args, **kwargs):
+            kwargs['usage'].requests = module_agent.BUDGET_ETAPES
+            raise UsageLimitExceeded('request limit')
+        with patch.object(module_agent, 'modele_agir', return_value=TestModel()), \
+             patch.object(self.Agent, '_executer_boucle', side_effect=epuiser):
+            res = self.Agent().process_message(self.user, 'fais tout')
+        self.assertIn("trop d'étapes", res['response'])
+        self.assertNotIn('limite de jetons', res['response'])
 
     def test_une_panne_de_boucle_apres_mutation_annonce_QUAND_MEME_les_faits(self):
         """Le pire cas du produit: on a ecrit dans le planning et la boucle
@@ -217,6 +243,7 @@ class ResilienceTests(TestCase):
         with patch.object(self.Agent, '_boucle', _boucle):
             res = self.Agent().process_message(self.user, "ajoute maths")
         self.assertIn('Maths', res['response'])
+        self.assertEqual(RecurringBlock.objects.filter(user=self.user, title='Maths').count(), 1)
 
     def test_un_budget_epuise_est_dit_a_l_utilisateur(self):
         def _boucle_sature(self_agent, user, message, registre):

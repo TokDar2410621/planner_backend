@@ -76,7 +76,9 @@ class TiretLongTests(NarrateurBase):
             question=f"Tu préfères le matin {TIRET_LONG} ou le soir ?",
             options=[f"Matin {TIRET_LONG} 7 h", "Soir"]))
         self.assertNotIn(TIRET_LONG, done["response"])
-        self.assertIn("vendredi : une heure", done["response"])
+        self.assertEqual(done["response"], "Tu préfères le matin : ou le soir ?")
+        self.assertEqual(done["quick_replies"][0],
+                         {"label": "Matin : 7 h", "value": "Matin : 7 h"})
         for chip in done["quick_replies"]:
             self.assertNotIn(TIRET_LONG, chip["label"])
             self.assertNotIn(TIRET_LONG, chip["value"])
@@ -92,11 +94,13 @@ class TiretLongTests(NarrateurBase):
 
 
 class QuestionHorsChampTests(NarrateurBase):
-    def test_question_dans_l_ouverture_est_comptee(self):
+    def test_question_dans_l_ouverture_coupee_et_repli_compte(self):
         _, done = self.tour(dire=ReponseDire(
             ouverture="Pour confirmer, est-ce que ça concerne seulement ce jeudi ou tous les jeudis?"))
         self.assertTrue(done["question_posee"])
-        self.assertTrue(done["question"].endswith("?"))
+        from services.agent_v2.agent import REPLI_QUESTION
+        self.assertEqual(done["question"], REPLI_QUESTION)
+        self.assertNotIn("Pour confirmer", done["response"])
         self.assertTrue(self.metadonnees()["question_posee"])
         from services.agent_v2.suggestions import tour_a_pose_une_question
         self.assertTrue(tour_a_pose_une_question(self.user))

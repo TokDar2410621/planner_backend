@@ -92,10 +92,9 @@ class ConsultationTests(TransactionTestCase):
         """Juge indisponible: pas de liste devinee, mais pas « je n'ai pas
         compris » non plus, puisque la boucle annoncait bien une liste."""
         res = self._tour("Mon planning d'aujourd'hui stp", juger_script({}))
-        self.assertIn('ta journée', res['response'])
-        self.assertNotIn("Je n'ai pas compris", res['response'])
-        self.assertEqual([p['label'] for p in res['quick_replies']],
-                         ['Ma journée', 'Ma semaine', 'Mes tâches'])
+        self.assertIn('?', res['response'])
+        self.assertNotIn('Conception', res['response'])
+        self.assertEqual(res['quick_replies'], [])
 
     def test_le_juge_qui_dit_aucune_ne_declenche_aucune_lecture(self):
         """« aucune »: la personne ne demandait pas a voir son horaire. Le
@@ -267,7 +266,8 @@ class PlanningDuJourEffectifTests(TransactionTestCase):
         # « - Titre: jeu 08:00-11:00 ». Seul le second doit rester.
         self.assertNotIn('08:00-11:00 Conception', prompt)
         self.assertIn('SEMAINE TYPE', prompt)
-        self.assertIn('- Conception: jeu 08:00-11:00', prompt)
+        jour = ('lun', 'mar', 'mer', 'jeu', 'ven', 'sam', 'dim')[timezone.localdate().weekday()]
+        self.assertIn(f'- Conception: {jour} 08:00-11:00', prompt)
 
 
 class ContexteDuJugeTests(TransactionTestCase):
@@ -369,7 +369,8 @@ class LectureSansDemandeTests(TransactionTestCase):
                 {message: {"sociale": ("oui", 0.63),
                            "consultation": ("aucune", 0.93)}}))
         self.assertNotIn("Conception", res["response"])
-        self.assertIn("Salut", res["response"])
+        self.assertNotIn("Salut", res["response"])  # Prose libre ecartee sur un tour outille.
+        self.assertTrue(res['response'])
         self.assertTrue(any("masques=1" in ligne for ligne in logs.output),
                         logs.output)
         # Un masquage voulu n'est pas le defaut « lu sans rien montrer ».

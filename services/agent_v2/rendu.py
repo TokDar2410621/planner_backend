@@ -740,6 +740,23 @@ class _Narrateur:
             self.sections.insert(self.nb_imports, recap)
             self.nb_imports += 1
 
+    def _ok_resolve_document_entry(self, a, d, p):
+        if not a.etat_verifie:
+            return
+        if d.get('already_resolved'):
+            self.ajouter_fait(_Fait('Cette entrée est déjà résolue et son créneau a été vérifié.',
+                                    'document_resolu', ''))
+            return
+        if _dict(d.get('resolution')).get('pending'):
+            from services.agent_v2.importation import message_precision
+            precisions = _dicts(_dict(d.get('entry_summary')).get('precisions'))
+            if precisions:
+                self.sections.append('Précision enregistrée. ' + message_precision(precisions[0]))
+        else:
+            recap = _recap_import(_dict(d.get('entry_summary')), self.auj)
+            if recap:
+                self.sections.append(recap)
+
     # -- sauts de create_block (reussite partielle ou refus)
 
     def sautes_create_block(self, a, d, p, ignorer_chevauchement: bool = False):
@@ -1178,9 +1195,11 @@ _NOMS_IMPORT = {
 
 
 def _recap_import(donnees: dict, auj: date) -> str:
+    from services.agent_v2.importation import message_precision, raison_ignoree
     blocs = _dicts(donnees.get("blocs"))
     dates = _dicts(donnees.get("dates"))
     ignores = _dicts(donnees.get("ignores"))
+    precisions = _dicts(donnees.get('precisions'))
     try:
         en_attente = int(donnees.get("en_attente") or 0)
     except (TypeError, ValueError):
@@ -1238,10 +1257,12 @@ def _recap_import(donnees: dict, auj: date) -> str:
         ) if m)
         titre = _txt(i.get("titre")) or "Un cours"
         verifier.append(f"{titre}{f' ({moment})' if moment else ''} n'est pas ajouté : "
-                        "il tombe en même temps qu'un créneau déjà en place.")
-    if en_attente:
-        pronom = "le" if en_attente == 1 else "les"
-        verifier.append(f"{pluriel(en_attente, 'créneau lu', 'créneaux lus')} avec un doute : "
+                        + raison_ignoree(i.get('reason')) + '.')
+    verifier.extend(message_precision(p) for p in precisions)
+    a_confirmer = max(0, en_attente - len(precisions))
+    if a_confirmer:
+        pronom = "le" if a_confirmer == 1 else "les"
+        verifier.append(f"{pluriel(a_confirmer, 'créneau lu', 'créneaux lus')} avec un doute : "
                         f"confirme-{pronom} dans ton planning.")
 
     texte = tete
@@ -1318,7 +1339,10 @@ def rendre_faits(registre: Registre, aujourdhui: date | None = None,
 
     lignes = n.lignes_de_faits() + n.refus + n.retenues
     if registre.budget_epuise:
-        lignes.append("Je me suis arrêté avant la fin : il restait trop d'étapes.")
+        if registre.motif_budget == "jetons":
+            lignes.append("Je me suis arrêté : la limite de jetons ne permettait pas un autre appel.")
+        else:
+            lignes.append("Je me suis arrêté avant la fin : il restait trop d'étapes.")
     if registre.delai_depasse:
         lignes.append("Je me suis arrêté : le délai du tour était dépassé.")
     if getattr(registre, "boucle_interrompue", False):

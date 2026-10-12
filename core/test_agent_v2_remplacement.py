@@ -69,6 +69,9 @@ class RemplacementTests(TransactionTestCase):
         self.assertTrue(self.cours.active)
         self.assertEqual(self.cours.title, "L’entreprise et ses systèmes")
         # Un seul reçu, pour un seul geste.
+        self.assertEqual(registre.recus_confirmes(), [])
+        from services.agent_v2.reconciliation import reconcilier
+        reconcilier(self.user, registre)
         self.assertEqual(len(registre.recus_confirmes()), 1)
 
     def test_les_heures_du_bloc_remplace_sont_reprises_par_defaut(self):

@@ -1,6 +1,6 @@
 """Cache du plan OR-Tools pour organize_day: la proposition d'un jour est
-resservie sans re-resoudre quand les entrees du solveur sont inchangees, et
-l'apply reutilise l'arrangement valide.
+resservie sans re-resoudre quand les entrees du solveur sont inchangees.
+L'apply enregistre l'occurrence et préserve la série.
 
 Meme contrat de fraicheur que le plan semaine (test_agent_v2_plan_cache.py):
 l'empreinte des ENTREES (pas de la solution) decide. Si une entree change,
@@ -144,17 +144,18 @@ class PlanJourCacheTests(TestCase):
         profil.save(update_fields=["transport_time_minutes"])
         self.assertNotEqual(avant, empreinte_entrees_jour(self.user, self.jour), "profil transport")
 
-    def test_apply_applique_l_arrangement_fourni(self):
+    def test_apply_date_l_occurrence_avec_arrangement_fourni(self):
         arrangement = _arrangement_fixe(block_id=self.bloc.id, start_min=540)
         resultat = self.outil.execute(
             self.user, date=LUNDI, apply=True, _arrangement=arrangement)
-        self.assertTrue(resultat.success)
+        self.assertTrue(resultat.success, resultat.message)
         self.assertTrue(resultat.data["applied"])
         self.bloc.refresh_from_db()
-        self.assertEqual((self.bloc.start_time.hour, self.bloc.start_time.minute), (9, 0))
-        self.assertEqual((self.bloc.end_time.hour, self.bloc.end_time.minute), (10, 0))
-        self.assertEqual(resultat.data["moved"],
-                         [{"title": "Sport", "start_time": "09:00", "end_time": "10:00"}])
+        self.assertEqual((self.bloc.start_time.hour, self.bloc.start_time.minute), (6, 0))
+        self.assertEqual((self.bloc.end_time.hour, self.bloc.end_time.minute), (7, 0))
+        self.assertEqual(len(resultat.data["moved"]), 1)
+        self.assertEqual(resultat.data["placed"],
+                         [{"block_id": self.bloc.id, "title": "Sport", "start_time": "09:00", "end_time": "10:00"}])
 
     def test_apply_via_cache_ne_resout_pas(self):
         """Niveau 3 de bout en bout: le cache alimente execute, sans re-solve."""
@@ -167,8 +168,10 @@ class PlanJourCacheTests(TestCase):
         ):
             resultat = self.outil.execute(
                 self.user, date=LUNDI, apply=True, _arrangement=arrangement)
-        self.assertTrue(resultat.success)
+        self.assertTrue(resultat.success, resultat.message)
         self.assertTrue(resultat.data["applied"])
+        self.bloc.refresh_from_db()
+        self.assertEqual(self.bloc.start_time, time(6))
 
     def test_apply_sans_arrangement_resout_comme_avant(self):
         """v1 / chemin historique: sans kwarg prive, on re-solve."""
@@ -177,7 +180,8 @@ class PlanJourCacheTests(TestCase):
             sched_module, "solve_placement", wraps=sched_module.solve_placement
         ) as spy:
             resultat = self.outil.execute(self.user, date=LUNDI, apply=True)
-        self.assertTrue(resultat.success)
+        self.assertTrue(resultat.success, resultat.message)
+        self.assertTrue(resultat.data["applied"])
         self.assertEqual(spy.call_count, 1)
 
     def test_propose_date_invalide_sans_cache(self):

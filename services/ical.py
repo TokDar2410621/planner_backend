@@ -92,13 +92,14 @@ def build_calendar(user, include_tasks: bool = False, cal_name: str | None = Non
     """Return the full .ics document (str) for a user's schedule."""
     # Local import keeps this module importable without Django app-loading order
     # concerns during migrations.
-    from core.models import RecurringBlock, RecurringBlockException, ScheduledBlock, Task
+    from core.models import (RecurringBlock, RecurringBlockException,
+                             RecurringBlockOverride, ScheduledBlock, Task)
 
     now = timezone.now()
     dtstamp = _dt_utc(now)
     today = timezone.localtime(now).date()
     owner = user.first_name or user.username
-    name = cal_name or f"Planner AI — {owner}"
+    name = cal_name or f"Planner AI : {owner}"
 
     lines: list[str] = [
         "BEGIN:VCALENDAR",
@@ -143,9 +144,10 @@ def build_calendar(user, include_tasks: bool = False, cal_name: str | None = Non
         ]
         # Occurrences ignorées (skip) -> EXDATE, pour que le calendrier abonné
         # n'affiche pas ce jour-là (heure flottante alignée sur DTSTART).
-        for exd in RecurringBlockException.objects.filter(
+        ignored_dates = set(RecurringBlockException.objects.filter(
             user=user, recurring_block=b, date__gte=today
-        ).values_list("date", flat=True):
+        ).values_list("date", flat=True))
+        for exd in sorted(ignored_dates):
             lines.append(f"EXDATE:{_dt_floating(exd, b.start_time)}")
         lines += [
             f"SUMMARY:{_esc(b.title)}",
@@ -154,6 +156,33 @@ def build_calendar(user, include_tasks: bool = False, cal_name: str | None = Non
         if b.location:
             lines.append(f"LOCATION:{_esc(b.location)}")
         lines.append("END:VEVENT")
+
+        # RFC 5545 section 3.8.4.4: l'identité conserve l'heure initiale
+        # même quand DTSTART de cette occurrence a été déplacé.
+        overrides = RecurringBlockOverride.objects.filter(
+            user=user, recurring_block=b, date__gte=start_date,
+        ).order_by('date')
+        for override in overrides:
+            if (override.date in ignored_dates
+                    or override.date.weekday() != b.day_of_week
+                    or (b.end_date and override.date > b.end_date)):
+                continue
+            override_end = override.date
+            if override.end_time <= override.start_time:
+                override_end += timedelta(days=1)
+            lines += [
+                'BEGIN:VEVENT',
+                f'UID:recblock-{b.id}@planner-ai',
+                f'DTSTAMP:{dtstamp}',
+                f'RECURRENCE-ID:{_dt_floating(override.date, b.start_time)}',
+                f'DTSTART:{_dt_floating(override.date, override.start_time)}',
+                f'DTEND:{_dt_floating(override_end, override.end_time)}',
+                f'SUMMARY:{_esc(b.title)}',
+                f'CATEGORIES:{_esc(label)}',
+            ]
+            if b.location:
+                lines.append(f'LOCATION:{_esc(b.location)}')
+            lines.append('END:VEVENT')
 
     if include_tasks:
         # --- Scheduled task blocks (next 30 days) -> dated VEVENTs ------------

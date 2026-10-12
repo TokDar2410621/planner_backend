@@ -151,7 +151,7 @@ class ChatEndpointTest(APITestCase):
         self.client.force_authenticate(user=self.user)
         fake = {'response': 'Bonjour !', 'quick_replies': [], 'blocks_created': [], 'tasks_created': []}
         # Depuis la bascule du 2026-08-30, le chemin par defaut est v2.
-        with patch('services.agent_v2.PlannerAgentV2') as MockAgent:
+        with patch('services.agent_v2.conversation.AgentConversation') as MockAgent:
             MockAgent.return_value.process_message.return_value = fake
             resp = self.client.post(reverse('chat'), {'message': 'salut'})
         self.assertEqual(resp.status_code, status.HTTP_200_OK)

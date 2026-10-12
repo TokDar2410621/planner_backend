@@ -80,9 +80,10 @@ class TestExecution(MemoireBase):
     def test_lister_vide(self):
         self.assertIn("rien", memoire.lister(self.user).lower())
 
-    def test_conflit_remplace_sans_hard_delete(self):
+    def test_remplacement_explicite_sans_hard_delete(self):
         memoire.memoriser(self.user, "je ne veux jamais de réunion avant 9h")
-        phrase = memoire.memoriser(self.user, "pas de réunion avant 9h")
+        cible = PreferenceUtilisateur.objects.get(user=self.user, actif=True)
+        phrase = memoire.memoriser(self.user, "pas de réunion avant 9h", remplace_id=cible.pk)
         self.assertIn("Remplace", phrase)
         actives = PreferenceUtilisateur.objects.filter(user=self.user, actif=True)
         self.assertEqual(actives.count(), 1)
@@ -100,13 +101,13 @@ class TestExecution(MemoireBase):
     def test_oublier_flou(self):
         memoire.memoriser(self.user, "pas de réunion avant 9h")
         phrase = memoire.oublier(self.user, "les réunions du matin")
-        self.assertIn("Oublie", phrase)
+        self.assertIn("Précise", phrase)
         self.assertEqual(
-            PreferenceUtilisateur.objects.filter(user=self.user, actif=True).count(), 0)
+            PreferenceUtilisateur.objects.filter(user=self.user, actif=True).count(), 1)
 
     def test_oublier_inconnu(self):
         phrase = memoire.oublier(self.user, "mon avion pour Tokyo")
-        self.assertIn("rien memorise", phrase)
+        self.assertIn("Rien n'a changé", phrase)
 
     def test_categorie_auto(self):
         p = PreferenceUtilisateur.objects.create(

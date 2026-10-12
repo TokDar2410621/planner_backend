@@ -60,10 +60,11 @@ class DatedEventsImportTest(TestCase):
         self._run(ev)
         self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 1)
 
-    def test_missing_end_time_defaults_to_two_hours(self):
+    def test_missing_end_time_waits_for_precision(self):
         self._run([{'name': 'Tournoi', 'date': '2026-09-01', 'start_time': '10:00'}])
-        sb = ScheduledBlock.objects.get(user=self.user)
-        self.assertEqual(sb.end_time, time(12, 0))
+        self.assertFalse(ScheduledBlock.objects.filter(user=self.user).exists())
+        self.doc.refresh_from_db()
+        self.assertEqual(self.doc.extracted_data['_pending_entries'][0]['missing_fields'], ['end_time'])
 
     def test_undated_event_still_recurring_but_named(self):
         # Sans date: comportement hebdomadaire conservé, mais le NOM n'est plus

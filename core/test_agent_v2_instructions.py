@@ -8,7 +8,8 @@ une revision en 2025. Ce test aurait attrape le defaut.
 """
 from unittest.mock import patch
 
-from django.test import SimpleTestCase
+from django.test import TransactionTestCase
+from django.contrib.auth import get_user_model
 from pydantic_ai.messages import (ModelRequest, ModelResponse, TextPart,
                                   UserPromptPart)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -18,8 +19,15 @@ from services.agent_v2.agent import PlannerAgentV2
 from services.agent_v2.registre import Registre
 
 
-class InstructionsDeSuiviTests(SimpleTestCase):
+class InstructionsDeSuiviTests(TransactionTestCase):
     def test_la_date_atteint_le_modele_sur_un_tour_de_suivi(self):
+        from services.agent_v2.budget_tour import ouvrir_trace, fermer_trace
+        from services.agent_v2.trace_tour import trace_courante
+        user = get_user_model().objects.create_user(username='instructions-budget')
+        trace = ouvrir_trace(user)
+        jeton = trace_courante.set(trace)
+        self.addCleanup(trace_courante.reset, jeton)
+        self.addCleanup(fermer_trace, trace)
         vues: list = []
 
         def repondre(messages, info: AgentInfo):
@@ -42,7 +50,7 @@ class InstructionsDeSuiviTests(SimpleTestCase):
              patch.object(module_agent, "prompt_agir", return_value="DATE: lundi 2026-09-14"), \
              patch.object(module_agent, "outils_pour", return_value=[]), \
              patch.object(PlannerAgentV2, "_historique", return_value=historique):
-            agent._boucle(None, "Jeudi", Registre())
+            agent._boucle(user, "Jeudi", Registre())
 
         self.assertTrue(vues)
         derniere = [m for m in vues[-1] if isinstance(m, ModelRequest)][-1]

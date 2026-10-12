@@ -81,12 +81,18 @@ class NarrateurIntegrationTests(TransactionTestCase):
             user=self.user, role="assistant").latest("pk").metadata
 
     def test_question_menteuse_supprimee(self):
+        from services.agent_v2.agent import REPLI_QUESTION
+
+        quart = self._quart()
         done = self._tour("bonjour", dire=ReponseDire(
             ouverture="Salut.", question="J'ai supprimé ton cours, autre chose ?",
             options=["Oui", "Non"]))
-        self.assertEqual(done["question"], "")
+        self.assertEqual(done["question"], REPLI_QUESTION)
+        self.assertEqual(done["response"], REPLI_QUESTION)
         self.assertEqual(done["quick_replies"], [])
-        self.assertFalse(done["question_posee"])
+        self.assertTrue(done["question_posee"])
+        self.assertTrue(RecurringBlock.all_objects.get(pk=quart.pk).active)
+        self.assertEqual(self._meta()["question"], REPLI_QUESTION)
 
     def test_chips_reelles_portee_jour(self):
         q = self._quart()

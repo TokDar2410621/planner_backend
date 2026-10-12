@@ -202,6 +202,8 @@ class P2GardeTests(HarnaisGardes, TransactionTestCase):
                      start_time='18:00', end_time='19:00')
         self.assertTrue(registre.actions[-1].succes, registre.actions[-1].message)
         self.assertTrue(ScheduledBlock.objects.filter(user=self.user, date='2026-09-17').exists())
+        from services.agent_v2.reconciliation import reconcilier
+        reconcilier(self.user, registre)
         faits = bloc_factuel(registre)
         self.assertIn('Souper', faits)
         self.assertNotIn("Je n'ai pas pu", faits)

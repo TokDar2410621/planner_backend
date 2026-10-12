@@ -746,7 +746,9 @@ class DonneesDesOutilsTests(HarnaisGardes, TransactionTestCase):
         r = execute_tool('get_week_schedule', self.user, {})
         lundi = r.data['days'][0]
         self.assertEqual(lundi['blocks'], ['Calcul différentiel (10:00-11:40)'])
-        self.assertEqual(lundi['detail'], [{'title': 'Calcul différentiel', 'start_time': '10:00',
+        self.assertEqual(lundi['detail'], [{'id': RecurringBlock.objects.get(user=self.user, title='Calcul différentiel').pk,
+                                            'type': 'recurring', 'location': None,
+                                            'title': 'Calcul différentiel', 'start_time': '10:00',
                                             'end_time': '11:40', 'block_type': 'course',
                                             'is_flexible': False}])
 

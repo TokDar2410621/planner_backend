@@ -14,13 +14,14 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth.models import User
-from django.test import SimpleTestCase, TestCase
+from django.test import SimpleTestCase, TransactionTestCase
 from django.utils import timezone
 from pydantic_ai.messages import (ModelResponse, PartDeltaEvent, PartStartEvent,
                                   TextPart, TextPartDelta, ThinkingPart,
                                   ThinkingPartDelta)
 
 from core.models import ConversationMessage, RecurringBlock, UploadedDocument
+from services.agent.tools import execute_tool
 from services.agent.tools.base import ToolResult
 from services.agent_v2 import agent as module_agent
 from services.agent_v2 import redaction
@@ -93,7 +94,7 @@ def formulaire():
         {"id": "heure", "type": "time", "label": "Heure", "question": "À quelle heure ?"}])
 
 
-class NarrateurBase(TestCase):
+class NarrateurBase(TransactionTestCase):
     def setUp(self):
         self.user = User.objects.create_user(username="narrateur", password="x")
         self.journal: dict = {}
@@ -116,6 +117,23 @@ class NarrateurBase(TestCase):
         self.ordre.append("appliquer")
         self.journal["appliquer"] = (a, k)
         return list(self.choix)
+
+    def action_reelle(self, outil, params, **donnees):
+        """Prepare un resultat dont le runtime doit relire les postconditions."""
+        resultat = execute_tool(outil, self.user, params)
+        self.assertTrue(resultat.success, resultat.message)
+        resultat.data.update(donnees)
+        return outil, params, resultat
+
+    def creation_reelle(self, titre="Maths"):
+        return self.action_reelle("create_block", {
+            "title": titre, "block_type": "course", "days": [0],
+            "start_time": "09:00", "end_time": "10:00"})
+
+    def bloc_reel(self, titre="Quart au dépanneur"):
+        return RecurringBlock.objects.create(
+            user=self.user, title=titre, block_type="work", day_of_week=3,
+            start_time="19:00", end_time="20:00")
 
     def tour(self, actions=(), dire=None, message="bonjour", agir=None, dire_effet=None):
         """Un tour avec la boucle simulee.
@@ -347,6 +365,9 @@ class AgentFactice:
         return SimpleNamespace(output=AgentFactice.sortie, all_messages=lambda: [],
                                usage=lambda: None)
 
+    async def run(self, *a, **kw):
+        return self.run_sync(*a, **kw)
+
 
 class MessageBrutTests(NarrateurBase):
     def _import_recent(self):
@@ -409,10 +430,11 @@ class MessageBrutTests(NarrateurBase):
         self.assertTrue(any("choix_code=0" in ligne for ligne in logs.output), logs.output)
 
     def test_l_effet_execute_par_le_code_est_trace_et_persiste(self):
+        bloc = self.bloc_reel()
+
         def appliquer(user, registre, message, tache="", signaler=None):
-            action = registre.ajouter("delete_block", {"block_id": 5}, ToolResult(
-                success=True, message="ok",
-                data={"cle_demande": "k", "par_le_code": True}))
+            action = registre.ajouter(*self.action_reelle(
+                "delete_block", {"block_id": bloc.pk}, cle_demande="k", par_le_code=True))
             signaler(action)
             return [{"cle": "k", "motif": "portee_jour", "option": "serie",
                      "action_id": action.id, "resume": "FAIT PAR LE CODE (a1)"}]
@@ -426,6 +448,7 @@ class MessageBrutTests(NarrateurBase):
         self.assertEqual(self.metadonnees()["actions"],
                          [{"id": "a1", "outil": "delete_block", "succes": True, "par_le_code": True}])
         self.assertTrue(done["response"].startswith("FAITS"))
+        self.assertFalse(RecurringBlock.all_objects.get(pk=bloc.pk).active)
 
     def test_une_panne_du_choix_ne_fait_pas_tomber_le_tour(self):
         def casse(*a, **k):
@@ -433,7 +456,8 @@ class MessageBrutTests(NarrateurBase):
 
         with patch.object(module_agent, "_charger_appliquer_choix", return_value=casse):
             _, done = self.tour()
-        self.assertEqual(done["response"], "Ok.")
+        self.assertEqual(done["response"], module_agent.REPLI_QUESTION)
+        self.assertTrue(done["question_posee"])
 
 
 # ── 2a: la boucle voit le contexte, ne cite pas l'import ──────────────────
@@ -472,15 +496,11 @@ class QuestionDeDireTests(NarrateurBase):
         self.assertEqual(done["question"], "À quelle heure ?")
 
     def test_affirmation_sans_recu_coupee_ref_inventee_retiree(self):
-        """Boucle unique: verifier_prose remplace la guillotine de DIRE.
-
-        Une ref inventee ne fait plus tomber toute la prose; elle est
-        retiree, et chaque affirmation d'action sans recu verifie est
-        coupee phrase par phrase. La garantie de securite tient: aucune
-        action affirmee sans recu n'atteint l'utilisateur."""
+        """Le code rend le fait relu; seule la question du modele survit."""
+        creation = self.creation_reelle()
         with self.assertLogs("services.agent_v2.agent", level="WARNING") as logs:
             _, done = self.tour(
-                actions=[ok("create_block", created=[{"title": "Maths"}])],
+                actions=[creation],
                 dire=ReponseDire(refs=["a9"], ouverture="Top !",
                                  suite="J'ai ajouté ton gym jeudi.",
                                  question="Tu gardes ça ?", options=["Oui", "Non"]))
@@ -488,11 +508,13 @@ class QuestionDeDireTests(NarrateurBase):
         # est coupee.
         self.assertNotIn("a9", done["response"])
         self.assertNotIn("J'ai ajouté ton gym", done["response"])
-        # Les faits du registre parlent, la prose innocente survit.
+        # L'ouverture et la suite libres sont coupees, meme avec un vrai recu.
         self.assertIn("FAITS", done["response"])
-        self.assertIn("Top !", done["response"])
+        self.assertNotIn("Top !", done["response"])
         self.assertEqual(done["question"], "Tu gardes ça ?")
-        self.assertTrue(any("fuites=1" in ligne for ligne in logs.output), logs.output)
+        self.assertTrue(any("ouverture:prose_hors_contrat" in ligne
+                            and "suite:prose_hors_contrat" in ligne
+                            for ligne in logs.output), logs.output)
 
 
 # ── Une question par tour, selon PRIORITE ────────────────────────────────
@@ -591,7 +613,7 @@ class PrioriteTests(NarrateurBase):
                                                  options=["a", "b"]))
             self.assertEqual(done["question_motif"], "fin_recurrence")
             self.assertEqual(len(done["quick_replies"]), 2)
-            self.assertEqual(done["response"], "Reçu.\n\nJusqu'à quand veux-tu le garder ?")
+            self.assertEqual(done["response"], "Jusqu'à quand veux-tu le garder ?")
         with self.subTest("apres un chevauchement"):
             _, done = self.tour(actions=[("create_block", {}, ToolResult(
                 success=True, message="ok",
@@ -622,29 +644,37 @@ class PrioriteTests(NarrateurBase):
 
 class NarrateurUniqueTests(NarrateurBase):
     def test_un_seul_narrateur(self):
-        gym = ok("update_block", {"block_id": 1}, block={"title": "Gym"})
+        bloc = self.bloc_reel("Ancien titre")
+        gym = self.action_reelle("update_block", {"block_id": bloc.pk, "title": "Gym"})
         _, done = self.tour(
             actions=[gym, gym, gym],
             dire=ReponseDire(actions=[ActionCitee(ref="a1", phrase="J'ai mis à jour le bloc Gym.")]))
         self.assertNotIn("J'ai mis à jour le bloc Gym", done["response"])
         self.assertEqual(done["response"].count("FAITS"), 1)
+        self.assertEqual(RecurringBlock.objects.get(pk=bloc.pk).title, "Gym")
 
     def test_ordre_stable(self):
         evts, done = self.tour(
-            actions=[ok("create_block", created=[{"title": "Maths"}])],
+            actions=[self.creation_reelle()],
             dire=ReponseDire(ouverture="Bonne soirée.", question="Autre chose à ajouter ?",
                              options=["Oui", "Non merci"]))
         deltas = self.deltas(evts)
         self.assertEqual("".join(deltas), done["response"])
         self.assertEqual(deltas[0], "FAITS")
-        self.assertEqual(deltas, ["FAITS", "\n\nBonne soirée.", "\n\nAutre chose à ajouter ?"])
+        self.assertEqual(deltas, ["FAITS", "\n\nAutre chose à ajouter ?"])
         self.assertEqual(evts[-1]["type"], "done")
         self.assertEqual([e["type"] for e in evts].count("done"), 1)
 
-    def test_sans_faits_la_prose_ouvre_sans_saut_de_ligne(self):
-        evts, done = self.tour(dire=ReponseDire(ouverture="Salut !"))
-        self.assertEqual(self.deltas(evts), ["Salut !"])
-        self.assertEqual(done["response"], "Salut !")
+    def test_sans_faits_la_question_ouvre_sans_saut_de_ligne(self):
+        evts, done = self.tour(dire=ReponseDire(ouverture="Salut !", question="Quel jour ?"))
+        self.assertEqual(self.deltas(evts), ["Quel jour ?"])
+        self.assertEqual(done["response"], "Quel jour ?")
+
+    def test_un_succes_sans_objet_relu_ne_devient_pas_un_fait(self):
+        _, done = self.tour(actions=[ok("create_block", created=[{"title": "Maths"}])])
+        self.assertNotIn("FAITS", done["response"])
+        self.assertIn("Je ne peux pas confirmer les changements", done["response"])
+        self.assertFalse(RecurringBlock.objects.filter(user=self.user).exists())
 
     def test_voici_sans_liste_retire(self):
         with self.assertLogs("services.agent_v2.agent", level="INFO") as logs:
@@ -659,7 +689,7 @@ class NarrateurUniqueTests(NarrateurBase):
 
     def test_repli_accentue(self):
         with self.subTest("avec faits"):
-            evts, done = self.tour(actions=[ok("create_block", created=[{"title": "Maths"}])],
+            evts, done = self.tour(actions=[self.creation_reelle()],
                                    dire_effet=RuntimeError("502"))
             self.assertTrue(done["response"].endswith(
                 "Voici ce qui a changé. Dis-moi si tu veux autre chose."))
@@ -713,13 +743,15 @@ class MesureTests(NarrateurBase):
             self.assertIn(cle, done)
 
     def test_un_tour_sans_question_compte_zero(self):
+        creation = self.creation_reelle()
         with self.assertLogs("services.agent_v2.agent", level="INFO") as logs:
-            _, done = self.tour(dire=ReponseDire(ouverture="Salut !"))
+            _, done = self.tour(actions=[creation], dire=ReponseDire())
         ligne = next(l for l in logs.output if "agent_v2 tour" in l)
         self.assertIn("asked=0 form=0 choices=0", ligne)
         self.assertIn("motif=- choix_code=0", ligne)
         self.assertFalse(done["question_posee"])
         self.assertEqual(done["question_motif"], "")
+        self.assertEqual(done["response"], "FAITS")
 
     def test_les_marqueurs_bruts_sont_comptes(self):
         journal = {}

@@ -142,6 +142,9 @@ class AppelIndirectTests(TransactionTestCase):
                                     {'task_id': tache.id, 'title': 'Renommee'})
         self.assertEqual(registre.actions[-1].outil, 'update_task')
         self.assertTrue(registre.actions[-1].est_mutation)
+        self.assertEqual(registre.recus_confirmes(), [])
+        from services.agent_v2.reconciliation import reconcilier
+        reconcilier(self.user, registre)
         self.assertEqual(len(registre.recus_confirmes()), 1)
 
     def test_un_outil_deja_expose_est_refuse(self):

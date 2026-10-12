@@ -23,7 +23,7 @@ c'est attendu, l'explication est dans le scenario.
 """
 import asyncio
 from datetime import date, datetime, time
-from unittest import expectedFailure, mock
+from unittest import mock
 
 from django.contrib.auth.models import User
 from django.test import TransactionTestCase
@@ -715,7 +715,6 @@ class VeriteDesReponsesTests(HarnaisScenarios, TransactionTestCase):
         self.assertIn('Examen', texte)
         self.assertActif(cours, True)
 
-    @expectedFailure
     def test_23_justification_inventee_sans_recu(self):
         """Echec reel : « il avait été remplacé par celui de 13 h, car ils
         portaient le même nom » : causalite inventee, aucun recu.
@@ -728,10 +727,16 @@ class VeriteDesReponsesTests(HarnaisScenarios, TransactionTestCase):
         self.assertFalse(ScheduledBlock.objects.exists())
         prose = ("il avait été remplacé par celui de 13 h, "
                  "car ils portaient le même nom")
-        # Cible : le croisement prose/registre refuse la causalite sans recu.
-        self.assertTrue(
-            any(a.succes and a.est_mutation for a in registre.actions),
-            f"causalite affirmee sans recu, non refusee : {prose!r}")
+        from services.agent_v2.mesure import verifier_prose
+        from services.agent_v2.redaction import composer
+        for champ in ('ouverture', 'suite'):
+            with self.subTest(champ=champ):
+                reponse = ReponseDire(**{champ: prose})
+                epuree, supprimees, _ = verifier_prose(reponse, registre)
+                composition = composer(epuree, registre, '', None)
+                self.assertGreater(supprimees, 0)
+                self.assertNotIn(prose, composition.texte)
+                self.assertFalse(registre.actions)
 
 
 # ============================================================================
@@ -740,17 +745,8 @@ class VeriteDesReponsesTests(HarnaisScenarios, TransactionTestCase):
 
 class RobustesseTests(HarnaisScenarios, TransactionTestCase):
 
-    @expectedFailure
-    def test_24_faute_frappe_retrouve_le_cours(self):
-        """« cours d'entriprise » (faute reelle) : COMPORTEMENT CIBLE (xrange),
-        la resolution retrouve semantiquement le cours malgre la faute.
-
-        L'architecture actuelle echoue proprement sans rien toucher (le
-        contrat minimum : jamais de skip sur un mauvais bloc), mais ne
-        retrouve pas le cours. La tolerance aux fautes appartient a la
-        boucle (le modele lit l'horaire et rapproche) : pas encore evaluee
-        au niveau des outils scriptes.
-        """
+    def test_24a_outil_refuse_titre_mal_orthographie_sans_mutation(self):
+        """Le résolveur strict refuse une approximation, sans choisir un bloc."""
         cours = self.bloc("L'entreprise et ses systèmes", 1, '13:00', '16:00')
         brut = "J'ai examen à la place du cours d'entriprise"
         registre, tools = self.outils(brut)
@@ -758,12 +754,29 @@ class RobustesseTests(HarnaisScenarios, TransactionTestCase):
             retour = self.appeler(registre, tools, 'skip_block_occurrence',
                                   date='2026-09-29', title="cours d'entriprise",
                                   block_type='course')
-        # CIBLE : le cours est retrouve malgre la faute, l'occurrence saute.
-        self.assertTrue(
-            retour.succes,
-            "le cours n'a pas ete retrouve malgre la faute de frappe")
+        self.assertFalse(retour.succes)
+        self.assertFalse(RecurringBlockException.objects.filter(user=self.user).exists())
+        self.assertActif(cours, True)
+        self.assert_sans_recu(registre, 'skip_block_occurrence')
+
+    def test_24b_titre_canonique_lu_annule_uniquement_occurrence_visee(self):
+        """La lecture fournit le titre exact pour l'outil, sans recherche floue."""
+        cours = self.bloc("L'entreprise et ses systèmes", 1, '13:00', '16:00')
+        autre = self.bloc('Mathématiques', 1, '09:00', '10:00')
+        brut = "Annule seulement aujourd'hui mon cours d'entriprise, garde les autres séances."
+        registre, tools = self.outils(brut)
+        lecture = self.appeler(registre, tools, 'get_today_schedule', date='2026-09-29')
+        candidat = next(b for b in lecture.donnees['blocks'] if b['title'] == cours.title)
+        with self.juge_saut_ponctuel(brut):
+            retour = self.appeler(registre, tools, 'skip_block_occurrence',
+                                  date='2026-09-29', title=candidat['title'], block_type='course')
+        self.assertTrue(retour.succes)
         self.assertTrue(RecurringBlockException.objects.filter(
             user=self.user, recurring_block=cours, date=AUJOURDUI).exists())
+        self.assertEqual(RecurringBlockException.objects.filter(user=self.user).count(), 1)
+        self.assertActif(cours, True)
+        self.assertActif(autre, True)
+        self.assert_recu(registre, 'skip_block_occurrence')
 
     def test_25_message_bruit_aucune_mutation(self):
         """« euh » : aucune mutation, aucune exception, aucune demande piegee."""

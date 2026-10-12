@@ -26,7 +26,7 @@ from django.utils import timezone
 from core.models import UploadedDocument
 from services.agent.tools.base import ToolResult
 from services.agent_v2.redaction import ReponseDire
-from services.agent_v2.registre import Registre
+from services.agent_v2.registre import Postcondition, Registre
 
 
 class PieceJointeTests(TestCase):
@@ -97,6 +97,10 @@ class AncrageTemporelTests(TestCase):
             success=True,
             data={'scheduled_block': {'date': str(date), 'end_time': heure_fin}},
             message=f"Revision calee le {date}"))
+        # Fixture du calcul temporel uniquement ; relectures ORM dans
+        # test_refonte_verite, où une donnée brute ne suffit jamais.
+        registre.verifier('a1', 1, [Postcondition('ScheduledBlock', {'id': 1},
+                                                 {'date': str(date)}, {'date': str(date)}, True)])
         return registre
 
     def _ecarts_a(self, maintenant_txt, date, heure_fin):
@@ -192,7 +196,7 @@ class ImportAuRegistreTests(TestCase):
         reponse = resultat['response']
         self.assertIn('Physique', reponse)
         self.assertIn('Anglais', reponse)
-        self.assertTrue(reponse.index('Physique') < reponse.index('Ok.'), reponse)
+        self.assertNotIn('Ok.', reponse)  # Le compte rendu du code suffit.
 
     def test_le_recap_nomme_les_cours_ecartes_par_le_processeur(self):
         """5 cours lus, 4 crees: le manquant doit etre nomme, avec sa raison."""

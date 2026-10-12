@@ -84,7 +84,7 @@ class CreateBlocksConfidenceTest(TestCase):
             'events': [],
         }
         blocks = DocumentProcessor()._create_recurring_blocks(self.doc, data)
-        self.assertEqual(len(blocks), 2)
+        self.assertEqual(len(blocks), 1)
 
         # Default manager hides the pending one.
         visible = RecurringBlock.objects.filter(user=self.user)
@@ -92,11 +92,13 @@ class CreateBlocksConfidenceTest(TestCase):
         self.assertEqual(visible.first().title, 'Mathématiques')
         self.assertEqual(visible.first().status, RecurringBlock.STATUS_ACTIVE)
 
-        # all_objects sees both; the incomplete one is pending with low confidence.
+        # Une heure absente reste une précision du document, sans créneau inventé.
         allb = RecurringBlock.all_objects.filter(user=self.user)
-        self.assertEqual(allb.count(), 2)
-        pending = allb.get(status=RecurringBlock.STATUS_PENDING)
-        self.assertLess(pending.confidence, PENDING_CONFIDENCE_THRESHOLD)
+        self.assertEqual(allb.count(), 1)
+        self.doc.refresh_from_db()
+        pending = self.doc.extracted_data['_pending_entries']
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]['missing_fields'], ['start_time', 'end_time'])
 
 
 class PendingEndpointsTest(APITestCase):

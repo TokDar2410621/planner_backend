@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from services.scheduling.exceptions import skipped_block_ids
+from services.scheduling.exceptions import skipped_block_ids  # compatibilité des lecteurs existants
+from services.scheduling.occurrences import recurring_occurrences
 from services.scheduling.overlap import (
     MINUTES_PER_DAY,
     is_overnight,
@@ -142,12 +143,13 @@ def _murs_de_nuit(blocs, profile, date) -> list[tuple[int, int]]:
 
     murs: list[tuple[int, int]] = []
     for bloc in blocs:
-        if bloc.is_flexible or not bloc.active_on(date):
+        if (bloc.is_flexible and not getattr(bloc, "occurrence_override", False)) or not bloc.active_on(date):
             continue
         if not is_overnight(bloc.start_time, bloc.end_time, bloc.is_night_shift):
             continue
         before, after = (
-            block_commute_minutes(bloc, profile) if profile is not None else (0, 0)
+            block_commute_minutes(bloc, profile)
+            if profile is not None and not bloc.is_flexible else (0, 0)
         )
         murs.append(
             (time_to_min(bloc.start_time) - before, time_to_min(bloc.end_time) + after)
@@ -170,6 +172,8 @@ def _reports_du_jour(blocs, profile, date) -> dict[int, dict]:
     for bloc in blocs:
         if not bloc.is_flexible or bloc.block_type != "sleep":
             continue
+        if getattr(bloc, "occurrence_override", False):
+            continue
         if not bloc.active_on(date):
             continue
         if not is_overnight(bloc.start_time, bloc.end_time, bloc.is_night_shift):
@@ -188,18 +192,7 @@ def _reports_du_jour(blocs, profile, date) -> dict[int, dict]:
 def _blocs_du_jour(user, date) -> list:
     """Blocs recurrents actifs du jour de semaine de ``date``, occurrences
     sautees exclues, lieu precharge pour le calcul du trajet."""
-    from core.models import RecurringBlock
-
-    return list(
-        RecurringBlock.objects.filter(
-            user=user,
-            active=True,
-            day_of_week=date.weekday(),
-        )
-        .exclude(id__in=skipped_block_ids(user, date))
-        .select_related("place")
-        .order_by("id")
-    )
+    return list(recurring_occurrences(user, date))
 
 
 def intervalles_sommeil_reporte(user, date) -> list[tuple[int, int]]:
@@ -237,47 +230,37 @@ def fixed_busy_intervals(
     spill into the current morning, and all scheduled blocks on the date count
     as walls. Flexible recurring blocks are intentionally excluded.
     """
-    from core.models import RecurringBlock, ScheduledBlock
+    from core.models import ScheduledBlock
     from services.commute import block_commute_minutes, task_commute_minutes
 
-    dow = date.weekday()
-    prev_dow = (dow - 1) % 7
     prev_date = date - timedelta(days=1)
-    skipped_today = skipped_block_ids(user, date)
-    skipped_prev = skipped_block_ids(user, prev_date)
     profile = getattr(user, "profile", None)
 
     raw: list[tuple[int, int]] = []
 
-    today_blocks = RecurringBlock.objects.filter(
-        user=user,
-        active=True,
-        day_of_week=dow,
-    ).exclude(id__in=skipped_today).select_related("place")
+    today_blocks = recurring_occurrences(user, date)
     for block in today_blocks:
-        if block.is_flexible:
+        if block.is_flexible and not getattr(block, "occurrence_override", False):
             continue
         start = time_to_min(block.start_time)
         end = time_to_min(block.end_time)
         before, after = (
-            block_commute_minutes(block, profile) if profile is not None else (0, 0)
+            block_commute_minutes(block, profile)
+            if profile is not None and not block.is_flexible else (0, 0)
         )
         if is_overnight(block.start_time, block.end_time, block.is_night_shift):
             raw.append((start - before, MINUTES_PER_DAY))
         else:
             raw.append((start - before, end + after))
 
-    previous_blocks = RecurringBlock.objects.filter(
-        user=user,
-        active=True,
-        day_of_week=prev_dow,
-    ).exclude(id__in=skipped_prev).select_related("place")
+    previous_blocks = recurring_occurrences(user, prev_date)
     for block in previous_blocks:
-        if block.is_flexible:
+        if block.is_flexible and not getattr(block, "occurrence_override", False):
             continue
         if is_overnight(block.start_time, block.end_time, block.is_night_shift):
             _, after = (
-                block_commute_minutes(block, profile) if profile is not None else (0, 0)
+                block_commute_minutes(block, profile)
+                if profile is not None and not block.is_flexible else (0, 0)
             )
             raw.append((0, time_to_min(block.end_time) + after))
 
@@ -354,8 +337,14 @@ def occupied_intervals(
     reporte = intervalles_sommeil_reporte(user, date)
     raw.extend(reporte)
 
-    for placement in _placer_jour(user, date, day_start, day_end, reporte=reporte):
+    # La fenêtre de lecture rogne les intervalles, sans replacer les activités.
+    # Sinon un sport effectif à 06:00 se déplace à 07:00 quand on demande les
+    # disponibilités 07:00-23:00, en contradiction avec le rendu de la journée.
+    for placement in _placer_jour(user, date, reporte=reporte):
         if placement["skipped"]:
+            continue
+        if placement.get("occurrence_override"):
+            # Déjà comptée, avec sa vraie date de début, parmi les murs.
             continue
 
         start = placement["start_min"]
@@ -363,7 +352,10 @@ def occupied_intervals(
         if start is None or end is None:
             continue
         if end <= start:
-            end = day_end
+            # Même convention que le placement et le solveur : un souple
+            # overnight protège aussi le morceau du matin de cette journée.
+            raw.append((0, end))
+            end = MINUTES_PER_DAY
 
         clipped = _clip_interval(start, end, day_start, day_end)
         if clipped is not None:
@@ -464,6 +456,16 @@ def _placer_jour(user, date, day_start=0, day_end=MINUTES_PER_DAY, *, reporte=No
         start = time_to_min(block.start_time)
         end = time_to_min(block.end_time)
         duration = block.effective_duration_minutes()
+        if getattr(block, "occurrence_override", False):
+            overnight_results.append({
+                **_result(block, start_min=start, end_min=end,
+                          start_time=block.start_time.strftime("%H:%M"),
+                          end_time=block.end_time.strftime("%H:%M"),
+                          preferred=True, shrunk=False, skipped=False,
+                          overnight_kept=end < start),
+                "occurrence_override": True,
+            })
+            continue
         if is_overnight(block.start_time, block.end_time, block.is_night_shift):
             duration = block.effective_duration_minutes()
             report = reports.get(block.id)

@@ -73,7 +73,7 @@ def _flexible_candidates(user, date):
 
     cands, extra_walls = [], list(intervalles_sommeil_reporte(user, date))
     for b in blocs:
-        if not b.is_flexible:
+        if not b.is_flexible or getattr(b, "occurrence_override", False):
             continue
         start = time_to_min(b.start_time)
         duration = b.effective_duration_minutes()
@@ -232,6 +232,16 @@ def solve_placement(user, date, day_start=0, day_end=MINUTES_PER_DAY, time_limit
             continue
         start = time_to_min(b.start_time)
         duration = b.effective_duration_minutes()
+        if getattr(b, "occurrence_override", False):
+            end = time_to_min(b.end_time)
+            results.append({
+                **_placement_dict(b, start, end, preferred=True, shrunk=False,
+                                  skipped=False, overnight_kept=end < start,
+                                  start_time=b.start_time.strftime("%H:%M"),
+                                  end_time=b.end_time.strftime("%H:%M")),
+                "occurrence_override": True,
+            })
+            continue
         report = reports.get(b.id)
         if report is not None:
             # Meme regle que place_day: sommeil reporte au lendemain, jamais
@@ -316,6 +326,7 @@ def _empreinte_entrees(user, debut, fin) -> str:
     from core.models import (
         RecurringBlock,
         RecurringBlockException,
+        RecurringBlockOverride,
         ScheduledBlock,
     )
 
@@ -326,7 +337,7 @@ def _empreinte_entrees(user, debut, fin) -> str:
     )
     entrees_blocs = [
         [
-            b.id, b.day_of_week, str(b.start_time), str(b.end_time),
+            b.id, b.title, b.day_of_week, str(b.start_time), str(b.end_time),
             b.flexibility, b.active, b.block_type, b.is_night_shift,
             b.duration_minutes, str(b.start_date), str(b.end_date),
             b.place_id,
@@ -349,6 +360,13 @@ def _empreinte_entrees(user, debut, fin) -> str:
         .select_related("task", "task__place")
         .order_by("id")
     )
+    overrides = list(
+        RecurringBlockOverride.objects.filter(
+            user=user, recurring_block__user=user, date__gte=debut, date__lt=fin,
+        ).order_by("recurring_block_id", "date").values_list(
+            "recurring_block_id", "date", "start_time", "end_time",
+        )
+    )
     entrees_ponctuels = [
         [
             s.id, str(s.date), str(s.start_time), str(s.end_time),
@@ -369,6 +387,7 @@ def _empreinte_entrees(user, debut, fin) -> str:
         {
             "blocs": entrees_blocs,
             "exceptions": exceptions,
+            "overrides": overrides,
             "ponctuels": entrees_ponctuels,
             "profil": entrees_profil,
         },

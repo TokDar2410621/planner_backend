@@ -14,7 +14,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from core.models import ConversationMessage
-from services.agent_v2 import PlannerAgentV2
+from services.agent_v2.conversation import AgentConversation
 from services.agent_v2.suggestions import (filtrer_suggestions,
                                            tour_a_pose_une_question)
 
@@ -43,7 +43,7 @@ class VueSuggestionsTests(_AvecClient):
         self._message("user", "ajoute mon quart jeudi")
         self._message("assistant", "À quelle heure commence ton quart ?",
                       {"question_posee": True})
-        with patch.object(PlannerAgentV2, "quick_replies_for") as generer:
+        with patch.object(AgentConversation, "quick_replies_for") as generer:
             reponse = self._suggestions()
         self.assertEqual(reponse.status_code, 200)
         self.assertEqual(reponse.json(), {"quick_replies": []})
@@ -55,7 +55,7 @@ class VueSuggestionsTests(_AvecClient):
             with self.subTest(meta=meta):
                 self._message("user", "salut")
                 self._message("assistant", "Choisis.", meta)
-                with patch.object(PlannerAgentV2, "quick_replies_for") as generer:
+                with patch.object(AgentConversation, "quick_replies_for") as generer:
                     reponse = self._suggestions()
                 self.assertEqual(reponse.json(), {"quick_replies": []})
                 generer.assert_not_called()
@@ -69,7 +69,7 @@ class VueSuggestionsTests(_AvecClient):
             {"label": "📅 Ma semaine", "value": "Montre ma semaine"},
             {"label": "Ajoute du sport", "value": "Ajoute du sport mardi"},
         ]
-        with patch.object(PlannerAgentV2, "quick_replies_for",
+        with patch.object(AgentConversation, "quick_replies_for",
                           return_value=brutes) as generer:
             reponse = self._suggestions()
         generer.assert_called_once()
@@ -81,14 +81,14 @@ class VueSuggestionsTests(_AvecClient):
     def test_une_question_deja_repondue_ne_bloque_plus(self):
         self._message("assistant", "À quelle heure ?", {"question_posee": True})
         self._message("user", "19 h")
-        with patch.object(PlannerAgentV2, "quick_replies_for",
+        with patch.object(AgentConversation, "quick_replies_for",
                           return_value=[]) as generer:
             reponse = self._suggestions()
         self.assertEqual(reponse.status_code, 200)
         generer.assert_called_once()
 
     def test_une_panne_du_modele_rend_une_liste_vide(self):
-        with patch.object(PlannerAgentV2, "quick_replies_for",
+        with patch.object(AgentConversation, "quick_replies_for",
                           side_effect=RuntimeError("boom")):
             reponse = self._suggestions()
         self.assertEqual(reponse.status_code, 200)
@@ -174,7 +174,7 @@ class ChatViewQuestionTests(_AvecClient):
     def test_chat_view_relaie_question_posee(self):
         resultat = {"response": "Quelle heure ?", "question_posee": True,
                     "question": "Quelle heure ?", "question_motif": "dire"}
-        with patch.object(PlannerAgentV2, "process_message",
+        with patch.object(AgentConversation, "process_message",
                           return_value=resultat):
             reponse = self.client_api.post("/api/chat/", {"message": "ajoute mon quart"})
         self.assertEqual(reponse.status_code, 200)
@@ -187,7 +187,7 @@ class ChatViewQuestionTests(_AvecClient):
         resultat = {"response": "", "question_posee": True, "question": "",
                     "question_motif": "formulaire",
                     "interactive_inputs": [{"type": "text", "name": "heure"}]}
-        with patch.object(PlannerAgentV2, "process_message",
+        with patch.object(AgentConversation, "process_message",
                           return_value=resultat):
             corps = self.client_api.post("/api/chat/", {"message": "x"}).json()
         self.assertEqual(corps["question"], "")
@@ -195,7 +195,10 @@ class ChatViewQuestionTests(_AvecClient):
         self.assertTrue(corps["question_posee"])
 
     def test_resultat_sans_question_n_ajoute_rien(self):
-        with patch.object(PlannerAgentV2, "process_message",
+        with patch.object(AgentConversation, "process_message",
                           return_value={"response": "ok"}):
             corps = self.client_api.post("/api/chat/", {"message": "salut"}).json()
+        from uuid import UUID
+        turn_id = corps.pop('turn_id')
+        self.assertEqual(str(UUID(turn_id)), turn_id)
         self.assertEqual(corps, {"response": "ok"})

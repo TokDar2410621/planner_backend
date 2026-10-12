@@ -1,16 +1,18 @@
-"""optimize_week — l'optimiseur de SEMAINE (A8): solveur exact jour par jour.
+"""optimize_week : solveur exact des occurrences de la semaine demandée.
 
-apply=false PROPOSE sans muter; apply=true déplace les blocs souples. Ne touche
-jamais aux fixes. Chaque bloc récurrent vit sur son jour de semaine, la passe
-hebdo le traite exactement une fois.
+apply=false propose sans écrire; apply=true fixe les occurrences souples aux
+heures proposées. Les séries et les occurrences des autres semaines restent
+intactes.
 """
 from datetime import date, time, timedelta
 
 from django.contrib.auth.models import User
 from django.test import TestCase
 
-from core.models import RecurringBlock
+from core.models import RecurringBlock, RecurringBlockOverride
 from services.agent.tools.schedule import OptimizeWeekTool
+from services.scheduling.day_view import effective_day_entries
+from services.scheduling.occurrences import recurring_occurrences
 
 
 MONDAY = date(2026, 8, 3)  # un lundi
@@ -37,6 +39,7 @@ class OptimizeWeekToolTests(TestCase):
 
         self.assertTrue(result.success)
         self.assertFalse(result.data["applied"])
+        self.assertFalse(RecurringBlockOverride.objects.exists())
         sport.refresh_from_db()
         # PROPOSE seulement: le bloc n'a pas bougé en base.
         self.assertEqual(sport.start_time, time(16, 0))
@@ -50,16 +53,32 @@ class OptimizeWeekToolTests(TestCase):
     def test_apply_moves_flexible_outside_fixed_wall(self):
         _rb(self.user, "Travail", "work", 0, time(9, 0), time(17, 0), "fixed")
         sport = _rb(self.user, "Sport", "sport", 0, time(16, 0), time(17, 0), "flexible")
+        series_before = list(RecurringBlock.objects.filter(user=self.user).values())
+        before = next(b for b in effective_day_entries(self.user, MONDAY) if b["id"] == sport.pk)
 
         result = self.tool.execute(
             self.user, start_date=MONDAY.isoformat(), apply=True)
 
         self.assertTrue(result.success)
         self.assertTrue(result.data["applied"])
-        self.assertGreaterEqual(result.data["moved_count"], 1)
-        sport.refresh_from_db()
-        # le souple est sorti du mur fixe
-        self.assertFalse(time(9, 0) <= sport.start_time < time(17, 0))
+        placed = next(p for p in result.data["days"][0]["placed"] if p["block_id"] == sport.pk)
+        override = RecurringBlockOverride.objects.get()
+        self.assertEqual((override.user_id, override.recurring_block_id, override.date),
+                         (self.user.pk, sport.pk, MONDAY))
+        observed = next(b for b in effective_day_entries(self.user, MONDAY) if b["id"] == sport.pk)
+        for key in ("start_time", "end_time"):
+            self.assertEqual(getattr(override, key).strftime("%H:%M"), placed[key])
+            self.assertEqual(observed[key], placed[key])
+        self.assertTrue(override.start_time >= time(17) or override.end_time <= time(9))
+        # Le compteur porte sur les heures affichées avant/après, y compris si
+        # le placement automatique affichait déjà le bloc hors du mur fixe.
+        changed = any(before[key] != observed[key] for key in ("start_time", "end_time"))
+        self.assertEqual(result.data["moved_count"], int(changed))
+        self.assertEqual(list(RecurringBlock.objects.filter(user=self.user).values()), series_before)
+        next_sport = next(b for b in recurring_occurrences(self.user, MONDAY + timedelta(days=7))
+                          if b.pk == sport.pk)
+        self.assertFalse(next_sport.occurrence_override)
+        self.assertEqual((next_sport.start_time, next_sport.end_time), (time(16), time(17)))
 
     def test_fixed_blocks_never_move(self):
         work = _rb(self.user, "Travail", "work", 0, time(9, 0), time(17, 0), "fixed")

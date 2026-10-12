@@ -8,6 +8,9 @@ SANS_RAISONNEMENT existe pour ce cas.
 """
 from __future__ import annotations
 
+import inspect
+import logging
+
 from django.conf import settings
 from openai import AsyncOpenAI
 from pydantic_ai.models.fallback import FallbackModel
@@ -40,6 +43,30 @@ REGLAGES_BOUCLE_SANS_RAISONNEMENT = {"extra_body": {"thinking": {"type": "disabl
 DELAI_MODELE = 60.0
 
 
+async def fermer_modele(modele):
+    """Ferme les clients de ce tour avant que sa boucle asyncio disparaisse."""
+    from pydantic_ai.models.wrapper import WrapperModel
+    if isinstance(modele, WrapperModel):
+        await fermer_modele(modele.wrapped)
+        return
+    if isinstance(modele, FallbackModel):
+        for membre in modele.models:
+            await fermer_modele(membre)
+        return
+    client = getattr(modele, 'client', None)
+    if client is None:
+        return
+    try:
+        aio = getattr(client, 'aio', None)
+        if aio is not None and hasattr(aio, 'aclose'):
+            await aio.aclose()
+        fermeture = client.close()
+        if inspect.isawaitable(fermeture):
+            await fermeture
+    except Exception as exc:
+        logging.getLogger(__name__).warning('fermeture client modèle type=%s', type(exc).__name__)
+
+
 def _deepseek():
     cle = getattr(settings, "DEEPSEEK_API_KEY", "")
     if not cle:
@@ -62,11 +89,16 @@ def _gemini():
     if not cle:
         return None
     try:
+        from google import genai
+        from google.genai import types
         from pydantic_ai.models.google import GoogleModel
         from pydantic_ai.providers.google import GoogleProvider
     except ImportError:
         return None
-    return GoogleModel("gemini-2.5-flash", provider=GoogleProvider(api_key=cle))
+    client = genai.Client(api_key=cle, http_options=types.HttpOptions(
+        timeout=int(DELAI_MODELE * 1000),
+        retry_options=types.HttpRetryOptions(attempts=1)))
+    return GoogleModel("gemini-2.5-flash", provider=GoogleProvider(client=client))
 
 
 def _claude():
@@ -74,11 +106,13 @@ def _claude():
     if not cle:
         return None
     try:
+        from anthropic import AsyncAnthropic
         from pydantic_ai.models.anthropic import AnthropicModel
         from pydantic_ai.providers.anthropic import AnthropicProvider
     except ImportError:
         return None
-    return AnthropicModel("claude-sonnet-4-5", provider=AnthropicProvider(api_key=cle))
+    return AnthropicModel("claude-sonnet-4-5", provider=AnthropicProvider(
+        anthropic_client=AsyncAnthropic(api_key=cle, timeout=DELAI_MODELE, max_retries=0)))
 
 
 def _chaine():
@@ -92,7 +126,8 @@ def _chaine():
 
 
 def modele_agir():
-    return _chaine()
+    from services.agent_v2.budget_tour import modele_borne
+    return modele_borne(_chaine())
 
 
 def noms_de(modele) -> list[str]:

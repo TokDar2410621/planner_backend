@@ -24,7 +24,7 @@ from rest_framework.test import APIClient
 from core.lecture_flux import corps_du_flux
 from core.models import ConversationMessage
 from core.views import STATUT_ATTENTE, TRAME_ERREUR, lancer_flux
-from services.agent_v2 import PlannerAgentV2
+from services.agent_v2.conversation import AgentConversation
 
 
 def _trame(evenement):
@@ -217,14 +217,16 @@ class FluxTourAbandonneTests(TransactionTestCase):
         depart = time.monotonic()
         corps = []
         for n in (1, 2):
-            with patch.object(PlannerAgentV2, "process_message_stream",
+            with patch.object(AgentConversation, "process_message_stream",
                               side_effect=lambda u, m, a, n=n: generateur(n)):
                 reponse = client.post("/api/chat/stream/", {"message": f"tour {n}"})
                 corps.append(corps_du_flux(reponse))
         self.assertLess(time.monotonic() - depart, 10)
 
         for n, texte in zip((1, 2), corps):
-            self.assertEqual(texte, "".join([
+            frames = [json.loads(line[6:]) for line in texte.split("\n\n") if line.startswith("data: ")]
+            self.assertEqual(len({frame.pop("turn_id") for frame in frames}), 1)
+            self.assertEqual("".join(_trame(frame) for frame in frames), "".join([
                 _trame({"type": "status", "text": "Réflexion..."}),
                 _trame({"type": "thinking", "text": f"pensée {n}"}),
                 _trame({"type": "done", "response": f"réponse {n}"}),
@@ -373,7 +375,7 @@ class FluxTourAbandonneTests(TransactionTestCase):
             sauve.set()
             yield {"type": "done", "response": "ok"}
 
-        with patch.object(PlannerAgentV2, "process_message_stream",
+        with patch.object(AgentConversation, "process_message_stream",
                           side_effect=lambda u, m, a: generateur()):
             reponse = client.post("/api/chat/stream/", {"message": "salut"})
             self.assertEqual(reponse["Content-Type"], "text/event-stream")
