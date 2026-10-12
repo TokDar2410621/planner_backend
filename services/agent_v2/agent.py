@@ -877,7 +877,9 @@ class PlannerAgentV2:
             # tour de reprise, le code parle seul (PROSE_REPRISE plus bas).
             brut = (reponse_boucle.model_copy(update={"ouverture": "", "suite": ""})
                     if reemises else reponse_boucle)
-            brut, supprimees, fuites = verifier_prose(brut, registre, autoriser_conversation=voie_rapide)
+            brut, supprimees, fuites = verifier_prose(
+                brut, registre, autoriser_conversation=voie_rapide,
+                sans_faits=not faits)
             compo = composer(brut, registre, faits, gagnant)
         else:
             # La boucle n'a rien rendu (panne, budget d'etapes): les faits

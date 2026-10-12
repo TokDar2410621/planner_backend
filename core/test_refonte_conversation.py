@@ -207,3 +207,73 @@ class ContratConversationTests(TransactionTestCase):
         planning.assert_called_once()
         self.assertEqual(agent._decision_tour.mode, 'planning')
         self.assertFalse(agent._decision_tour.autoriser_modifications)
+
+
+class ReponseAUneQuestionDuCodeTests(TransactionTestCase):
+    """Le routeur ne doit jamais avaler la reponse a une question du code.
+
+    Le code retient une action destructive et pose sa question. Le message
+    suivant est peut-etre le « oui ». Si le routeur y repond lui-meme, l'action
+    retenue meurt en silence et personne ne sait que la suppression demandee
+    n'a pas eu lieu. Symetrique du filet du document joint juste au-dessus.
+    """
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(username='reponse-garde')
+
+    def _question_posee(self, minutes=0):
+        from datetime import timedelta
+        from django.utils import timezone
+        precedent = ConversationMessage.objects.create(
+            user=self.user, role='user', content='supprime mon cours de chimie')
+        emise = timezone.now() - timedelta(minutes=minutes)
+        ConversationMessage.objects.create(
+            user=self.user, role='assistant',
+            content='Je supprime toutes les occurrences ou juste celle-la ?',
+            metadata={'en_reponse_a': precedent.pk, 'question_posee': True,
+                      'demandes': [{'cle': 'portee:1', 'motif': 'portee_jour',
+                                    'emise_le': emise.isoformat(),
+                                    'options': [{'id': 'serie', 'libelle': 'Toutes'},
+                                                {'id': 'jour', 'libelle': 'Juste celle-la'}]}]})
+
+    def _tour(self, message, payload):
+        with patch('services.agent_v2.conversation.modele_agir',
+                   return_value=modele_decision(payload, [])), \
+             patch('services.agent_v2.agent.PlannerAgentV2.process_message_stream',
+                   return_value=iter([{'type': 'done', 'response': 'Traite'}])) as planning:
+            agent = AgentConversation()
+            agent.process_message(self.user, message)
+        return agent, planning
+
+    def test_un_oui_rejoint_la_garde_meme_classe_en_conversation(self):
+        self._question_posee()
+        agent, planning = self._tour('oui', {'mode': 'conversation', 'reponse': 'D accord !'})
+        planning.assert_called_once()
+        self.assertEqual(agent._decision_tour.mode, 'planning')
+        # La garde en aval doit pouvoir executer l'action retenue.
+        self.assertTrue(agent._decision_tour.autoriser_modifications)
+
+    def test_sans_question_en_attente_la_conversation_reste_au_routeur(self):
+        agent, planning = self._tour('merci !', {'mode': 'conversation', 'reponse': 'Avec plaisir !'})
+        planning.assert_not_called()
+        self.assertEqual(agent._decision_tour.mode, 'conversation')
+
+    def test_une_question_perimee_ne_rouvre_pas_la_boucle(self):
+        self._question_posee(minutes=45)
+        agent, planning = self._tour('oui', {'mode': 'conversation', 'reponse': 'D accord !'})
+        planning.assert_not_called()
+        self.assertEqual(agent._decision_tour.mode, 'conversation')
+
+    def test_une_question_d_un_autre_echange_ne_compte_pas(self):
+        """La demande doit repondre au message precedent, pas flotter."""
+        from django.utils import timezone
+        ConversationMessage.objects.create(user=self.user, role='user', content='autre chose')
+        ConversationMessage.objects.create(
+            user=self.user, role='assistant', content='Je supprime quoi ?',
+            metadata={'en_reponse_a': 999999,
+                      'demandes': [{'cle': 'portee:1', 'motif': 'portee_jour',
+                                    'emise_le': timezone.now().isoformat(),
+                                    'options': [{'id': 'serie', 'libelle': 'Toutes'}]}]})
+        agent, planning = self._tour('oui', {'mode': 'conversation', 'reponse': 'D accord !'})
+        planning.assert_not_called()
+        self.assertEqual(agent._decision_tour.mode, 'conversation')

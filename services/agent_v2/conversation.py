@@ -224,6 +224,16 @@ class AgentConversation(PlannerAgentV2):
             decision = decision.model_copy(update={
                 'mode': 'planning', 'objectif': 'Présenter le résultat du document joint',
                 'consultation': 'aucune', 'autoriser_modifications': False})
+        elif decision.mode != 'planning' and self._question_du_code_en_attente(user):
+            # Filet symetrique du precedent. Le code a retenu une action et
+            # pose sa question ; ce message est peut-etre la reponse. Le routeur
+            # qui repond lui-meme jetterait la confirmation, et l'action
+            # retenue mourrait sans que personne ne le sache. La garde en aval
+            # reste seule juge de ce que la reponse vaut : ici on lui laisse
+            # seulement le passage.
+            decision = decision.model_copy(update={
+                'mode': 'planning', 'objectif': 'Lire la réponse à la question posée',
+                'consultation': 'aucune', 'autoriser_modifications': True})
         self._decision_tour = decision
         lecture_directe = decision.affichage_direct and attachment is None
         if decision.mode == 'planning' and not lecture_directe:
@@ -299,6 +309,32 @@ class AgentConversation(PlannerAgentV2):
         except Exception as exc:
             logger.warning('consultation directe indisponible type=%s', type(exc).__name__)
         return '', registre
+
+    @staticmethod
+    def _question_du_code_en_attente(user) -> bool:
+        """Une question posee par le code attend-elle sa reponse ?
+
+        Meme forme que _tap_valide, sans la puce : le dernier message de
+        l'assistant porte une demande, il repondait bien au message precedent,
+        et la fenetre n'est pas perimee. Le message courant n'est pas encore
+        sauve a cet instant, d'ou la lecture sur deux lignes et non trois.
+        """
+        from datetime import timedelta
+        from services.agent_v2.demandes import FENETRE_ATTENTE, _moment
+        lignes = list(ConversationMessage.objects.filter(user=user).order_by('-pk')[:2])
+        if len(lignes) != 2 or lignes[0].role != 'assistant' or lignes[1].role != 'user':
+            return False
+        meta = lignes[0].metadata or {}
+        if meta.get('en_reponse_a') != lignes[1].pk:
+            return False
+        maintenant = timezone.now()
+        for demande in meta.get('demandes') or []:
+            if not isinstance(demande, dict) or not demande.get('cle'):
+                continue
+            emise = _moment(demande.get('emise_le'))
+            if emise and maintenant - FENETRE_ATTENTE < emise <= maintenant + timedelta(minutes=1):
+                return True
+        return False
 
     @staticmethod
     def _tap_valide(user, tap):

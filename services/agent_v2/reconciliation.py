@@ -306,13 +306,26 @@ def _postconditions(user, action):
         if identifiant is None:
             return [], False
         doc = UploadedDocument.objects.filter(user=user, pk=identifiant, processed=True).first()
-        preuves = [_preuve("UploadedDocument", {"id": identifiant, "user_id": user.pk}, d,
+        # Ce qui a ete ANNONCE, jamais l'immobilite du document. Comparer tout
+        # le resume (blocs, dates, ignores, precisions) exigeait qu'il soit
+        # fige: confirmer une precision ou renommer un cours tuait le recu de
+        # l'import, et l'agent niait ensuite ce qu'il venait de faire. Le
+        # document prouve son identite, chaque bloc et chaque date nommes
+        # prouvent leur presence.
+        annonce = {k: d[k] for k in ("document_id", "fichier") if k in d}
+        annonce.setdefault("document_id", identifiant)
+        preuves = [_preuve("UploadedDocument", {"id": identifiant, "user_id": user.pk}, annonce,
                            resume_import(doc) if doc is not None else None)]
         for bloc in d.get("blocs") or []:
             actif = RecurringBlock.objects.filter(user=user, source_document_id=identifiant,
                                                    pk=bloc.get("id"), active=True).exists()
             preuves.append(_preuve("RecurringBlock", {"id": bloc.get("id"), "user_id": user.pk},
                                    {"active": True}, {"active": actif}))
+        for jour_dit in d.get("dates") or []:
+            pose = ScheduledBlock.objects.filter(user=user, source_document_id=identifiant,
+                                                 pk=jour_dit.get("id")).exists()
+            preuves.append(_preuve("ScheduledBlock", {"id": jour_dit.get("id"), "user_id": user.pk},
+                                   {"existe": True}, {"existe": pose}))
         return preuves, False
     return [], sans_mutation
 

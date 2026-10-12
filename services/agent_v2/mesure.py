@@ -591,19 +591,33 @@ def _refs_verifiees(reponse, registre) -> set[str]:
     return {ref for ref in getattr(reponse, "refs", None) or [] if ref in confirmees}
 
 
-def verifier_prose(reponse: ReponseDire, registre, *, autoriser_conversation=False) -> tuple[ReponseDire, int, list[str]]:
+def verifier_prose(reponse: ReponseDire, registre, *, autoriser_conversation=False,
+                   sans_faits=False) -> tuple[ReponseDire, int, list[str]]:
     """Le code raconte les actions ; une référence ne certifie aucune prose.
 
     Sur un tour outillé, ouverture et suite sont retirées indépendamment de
     leur vocabulaire. Une paraphrase n'est pas une postcondition. Le routeur
     sémantique rend la conversation hors de cette voie ; l'option explicite
     reste disponible aux appelants sans registre d'actions.
+
+    sans_faits dit que le code n'a rien rendu a l'ecran sur ce tour. Dans ce
+    cas, et seulement si aucune mutation n'a abouti, la prose du modele passe
+    la garde large et ne subit que la garde phrase par phrase.
     """
     champs = {}
     supprimees = 0
     fuites = []
     conversation = bool(autoriser_conversation and registre is not None and registre.vide())
-    if not conversation:
+    # Le code n'a rien rendu et aucune mutation n'a abouti: la prose du modele
+    # est alors tout ce qui reste, et l'effacer en bloc repondait « Je n'ai pas
+    # compris » a quelqu'un qui venait de parler. La garde PRECISE plus bas
+    # (epurer_reponse) coupe de toute facon chaque phrase qui affirme une
+    # action: on retire la garde large, jamais la fine. Une mutation reussie
+    # garde la garde entiere, car le code doit raconter ce qu'il a fait.
+    mutation = bool(registre is not None
+                    and any(a.succes and a.est_mutation for a in registre.actions))
+    prose_seule = bool(sans_faits and not mutation)
+    if not conversation and not prose_seule:
         for champ in ("ouverture", "suite"):
             texte = getattr(reponse, champ, "") or ""
             if texte.strip():

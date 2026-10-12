@@ -181,6 +181,42 @@ class PreuvesMutationTests(TestCase):
         propre, _, _ = verifier_prose(ReponseDire(ouverture="Bonjour !"), self.registre, autoriser_conversation=True)
         self.assertEqual(propre.ouverture, "Bonjour !")
 
+    def test_sans_faits_rendus_la_prose_innocente_vit(self):
+        """Le code n'a rien rendu: l'effacer repondrait « je n'ai pas compris »."""
+        self.registre.ajouter("list_tasks", {}, ToolResult(success=True))
+        propre, supprimees, _ = verifier_prose(
+            ReponseDire(ouverture="Ok."), self.registre, sans_faits=True)
+        self.assertEqual(propre.ouverture, "Ok.")
+        self.assertEqual(supprimees, 0)
+
+    def test_sans_faits_rendus_une_action_affirmee_tombe_quand_meme(self):
+        """La garde large part, la garde phrase par phrase reste.
+
+        C'est ici que le correctif pourrait avoir ouvert une porte: le modele
+        s'attribue une suppression sur un tour ou le code n'a rien rendu.
+        """
+        action = self.registre.ajouter("list_tasks", {}, ToolResult(success=True))
+        for texte in ("J'ai supprimé tous tes cours.",
+                      "C'est fait, ton gym est déplacé à 20 h.",
+                      "Parfait ! J'ai supprimé tous tes cours."):
+            with self.subTest(texte=texte):
+                propre, supprimees, fuites = verifier_prose(
+                    ReponseDire(ouverture=texte, refs=[action.id]),
+                    self.registre, sans_faits=True)
+                self.assertNotIn("supprimé", propre.ouverture)
+                self.assertNotIn("déplacé", propre.ouverture)
+                self.assertGreaterEqual(supprimees, 1)
+                self.assertTrue(fuites)
+
+    def test_une_mutation_reussie_garde_la_garde_entiere(self):
+        """Le code doit raconter ce qu'il a fait, jamais le modele."""
+        self.agir("create_task", title="Sport")
+        reconcilier(self.user, self.registre)
+        propre, supprimees, _ = verifier_prose(
+            ReponseDire(ouverture="Voilà !"), self.registre, sans_faits=True)
+        self.assertEqual(propre.ouverture, "")
+        self.assertEqual(supprimees, 1)
+
     def test_import_relecture_document_exact_et_bloc_archive_refuse(self):
         from core.models import UploadedDocument
         from services.agent_v2.importation import inscrire_import

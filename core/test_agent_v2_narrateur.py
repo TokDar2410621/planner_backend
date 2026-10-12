@@ -456,8 +456,9 @@ class MessageBrutTests(NarrateurBase):
 
         with patch.object(module_agent, "_charger_appliquer_choix", return_value=casse):
             _, done = self.tour()
-        self.assertEqual(done["response"], module_agent.REPLI_QUESTION)
-        self.assertTrue(done["question_posee"])
+        # Le code n'a rien rendu: la prose du modele est tout ce qui reste, et
+        # « Je n'ai pas compris » serait faux apres un message compris.
+        self.assertEqual(done["response"], "Ok.")
 
 
 # ── 2a: la boucle voit le contexte, ne cite pas l'import ──────────────────
@@ -613,7 +614,8 @@ class PrioriteTests(NarrateurBase):
                                                  options=["a", "b"]))
             self.assertEqual(done["question_motif"], "fin_recurrence")
             self.assertEqual(len(done["quick_replies"]), 2)
-            self.assertEqual(done["response"], "Jusqu'à quand veux-tu le garder ?")
+            self.assertEqual(done["response"],
+                             "Reçu.\n\nJusqu'à quand veux-tu le garder ?")
         with self.subTest("apres un chevauchement"):
             _, done = self.tour(actions=[("create_block", {}, ToolResult(
                 success=True, message="ok",
@@ -665,10 +667,15 @@ class NarrateurUniqueTests(NarrateurBase):
         self.assertEqual(evts[-1]["type"], "done")
         self.assertEqual([e["type"] for e in evts].count("done"), 1)
 
-    def test_sans_faits_la_question_ouvre_sans_saut_de_ligne(self):
+    def test_sans_faits_la_prose_ouvre_sans_saut_de_ligne(self):
+        evts, done = self.tour(dire=ReponseDire(ouverture="Salut !"))
+        self.assertEqual(self.deltas(evts), ["Salut !"])
+        self.assertEqual(done["response"], "Salut !")
+
+    def test_sans_faits_la_prose_precede_la_question_du_modele(self):
         evts, done = self.tour(dire=ReponseDire(ouverture="Salut !", question="Quel jour ?"))
-        self.assertEqual(self.deltas(evts), ["Quel jour ?"])
-        self.assertEqual(done["response"], "Quel jour ?")
+        self.assertEqual(self.deltas(evts), ["Salut !", "\n\nQuel jour ?"])
+        self.assertEqual(done["response"], "Salut !\n\nQuel jour ?")
 
     def test_un_succes_sans_objet_relu_ne_devient_pas_un_fait(self):
         _, done = self.tour(actions=[ok("create_block", created=[{"title": "Maths"}])])

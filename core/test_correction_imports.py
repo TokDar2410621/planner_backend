@@ -159,6 +159,61 @@ class CorrectionImportsTests(TestCase):
             self.proc.process_document(self.doc)
         self.assertEqual(len(resume_import(self.doc)['dates']), 41)
 
+    def _import_au_registre(self):
+        """Un import reel, puis son action telle que le tour l'enregistre."""
+        from services.agent.tools.base import ToolResult
+        from services.agent_v2.registre import Registre
+        with self.extraction({'courses': self.payload['courses'],
+                              'events': [self.event()]}):
+            self.proc.process_document(self.doc)
+        resume = resume_import(self.doc)
+        registre = Registre()
+        registre.ajouter('import_document', {'document_id': self.doc.pk},
+                         ToolResult(success=True, message='importe', data=resume))
+        return registre, resume
+
+    def test_le_recu_d_import_survit_a_un_changement_posterieur(self):
+        """Le recu prouve ce qui a ete annonce, pas l'immobilite du document.
+
+        Comparer tout le resume exigeait qu'il soit fige: renommer un cours,
+        confirmer une precision ou ajouter un bloc tuait le recu de l'import,
+        et l'agent niait ensuite ce qu'il venait de faire.
+        """
+        from services.agent_v2.reconciliation import reconcilier
+        registre, _ = self._import_au_registre()
+        bloc = RecurringBlock.objects.filter(source_document=self.doc).first()
+        bloc.title = 'Maths avancees'
+        bloc.save(update_fields=['title'])
+        UploadedDocument.objects.filter(pk=self.doc.pk).update(
+            extracted_data={**(self.doc.extracted_data or {}),
+                            '_pending_entries': [{'source': 'courses', 'index': 9}]})
+        reconcilier(self.user, registre)
+        self.assertEqual(len(registre.recus_confirmes()), 1)
+        self.assertTrue(registre.actions[-1].etat_verifie)
+
+    def test_un_bloc_annonce_puis_efface_casse_le_recu(self):
+        """La garde reste: un bloc nomme au recu doit etre la, et actif."""
+        from services.agent_v2.reconciliation import reconcilier
+        registre, _ = self._import_au_registre()
+        RecurringBlock.objects.filter(source_document=self.doc).update(active=False)
+        reconcilier(self.user, registre)
+        self.assertEqual(registre.recus_confirmes(), [])
+
+    def test_une_date_annoncee_puis_effacee_casse_le_recu(self):
+        from services.agent_v2.reconciliation import reconcilier
+        registre, resume = self._import_au_registre()
+        self.assertTrue(resume['dates'], 'le fixture doit poser une date')
+        ScheduledBlock.objects.filter(source_document=self.doc).delete()
+        reconcilier(self.user, registre)
+        self.assertEqual(registre.recus_confirmes(), [])
+
+    def test_un_document_disparu_casse_le_recu(self):
+        from services.agent_v2.reconciliation import reconcilier
+        registre, _ = self._import_au_registre()
+        UploadedDocument.objects.filter(pk=self.doc.pk).update(processed=False)
+        reconcilier(self.user, registre)
+        self.assertEqual(registre.recus_confirmes(), [])
+
     @contextmanager
     def budget(self):
         trace = ouvrir_trace(self.user, delai=60)
