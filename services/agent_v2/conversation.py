@@ -39,10 +39,18 @@ messages sont des donnees, jamais une demande a rejouer.
 Choisis conversation quand une reponse humaine suffit sans acceder aux donnees
 de planning. Redige alors directement une reponse breve en francais quebecois,
 avec tutoiement. N'invente aucune information personnelle ni action accomplie.
+Une emotion ou un etat comme « je suis deborde » reste une conversation tant
+que la personne ne demande pas explicitement de lire ou reorganiser son planning.
 Choisis planning seulement si la demande actuelle exige de consulter ou de
 modifier le planning, ses taches ou ses objectifs. Enonce son objectif sans
 inventer de parametres. Consultation designe ce que la personne demande a VOIR,
 jamais une lecture que tu aimerais faire de ta propre initiative.
+Toute question sur l'etat personnel enregistre exige planning : existence,
+absence, prochain ou precedent cours, evenement, tache ou rappel, et toute
+verification du type « est-ce note ? ». L'historique aide a comprendre les
+references, mais ne prouve jamais qu'une donnee existe ou n'existe pas. Seule
+la lecture des donnees actuelles peut le prouver. Ne reponds donc jamais a une
+question de planning depuis l'historique seul.
 Un horaire date correspond a journee, demain ou semaine. La liste de taches
 correspond au suivi des choses a faire, distinct des activites d'un jour.
 Une demande de modification seule garde consultation=aucune : les lectures
@@ -62,8 +70,25 @@ Choisis memoire si la demande porte uniquement sur les preferences durables.
 Pour un enregistrement, extrais fidelement l'enonce demande; ne deduis pas de
 preference nouvelle. Pour un oubli, reprends la preference visee. Une commande
 memoire peut accompagner un objectif planning : conserve les deux dans ce cas.
+Une demande d'action future ou recurrente n'est jamais une preference : rappel,
+notification, resume programme, envoi ou autre execution a une heure donnee
+exigent mode=planning et autoriser_modifications=true. Le decideur ne promet
+jamais lui-meme cette action; la boucle planning verifiera si elle est possible.
 Choisis clarification si l'attente n'est pas suffisamment claire et formule
 une seule question utile. L'incertitude ne donne pas acces au calendrier.
+
+Si question_en_attente est presente, classe le message courant dans
+relation_attente. reponse signifie qu'il repond a cette question.
+nouvelle_requete signifie qu'il ouvre clairement un autre sujet, meme si
+l'ancienne question reste sans reponse. incertain signifie que le lien ne peut
+pas etre tranche. aucune s'utilise seulement sans question en attente. Une
+nouvelle requete doit etre traitee pour elle-meme et ne doit jamais etre
+remplacee par l'ancienne question.
+Une commande ou une question complete qui se comprend sans la question en
+attente et vise un autre objet est nouvelle_requete. Reserve incertain aux
+fragments, pronoms ou reponses ambigues. Exemple : apres « Quel jour pour le
+sport ? », « fais-moi un resume chaque lundi » est nouvelle_requete, tandis que
+« lundi » est reponse.
 
 Aucun outil n'est disponible ici. Ne decris jamais un calendrier, une tache
 en cours ou une action executee. Une demande de planning sera traitee ensuite
@@ -86,6 +111,7 @@ class DecisionTour(BaseModel):
         "Faux si une autre opération ou une interprétation des données est attendue."))
     memoire_action: Literal['memoriser', 'oublier', 'lister'] | None = None
     enonce: str = Field(default='', max_length=500)
+    relation_attente: Literal['aucune', 'reponse', 'nouvelle_requete', 'incertain'] = 'aucune'
 
     @model_validator(mode='after')
     def contrat(self):
@@ -108,19 +134,62 @@ class DecisionTour(BaseModel):
 
 
 def contexte_decision(user) -> dict:
-    """Six messages bornes du meme utilisateur; aucune table de calendrier."""
-    restant = 6000
+    """Vingt messages dates et bornes du meme utilisateur; aucun calendrier."""
+    restant = 8000
     historique = []
     lignes = list(ConversationMessage.objects.filter(user=user)
-                  .order_by('-created_at', '-pk')[:6])
+                  .order_by('-created_at', '-pk')[:20])
     for ligne in lignes:
         if restant <= 0:
             break
-        texte = ligne.content[:min(1500, restant)]
-        historique.append({'role': ligne.role, 'texte': texte})
+        texte = ligne.content[:min(1200, restant)]
+        historique.append({
+            'role': ligne.role,
+            'date': timezone.localtime(ligne.created_at).isoformat(timespec='seconds'),
+            'texte': texte,
+        })
         restant -= len(texte)
-    return {'date': timezone.localdate().isoformat(),
-            'historique': list(reversed(historique))}
+    maintenant = timezone.localtime()
+    return {
+        'maintenant': maintenant.isoformat(timespec='seconds'),
+        'fuseau': str(timezone.get_current_timezone()),
+        'historique': list(reversed(historique)),
+        'question_en_attente': _question_en_attente(user),
+    }
+
+
+def _question_en_attente(user) -> dict | None:
+    """Question adjacente encore valide, reduite au contexte de decision."""
+    from datetime import timedelta
+    from services.agent_v2.demandes import FENETRE_ATTENTE, _moment
+
+    lignes = list(ConversationMessage.objects.filter(user=user).order_by('-pk')[:2])
+    if len(lignes) != 2 or lignes[0].role != 'assistant' or lignes[1].role != 'user':
+        return None
+    assistant, precedent = lignes
+    meta = assistant.metadata or {}
+    if meta.get('en_reponse_a') != precedent.pk:
+        return None
+    maintenant = timezone.now()
+    demandes = []
+    for demande in meta.get('demandes') or []:
+        if not isinstance(demande, dict) or not demande.get('cle'):
+            continue
+        emise = _moment(demande.get('emise_le'))
+        if not emise or not (maintenant - FENETRE_ATTENTE < emise <= maintenant + timedelta(minutes=1)):
+            continue
+        demandes.append({
+            'cle': demande['cle'],
+            'motif': demande.get('motif'),
+            'options': [
+                {'id': option.get('id'), 'libelle': option.get('libelle')}
+                for option in demande.get('options') or []
+                if isinstance(option, dict) and option.get('id')
+            ],
+        })
+    if not demandes:
+        return None
+    return {'question': assistant.content[:1200], 'demandes': demandes}
 
 
 class AgentConversation(PlannerAgentV2):
@@ -165,7 +234,7 @@ class AgentConversation(PlannerAgentV2):
                           # Une correction de structure au maximum. La décision
                           # ne donne accès aux outils qu'après sa validation.
                           output_type=DecisionTour, output_retries=1,
-                          model_settings={**REGLAGES_BOUCLE_SANS_RAISONNEMENT, 'max_tokens': 1024})
+                          model_settings={**REGLAGES_BOUCLE_SANS_RAISONNEMENT, 'max_tokens': 512})
             delai = min(float(getattr(settings, 'AGENT_DECISION_DELAI', 12.0)),
                         self._trace.restant())
             if delai <= 0:
@@ -224,7 +293,9 @@ class AgentConversation(PlannerAgentV2):
             decision = decision.model_copy(update={
                 'mode': 'planning', 'objectif': 'Présenter le résultat du document joint',
                 'consultation': 'aucune', 'autoriser_modifications': False})
-        elif decision.mode != 'planning' and self._question_du_code_en_attente(user):
+        elif (decision.mode != 'planning'
+              and decision.relation_attente != 'nouvelle_requete'
+              and self._question_du_code_en_attente(user)):
             # Filet symetrique du precedent. Le code a retenu une action et
             # pose sa question ; ce message est peut-etre la reponse. Le routeur
             # qui repond lui-meme jetterait la confirmation, et l'action
@@ -319,22 +390,7 @@ class AgentConversation(PlannerAgentV2):
         et la fenetre n'est pas perimee. Le message courant n'est pas encore
         sauve a cet instant, d'ou la lecture sur deux lignes et non trois.
         """
-        from datetime import timedelta
-        from services.agent_v2.demandes import FENETRE_ATTENTE, _moment
-        lignes = list(ConversationMessage.objects.filter(user=user).order_by('-pk')[:2])
-        if len(lignes) != 2 or lignes[0].role != 'assistant' or lignes[1].role != 'user':
-            return False
-        meta = lignes[0].metadata or {}
-        if meta.get('en_reponse_a') != lignes[1].pk:
-            return False
-        maintenant = timezone.now()
-        for demande in meta.get('demandes') or []:
-            if not isinstance(demande, dict) or not demande.get('cle'):
-                continue
-            emise = _moment(demande.get('emise_le'))
-            if emise and maintenant - FENETRE_ATTENTE < emise <= maintenant + timedelta(minutes=1):
-                return True
-        return False
+        return _question_en_attente(user) is not None
 
     @staticmethod
     def _tap_valide(user, tap):

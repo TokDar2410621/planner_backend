@@ -10,7 +10,11 @@ from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.usage import RequestUsage
 
 from core.models import BudgetJetonsJournalier, ConversationMessage, PreferenceUtilisateur
-from services.agent_v2.conversation import AgentConversation, DecisionTour
+from services.agent_v2.conversation import (
+    AgentConversation,
+    DecisionTour,
+    contexte_decision,
+)
 
 
 def modele_decision(payload, appels):
@@ -114,6 +118,20 @@ class ContratConversationTests(TransactionTestCase):
         texte = str(appels[0][0])
         self.assertNotIn('SECRET-AUTRE', texte)
         self.assertLess(len(texte), 18000)
+
+    def test_historique_decision_garde_vingt_messages_dates_et_heure_courante(self):
+        for i in range(24):
+            ConversationMessage.objects.create(
+                user=self.user, role='user', content=f'message-{i}')
+
+        contexte = contexte_decision(self.user)
+
+        self.assertEqual(len(contexte['historique']), 20)
+        self.assertEqual(contexte['historique'][0]['texte'], 'message-4')
+        self.assertEqual(contexte['historique'][-1]['texte'], 'message-23')
+        self.assertTrue(all(ligne.get('date') for ligne in contexte['historique']))
+        self.assertIn('T', contexte['maintenant'])
+        self.assertTrue(contexte['fuseau'])
 
     def test_pas_de_suggestions_payantes_pour_une_conversation(self):
         self.executer('Bonjour', {'mode': 'conversation', 'reponse': 'Salut !'})
@@ -252,6 +270,50 @@ class ReponseAUneQuestionDuCodeTests(TransactionTestCase):
         self.assertEqual(agent._decision_tour.mode, 'planning')
         # La garde en aval doit pouvoir executer l'action retenue.
         self.assertTrue(agent._decision_tour.autoriser_modifications)
+
+    def test_une_nouvelle_requete_n_est_pas_avalee_par_la_question_precedente(self):
+        self._question_posee()
+        agent, planning = self._tour('Fais-moi un résumé récurrent chaque lundi', {
+            'mode': 'planning',
+            'objectif': 'Créer un résumé récurrent chaque lundi',
+            'autoriser_modifications': True,
+            'relation_attente': 'nouvelle_requete',
+        })
+        planning.assert_called_once()
+        self.assertEqual(agent._decision_tour.relation_attente, 'nouvelle_requete')
+
+    def test_nouvelle_requete_de_planning_ignore_le_garde_precedent(self):
+        from unittest.mock import Mock
+        from services.agent_v2.redaction import ReponseDire
+
+        self._question_posee()
+        appliquer = Mock(return_value=[])
+
+        def boucle(_agent, _user, _message, _registre):
+            return ReponseDire(ouverture='Résumé récurrent préparé.')
+
+        with patch('services.agent_v2.conversation.modele_agir', return_value=modele_decision({
+                'mode': 'planning',
+                'objectif': 'Créer un résumé récurrent chaque lundi',
+                'autoriser_modifications': True,
+                'relation_attente': 'nouvelle_requete',
+             }, [])), \
+             patch('services.agent_v2.agent._charger_appliquer_choix', return_value=appliquer), \
+             patch('services.agent_v2.agent.PlannerAgentV2._boucle', boucle):
+            AgentConversation().process_message(
+                self.user, 'Fais-moi un résumé récurrent chaque lundi')
+
+        appliquer.assert_not_called()
+
+    def test_nouvelle_conversation_n_est_pas_forcee_dans_la_boucle_en_attente(self):
+        self._question_posee()
+        agent, planning = self._tour('En fait, comment vas-tu ?', {
+            'mode': 'conversation',
+            'reponse': 'Bien, merci !',
+            'relation_attente': 'nouvelle_requete',
+        })
+        planning.assert_not_called()
+        self.assertEqual(agent._decision_tour.mode, 'conversation')
 
     def test_sans_question_en_attente_la_conversation_reste_au_routeur(self):
         agent, planning = self._tour('merci !', {'mode': 'conversation', 'reponse': 'Avec plaisir !'})

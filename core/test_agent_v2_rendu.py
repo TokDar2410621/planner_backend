@@ -369,6 +369,15 @@ class AutresMutationsTests(SimpleTestCase):
                               "Heure invalide (attendu HH:MM)."))
         self.assertEqual(faits(cree_rate), "Je n'ai pas pu planifier Gym, rien n'a changé.")
 
+    def test_deux_outils_rates_sur_le_meme_titre_ne_redoublent_pas_l_echec(self):
+        r = registre(
+            ("create_block", {"title": "Sport"}, False, {}, "jour manquant"),
+            ("schedule_task_at", {"title": "Sport"}, False, {}, "date manquante"),
+        )
+        sortie = faits(r)
+        self.assertEqual(sortie.count("Sport"), 1)
+        self.assertEqual(sortie.count("rien n'a changé"), 1)
+
     def test_ancienne_garde_sans_demande(self):
         r = registre(("delete_block", {"block_id": 4}, False, {"needs_confirmation": True},
                       "Action destructrice: il faut une confirmation explicite. Demande-la, n'invente pas."))

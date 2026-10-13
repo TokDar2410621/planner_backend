@@ -696,10 +696,14 @@ class NarrateurUniqueTests(NarrateurBase):
 
     def test_repli_accentue(self):
         with self.subTest("avec faits"):
+            # La boucle est tombee apres une creation reelle: les faits rendus
+            # par le code disent ce qui a change, et rien ne vient les redire.
+            # « Voici ce qui a change » a ete retire: une phrase qui annonce
+            # les faits juste en dessous des faits n'apprend rien.
             evts, done = self.tour(actions=[self.creation_reelle()],
                                    dire_effet=RuntimeError("502"))
-            self.assertTrue(done["response"].endswith(
-                "Voici ce qui a changé. Dis-moi si tu veux autre chose."))
+            self.assertTrue(done["response"].startswith("FAITS"))
+            self.assertNotIn("Dis-moi si tu veux autre chose", done["response"])
             self.assertEqual("".join(self.deltas(evts)), done["response"])
         with self.subTest("sans faits"):
             evts, done = self.tour(dire_effet=RuntimeError("502"))

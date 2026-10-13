@@ -178,8 +178,6 @@ PRIORITE = [
 ]
 CHIPS_MAX = 4
 
-REPLI_PROSE = "Voici ce qui a changé. Dis-moi si tu veux autre chose."
-REPLI_PROSE_LECTURE = "Dis-moi si tu veux autre chose."
 REPLI_QUESTION = "Je n'ai pas compris. Tu veux ajouter, déplacer ou voir quelque chose ?"
 # Quand la boucle a ANNONCE une liste sans la montrer et que le juge n'a pas
 # tranche ce qu'il fallait lire: on demande quoi voir, on ne dit pas qu'on n'a
@@ -717,16 +715,22 @@ class PlannerAgentV2:
         # le bilan pour ne pas le rejouer; le message brut reste intact.
         self._file_pensees = queue.Queue()
         choix: list = []
-        try:
-            # `tap` seulement s'il existe: les simulations de tests et tout
-            # remplacant sans ce parametre restent valides.
-            extra_tap = {"tap": self._tap} if self._tap else {}
-            choix = list(_charger_appliquer_choix()(
-                user, registre, message, tache=self._tache,
-                signaler=self.signaler_outil, **extra_tap) or [])
-        except Exception:  # noqa: BLE001 - un choix non applique se redemande
-            logger.error("Choix en attente non appliques", exc_info=True)
-            choix = []
+        nouvelle_requete = (
+            self._tap is None
+            and decision is not None
+            and getattr(decision, "relation_attente", "aucune") == "nouvelle_requete"
+        )
+        if not nouvelle_requete:
+            try:
+                # `tap` seulement s'il existe: les simulations de tests et tout
+                # remplacant sans ce parametre restent valides.
+                extra_tap = {"tap": self._tap} if self._tap else {}
+                choix = list(_charger_appliquer_choix()(
+                    user, registre, message, tache=self._tache,
+                    signaler=self.signaler_outil, **extra_tap) or [])
+            except Exception:  # noqa: BLE001 - un choix non applique se redemande
+                logger.error("Choix en attente non appliques", exc_info=True)
+                choix = []
         yield from self._vider_file()
         choix = [c for c in choix if isinstance(c, dict)]
         choix_code = sum(1 for c in choix if c.get("action_id"))
@@ -803,6 +807,9 @@ class PlannerAgentV2:
         lecture_typee = (self._lecture_de_boucle(user, message, reponse_boucle)
                          if configurees else None)
         actives = configurees if lecture_typee is not None else frozenset()
+        # La regle pose son formulaire dans le registre et produit la phrase
+        # factuelle qui l'accompagne. Cette phrase prime sur une prose du
+        # modele qui peut contredire les candidats verifies.
         regle, prose_regle = "-", ""
         if regles.FORMULAIRE_COURS in actives:
             try:
@@ -866,10 +873,10 @@ class PlannerAgentV2:
 
         supprimees = 0
         fuites: list[str] = []
-        # Regle formulaire_cours: le code parle seul (pas de prose generee).
-        # Chemin rapide et budget journalier epuise: meme traitement.
+        # Chemin rapide et budget journalier epuise: la boucle n'a pas tourne,
+        # il n'y a aucune prose de modele a soumettre.
         t0_verif = time.perf_counter()
-        if par_le_code or prose_regle or budget_jour_epuise:
+        if par_le_code or budget_jour_epuise:
             compo = composer(None, registre, faits, gagnant)
         elif reponse_boucle is not None:
             # Verifier-puis-rendre: la prose de la boucle ne survit que contre
@@ -918,12 +925,13 @@ class PlannerAgentV2:
         formulaire = gagnant.get("interactive_inputs") if gagnant and \
             gagnant.get("source") == "formulaire" else None
         if panne is not None and reponse_boucle is None and faits and not prose:
-            # La boucle est tombee. Se taire laisserait croire que rien n'a
-            # eu lieu, alors que le planning a peut-etre change.
+            # La boucle est tombee. Le delai depasse se dit, parce que les
+            # faits ne disent pas pourquoi le tour s'arrete la. Une panne sans
+            # delai n'a rien a ajouter: les faits rendus juste au-dessus disent
+            # ce qui a change, et « Voici ce qui a change » les redisait sans
+            # rien apprendre a personne.
             if registre.delai_depasse:
                 prose = PROSE_DELAI
-            else:
-                prose = REPLI_PROSE if mutation_reussie else REPLI_PROSE_LECTURE
         if formulaire and not faits and not prose:
             prose = PROSE_FORMULAIRE
         if budget_jour_epuise and not faits and not prose and not question and not formulaire:
@@ -1752,14 +1760,6 @@ class PlannerAgentV2:
         except Exception:  # noqa: BLE001 - un volet d'affichage ne casse pas un tour
             logger.debug("Raisonnement illisible", exc_info=True)
         return "\n".join(m for m in morceaux if m)
-
-    @staticmethod
-    def _repli(faits: str) -> str:
-        """DIRE est tombe. Se taire laisserait l'utilisateur croire que rien
-        n'a eu lieu, alors que son planning a peut-etre change."""
-        if faits:
-            return f"{faits}\n\n{REPLI_PROSE}"
-        return REPLI_QUESTION
 
     @staticmethod
     def _crees(registre: Registre, outil: str, cle: str) -> list:

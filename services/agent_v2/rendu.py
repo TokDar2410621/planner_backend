@@ -417,6 +417,7 @@ class _Narrateur:
         self.couverts: set = set()     # (action_id, genre d'ecart deja dit)
         self.cles_heure: set = set()
         self.cles_retenues: set = set()
+        self.echecs_generiques: set[str] = set()
 
     # -- utilitaires
 
@@ -917,6 +918,11 @@ class _Narrateur:
         # tentative corrigee: le raconter contredirait la ligne de succes.
         if _reussie_plus_loin(self.registre.actions, index, a):
             return
+        titre_echec = _txt(p.get("title")).casefold()
+        if titre_echec and titre_echec in self.echecs_generiques:
+            return
+        if titre_echec:
+            self.echecs_generiques.add(titre_echec)
         self.ajouter_refus(_echec_generique(outil, p))
 
     def retenue(self, a, demande) -> None:
