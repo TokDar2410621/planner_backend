@@ -23,6 +23,7 @@ from services.agent_v2 import chargeur
 from services.agent_v2.outils import (NOM_APPEL, NOM_CHERCHEUR, OUTILS_EXPOSES,
                                       description_v2, outils_pour_le_modele,
                                       schema_expose)
+from services.agent_v2.redaction import question_code
 from services.agent_v2.registre import Registre
 
 
@@ -54,6 +55,37 @@ class ExpositionTests(TransactionTestCase):
         # un gain d'au moins 20 %, pour laisser respirer les descriptions.
         self.assertGreater((avant - apres) / avant, 0.20)
 
+    def test_deux_suppressions_ciblees_sont_directes_et_groupables(self):
+        """Une demande courante ne doit pas dependre du chargeur rare.
+
+        Cas de production du 2026-10-13: « supprime toutes les recontres avec
+        Camille » a bien lu les taches, puis a epuise la boucle sans jamais
+        atteindre delete_task. Deux cibles exactes doivent produire une seule
+        confirmation groupee, sans rien supprimer au premier tour.
+        """
+        message = "Parfait supprime toutes les recontres avec Camille"
+        registre, outils = self._outils(message)
+        self.assertIn('delete_task', outils)
+        self.assertIn('delete_block', outils)
+
+        disponibilite = Task.objects.create(
+            user=self.user, title='Rencontre (disponibilite de Camille)')
+        rendez_vous = Task.objects.create(
+            user=self.user, title='Rendez-vous avec Camille')
+        for tache in (disponibilite, rendez_vous):
+            asyncio.run(outils['delete_task'].function_schema.function(
+                task_id=tache.pk, confirm=True))
+
+        demandes = [(a.donnees or {}).get('demande') for a in registre.actions]
+        demandes = [d for d in demandes if isinstance(d, dict)]
+        question, chips, cles = question_code(demandes)
+        self.assertIn(disponibilite.title, question)
+        self.assertIn(rendez_vous.title, question)
+        self.assertEqual([c['option'] for c in chips], ['confirmer', 'annuler'])
+        self.assertEqual(len(cles), 2)
+        self.assertTrue(Task.objects.filter(pk=disponibilite.pk).exists())
+        self.assertTrue(Task.objects.filter(pk=rendez_vous.pk).exists())
+
     def test_chaque_outil_est_soit_expose_soit_joignable(self):
         """Aucun outil ne doit devenir inatteignable."""
         _, outils = self._outils()
@@ -79,7 +111,6 @@ class RechercheTests(TransactionTestCase):
 
     def test_le_bon_outil_arrive_en_premier(self):
         for besoin, attendu in (
-                ('supprimer une tache', 'delete_task'),
                 ('envoyer une notification', 'send_notification'),
                 ('reorganiser ma journee', 'organize_day'),
                 ('vider tout mon planning', 'clear_all_blocks'),
@@ -92,11 +123,11 @@ class RechercheTests(TransactionTestCase):
         """Le modele ne doit jamais rester bloque."""
         rendu = chargeur.chercher('xyzzy', self.caches, description_v2)
         self.assertIn('Aucun outil', rendu)
-        self.assertIn('delete_task', rendu)
+        self.assertIn('clear_all_blocks', rendu)
 
     def test_un_besoin_vide_rend_la_liste(self):
         rendu = chargeur.chercher('', self.caches, description_v2)
-        self.assertIn('delete_task', rendu)
+        self.assertIn('clear_all_blocks', rendu)
 
     def test_le_schema_rendu_nomme_les_parametres_requis(self):
         rendu = chargeur.chercher('supprimer une tache', self.caches, description_v2)
@@ -154,7 +185,7 @@ class AppelIndirectTests(TransactionTestCase):
     def test_un_outil_inconnu_est_refuse_avec_la_liste(self):
         _, sortie = self._appeler('outil_imaginaire', {})
         self.assertIn('inconnu', sortie)
-        self.assertIn('delete_task', sortie)
+        self.assertIn('clear_all_blocks', sortie)
 
     def test_un_parametre_requis_manquant_est_refuse_avant_execution(self):
         registre, sortie = self._appeler('update_task', {})
@@ -183,8 +214,8 @@ class AppelIndirectTests(TransactionTestCase):
         Sans cela, le chargeur serait un chemin parallele qui supprime un bloc
         recurrent sans confirmation. C'est le seul vrai risque du mecanisme.
         """
-        registre, sortie = self._appeler('delete_block', {'block_id': self.cours.id},
-                                         message='supprime mon gym')
+        registre, sortie = self._appeler('clear_all_blocks', {'confirm': True},
+                                         message='vide tout mon planning')
         # Rien n'est supprime: le code retient et pose sa question.
         self.cours.refresh_from_db()
         self.assertTrue(self.cours.active)

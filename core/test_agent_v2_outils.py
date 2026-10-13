@@ -71,7 +71,10 @@ class PariteDesOutilsTests(TestCase):
              "organize_day",
              # Les deux outils qu'on enchainait a la main pour un remplacement
              # renvoient desormais vers replace_block_occurrence.
-             "skip_block_occurrence", "schedule_task_at"},
+             "skip_block_occurrence", "schedule_task_at",
+             # La demande initiale arme la garde; seule la puce du tour suivant
+             # autorise vraiment la suppression.
+             "delete_task"},
         )
 
     def test_chaque_schema_serialise_est_identique(self):

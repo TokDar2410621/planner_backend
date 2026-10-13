@@ -2537,7 +2537,8 @@ OUTILS_EXPOSES = frozenset({
     # ecritures du quotidien
     "create_block", "update_block", "schedule_task_at",
     "skip_block_occurrence", "replace_block_occurrence",
-    "cancel_scheduled_block", "create_task", "complete_task",
+    "cancel_scheduled_block", "delete_block", "create_task", "complete_task",
+    "delete_task",
     # questions posees par le modele, relayees par le code
     "present_form", "present_choices", "poser_question",
 })
@@ -2619,6 +2620,14 @@ DESCRIPTIONS_V2 = {
         "bouge, et parle des heures effectives, jamais de memoire ni d'apres "
         "l'historique (un bloc souple peut etre place a une autre heure que "
         "son heure habituelle)."
+    ),
+    "delete_task": (
+        "Supprime une tache et ses evenements ponctuels planifies. Resous "
+        "d'abord les taches exactes avec list_tasks, puis appelle cet outil "
+        "pour CHAQUE tache visee. Au premier tour, le code retient tous les "
+        "appels et construit une confirmation groupee: rien n'est supprime. "
+        "Passe confirm=true; cette valeur n'autorise jamais l'action a elle "
+        "seule, seule la puce de confirmation du tour suivant l'autorise."
     ),
 }
 
