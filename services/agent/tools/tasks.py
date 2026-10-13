@@ -4,6 +4,7 @@ Task tools for the Planner AI agent.
 from datetime import date, datetime
 
 from django.contrib.auth.models import User
+from django.db.models import Q
 from django.utils import timezone
 
 from core.models import Task, UserPlace
@@ -139,7 +140,11 @@ _PLACE_PARAMS = {
 
 class ListTasksTool(BaseTool):
     name = "list_tasks"
-    description = "Liste les tâches de l'utilisateur. Peut filtrer par statut (complétée ou non), type, ou limite."
+    description = (
+        "Liste les tâches de l'utilisateur. Peut filtrer par statut, type, texte "
+        "ou limite. Pour retrouver une tâche par nom, sujet ou personne, passe "
+        "query au lieu de répéter une liste non filtrée."
+    )
     parameters = {
         "type": "object",
         "properties": {
@@ -151,6 +156,14 @@ class ListTasksTool(BaseTool):
                 "type": "string",
                 "description": "Filtrer par type",
                 "enum": ["deep_work", "shallow", "errand"],
+            },
+            "query": {
+                "type": "string",
+                "description": (
+                    "Texte à chercher dans le titre, la description ou le cours "
+                    "lié, par exemple le nom d'une personne."
+                ),
+                "maxLength": 200,
             },
             "limit": {
                 "type": "integer",
@@ -172,6 +185,14 @@ class ListTasksTool(BaseTool):
         task_type = kwargs.get("task_type")
         if task_type:
             tasks = tasks.filter(task_type=task_type)
+
+        query = str(kwargs.get("query") or "").strip()
+        if query:
+            tasks = tasks.filter(
+                Q(title__icontains=query)
+                | Q(description__icontains=query)
+                | Q(related_course__icontains=query)
+            ).order_by("-created_at", "-pk")
 
         limit = kwargs.get("limit", 20)
         tasks = tasks[:limit]

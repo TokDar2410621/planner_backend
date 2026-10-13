@@ -68,10 +68,16 @@ class ExpositionTests(TransactionTestCase):
         self.assertIn('delete_task', outils)
         self.assertIn('delete_block', outils)
 
+        for index in range(60):
+            Task.objects.create(user=self.user, title=f'Tache historique {index}')
         disponibilite = Task.objects.create(
             user=self.user, title='Rencontre (disponibilite de Camille)')
         rendez_vous = Task.objects.create(
             user=self.user, title='Rendez-vous avec Camille')
+        asyncio.run(outils['list_tasks'].function_schema.function(query='Camille'))
+        trouves = {t['id'] for t in registre.actions[-1].donnees['tasks']}
+        self.assertEqual(trouves, {disponibilite.pk, rendez_vous.pk})
+
         for tache in (disponibilite, rendez_vous):
             asyncio.run(outils['delete_task'].function_schema.function(
                 task_id=tache.pk, confirm=True))
