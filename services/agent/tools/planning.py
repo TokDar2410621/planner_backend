@@ -7,7 +7,7 @@ from django.contrib.auth.models import User
 from django.utils import timezone
 
 from core.models import RecurringBlock, Task
-from .base import BaseTool, ToolResult
+from .base import BaseTool, ToolResult, ISSUE_TERMINEE
 
 DAY_NAMES = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
 
@@ -118,6 +118,14 @@ class SuggestOptimizationTool(BaseTool):
                 "message": f"{high_priority} tâche(s) haute priorité en attente. Trouve-leur un créneau !",
             })
 
+        # Contrat d'issue (audit 2026-10-13): les suggestions portent deja
+        # des messages affichables, on les relaie tels quels.
+        if suggestions:
+            lignes = "\n".join(f"- {s.get('message', '').strip()}"
+                               for s in suggestions if s.get("message"))
+            public = f"Quelques pistes pour ton horaire :\n{lignes}"
+        else:
+            public = "Ton horaire est bien équilibré, rien à signaler."
         return ToolResult(
             success=True,
             data={
@@ -130,6 +138,7 @@ class SuggestOptimizationTool(BaseTool):
                 "suggestions": suggestions,
             },
             message=f"{len(suggestions)} suggestion(s) d'optimisation trouvée(s).",
+            issue=ISSUE_TERMINEE, cause="", public=public,
         )
 
 
@@ -188,8 +197,20 @@ class DetectConflictsTool(BaseTool):
                                 "overlap_minutes": overlap_end - overlap_start,
                             })
 
+        # Contrat d'issue (audit 2026-10-13): les titres sont des donnees
+        # lues, on les nomme sans rien inventer.
+        if conflicts:
+            lignes = "\n".join(
+                f"- {c['day_name']} : {c['block_a']['title']} "
+                f"({c['block_a']['time']}) chevauche {c['block_b']['title']} "
+                f"({c['block_b']['time']})"
+                for c in conflicts)
+            public = f"{len(conflicts)} conflit(s) dans ton horaire :\n{lignes}"
+        else:
+            public = "Aucun conflit détecté dans ton horaire."
         return ToolResult(
             success=True,
             data={"conflicts": conflicts, "count": len(conflicts)},
             message=f"{len(conflicts)} conflit(s) détecté(s)." if conflicts else "Aucun conflit détecté.",
+            issue=ISSUE_TERMINEE, cause="", public=public,
         )

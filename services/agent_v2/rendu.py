@@ -54,6 +54,25 @@ LECTURES_RENDUES = ("get_week_schedule", "get_today_schedule", "list_blocks",
 # recent est du contexte pour DIRE.
 _IGNORES = frozenset({"present_form", "present_choices", "import_recent"})
 
+# Audit 2026-10-13 (#3): lignes honnetes pour les lectures ratees, quand
+# l'outil n'a pas ecrit son propre texte affichable (`public`). On nomme
+# ce qui n'a pas pu etre lu, sans recopier de message brut.
+_LIGNES_LECTURE_RATEE = {
+    "find_free_slots": "Je n'ai pas pu vérifier les créneaux libres.",
+    "get_week_schedule": "Je n'ai pas pu lire ta semaine.",
+    "get_today_schedule": "Je n'ai pas pu lire ta journée.",
+    "list_blocks": "Je n'ai pas pu lire ton horaire.",
+    "list_tasks": "Je n'ai pas pu lire ta liste de tâches.",
+    "get_preferences": "Je n'ai pas pu lire tes préférences.",
+    "list_goals": "Je n'ai pas pu lire tes objectifs.",
+    "get_productivity_stats": "Je n'ai pas pu lire tes statistiques.",
+    "detect_conflicts": "Je n'ai pas pu détecter les conflits.",
+    "send_notification": "Je n'ai pas pu envoyer la notification.",
+    "check_feasibility": "Je n'ai pas pu vérifier la faisabilité.",
+    "suggest_schedule_optimization": "Je n'ai pas pu analyser ton horaire.",
+    "process_uploaded_document": "Je n'ai pas pu traiter le document.",
+}
+
 # Au-dela, les reussites d'une meme famille se regroupent en une ligne.
 SEUIL_GROUPEMENT = 5
 
@@ -1287,12 +1306,14 @@ def _deja_fait(action) -> bool:
 
 def rendre_faits(registre: Registre, aujourdhui: date | None = None,
                  cles_posees: set[str] | None = None) -> str:
-    """Le compte rendu de ce que le tour a CHANGE, en francais lisible.
+    """Le compte rendu de ce que le tour a FAIT, en francais lisible.
 
-    Rien de ce qui sort d'ici ne vient de ToolResult.message. Les lectures
-    ratees se taisent (un « Format de date invalide » ne concerne pas
-    l'utilisateur), les actions retenues par une garde aussi quand la
-    question du tour les couvre.
+    Rien de ce qui sort d'ici ne vient de ToolResult.message brut (il peut
+    contenir une exception ou une instruction). Les explications affichables
+    viennent du champ `public` ecrit par l'outil (contrat d'issue, audit
+    2026-10-13): le rendu les relaie, il ne les invente pas. Les lectures
+    ratees se disent en une ligne honnete au lieu de se taire; les actions
+    retenues par une garde se taisent quand la question du tour les couvre.
     """
     auj = _aujourdhui(aujourdhui)
     n = _Narrateur(registre, auj, cles_posees)
@@ -1325,6 +1346,28 @@ def rendre_faits(registre: Registre, aujourdhui: date | None = None,
                 n.heure_refusee(a, demande)
         else:
             n.refus_de(a, index)
+
+    # Audit 2026-10-13 (#3): une lecture ratee ne se tait plus. Sa ligne
+    # vient du champ `public` ecrit par l'outil; a defaut, on nomme l'outil
+    # sans recopier de message brut. Les mutations ratees gardent leur
+    # propre chemin (refus_de) ci-dessus.
+    for index, a in enumerate(registre.actions):
+        if a.outil in _IGNORES or _deja_fait(a):
+            continue
+        if a.succes or a.est_mutation:
+            continue
+        # Un echec suivi d'une reussite du meme outil dans le tour : la
+        # reussite raconte la fin de l'histoire, pas l'echec intermediaire.
+        if any(b.succes and b.outil == a.outil
+               for b in registre.actions[index + 1:]):
+            continue
+        public = _txt(getattr(a, "public", "") or "")
+        if public:
+            n.ajouter_refus(public)
+        else:
+            ligne = _LIGNES_LECTURE_RATEE.get(a.outil)
+            if ligne:
+                n.ajouter_refus(ligne)
 
     if abandonnes:
         n.ajouter_refus(f"Je laisse tomber {_objets_abandonnes(abandonnes)}. "
@@ -1549,9 +1592,23 @@ def _lecture_creneaux(d: dict, auj: date) -> str:
     return f"Aucun créneau libre {_quand(d.get('date'), auj)}.".replace(" .", ".")
 
 
-def _lecture_taches(d: dict, auj: date) -> str:
+def _lecture_taches(d: dict, auj: date, criteres: dict | None = None) -> str:
     taches = _dicts(d.get("tasks"))
     if not taches:
+        # Audit 2026-10-13 (#7): un filtre sans correspondance n'est pas une
+        # preuve que la liste entiere est vide. On nomme le critere demande.
+        morceaux = []
+        criteres = criteres or {}
+        if _txt(criteres.get("query")):
+            morceaux.append(f"« {_txt(criteres.get('query'))} »")
+        if criteres.get("completed") is True:
+            morceaux.append("parmi les tâches terminées")
+        elif criteres.get("completed") is False:
+            morceaux.append("parmi les tâches en cours")
+        if _txt(criteres.get("task_type")):
+            morceaux.append(f"de type {_txt(criteres.get('task_type'))}")
+        if morceaux:
+            return f"Aucune tâche ne correspond à {' '.join(morceaux)}."
         return "Ta liste de tâches est vide."
     lignes = []
     for t in sorted(taches, key=lambda t: bool(t.get("completed"))):
@@ -1573,6 +1630,31 @@ _LECTEURS = {
 }
 
 
+# Audit 2026-10-13 (#5): huit outils n'avaient aucun lecteur de
+# restitution. Le texte vient d'abord de l'outil (champ `public` du
+# contrat d'issue, ref OpenCode Tool.Result.content); le repli ne dit que
+# l'issue connue, sans inventer de detail. Ces outils reussis ne peuvent
+# plus retomber sur « Je n'ai pas compris » faute de lecteur.
+_REPLIS_LECTEURS_SIMPLES = {
+    "get_preferences": "Tes préférences ont été lues.",
+    "list_goals": "Tes objectifs ont été lus.",
+    "get_productivity_stats": "Tes statistiques ont été lues.",
+    "detect_conflicts": "La détection de conflits a été exécutée.",
+    "send_notification": "La notification a été traitée.",
+    "check_feasibility": "La vérification de faisabilité a été exécutée.",
+    "suggest_schedule_optimization": "L'analyse d'optimisation a été exécutée.",
+    "process_uploaded_document": "Le document a été pris en compte.",
+}
+
+
+def _lecture_simple(action) -> str:
+    """Relaye le texte affichable ecrit par l'outil, sinon un repli honnete."""
+    public = _txt(getattr(action, "public", "") or "")
+    if public:
+        return public
+    return _REPLIS_LECTEURS_SIMPLES.get(action.outil, "")
+
+
 def rendre_lecture(registre: Registre, aujourdhui: date | None = None,
                    titres_vises=None) -> str:
     """Ce que l'agent a VU, sur un tour qui n'a rien change.
@@ -1583,17 +1665,27 @@ def rendre_lecture(registre: Registre, aujourdhui: date | None = None,
     """
     if any(a.succes and a.est_mutation for a in registre.actions):
         return ""
-    lectures = [a for a in registre.actions if a.succes and a.outil in _LECTEURS]
+    lectures = [a for a in registre.actions
+                if a.succes and (a.outil in _LECTEURS
+                                 or a.outil in _REPLIS_LECTEURS_SIMPLES)]
     if not lectures:
         return ""
     auj = _aujourdhui(aujourdhui)
     montrer = frozenset(_plat(_txt(t)) for t in (titres_vises or []) if _txt(t))
     for action in reversed(lectures):
-        lecteur = _LECTEURS[action.outil]
-        if action.outil in ("list_blocks", "get_today_schedule"):
-            texte = lecteur(action.donnees or {}, auj, montrer)
+        if action.outil in _LECTEURS:
+            lecteur = _LECTEURS[action.outil]
+            if action.outil in ("list_blocks", "get_today_schedule"):
+                texte = lecteur(action.donnees or {}, auj, montrer)
+            elif action.outil == "list_tasks":
+                # Audit 2026-10-13 (#7): les criteres du filtre suivent,
+                # pour ne pas dire « liste vide » sur une recherche ciblee.
+                texte = lecteur(action.donnees or {}, auj,
+                                action.parametres or {})
+            else:
+                texte = lecteur(action.donnees or {}, auj)
         else:
-            texte = lecteur(action.donnees or {}, auj)
+            texte = _lecture_simple(action)
         if texte:
             return texte
     return ""

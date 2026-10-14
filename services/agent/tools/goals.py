@@ -6,6 +6,7 @@ from django.utils.dateparse import parse_date
 
 from core.models import Goal
 from .base import BaseTool, ToolResult, validate_choice, validate_max_length
+from .base import ISSUE_TERMINEE
 
 
 def _parse_deadline(value):
@@ -71,10 +72,21 @@ class ListGoalsTool(BaseTool):
 
         goal_list = [_goal_to_dict(g) for g in goals]
 
+        # Contrat d'issue (audit 2026-10-13): texte affichable ecrit par
+        # l'outil, avec les titres reels (donnees deja lues, rien d'invente).
+        if goal_list:
+            lignes = "\n".join(f"- {g.get('title', '').strip()}"
+                               for g in goal_list if g.get("title"))
+            public = f"Tes objectifs :\n{lignes}" if lignes else \
+                f"{len(goal_list)} objectif(s)."
+        else:
+            public = ("Tu n'as pas encore d'objectif"
+                      + (" avec ce statut." if status else "."))
         return ToolResult(
             success=True,
             data={"goals": goal_list, "count": len(goal_list)},
             message=f"{len(goal_list)} objectif(s) trouvé(s).",
+            issue=ISSUE_TERMINEE, cause="", public=public,
         )
 
 

@@ -179,6 +179,40 @@ PRIORITE = [
 CHIPS_MAX = 4
 
 REPLI_QUESTION = "Je n'ai pas compris. Tu veux ajouter, déplacer ou voir quelque chose ?"
+# Audit 2026-10-13 (#6): des actions ont ete tentees mais aucun rendu ne les
+# a couvertes. Ce n'est pas de l'incomprehension, c'est un trou de rendu:
+# on le dit honnetement au lieu d'accuser la demande.
+REPLI_RESULTAT = ("J'ai traité ta demande mais je n'ai pas pu t'en montrer "
+                  "le détail pour l'instant. Redis-le-moi si ce n'est pas "
+                  "ce que tu attendais.")
+
+
+def _parametres_journal(parametres: dict | None) -> dict:
+    """Parametres d'outil expurges pour le journal d'execution.
+
+    On garde les cles et la forme des valeurs (type, apercu court des
+    chaines), jamais le texte integral ni les secrets. Suffit pour
+    diagnostiquer « quel appel, avec quels criteres » sans rejouer les
+    donnees personnelles dans les metadonnees.
+    """
+    journal = {}
+    for cle, valeur in (parametres or {}).items():
+        if isinstance(valeur, str):
+            journal[cle] = {"type": "str",
+                            "apercu": valeur[:40]}
+        elif isinstance(valeur, bool):
+            journal[cle] = {"type": "bool", "valeur": valeur}
+        elif isinstance(valeur, (int, float)):
+            journal[cle] = {"type": type(valeur).__name__, "valeur": valeur}
+        elif isinstance(valeur, (list, tuple)):
+            journal[cle] = {"type": "list", "longueur": len(valeur)}
+        elif isinstance(valeur, dict):
+            journal[cle] = {"type": "dict", "cles": sorted(valeur.keys())[:10]}
+        elif valeur is None:
+            journal[cle] = {"type": "null"}
+        else:
+            journal[cle] = {"type": type(valeur).__name__}
+    return journal
 # Quand la boucle a ANNONCE une liste sans la montrer et que le juge n'a pas
 # tranche ce qu'il fallait lire: on demande quoi voir, on ne dit pas qu'on n'a
 # pas compris (defaut A, prod du 2026-09-29).
@@ -859,10 +893,21 @@ class PlannerAgentV2:
         # modele a lu sans que personne ne demande a voir) ne s'affiche
         # pas; seule une lecture qui repond a une demande est rendue. Le
         # registre garde les faits: seul l'affichage est coupe.
+        # Audit 2026-10-13 (#4): l'ancien `faits = ""` effacait tout le bloc
+        # factuel, y compris les explications d'echec deja composees. On ne
+        # masque que les listes lues pour raisonner; le bilan d'execution
+        # (succes comme echecs) reste visible.
         lecture_masquee = self._lecture_sans_demande(registre)
         if lecture_masquee:
-            logger.info("agent_v2 lecture masquee: rien de demande a voir")
-            faits = ""
+            logger.info("agent_v2 lecture masquee: listes cachees, bilan conserve")
+            faits = sans_tiret_long(bloc_factuel(
+                affichage, cles_posees=cles_posees, sans_lecture=True,
+                titres_vises=[t for t in titres_vises if t]) or "")
+            # La section RESTE (calculee plus haut) n'est pas une liste lue
+            # pour raisonner: elle survit au masquage comme le bilan.
+            if reste:
+                faits = f"{faits}\n{reste}" if faits else reste
+                faits = sans_tiret_long(faits or "")
 
         # Les faits partent AVANT la redaction: ils sont deja vrais, et
         # l'utilisateur n'a pas a attendre l'enrobage pour les voir.
@@ -964,8 +1009,13 @@ class PlannerAgentV2:
             elif compo.lecture_sans_liste:
                 question, motif = REPLI_LISTE, "dire"
                 chips = [dict(c) for c in CHIPS_LISTE]
-            else:
+            elif not registre.actions:
+                # Vraie indetermination: rien n'a ete tente et le modele n'a
+                # rien dit d'exploitable. Seul cas qui autorise encore
+                # « Je n'ai pas compris » (audit 2026-10-13, #6).
                 question, motif, chips = REPLI_QUESTION, "dire", []
+            else:
+                question, motif, chips = REPLI_RESULTAT, "dire", []
 
         if prose:
             morceau = ("\n\n" if emis else "") + prose
@@ -1079,7 +1129,15 @@ class PlannerAgentV2:
                                     and (a.donnees or {}).get("par_le_code")), ""),
             "actions": [
                 {"id": a.id, "outil": a.outil, "succes": bool(a.succes),
-                 "par_le_code": bool((a.donnees or {}).get("par_le_code"))}
+                 "par_le_code": bool((a.donnees or {}).get("par_le_code")),
+                 # Journal d'execution (audit 2026-10-13, ref OpenCode:
+                 # la session persiste chaque appel complet). Parametres
+                 # expurges: cles + type, aprecu court pour les chaines,
+                 # jamais de secret ni de texte integral.
+                 "parametres": _parametres_journal(a.parametres),
+                 "issue": a.issue or "",
+                 "cause": a.cause or "",
+                 "duree_ms": round(a.duree_ms or 0.0, 1)}
                 for a in registre.actions
             ],
         }

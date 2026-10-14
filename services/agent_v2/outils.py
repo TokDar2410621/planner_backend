@@ -54,6 +54,7 @@ from pydantic_ai.tools import Tool
 
 from services.agent.tools import ALL_TOOLS, TOOL_MAP
 from services.agent.tools.base import ToolResult
+from services.agent.tools.base import ISSUE_ECHEC, ISSUE_EFFET_A_VERIFIER
 from services.agent_v2 import demandes as dem
 from services.agent_v2 import chargeur
 from services.agent_v2.registre import (OUTILS_DE_MUTATION, Registre,
@@ -2055,14 +2056,19 @@ def _apres(ctx: _Contexte, nom: str, kwargs: dict, resultat: ToolResult,
         change = True
     if not change:
         return resultat
-    return ToolResult(success=resultat.success, data=donnees, message=resultat.message)
+    # Le post-traitement enrichit les donnees (demande armee) sans perdre le
+    # contrat d'issue ecrit par l'outil (audit 2026-10-13).
+    return ToolResult(success=resultat.success, data=donnees,
+                      message=resultat.message, issue=resultat.issue,
+                      cause=resultat.cause, public=resultat.public)
 
 
 # -------------------------------------------------------------------- noyau
 
 def _consigner(ctx: _Contexte, nom: str, kwargs: dict, resultat: ToolResult,
-               cle_operation: str = ""):
-    action = ctx.registre.ajouter(nom, kwargs, resultat, cle_operation=cle_operation)
+               cle_operation: str = "", duree_ms: float = 0.0):
+    action = ctx.registre.ajouter(nom, kwargs, resultat,
+                                  cle_operation=cle_operation, duree_ms=duree_ms)
     if ctx.signaler:
         ctx.signaler(action)
     return action
@@ -2363,6 +2369,9 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
     # le banc ne lit que le nom, et un dump multi-Ko polluerait les logs.
     kwargs_publics = {k: v for k, v in kwargs.items() if not k.startswith("_")}
     logger.info(f"Executing tool: {nom}({kwargs_publics})")
+    # Journal d'execution (audit 2026-10-13): duree mesuree autour de
+    # l'execution reelle, consignee avec l'action.
+    t0_outil = time.perf_counter()
     try:
         if nom == "optimize_week" and not kwargs.get("apply"):
             # La proposition passe par _plan_propose pour ALIMENTER le cache
@@ -2409,9 +2418,16 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
                          "action en attente de confirmation. Verifie l'etat "
                          "reel avec un outil de lecture avant de reessayer; "
                          "ne reemets pas a l'aveugle."),
+                # Contrat d'issue (audit 2026-10-13): un resultat ambigu
+                # n'est ni un succes ni un echec, et ca se dit.
+                issue=ISSUE_EFFET_A_VERIFIER, cause="resultat_incertain",
+                public=("Le résultat est incertain, "
+                        "je vérifie avant de continuer."),
             )
         else:
-            resultat = ToolResult(success=False, data={}, message=f"Erreur de l'outil: {e}")
+            resultat = ToolResult(success=False, data={}, message=f"Erreur de l'outil: {e}",
+                                  issue=ISSUE_ECHEC, cause="exception_outil",
+                                  public="L'outil a rencontré une erreur.")
     # Kwargs prives du niveau 3: ne doivent pas polluer le registre ni le rendu.
     kwargs.pop("_arrangements", None)
     kwargs.pop("_arrangement", None)
@@ -2422,6 +2438,7 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
             data={**(resultat.data or {}), "cle_demande": choix.get("cle"), "par_le_code": True,
                   "decision_code": DECISION_EXECUTE},
             message=resultat.message,
+            issue=resultat.issue, cause=resultat.cause, public=resultat.public,
         )
     else:
         try:
@@ -2437,7 +2454,9 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
         etat.cache[cle] = resultat
     # Diffuse au fil de l'execution: c'est ce qui meuble l'attente cote
     # interface.
-    _consigner(ctx, nom, kwargs, resultat, cle_operation=cle or "")
+    duree_ms = (time.perf_counter() - t0_outil) * 1000.0
+    _consigner(ctx, nom, kwargs, resultat, cle_operation=cle or "",
+               duree_ms=duree_ms)
 
     # Garde de terminaison, ici parce que c'est le seul point par lequel
     # TOUS les appels passent. On rend au modele une consigne explicite

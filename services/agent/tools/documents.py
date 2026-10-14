@@ -5,7 +5,8 @@ import logging
 from django.contrib.auth.models import User
 
 from core.models import UploadedDocument
-from .base import BaseTool, ToolResult
+from .base import (BaseTool, ToolResult, ISSUE_TERMINEE, ISSUE_ECHEC,
+                   ISSUE_BESOIN_PRECISION, ISSUE_EFFET_A_VERIFIER)
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +32,15 @@ class ProcessUploadedDocumentTool(BaseTool):
             try:
                 doc = UploadedDocument.objects.get(id=doc_id, user=user)
             except UploadedDocument.DoesNotExist:
-                return ToolResult(success=False, data={}, message=f"Document #{doc_id} introuvable.")
+                return ToolResult(success=False, data={}, message=f"Document #{doc_id} introuvable.",
+                                  issue=ISSUE_ECHEC, cause="document_introuvable",
+                                  public="Je n'ai pas retrouvé ce document.")
         else:
             doc = UploadedDocument.objects.filter(user=user).order_by('-uploaded_at').first()
             if not doc:
-                return ToolResult(success=False, data={}, message="Aucun document uploadé.")
+                return ToolResult(success=False, data={}, message="Aucun document uploadé.",
+                                  issue=ISSUE_BESOIN_PRECISION, cause="aucun_document",
+                                  public="Aucun document n'a été téléversé pour le moment.")
 
         if doc.processing_error:
             # Un échec garde processed=False. Le détail historique peut contenir
@@ -45,6 +50,8 @@ class ProcessUploadedDocumentTool(BaseTool):
                 success=False,
                 data={"document_id": doc.id, "status": "failed", "error": GENERIC_PROCESSING_ERROR},
                 message=GENERIC_PROCESSING_ERROR,
+                issue=ISSUE_ECHEC, cause="traitement_echoue",
+                public="Le traitement du document a échoué.",
             )
 
         if not doc.processed:
@@ -52,6 +59,8 @@ class ProcessUploadedDocumentTool(BaseTool):
                 success=False,
                 data={"document_id": doc.id, "status": "processing"},
                 message="Le document est encore en cours de traitement. Réessaie dans quelques secondes.",
+                issue=ISSUE_EFFET_A_VERIFIER, cause="traitement_en_cours",
+                public="Le document est encore en cours de traitement, réessaie dans quelques secondes.",
             )
 
         from services.agent_v2.importation import resume_import, message_import
@@ -61,6 +70,8 @@ class ProcessUploadedDocumentTool(BaseTool):
         status = ('needs_clarification' if pending else
                   'needs_confirmation' if to_confirm else 'processed')
 
+        # Contrat d'issue (audit 2026-10-13): message_import est deja ecrit
+        # pour etre lu par l'utilisateur, on le declare affichable.
         return ToolResult(
             success=True,
             data={
@@ -75,6 +86,7 @@ class ProcessUploadedDocumentTool(BaseTool):
                 "import_summary": summary,
             },
             message=message_import(summary),
+            issue=ISSUE_TERMINEE, cause="", public=message_import(summary),
         )
 
 

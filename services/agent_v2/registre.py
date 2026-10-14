@@ -60,6 +60,16 @@ class Action:
     succes: bool
     message: str
     donnees: dict
+    # Contrat d'issue metier (audit 2026-10-13, ref OpenCode Tool.Result):
+    # l'outil ecrit son issue, sa cause et son explication affichable; le
+    # registre les transporte jusqu'au rendu et au journal, sans les
+    # reinterpreter. Chaines vides = outil non migre, comportement inchange.
+    issue: str = ""
+    cause: str = ""
+    public: str = ""
+    # Duree d'execution de l'outil en millisecondes (journal, audit
+    # 2026-10-13). 0.0 = non mesuree (chemins par le code, refus de garde).
+    duree_ms: float = 0.0
     # Recu d'idempotence (boucle unique, 2026-09-29). `cle_operation` identifie
     # l'intention metier (tache + outil + empreinte des parametres); `recu`
     # porte le statut de confirmation. Une mutation dont le resultat est
@@ -154,7 +164,7 @@ class Registre:
         self._verrou = threading.Lock()
 
     def ajouter(self, outil: str, parametres: dict, resultat: ToolResult,
-                cle_operation: str = "") -> Action:
+                cle_operation: str = "", duree_ms: float = 0.0) -> Action:
         with self._verrou:
             donnees = dict(resultat.data or {})
             recu = {}
@@ -179,6 +189,10 @@ class Registre:
                 donnees=donnees,
                 cle_operation=cle_operation or "",
                 recu=recu,
+                issue=getattr(resultat, "issue", "") or "",
+                cause=getattr(resultat, "cause", "") or "",
+                public=getattr(resultat, "public", "") or "",
+                duree_ms=float(duree_ms or 0.0),
             )
             self.actions.append(action)
             self._index[action.id] = action

@@ -8,7 +8,7 @@ from django.db.models import Count, Q
 from django.utils import timezone
 
 from core.models import Task, RecurringBlockCompletion, RecurringBlock
-from .base import BaseTool, ToolResult
+from .base import BaseTool, ToolResult, ISSUE_TERMINEE
 
 
 class GetProductivityStatsTool(BaseTool):
@@ -81,4 +81,10 @@ class GetProductivityStatsTool(BaseTool):
                 "overdue_tasks": overdue_tasks,
             },
             message=f"Stats ({period}j): {completion_rate}% tâches complétées, streak de {streak} jour(s), {overdue_tasks} tâche(s) en retard.",
+            # Contrat d'issue (audit 2026-10-13): le message ci-dessus est
+            # deja affichable, on le declare tel quel.
+            issue=ISSUE_TERMINEE, cause="",
+            public=(f"Sur les {period} derniers jours : {completion_rate} % de tâches "
+                    f"complétées ({completed_tasks}/{total_tasks}), série de {streak} jour(s), "
+                    f"{overdue_tasks} tâche(s) en retard, {pending_tasks} en cours."),
         )

@@ -22,6 +22,7 @@ from services.scheduling.solve_day import (
     empreinte_entrees_jour, empreinte_entrees_semaine, solve_day, solve_placement,
 )
 from .base import BaseTool, ToolResult, validate_choice
+from .base import (ISSUE_TERMINEE, ISSUE_BESOIN_PRECISION, ISSUE_ECHEC)
 
 DAY_NAMES = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
 VALID_TASK_TYPES = {c[0] for c in Task.TASK_TYPE_CHOICES}
@@ -75,7 +76,9 @@ class GetTodayScheduleTool(BaseTool):
             try:
                 target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
             except ValueError:
-                return ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.")
+                return ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.",
+                              issue=ISSUE_ECHEC, cause="date_illisible",
+                              public="Je n'ai pas pu vérifier ce créneau : la date était illisible.")
         else:
             target_date = timezone.localdate()
 
@@ -397,7 +400,12 @@ class ScheduleTaskAtTool(BaseTool):
         try:
             target_date = datetime.strptime(kwargs["date"], "%Y-%m-%d").date()
         except (ValueError, KeyError, TypeError):
-            return ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.")
+            # Audit 2026-10-13: une date illisible envoyee par le modele est
+            # un probleme de preparation interne. Le message public ne doit
+            # pas accuser l'utilisateur d'une date qu'il n'a pas saisie.
+            return ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.",
+                              issue=ISSUE_ECHEC, cause="date_illisible",
+                              public="Je n'ai pas pu vérifier ce créneau : la date était illisible.")
 
         try:
             start_t = parse_time(kwargs["start_time"])
@@ -554,7 +562,9 @@ class CheckFeasibilityTool(BaseTool):
         try:
             target_date = datetime.strptime(kwargs["date"], "%Y-%m-%d").date()
         except (ValueError, KeyError, TypeError):
-            return ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.")
+            return ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.",
+                              issue=ISSUE_ECHEC, cause="date_illisible",
+                              public="Je n'ai pas pu vérifier ce créneau : la date était illisible.")
 
         extra = []
         for a in kwargs.get("activities") or []:
@@ -568,7 +578,9 @@ class CheckFeasibilityTool(BaseTool):
                 continue
             extra.append({"title": a.get("title") or "Activité", "duration_minutes": dur})
         if not extra:
-            return ToolResult(success=False, data={}, message="Aucune activité valide à tester (titre + durée en minutes).")
+            return ToolResult(success=False, data={}, message="Aucune activité valide à tester (titre + durée en minutes).",
+                              issue=ISSUE_BESOIN_PRECISION, cause="activites_invalides",
+                              public="Je n'ai rien à vérifier : il me faut au moins une activité avec un titre et une durée.")
 
         # Fenêtre éveillée 07h-23h (comme find_free_slots) pour ne pas proposer un
         # créneau en pleine nuit; le sommeil reste un mur si l'utilisateur en a un.
@@ -595,6 +607,15 @@ class CheckFeasibilityTool(BaseTool):
                 f"{head} tout ne tient PAS le {day_name} {target_date.isoformat()}. "
                 f"Rentre: {placed_str}. Ne rentre pas: {unplaced_str}. Propose une option (créer ce qui rentre, autre jour, durée réduite)."
             )
+        # Contrat d'issue (audit 2026-10-13): le `msg` ci-dessus est deja
+        # ecrit pour etre lu, on le declare affichable tel quel.
+        public = (
+            f"Vérification du {day_name} {target_date.isoformat()} : "
+            + (f"tout rentre ({placed_str})."
+               if result["feasible"] else
+               f"tout ne rentre pas. Rentre : {placed_str}. "
+               f"Ne rentre pas : {unplaced_str}.")
+        )
         return ToolResult(
             success=True,
             data={
@@ -604,6 +625,7 @@ class CheckFeasibilityTool(BaseTool):
                 "date": target_date.isoformat(),
             },
             message=msg,
+            issue=ISSUE_TERMINEE, cause="", public=public,
         )
 
 
@@ -675,7 +697,9 @@ class OrganizeDayTool(BaseTool):
         try:
             target_date = datetime.strptime(kwargs["date"], "%Y-%m-%d").date()
         except (ValueError, KeyError, TypeError):
-            return ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.")
+            return ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.",
+                              issue=ISSUE_ECHEC, cause="date_illisible",
+                              public="Je n'ai pas pu vérifier ce créneau : la date était illisible.")
         apply = bool(kwargs.get("apply", False))
         expected_entries = kwargs.pop("_expected_entries", None) or empreinte_entrees_jour(user, target_date)
         # Kwarg PRIVE (agent v2): arrangement deja resolu et valide. Evite de
@@ -839,7 +863,9 @@ class OptimizeWeekTool(BaseTool):
             try:
                 start = datetime.strptime(raw, "%Y-%m-%d").date()
             except (ValueError, TypeError):
-                return ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.")
+                return ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.",
+                              issue=ISSUE_ECHEC, cause="date_illisible",
+                              public="Je n'ai pas pu vérifier ce créneau : la date était illisible.")
         else:
             start = timezone.localdate()
         apply = bool(kwargs.get("apply", False))
