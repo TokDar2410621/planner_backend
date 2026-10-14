@@ -707,6 +707,11 @@ Analyse ce texte et retourne le JSON structuré:"""
                                jetons_entree=entree, max_sortie=4096) as appel:
             config_kwargs = dict(
                 max_output_tokens=appel.max_sortie,
+                # L'extraction est mecanique : la reflexion (thinking) de
+                # Gemini 2.5 consommait ~3900 des 4096 tokens, ne laissant
+                # que ~150 tokens pour le JSON -> troncature MAX_TOKENS.
+                # On la desactive ici pour garder tout le budget en sortie.
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
                 http_options=types.HttpOptions(timeout=max(1, int(appel.delai * 1000)),
                     retry_options=types.HttpRetryOptions(attempts=1)),
             )
