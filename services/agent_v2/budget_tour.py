@@ -39,6 +39,19 @@ def _entier(nom, defaut):
         return defaut
 
 
+def _plafond_sortie(phase):
+    """Plafond de jetons de sortie selon la phase.
+
+    L'extraction de documents (phase='extraction') produit un JSON long et
+    ne doit pas être étranglée par le plafond du chat (AGENT_MAX_JETONS_SORTIE,
+    réglé bas en production). Un plafond dédié EXTRACTION_MAX_JETONS_SORTIE
+    permet de l'ajuster sans toucher au chat.
+    """
+    if phase == 'extraction':
+        return _entier('EXTRACTION_MAX_JETONS_SORTIE', 4096)
+    return _entier('AGENT_MAX_JETONS_SORTIE', 4096)
+
+
 def borne_texte(*parties):
     """Borne prudente texte : octets UTF-8, plus la structure fournisseur.
 
@@ -164,7 +177,7 @@ class AppelFournisseur:
         self.delai = self.trace.restant()
         if self.delai <= 0:
             raise TimeoutError('échéance du tour atteinte')
-        self.max_sortie = min(max(1, int(max_sortie)), _entier('AGENT_MAX_JETONS_SORTIE', 4096))
+        self.max_sortie = min(max(1, int(max_sortie)), _plafond_sortie(phase))
         self.provision = max(1, int(jetons_entree)) + self.max_sortie
         if self.provision > _entier('AGENT_MAX_JETONS_APPEL', 120000):
             raise BudgetEpuise('contexte fournisseur trop volumineux')

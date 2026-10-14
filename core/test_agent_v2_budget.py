@@ -198,3 +198,25 @@ class BudgetJetonsTests(TestCase):
         registre.delai_depasse = True
         faits = bloc_factuel(registre)
         self.assertIn('délai', faits)
+
+
+class PlafondSortieParPhaseTests(TestCase):
+    """L'extraction ne doit pas être étranglée par le plafond du chat.
+
+    Régression 2026-10-14 : AGENT_MAX_JETONS_SORTIE réglé bas en prod
+    tronquait les réponses d'extraction (finish_reason=MAX_TOKENS à ~100
+    jetons), rendant le JSON invalide.
+    """
+
+    def test_extraction_a_son_propre_plafond(self):
+        from services.agent_v2.budget_tour import _plafond_sortie
+        with override_settings(AGENT_MAX_JETONS_SORTIE=100,
+                               EXTRACTION_MAX_JETONS_SORTIE=4096):
+            self.assertEqual(_plafond_sortie('extraction'), 4096)
+            self.assertEqual(_plafond_sortie('planning'), 100)
+
+    def test_extraction_defaut_4096(self):
+        from services.agent_v2.budget_tour import _plafond_sortie
+        with override_settings(AGENT_MAX_JETONS_SORTIE=100):
+            # Sans EXTRACTION_MAX_JETONS_SORTIE explicite : 4096 par défaut.
+            self.assertEqual(_plafond_sortie('extraction'), 4096)

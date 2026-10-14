@@ -300,6 +300,11 @@ AGENT_MAX_JUGEMENTS = int(os.getenv('AGENT_MAX_JUGEMENTS', '6'))
 AGENT_RESERVATION_INITIALE = int(os.getenv('AGENT_RESERVATION_INITIALE', '12000'))
 AGENT_MAX_JETONS_APPEL = int(os.getenv('AGENT_MAX_JETONS_APPEL', '120000'))
 AGENT_MAX_JETONS_SORTIE = int(os.getenv('AGENT_MAX_JETONS_SORTIE', '4096'))
+# Plafond de sortie pour l'extraction de documents (phase='extraction').
+# Déconnecté du plafond du chat : un horaire structuré en JSON dépasse
+# largement les ~100 jetons du chat, et l'API tronquait la réponse
+# (finish_reason=MAX_TOKENS) quand les deux partageaient le même plafond.
+EXTRACTION_MAX_JETONS_SORTIE = int(os.getenv('EXTRACTION_MAX_JETONS_SORTIE', '4096'))
 AGENT_V2_BUDGET_JETONS_AGIR = int(os.getenv('AGENT_V2_BUDGET_JETONS_AGIR', '300000'))
 AGENT_V2_BUDGET_JETONS_DIRE = int(os.getenv('AGENT_V2_BUDGET_JETONS_DIRE', '100000'))
 AGENT_V2_BUDGET_JETONS_JOUR = int(os.getenv('AGENT_V2_BUDGET_JETONS_JOUR', '2000000'))
