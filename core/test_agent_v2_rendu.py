@@ -24,12 +24,13 @@ EM_DASH = "\u2014"
 
 
 def registre(*entrees):
-    """entrees: (outil, parametres, succes, donnees[, message])."""
+    """entrees: (outil, parametres, succes, donnees[, message[, public]])."""
     r = Registre()
     for e in entrees:
         outil, params, succes, donnees = e[:4]
         message = e[4] if len(e) > 4 else ""
-        r.ajouter(outil, params, ToolResult(success=succes, data=donnees, message=message))
+        public = e[5] if len(e) > 5 else ""
+        r.ajouter(outil, params, ToolResult(success=succes, data=donnees, message=message, public=public))
     return r
 
 
@@ -393,6 +394,86 @@ class AutresMutationsTests(SimpleTestCase):
         sortie = faits(r)
         self.assertEqual(sortie.count("Sport"), 1)
         self.assertEqual(sortie.count("rien n'a changé"), 1)
+
+    def test_refus_de_honore_public(self):
+        # 2026-10-14 (14) : refus_de rend le texte affichable ecrit par
+        # l'outil, au lieu du generique. Les branches specifiques restent
+        # prioritaires (voir le test conflit ci-dessous).
+        r = registre(("update_block", {"block_id": 9999}, False, {},
+                      "Bloc #9999 introuvable.",
+                      "Je n'ai pas modifié le créneau : je ne l'ai pas trouvé. Dis-moi lequel."))
+        sortie = faits(r)
+        self.assertIn("je ne l'ai pas trouvé", sortie)
+        self.assertNotIn("rien n'a changé", sortie)
+        self.assertEqual(marqueurs_bruts(sortie), [])
+
+    def test_public_ne_passe_pas_devant_une_branche_specifique(self):
+        # Un conflit garde sa ligne dediee, meme si l'outil a aussi ecrit un public.
+        r = registre(("update_block", {"title": "Gym"}, False,
+                      {"conflit": {"titre": "Cours", "debut": "10:00", "fin": "11:00"}},
+                      "chevauchement",
+                      "Je n'ai pas modifié le créneau : raison generique."))
+        sortie = faits(r)
+        self.assertIn("Cours", sortie)
+        self.assertNotIn("raison generique", sortie)
+        self.assertEqual(marqueurs_bruts(sortie), [])
+
+    def test_refus_appel_composite_dit_sa_raison(self):
+        r = registre(("update_block", {"block_id": 7, "title": "Nouveau nom",
+                                       "end_date": "2026-12-31"}, False,
+                      {"appel_composite": True},
+                      "Refuse par le code: un meme appel change le nom et les bornes."))
+        sortie = faits(r)
+        self.assertIn("ne peut pas toucher à la fois", sortie)
+        self.assertIn("Dis-moi d'abord l'un, puis l'autre", sortie)
+        self.assertNotIn("rien n'a changé", sortie)
+        self.assertNotIn("Refuse par le code", sortie)
+        self.assertEqual(marqueurs_bruts(sortie), [])
+
+    def test_refus_heure_dite_dit_sa_raison(self):
+        r = registre(("schedule_task_at", {"title": "Dentiste", "start_time": "09:00"}, False,
+                      {"heure_dite": "08:00"},
+                      "Retenu par le code: l'utilisateur a dit 08:00."))
+        sortie = faits(r)
+        self.assertIn("peut être le matin ou le soir", sortie)
+        self.assertIn("Dis-moi laquelle", sortie)
+        self.assertNotIn("rien n'a changé", sortie)
+        self.assertNotIn("Retenu par le code", sortie)
+        self.assertEqual(marqueurs_bruts(sortie), [])
+
+    def test_refus_evenement_unique_dit_sa_raison(self):
+        # Sans succes ulterieur du meme titre : la raison se dit, pas le generique.
+        r = registre(("create_block", {"title": "Gym", "days": ["lundi"]}, False,
+                      {"evenement_unique": ["2026-09-21"]},
+                      "Retenu par le code: jour nomme sans recurrence."))
+        sortie = faits(r)
+        self.assertIn("sans dire « chaque semaine »", sortie)
+        self.assertIn("Dis-moi si tu voulais chaque semaine", sortie)
+        self.assertNotIn("rien n'a changé", sortie)
+        self.assertNotIn("Retenu par le code", sortie)
+        self.assertEqual(marqueurs_bruts(sortie), [])
+
+    def test_echec_outil_converti_ne_tombe_plus_sur_le_generique(self):
+        # Cas reel d'un outil converti (UpdateBlockTool, bloc introuvable) :
+        # le public ecrit par l'outil sort, le generique ne sort plus.
+        r = registre(("update_block", {"block_id": 9999}, False, {},
+                      "Bloc #9999 introuvable.",
+                      "Je n'ai pas modifié le créneau : je ne l'ai pas trouvé. Dis-moi lequel."))
+        sortie = faits(r)
+        self.assertEqual(sortie, "Je n'ai pas modifié le créneau : je ne l'ai pas trouvé. Dis-moi lequel.")
+        self.assertEqual(marqueurs_bruts(sortie), [])
+
+    def test_echec_plan_non_applicable_dit_sa_raison(self):
+        # T8 : l'application d'un plan perime porte son public, pas le generique.
+        r = registre(("optimize_week", {"start_date": "2026-09-14", "apply": True}, False,
+                      {"applied": False, "reason": "stale_plan"},
+                      "Ce plan ne peut plus être appliqué tel quel.",
+                      "Je n'ai pas appliqué ce plan : il n'est plus valable tel quel. Demande une nouvelle proposition."))
+        sortie = faits(r)
+        self.assertIn("il n'est plus valable tel quel", sortie)
+        self.assertNotIn("rien n'a changé", sortie)
+        self.assertNotIn("stale_plan", sortie)
+        self.assertEqual(marqueurs_bruts(sortie), [])
 
     def test_ancienne_garde_sans_demande(self):
         r = registre(("delete_block", {"block_id": 4}, False, {"needs_confirmation": True},

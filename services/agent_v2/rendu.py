@@ -950,11 +950,46 @@ class _Narrateur:
                 "est déjà passée. Dis-moi la bonne année.")
             return
 
+        # 2026-10-14 (14) : garde appel composite (T2). Raison lue depuis
+        # les donnees structurees, jamais depuis le message.
+        if d.get("appel_composite"):
+            self.ajouter_refus(
+                "Je n'ai rien modifié : un même changement ne peut pas toucher à la fois "
+                "le nom ou le jour de la série et ses dates. Dis-moi d'abord l'un, puis l'autre.")
+            return
+
+        # 2026-10-14 (14) : heure dite sans matin ni soir (T3). Le code
+        # n'impose jamais une des deux lectures, il demande.
+        if d.get("heure_dite"):
+            self.ajouter_refus(
+                "Je n'ai rien changé : l'heure que tu as dite peut être le matin ou le soir. "
+                "Dis-moi laquelle.")
+            return
+
+        # 2026-10-14 (14) : jour nomme sans recurrence (T4). Le silence
+        # ci-dessus ne vaut que si le titre a ete place plus loin ; sinon
+        # l'utilisateur doit savoir que rien n'a ete cree, et pourquoi.
+        if d.get("evenement_unique"):
+            self.ajouter_refus(
+                "Je n'ai pas pu créer d'habitude : tu as nommé un jour sans dire « chaque semaine », "
+                "c'est un seul jour, pas une habitude. Dis-moi si tu voulais chaque semaine.")
+            return
+
         # Echec sans donnee exploitable: on ne recopie JAMAIS le message (il
         # peut porter une exception brute ou un ordre au modele). Si la meme
         # intention a reussi plus loin dans le tour, l'echec etait une
         # tentative corrigee: le raconter contredirait la ligne de succes.
         if _reussie_plus_loin(self.registre.actions, index, a):
+            return
+
+        # 2026-10-14 (14) : un echec qui porte un texte affichable ecrit
+        # par l'outil (champ `public` du contrat d'issue) le voit rendu tel
+        # quel, comme pour les lectures. Les branches specifiques ci-dessus
+        # restent prioritaires (plus precises). Le generique ne sert plus
+        # que pour les echecs vraiment sans raison.
+        public = _txt(getattr(a, "public", "") or "")
+        if public:
+            self.ajouter_refus(public)
             return
         titre_echec = _txt(p.get("title")).casefold()
         if titre_echec and titre_echec in self.echecs_generiques:

@@ -96,7 +96,9 @@ class UpdatePreferencesTool(BaseTool):
             "peak_productivity_time",
         )
         if err:
-            return ToolResult(success=False, data={}, message=err)
+            return ToolResult(success=False, data={}, message=err,
+                              public=("Je n'ai pas modifié tes préférences : le moment de pic est invalide. "
+                                      "Choisis parmi le matin, l'après-midi ou le soir."))
 
         for field in ["min_sleep_hours", "peak_productivity_time", "transport_time_minutes",
                        "max_deep_work_hours_per_day", "onboarding_completed"]:

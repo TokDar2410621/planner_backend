@@ -126,11 +126,15 @@ class ResolveDocumentEntryTool(BaseTool):
             result = processor.resolve_entry(user, kwargs.get('document_id'),
                 kwargs.get('source'), kwargs.get('index'), values)
         except DocumentResolutionError as exc:
-            return ToolResult(success=False, data={'status': 'refused'}, message=str(exc))
+            # Les messages de DocumentResolutionError sont deja des phrases
+            # francaises sures pour l'utilisateur (voir document_processor).
+            return ToolResult(success=False, data={'status': 'refused'}, message=str(exc),
+                              public=f"La précision n'a pas été enregistrée : {exc}")
         except Exception as exc:
             logger.warning('Résolution documentaire échouée (%s)', type(exc).__name__)
             return ToolResult(success=False, data={'status': 'failed'},
-                              message="La précision n'a pas pu être enregistrée. Réessaie.")
+                              message="La précision n'a pas pu être enregistrée. Réessaie.",
+                              public="La précision n'a pas pu être enregistrée. Réessaie.")
         resolution = result['resolution']
         doc = UploadedDocument.objects.get(pk=resolution['document_id'], user=user)
         summary = resume_import(doc)

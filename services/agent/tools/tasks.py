@@ -259,7 +259,8 @@ class CreateTaskTool(BaseTool):
             or validate_max_length(title, TASK_TITLE_MAX_LENGTH, "title")
         )
         if err:
-            return ToolResult(success=False, data={}, message=err)
+            return ToolResult(success=False, data={}, message=err,
+                              public="Je n'ai pas créé la tâche : une valeur fournie est invalide. Vérifie le type de tâche et le titre.")
 
         # Idempotency: guard against the model re-creating a task it already
         # mentioned earlier in the conversation. If an ACTIVE (non-completed)
@@ -326,7 +327,8 @@ class UpdateTaskTool(BaseTool):
         try:
             task = Task.objects.get(id=task_id, user=user)
         except Task.DoesNotExist:
-            return ToolResult(success=False, data={}, message=f"Tâche #{task_id} introuvable.")
+            return ToolResult(success=False, data={}, message=f"Tâche #{task_id} introuvable.",
+                              public="Je n'ai pas modifié la tâche : je ne l'ai pas trouvée. Dis-moi laquelle.")
 
         # Validation choices/max_length AVANT save().
         err = (
@@ -334,7 +336,8 @@ class UpdateTaskTool(BaseTool):
             or validate_max_length(kwargs.get("title"), TASK_TITLE_MAX_LENGTH, "title")
         )
         if err:
-            return ToolResult(success=False, data={}, message=err)
+            return ToolResult(success=False, data={}, message=err,
+                              public="Je n'ai pas modifié la tâche : une valeur fournie est invalide. Vérifie le type de tâche et le titre.")
 
         for field in ["title", "priority", "description", "task_type"]:
             if field in kwargs and kwargs[field] is not None:
@@ -408,7 +411,8 @@ class DeleteTaskTool(BaseTool):
         try:
             task = Task.objects.get(id=task_id, user=user)
         except Task.DoesNotExist:
-            return ToolResult(success=False, data={}, message=f"Tâche #{task_id} introuvable.")
+            return ToolResult(success=False, data={}, message=f"Tâche #{task_id} introuvable.",
+                              public="Je n'ai pas supprimé la tâche : je ne l'ai pas trouvée. Dis-moi laquelle.")
 
         title = task.title
         task.delete()
@@ -435,7 +439,8 @@ class CompleteTaskTool(BaseTool):
         try:
             task = Task.objects.get(id=task_id, user=user)
         except Task.DoesNotExist:
-            return ToolResult(success=False, data={}, message=f"Tâche #{task_id} introuvable.")
+            return ToolResult(success=False, data={}, message=f"Tâche #{task_id} introuvable.",
+                              public="Je n'ai pas marqué la tâche comme terminée : je ne l'ai pas trouvée. Dis-moi laquelle.")
 
         if hasattr(task, "mark_completed"):
             task.mark_completed()

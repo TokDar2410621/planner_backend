@@ -124,11 +124,13 @@ class CreateGoalTool(BaseTool):
             or validate_max_length(kwargs.get("title"), GOAL_TITLE_MAX_LENGTH, "title")
         )
         if err:
-            return ToolResult(success=False, data={}, message=err)
+            return ToolResult(success=False, data={}, message=err,
+                              public="Je n'ai pas créé l'objectif : une valeur fournie est invalide. Vérifie le type d'objectif et le titre.")
 
         deadline, derr = _parse_deadline(kwargs.get("deadline"))
         if derr:
-            return ToolResult(success=False, data={}, message=derr)
+            return ToolResult(success=False, data={}, message=derr,
+                              public="Je n'ai pas créé l'objectif : la date limite est invalide. Utilise le format AAAA-MM-JJ.")
 
         goal = Goal.objects.create(
             user=user,
@@ -177,7 +179,8 @@ class UpdateGoalTool(BaseTool):
         try:
             goal = Goal.objects.get(id=goal_id, user=user)
         except Goal.DoesNotExist:
-            return ToolResult(success=False, data={}, message=f"Objectif #{goal_id} introuvable.")
+            return ToolResult(success=False, data={}, message=f"Objectif #{goal_id} introuvable.",
+                              public="Je n'ai pas modifié l'objectif : je ne l'ai pas trouvé. Dis-moi lequel.")
 
         # Validation choices/max_length AVANT save().
         err = (
@@ -185,12 +188,14 @@ class UpdateGoalTool(BaseTool):
             or validate_max_length(kwargs.get("title"), GOAL_TITLE_MAX_LENGTH, "title")
         )
         if err:
-            return ToolResult(success=False, data={}, message=err)
+            return ToolResult(success=False, data={}, message=err,
+                              public="Je n'ai pas modifié l'objectif : une valeur fournie est invalide. Vérifie le statut et le titre.")
 
         if kwargs.get("deadline") is not None:
             deadline, derr = _parse_deadline(kwargs["deadline"])
             if derr:
-                return ToolResult(success=False, data={}, message=derr)
+                return ToolResult(success=False, data={}, message=derr,
+                                  public="Je n'ai pas modifié l'objectif : la date limite est invalide. Utilise le format AAAA-MM-JJ.")
             goal.deadline = deadline
 
         for field in ["title", "description", "progress", "status"]:

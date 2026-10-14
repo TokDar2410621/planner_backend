@@ -202,13 +202,17 @@ class CreateBlockTool(BaseTool):
                 try:
                     bounds[key] = dt_date.fromisoformat(raw[:10])
                 except ValueError:
-                    return ToolResult(success=False, data={}, message=f"{key} invalide: attendu YYYY-MM-DD.")
+                    libelle = {"start_date": "date de début", "end_date": "date de fin"}[key]
+                    return ToolResult(success=False, data={}, message=f"{key} invalide: attendu YYYY-MM-DD.",
+                                      public=f"Je n'ai pas créé le créneau : la {libelle} est invalide. Utilise le format AAAA-MM-JJ.")
         if bounds.get("start_date") and bounds.get("end_date") and bounds["end_date"] < bounds["start_date"]:
             return ToolResult(success=False, data={}, message=(
                 f"Impossible : la date de fin ({bounds['end_date'].isoformat()}) est avant "
                 f"la date de début ({bounds['start_date'].isoformat()}). "
                 "Si la fin vient d'une réponse de l'utilisateur sans année, elle est "
-                "peut-être dans le passé : demande-lui de confirmer l'année."))
+                "peut-être dans le passé : demande-lui de confirmer l'année."),
+                public=("Je n'ai pas créé le créneau : la date de fin est avant la date de début. "
+                        "Vérifie l'année de la date de fin."))
 
         # Validation choices/max_length AVANT toute écriture (le schéma JSON
         # n'est qu'indicatif pour le LLM; SQLite n'applique pas ces contraintes).
@@ -219,14 +223,18 @@ class CreateBlockTool(BaseTool):
             or validate_max_length(location, LOCATION_MAX_LENGTH, "location")
         )
         if err:
-            return ToolResult(success=False, data={}, message=err)
+            return ToolResult(success=False, data={}, message=err,
+                              public=("Je n'ai pas créé le créneau : une valeur fournie est invalide. "
+                                      "Vérifie le type de créneau, la flexibilité, le titre et le lieu."))
 
         # Parse + valide les heures une seule fois (format HH:MM).
         try:
             start_t = parse_time(start_time)
             end_t = parse_time(end_time)
         except ValueError as e:
-            return ToolResult(success=False, data={}, message=str(e))
+            return ToolResult(success=False, data={}, message=str(e),
+                              public=("Je n'ai pas créé le créneau : l'heure indiquée est invalide. "
+                                      "Dis-moi l'heure de début et l'heure de fin."))
 
         # Détection night shift basée sur les minutes (pas une comparaison de chaînes).
         is_night_shift = is_overnight(start_t, end_t, is_night_shift)
@@ -330,6 +338,8 @@ class CreateBlockTool(BaseTool):
                 success=False,
                 data={},
                 message=f"Création annulée (aucun bloc créé): {e}",
+                public=("Je n'ai pas créé le créneau : une erreur technique est survenue, "
+                        "aucun créneau n'a été créé. Réessaie."),
             )
 
         day_names = [DAY_NAMES[d] for d in days if 0 <= d <= 6]
@@ -343,6 +353,10 @@ class CreateBlockTool(BaseTool):
             success=len(created) > 0,
             data={"created": created, "skipped": skipped},
             message=msg,
+            # Ne rend que si rien n'a ete cree ni saute (aucun jour valide) :
+            # les sauts passent par la branche dediee du rendu.
+            public=("Je n'ai pas créé le créneau : aucun jour valide. "
+                    "Utilise des noms de jour, par exemple lundi."),
         )
 
 
@@ -390,7 +404,8 @@ class UpdateBlockTool(BaseTool):
         try:
             block = RecurringBlock.objects.get(id=block_id, user=user, active=True)
         except RecurringBlock.DoesNotExist:
-            return ToolResult(success=False, data={}, message=f"Bloc #{block_id} introuvable.")
+            return ToolResult(success=False, data={}, message=f"Bloc #{block_id} introuvable.",
+                              public="Je n'ai pas modifié le créneau : je ne l'ai pas trouvé. Dis-moi lequel.")
 
         # Validation choices/max_length AVANT save() (idem CreateBlockTool).
         err = (
@@ -400,7 +415,9 @@ class UpdateBlockTool(BaseTool):
             or validate_max_length(kwargs.get("location"), LOCATION_MAX_LENGTH, "location")
         )
         if err:
-            return ToolResult(success=False, data={}, message=err)
+            return ToolResult(success=False, data={}, message=err,
+                              public=("Je n'ai pas modifié le créneau : une valeur fournie est invalide. "
+                                      "Vérifie le type de créneau, la flexibilité, le titre et le lieu."))
 
         # L'etat AVANT modification, pour que le rendu dise ce qui a change.
         avant = {
@@ -416,7 +433,9 @@ class UpdateBlockTool(BaseTool):
             new_start = parse_time(kwargs["start_time"]) if kwargs.get("start_time") else block.start_time
             new_end = parse_time(kwargs["end_time"]) if kwargs.get("end_time") else block.end_time
         except ValueError as e:
-            return ToolResult(success=False, data={}, message=str(e))
+            return ToolResult(success=False, data={}, message=str(e),
+                              public=("Je n'ai pas modifié le créneau : l'heure indiquée est invalide. "
+                                      "Dis-moi l'heure de début et l'heure de fin."))
 
         # Déplacement inter-jours propre (pas de delete+create qui duplique).
         new_day = kwargs.get("day_of_week")
@@ -432,7 +451,9 @@ class UpdateBlockTool(BaseTool):
             if not compris:
                 return ToolResult(success=False, data={}, message=(
                     f"day_of_week invalide : {new_day!r} "
-                    "(nom de jour ou 0=Lundi..6=Dimanche). Corrige et réessaie."))
+                    "(nom de jour ou 0=Lundi..6=Dimanche). Corrige et réessaie."),
+                    public=("Je n'ai pas modifié le créneau : le jour indiqué n'est pas reconnu. "
+                            "Utilise un nom de jour, par exemple lundi."))
             new_day = compris[0]
 
         night = is_overnight(new_start, new_end, block.is_night_shift)
@@ -488,13 +509,17 @@ class UpdateBlockTool(BaseTool):
                 try:
                     setattr(block, key, dt_date.fromisoformat(raw[:10]))
                 except ValueError:
-                    return ToolResult(success=False, data={}, message=f"{key} invalide: attendu YYYY-MM-DD.")
+                    libelle = {"start_date": "date de début", "end_date": "date de fin"}[key]
+                    return ToolResult(success=False, data={}, message=f"{key} invalide: attendu YYYY-MM-DD.",
+                                      public=f"Je n'ai pas modifié le créneau : la {libelle} est invalide. Utilise le format AAAA-MM-JJ.")
         if block.start_date and block.end_date and block.end_date < block.start_date:
             return ToolResult(success=False, data={}, message=(
                 f"Impossible : la date de fin ({block.end_date.isoformat()}) est avant "
                 f"la date de début ({block.start_date.isoformat()}). "
                 "Si la fin vient d'une réponse de l'utilisateur sans année, elle est "
-                "peut-être dans le passé : demande-lui de confirmer l'année."))
+                "peut-être dans le passé : demande-lui de confirmer l'année."),
+                public=("Je n'ai pas modifié le créneau : la date de fin est avant la date de début. "
+                        "Vérifie l'année de la date de fin."))
         block.flexibility = new_flexibility
         block.start_time = new_start
         block.end_time = new_end
@@ -528,7 +553,8 @@ class DeleteBlockTool(BaseTool):
         try:
             block = RecurringBlock.objects.get(id=block_id, user=user, active=True)
         except RecurringBlock.DoesNotExist:
-            return ToolResult(success=False, data={}, message=f"Bloc #{block_id} introuvable.")
+            return ToolResult(success=False, data={}, message=f"Bloc #{block_id} introuvable.",
+                              public="Je n'ai pas supprimé le créneau : je ne l'ai pas trouvé. Dis-moi lequel.")
 
         title = block.title
         # Lu AVANT la desactivation: le rendu nomme le jour et les heures.
@@ -574,6 +600,7 @@ class ClearAllBlocksTool(BaseTool):
             return ToolResult(
                 success=False,
                 message="Suppression annulée: confirm doit être true.",
+                public="Je n'ai rien archivé : il me faut ta confirmation d'abord.",
             )
 
         # Soft-delete (active=False) au lieu d'un DELETE: réversible, restaurable.
@@ -651,10 +678,13 @@ def _parse_occurrence(kwargs):
     try:
         target_date = datetime.strptime(kwargs["date"], "%Y-%m-%d").date()
     except (ValueError, KeyError, TypeError):
-        return None, ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.")
+        return None, ToolResult(success=False, data={}, message="Format de date invalide. Utilise YYYY-MM-DD.",
+                                public="Je n'ai rien changé : la date est invalide. Utilise le format AAAA-MM-JJ.")
     err = validate_choice(kwargs.get("block_type"), VALID_BLOCK_TYPES, "block_type")
     if err:
-        return None, ToolResult(success=False, data={}, message=err)
+        return None, ToolResult(success=False, data={}, message=err,
+                                public=("Je n'ai rien changé : le type de créneau est invalide. "
+                                        "Dis-moi de quel type de créneau il s'agit."))
     return target_date, None
 
 
@@ -684,6 +714,7 @@ class SkipBlockOccurrenceTool(BaseTool):
                 success=False,
                 data={},
                 message=f"Aucun bloc récurrent{kind} le {DAY_NAMES[dow]} {target_date.isoformat()}. Rien à ignorer.",
+                public="Je n'ai rien annulé : aucun créneau ce jour-là. Vérifie le jour ou le titre.",
             )
         if len(matches) > 1:
             candidates = _candidates_payload(matches, dow)
@@ -764,7 +795,8 @@ class ReplaceBlockOccurrenceTool(BaseTool):
         remplacant = (kwargs.get("replacement_title") or "").strip()
         if not remplacant:
             return ToolResult(success=False, data={},
-                              message="Titre du remplaçant requis.")
+                              message="Titre du remplaçant requis.",
+                              public="Je n'ai rien remplacé : le titre du remplaçant est manquant. Dis-moi ce qui prend la place.")
 
         target_date, err = _parse_occurrence(kwargs)
         if err:
@@ -780,6 +812,7 @@ class ReplaceBlockOccurrenceTool(BaseTool):
                 data={},
                 message=(f"Aucun bloc récurrent{kind} le {DAY_NAMES[dow]} "
                          f"{target_date.isoformat()}. Rien à remplacer."),
+                public="Je n'ai rien remplacé : aucun créneau ce jour-là. Vérifie le jour ou le titre.",
             )
         if len(matches) > 1:
             candidates = _candidates_payload(matches, dow)
@@ -816,6 +849,9 @@ class ReplaceBlockOccurrenceTool(BaseTool):
                 data=dict(place.data or {}),
                 message=(f"{remplacant} n'a pas pu prendre la place de "
                          f"'{block.title}': {place.message}"),
+                # La raison du placement echoue est celle de l'outil interne :
+                # on la relaie, les branches specifiques (conflit, ...) restent prioritaires.
+                public=place.public,
             )
 
         donnees = dict(place.data or {})
@@ -859,6 +895,7 @@ class RestoreBlockOccurrenceTool(BaseTool):
                 success=False,
                 data={},
                 message=f"Aucun bloc récurrent{kind} le {DAY_NAMES[dow]} {target_date.isoformat()}.",
+                public="Je n'ai rien rétabli : aucun créneau ce jour-là. Vérifie le jour ou le titre.",
             )
         if len(matches) > 1:
             candidates = _candidates_payload(matches, dow)

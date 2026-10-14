@@ -136,7 +136,8 @@ class GetWeekScheduleTool(BaseTool):
                 start = datetime.strptime(start_str, "%Y-%m-%d").date()
             except ValueError:
                 return ToolResult(success=False, data={}, message=(
-                    f"Format de date invalide : {start_str!r}. Utilise YYYY-MM-DD."))
+                    f"Format de date invalide : {start_str!r}. Utilise YYYY-MM-DD."),
+                    public="Je n'ai pas pu lire ta semaine : la date est invalide. Utilise le format AAAA-MM-JJ.")
         else:
             today = timezone.localdate()
             start = today - timedelta(days=today.weekday())  # Monday
@@ -207,7 +208,8 @@ class FindFreeSlotsTool(BaseTool):
             target_date = datetime.strptime(kwargs["date"], "%Y-%m-%d").date()
         except ValueError:
             return ToolResult(success=False, data={}, message=(
-                f"Format de date invalide : {kwargs.get('date')!r}. Utilise YYYY-MM-DD."))
+                f"Format de date invalide : {kwargs.get('date')!r}. Utilise YYYY-MM-DD."),
+                public="Je n'ai pas pu vérifier les créneaux libres : la date est invalide. Utilise le format AAAA-MM-JJ.")
 
         day_of_week = target_date.weekday()
         min_duration = kwargs.get("min_duration_minutes", 30)
@@ -397,7 +399,8 @@ class ScheduleTaskAtTool(BaseTool):
     def execute(self, user: User, **kwargs) -> ToolResult:
         title = (kwargs.get("title") or "").strip()
         if not title:
-            return ToolResult(success=False, data={}, message="Titre requis.")
+            return ToolResult(success=False, data={}, message="Titre requis.",
+                              public="Je n'ai rien planifié : le titre est manquant. Dis-moi le titre de l'événement.")
 
         try:
             target_date = datetime.strptime(kwargs["date"], "%Y-%m-%d").date()
@@ -415,12 +418,15 @@ class ScheduleTaskAtTool(BaseTool):
         except (ValueError, KeyError):
             return ToolResult(success=False, data={}, message=(
                 f"Heure invalide (attendu HH:MM) : début={kwargs.get('start_time')!r}, "
-                f"fin={kwargs.get('end_time')!r}. Corrige le format et réessaie."))
+                f"fin={kwargs.get('end_time')!r}. Corrige le format et réessaie."),
+                public=("Je n'ai pas planifié l'événement : l'heure indiquée est invalide. "
+                        "Dis-moi l'heure de début et l'heure de fin."))
 
         s = _time_to_minutes(start_t)
         e = _time_to_minutes(end_t)
         if s == e:
-            return ToolResult(success=False, data={}, message="La durée doit être non nulle (fin différente du début).")
+            return ToolResult(success=False, data={}, message="La durée doit être non nulle (fin différente du début).",
+                              public="Je n'ai pas planifié l'événement : la fin doit être différente du début. Dis-moi l'heure de fin.")
 
         # task_type est OPTIONNEL: un type invalide (ex: le LLM envoie 'work' pour
         # un quart de nuit) ne doit PAS faire échouer toute la planification.
@@ -659,7 +665,8 @@ def _executer_organize_day(user, target_date, apply, arrangement, expected_entri
         except ValueError as exc:
             return ToolResult(success=False, data={"applied": False, "reason": str(exc),
                                                    "date": target_date.isoformat()},
-                              message="Cet arrangement ne peut plus être appliqué tel quel. Rien n'a changé. Demande une nouvelle proposition.")
+                              message="Cet arrangement ne peut plus être appliqué tel quel. Rien n'a changé. Demande une nouvelle proposition.",
+                              public="Je n'ai pas appliqué ce plan : il n'est plus valable tel quel. Demande une nouvelle proposition.")
         placed, overnight, skipped, listing = _mettre_en_forme_jour(arrangement)
         msg = f"Journée réorganisée le {target_date.isoformat()}: {listing}."
     return ToolResult(
@@ -890,7 +897,8 @@ class OptimizeWeekTool(BaseTool):
             except ValueError as exc:
                 return ToolResult(success=False, data={"applied": False, "reason": str(exc),
                                                        "start_date": start.isoformat()},
-                                  message="Ce plan ne peut plus être appliqué tel quel. Rien n'a changé. Demande une nouvelle proposition.")
+                                  message="Ce plan ne peut plus être appliqué tel quel. Rien n'a changé. Demande une nouvelle proposition.",
+                                  public="Je n'ai pas appliqué ce plan : il n'est plus valable tel quel. Demande une nouvelle proposition.")
             days_data, lines, skipped_total = _mettre_en_forme_semaine(user, start, arrangements)
             for jour, moved in zip(days_data, moved_days):
                 jour["moved"] = moved
@@ -927,7 +935,8 @@ class CancelScheduledBlockTool(BaseTool):
         try:
             target_date = datetime.strptime(kwargs["date"], "%Y-%m-%d").date()
         except (ValueError, KeyError, TypeError):
-            return ToolResult(success=False, data={}, message="Format de date invalide (attendu YYYY-MM-DD).")
+            return ToolResult(success=False, data={}, message="Format de date invalide (attendu YYYY-MM-DD).",
+                              public="Je n'ai rien annulé : la date est invalide. Utilise le format AAAA-MM-JJ.")
 
         title = (kwargs.get("title") or "").strip()
         qs = ScheduledBlock.objects.filter(user=user, date=target_date).select_related("task")
@@ -939,6 +948,7 @@ class CancelScheduledBlockTool(BaseTool):
             return ToolResult(
                 success=False, data={},
                 message=f"Aucun événement ponctuel trouvé le {target_date.isoformat()}{suffix}.",
+                public="Je n'ai rien annulé : aucun événement ponctuel ce jour-là. Vérifie la date.",
             )
 
         distinct = sorted({(b.task.title if b.task else "") for b in blocks})
