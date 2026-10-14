@@ -1163,6 +1163,7 @@ Analyse ce texte et retourne le JSON structuré:"""
             from services.llm import get_provider
             provider = get_provider('deepseek')
             if not provider.is_available():
+                logger.warning("DeepSeek fallback ignoré: provider indisponible (clé absente ?)")
                 return None
             with appel_fournisseur(phase='extraction', fournisseur='deepseek',
                                    jetons_entree=borne_texte(prompt), max_sortie=4096) as appel:
@@ -1178,6 +1179,10 @@ Analyse ce texte et retourne le JSON structuré:"""
                 }, succes=True)
                 response = provider._parse_response(raw)
                 if response.is_error or not (response.text or '').strip():
+                    logger.warning(
+                        "DeepSeek fallback sans contenu exploitable "
+                        "(is_error=%s, texte_vide=%s)",
+                        response.is_error, not (response.text or '').strip())
                     return None
             logger.info("DeepSeek text structuring fallback succeeded")
             return response.text
@@ -1411,7 +1416,21 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
         try:
             return json.loads(json_str)
         except json.JSONDecodeError as e:
-            logger.warning(f"JSON decode error: {e}")
+            # Les LLM glissent parfois une virgule surnuméraire ("a": 1, }).
+            # Une réparation minimale suffit souvent à sauver l'import.
+            repaired = re.sub(r',(\s*[}\]])', r'\1', json_str)
+            if repaired != json_str:
+                try:
+                    data = json.loads(repaired)
+                    logger.warning(f"JSON réparé (virgules surnuméraires) après erreur: {e}")
+                    return data
+                except json.JSONDecodeError:
+                    pass
+            # Loggue la zone exacte de l'échec en repr (pas de troncature
+            # aveugle) pour un diagnostic serveur précis.
+            start = max(0, e.pos - 120)
+            logger.warning(
+                f"JSON decode error: {e} ; zone: {json_str[start:e.pos + 80]!r}")
             return {"raw_response": response_text, "parse_error": True}
 
     def _confidence_status(self, *, start_defaulted, end_defaulted, title_generic, llm_confidence=None,

@@ -109,3 +109,9 @@ class DocTextFallbackTest(TestCase):
         proc._call_gemini('texte', json_mode=True)
         config = proc.gemini_client.models.generate_content.call_args.kwargs['config']
         self.assertEqual(config.response_mime_type, 'application/json')
+
+    def test_parse_response_repairs_trailing_comma(self):
+        proc = DocumentProcessor.__new__(DocumentProcessor)
+        out = proc._parse_response('{"courses": [{"name": "Maths",}], "shifts": []}')
+        self.assertNotIn('parse_error', out)
+        self.assertEqual(out['courses'][0]['name'], 'Maths')
