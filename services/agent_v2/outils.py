@@ -2380,6 +2380,26 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
         kwargs["_arrangement" if nom == "organize_day" else "_arrangements"] = arrangements
         kwargs["_expected_entries"] = entrees
 
+    if choix is not None:
+        # Le garde date passee s'applique AUSSI aux choix confirmes par
+        # l'utilisateur : la confirmation ne re-valide pas la date.
+        # Banc du 2026-10-14 : 10 update_block confirmes « Oui, confirme »
+        # ont ecrit end_date=2026-05-31 (deja passe), le garde ne voyait
+        # que le chemin modele. La confirmation ne dispense pas du controle.
+        # cle_demande/par_le_code/decision_code : comme le refus de plan
+        # ci-dessus, sinon appliquer_choix_en_attente ne retrouve pas
+        # l'action et le resume perd la raison.
+        issue = _date_passee(nom, kwargs)
+        if issue is not None:
+            refus = ToolResult(
+                success=False,
+                data={**issue.data, "cle_demande": choix.get("cle"),
+                      "par_le_code": True, "decision_code": DECISION_EXECUTE},
+                message=issue.message, issue=issue.issue, cause=issue.cause,
+                public=issue.public)
+            _consigner(ctx, nom, kwargs, refus)
+            return refus.to_string()
+
     # Meme marqueur que v1: le banc capte les appels d'outils par le
     # logger parent « services », et cette ligne est ce qu'il cherche.
     # Les kwargs prives (ex: _arrangements) sont exclus de l'affichage:
@@ -3073,6 +3093,14 @@ def _appliquer(ctx: _Contexte) -> list[dict]:
         elif action is not None and action.donnees.get("demande"):
             resume = ("PLAN CHANGE: la proposition de la semaine a change depuis la question, "
                       "une nouvelle confirmation est demandee, n'applique rien")
+        elif action is not None and action.donnees.get("date_passee"):
+            # Le garde date passee a refuse le choix confirme : la raison
+            # doit atteindre le modele, sinon il dirait « ca n'a pas
+            # abouti » sans explication. Il demande la bonne annee.
+            resume = (f"REFUSE PAR LE CODE ({action_id}): {sujet} n'a pas abouti car "
+                      f"{action.donnees.get('champ')} {action.donnees.get('date_passee')} "
+                      "est deja passe. Demande a l'utilisateur la bonne annee, "
+                      "n'insiste pas sur la date refusee.")
         else:
             resume = f"ECHEC DU CODE ({action_id}): {sujet} n'a pas abouti, n'insiste pas"
         sorties.append({"cle": cle, "motif": motif, "option": option,

@@ -1083,6 +1083,29 @@ class ContournementsDeLaRevueTests(HarnaisGardes, TransactionTestCase):
         self.assertIsNone(_date_passee('update_block', {'end_date': ''}))
         self.assertIsNone(_date_passee('update_block', {}))
 
+    def test_une_fin_passee_confirmee_est_refusee(self):
+        # 2026-10-14 (prod) : le garde ne s'appliquait qu'au chemin modele.
+        # Les 10 update_block confirmes « Oui, confirme » ont ecrit
+        # end_date=2026-05-31, deja passe, sans aucun blocage. La
+        # confirmation ne re-valide pas la date : le garde doit aussi voir
+        # le chemin des choix confirmes.
+        action = self.premier_tour('mes cours finissent fin mai', 'update_block',
+                                   block_id=self.q.id, end_date='2026-05-31')
+        self.assertFalse(action.succes)
+        demande = action.donnees['demande']
+        self.assertEqual(demande['motif'], 'destructif')
+        self.attendre([puces(demande)], 'Oui, je confirme.')
+        registre, tools = self.outils('Oui, je confirme.', tache='u:2')
+        self.appeler(tools, 'update_block', block_id=self.q.id,
+                     end_date='2026-05-31')
+        refus = registre.actions[-1]
+        self.assertFalse(refus.succes)
+        self.assertEqual(refus.donnees['date_passee'], '2026-05-31')
+        self.assertEqual(refus.donnees['champ'], 'end_date')
+        self.assertIn('2026-05-31', refus.message)
+        self.q.refresh_from_db()
+        self.assertIsNone(self.q.end_date)
+
     def test_la_question_des_ajouts_ne_nomme_que_le_retenu(self):
         brut = 'ajoute mes cours du matin'
         self.message_courant(brut)
