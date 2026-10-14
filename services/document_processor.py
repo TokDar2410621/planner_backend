@@ -1133,7 +1133,21 @@ Analyse ce texte et retourne le JSON structuré:"""
 
         if self.gemini_client:
             try:
-                raw = self._call_gemini(prompt, json_mode=True).text
+                gemini_response = self._call_gemini(prompt, json_mode=True)
+                raw = gemini_response.text
+                # Observabilite troncature : longueur reelle + finish_reason.
+                try:
+                    cands = getattr(gemini_response, 'candidates', None) or []
+                    fr = getattr(cands[0], 'finish_reason', None) if cands else None
+                    fr_name = getattr(fr, 'name', None) or (str(fr) if fr else None)
+                except Exception:
+                    fr_name = None
+                logger.info(
+                    f"Gemini structuration: {len(raw or '')} chars, "
+                    f"finish_reason={fr_name}")
+                if fr_name and str(fr_name).upper() in ('MAX_TOKENS', 'LENGTH'):
+                    logger.warning(
+                        "Gemini a tronqué la réponse (finish_reason=%s)", fr_name)
             except Exception as e:
                 # Structurer du TEXTE n'exige pas la vision: DeepSeek (cle deja
                 # en prod) peut sauver le coup quand Gemini tombe. On ne laisse
