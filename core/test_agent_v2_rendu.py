@@ -387,10 +387,16 @@ class AutresMutationsTests(SimpleTestCase):
 
 
 class LecturesRateesEtRetenuesTests(SimpleTestCase):
-    def test_lectures_ratees_invisibles(self):
+    def test_lectures_ratees_visibles_en_faits(self):
+        # Audit 2026-10-13: une lecture ratee ne se tait plus dans les faits;
+        # elle nomme ce qui n'a pas pu etre lu, sans recopier le message brut.
+        # Le bloc lecture, lui, ne montre que ce qui a ete vu.
         r = registre(*[(outil, {}, False, {}, "Format de date invalide.")
                        for outil in ("find_free_slots", "get_week_schedule", "list_blocks")])
-        self.assertEqual(faits(r), "")
+        self.assertEqual(faits(r),
+                         "- Je n'ai pas pu vérifier les créneaux libres.\n"
+                         "- Je n'ai pas pu lire ta semaine.\n"
+                         "- Je n'ai pas pu lire ton horaire.")
         self.assertEqual(lecture(r), "")
 
     def test_retenue_non_posee_dit_une_ligne(self):

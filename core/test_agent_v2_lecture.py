@@ -100,7 +100,10 @@ class ListeDeLectureTests(SimpleTestCase):
     def test_sans_lecture_d_horaire_rien_ne_s_affiche(self):
         """Contre-epreuve: on n'invente pas une liste sur un tour de politesse."""
         self.assertEqual(bloc_lecture(Registre()), "")
-        self.assertEqual(bloc_lecture(_registre(("get_preferences", {"a": 1}))), "")
+        # Audit 2026-10-13: une lecture reussie est accusee, mais sans inventer
+        # de liste d'horaire.
+        self.assertEqual(bloc_lecture(_registre(("get_preferences", {"a": 1}))),
+                         "Tes préférences ont été lues.")
 
     def test_la_derniere_lecture_fait_foi(self):
         """Si l'agent a relu apres coup, c'est la vue la plus recente qui compte."""

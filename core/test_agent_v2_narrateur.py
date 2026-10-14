@@ -446,7 +446,13 @@ class MessageBrutTests(NarrateurBase):
         self.assertEqual(outil["name"], "delete_block")
         self.assertLess(types.index("tool"), types.index("status"))
         self.assertEqual(self.metadonnees()["actions"],
-                         [{"id": "a1", "outil": "delete_block", "succes": True, "par_le_code": True}])
+                         [{"id": "a1", "outil": "delete_block", "succes": True,
+                           "par_le_code": True,
+                           # Audit 2026-10-13: le journal transporte le contrat
+                           # d'issue (parametres expurges, issue, cause, duree).
+                           "parametres": {"block_id": {"type": "int",
+                                                       "valeur": bloc.pk}},
+                           "issue": "", "cause": "", "duree_ms": 0.0}])
         self.assertTrue(done["response"].startswith("FAITS"))
         self.assertFalse(RecurringBlock.all_objects.get(pk=bloc.pk).active)
 
