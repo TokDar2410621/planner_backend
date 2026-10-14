@@ -135,7 +135,8 @@ class GetWeekScheduleTool(BaseTool):
             try:
                 start = datetime.strptime(start_str, "%Y-%m-%d").date()
             except ValueError:
-                return ToolResult(success=False, data={}, message="Format de date invalide.")
+                return ToolResult(success=False, data={}, message=(
+                    f"Format de date invalide : {start_str!r}. Utilise YYYY-MM-DD."))
         else:
             today = timezone.localdate()
             start = today - timedelta(days=today.weekday())  # Monday
@@ -205,7 +206,8 @@ class FindFreeSlotsTool(BaseTool):
         try:
             target_date = datetime.strptime(kwargs["date"], "%Y-%m-%d").date()
         except ValueError:
-            return ToolResult(success=False, data={}, message="Format de date invalide.")
+            return ToolResult(success=False, data={}, message=(
+                f"Format de date invalide : {kwargs.get('date')!r}. Utilise YYYY-MM-DD."))
 
         day_of_week = target_date.weekday()
         min_duration = kwargs.get("min_duration_minutes", 30)
@@ -411,7 +413,9 @@ class ScheduleTaskAtTool(BaseTool):
             start_t = parse_time(kwargs["start_time"])
             end_t = parse_time(kwargs["end_time"])
         except (ValueError, KeyError):
-            return ToolResult(success=False, data={}, message="Heure invalide (attendu HH:MM).")
+            return ToolResult(success=False, data={}, message=(
+                f"Heure invalide (attendu HH:MM) : début={kwargs.get('start_time')!r}, "
+                f"fin={kwargs.get('end_time')!r}. Corrige le format et réessaie."))
 
         s = _time_to_minutes(start_t)
         e = _time_to_minutes(end_t)

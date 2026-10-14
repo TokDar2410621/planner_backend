@@ -430,7 +430,9 @@ class UpdateBlockTool(BaseTool):
             # verrait pas passer.
             compris = normaliser_jours(new_day)
             if not compris:
-                return ToolResult(success=False, data={}, message="day_of_week invalide (nom de jour ou 0=Lundi..6=Dimanche).")
+                return ToolResult(success=False, data={}, message=(
+                    f"day_of_week invalide : {new_day!r} "
+                    "(nom de jour ou 0=Lundi..6=Dimanche). Corrige et réessaie."))
             new_day = compris[0]
 
         night = is_overnight(new_start, new_end, block.is_night_shift)

@@ -15,6 +15,9 @@ from core.models import RecurringBlock, UploadedDocument
 from services.document_processor import DocumentProcessor
 from services.scheduling.day_view import effective_day_blocks
 from services.agent.tools.blocks import CreateBlockTool, UpdateBlockTool
+from services.agent.tools.schedule import (
+    FindFreeSlotsTool, GetWeekScheduleTool, ScheduleTaskAtTool,
+)
 from services.ical import build_calendar
 
 
@@ -94,6 +97,41 @@ class BoundsModelTest(TestCase):
         self.assertIn('2026-05-31', res.message)
         self.assertIn('2026-10-14', res.message)
         self.assertIn('année', res.message)
+
+
+class ErreursActionnablesTest(TestCase):
+    """Audit 2026-10-14 (option 2) : tout message d'echec d'outil donne
+    la valeur recue + l'action corrective, sinon le modele ne peut pas
+    se corriger et abandonne apres une tentative."""
+
+    def setUp(self):
+        self.u = User.objects.create_user('erreurs', password='<redacted>')
+
+    def test_semaine_date_invalide_donne_la_valeur(self):
+        res = GetWeekScheduleTool().execute(self.u, start_date='31 mai')
+        self.assertFalse(res.success)
+        self.assertIn('31 mai', res.message)
+        self.assertIn('YYYY-MM-DD', res.message)
+
+    def test_creneaux_date_invalide_donne_la_valeur(self):
+        res = FindFreeSlotsTool().execute(self.u, date='demain')
+        self.assertFalse(res.success)
+        self.assertIn('demain', res.message)
+        self.assertIn('YYYY-MM-DD', res.message)
+
+    def test_planification_heure_invalide_donne_les_valeurs(self):
+        res = ScheduleTaskAtTool().execute(
+            self.u, title='X', date='2026-10-15',
+            start_time='25:00', end_time='26:00')
+        self.assertFalse(res.success)
+        self.assertIn('25:00', res.message)
+        self.assertIn('26:00', res.message)
+
+    def test_update_jour_invalide_donne_la_valeur(self):
+        b = _mk(self.u, start_date=date(2026, 9, 1))
+        res = UpdateBlockTool().execute(self.u, block_id=b.id, day_of_week='nimporte')
+        self.assertFalse(res.success)
+        self.assertIn('nimporte', res.message)
 
     def test_ical_until_and_ended_blocks(self):
         _mk(self.u, title='Fini', end_date=date(2020, 1, 6))
