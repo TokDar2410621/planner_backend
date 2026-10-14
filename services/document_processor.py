@@ -1143,11 +1143,16 @@ Analyse ce texte et retourne le JSON structuré:"""
                     cands = getattr(gemini_response, 'candidates', None) or []
                     fr = getattr(cands[0], 'finish_reason', None) if cands else None
                     fr_name = getattr(fr, 'name', None) or (str(fr) if fr else None)
+                    um = getattr(gemini_response, 'usage_metadata', None)
+                    tok_sortie = getattr(um, 'candidates_token_count', None) if um else None
+                    tok_pensee = getattr(um, 'thoughts_token_count', None) if um else None
+                    nb_parts = len(getattr(getattr(cands[0], 'content', None), 'parts', None) or []) if cands else 0
                 except Exception:
-                    fr_name = None
+                    fr_name, tok_sortie, tok_pensee, nb_parts = None, None, None, None
                 logger.info(
                     f"Gemini structuration: {len(raw or '')} chars, "
-                    f"finish_reason={fr_name}")
+                    f"finish_reason={fr_name}, tokens_sortie={tok_sortie}, "
+                    f"tokens_pensee={tok_pensee}, nb_parts={nb_parts}")
                 if fr_name and str(fr_name).upper() in ('MAX_TOKENS', 'LENGTH'):
                     logger.warning(
                         "Gemini a tronqué la réponse (finish_reason=%s)", fr_name)
