@@ -204,7 +204,11 @@ class CreateBlockTool(BaseTool):
                 except ValueError:
                     return ToolResult(success=False, data={}, message=f"{key} invalide: attendu YYYY-MM-DD.")
         if bounds.get("start_date") and bounds.get("end_date") and bounds["end_date"] < bounds["start_date"]:
-            return ToolResult(success=False, data={}, message="end_date avant start_date.")
+            return ToolResult(success=False, data={}, message=(
+                f"Impossible : la date de fin ({bounds['end_date'].isoformat()}) est avant "
+                f"la date de début ({bounds['start_date'].isoformat()}). "
+                "Si la fin vient d'une réponse de l'utilisateur sans année, elle est "
+                "peut-être dans le passé : demande-lui de confirmer l'année."))
 
         # Validation choices/max_length AVANT toute écriture (le schéma JSON
         # n'est qu'indicatif pour le LLM; SQLite n'applique pas ces contraintes).
@@ -484,7 +488,11 @@ class UpdateBlockTool(BaseTool):
                 except ValueError:
                     return ToolResult(success=False, data={}, message=f"{key} invalide: attendu YYYY-MM-DD.")
         if block.start_date and block.end_date and block.end_date < block.start_date:
-            return ToolResult(success=False, data={}, message="end_date avant start_date.")
+            return ToolResult(success=False, data={}, message=(
+                f"Impossible : la date de fin ({block.end_date.isoformat()}) est avant "
+                f"la date de début ({block.start_date.isoformat()}). "
+                "Si la fin vient d'une réponse de l'utilisateur sans année, elle est "
+                "peut-être dans le passé : demande-lui de confirmer l'année."))
         block.flexibility = new_flexibility
         block.start_time = new_start
         block.end_time = new_end

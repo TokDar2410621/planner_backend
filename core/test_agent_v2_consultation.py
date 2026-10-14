@@ -134,6 +134,14 @@ class SalutationSansLectureTests(TransactionTestCase):
         self.assertIn('aucune lecture', REGLES_AGIR.lower())
         self.assertIn('quels que soient ses mots', REGLES_AGIR)
 
+    def test_le_prompt_dit_mois_sans_annee_prochaine_occurrence(self):
+        # 2026-10-14: « fin mai » dit en octobre ne doit pas devenir
+        # mai de l'annee en cours (passe), mais le prochain mai.
+        from services.agent_v2.prompts import REGLES_AGIR
+        self.assertIn('MOIS SANS ANNEE', REGLES_AGIR)
+        self.assertIn('PROCHAINE occurrence', REGLES_AGIR)
+        self.assertIn('jamais une date passee', REGLES_AGIR)
+
     def test_aucune_regle_n_enumere_des_formules_de_politesse(self):
         """La garde contre la faute commise deux fois."""
         from services.agent_v2 import jugement, outils as outils_v2

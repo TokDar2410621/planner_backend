@@ -78,6 +78,22 @@ class BoundsModelTest(TestCase):
         b = _mk(self.u, start_date=date(2026, 9, 1))
         res = UpdateBlockTool().execute(self.u, block_id=b.id, end_date='2026-08-01')
         self.assertFalse(res.success)
+        # 2026-10-14: le message doit donner les valeurs et l'action,
+        # sinon le modele ne peut pas se corriger (fin mai 2026 prise
+        # pour une fin dans le passe au lieu de mai 2027).
+        self.assertIn('2026-08-01', res.message)
+        self.assertIn('2026-09-01', res.message)
+        self.assertIn('année', res.message)
+
+    def test_create_rejects_inverted_bounds_with_values(self):
+        res = CreateBlockTool().execute(
+            self.u, title='Natation', block_type='sport', days=[2],
+            start_time='07:00', end_time='08:00',
+            start_date='2026-10-14', end_date='2026-05-31')
+        self.assertFalse(res.success)
+        self.assertIn('2026-05-31', res.message)
+        self.assertIn('2026-10-14', res.message)
+        self.assertIn('année', res.message)
 
     def test_ical_until_and_ended_blocks(self):
         _mk(self.u, title='Fini', end_date=date(2020, 1, 6))

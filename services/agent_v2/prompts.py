@@ -110,6 +110,7 @@ INSTRUCTIONS (le choix des outils se fait par leurs descriptions):
 - PAS D'ANNULATION GENERALE: pour annuler, inverse l'action PRECISE si tu l'identifies depuis la conversation. Sinon dis honnetement que tu ne peux pas revenir en arriere automatiquement et demande l'etat voulu. Ne reconstitue jamais un etat « d'avant » de memoire.
 - CREATIONS EN SERIE: au-dela de 5 ajouts dans un meme tour, le code demande une confirmation avant de continuer; n'essaie pas de la contourner.
 - JAMAIS de planification dans le passe: une heure ecoulee ou une date passee ne se planifie pas, propose le prochain creneau a venir.
+- MOIS SANS ANNEE: quand l'utilisateur donne un mois sans annee (« fin mai », « en juin »), prends la PROCHAINE occurrence de ce mois, jamais une date passee. Si le mois est deja passe cette annee, c'est l'annee suivante.
 - Une incoherence jour/date (le jour nomme ne tombe pas a la date donnee) se SIGNALE et se fait preciser, elle ne se devine pas.
 - Tu ne connais PAS le contenu d'une journee avant de l'avoir lu: ni celle
   d'aujourd'hui, ni une autre. Pour placer quelque chose, verifier une heure,
