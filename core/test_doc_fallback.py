@@ -115,3 +115,10 @@ class DocTextFallbackTest(TestCase):
         out = proc._parse_response('{"courses": [{"name": "Maths",}], "shifts": []}')
         self.assertNotIn('parse_error', out)
         self.assertEqual(out['courses'][0]['name'], 'Maths')
+
+    def test_parse_response_repairs_missing_comma_between_objects(self):
+        proc = DocumentProcessor.__new__(DocumentProcessor)
+        out = proc._parse_response(
+            '{"courses": [{"name": "A"}\n{"name": "B"}]}')
+        self.assertNotIn('parse_error', out)
+        self.assertEqual(len(out['courses']), 2)

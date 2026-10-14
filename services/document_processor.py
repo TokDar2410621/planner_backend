@@ -1416,13 +1416,16 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
         try:
             return json.loads(json_str)
         except json.JSONDecodeError as e:
-            # Les LLM glissent parfois une virgule surnuméraire ("a": 1, }).
-            # Une réparation minimale suffit souvent à sauver l'import.
+            # Les LLM oublient parfois une virgule (",}" surnumeraire ou
+            # "," manquante entre deux objets d'un tableau). Ces deux
+            # reparations minimales suffisent souvent a sauver l'import.
             repaired = re.sub(r',(\s*[}\]])', r'\1', json_str)
+            repaired = re.sub(r'\}\s*\{', '},{', repaired)
+            repaired = re.sub(r'\]\s*\[', '],[', repaired)
             if repaired != json_str:
                 try:
                     data = json.loads(repaired)
-                    logger.warning(f"JSON réparé (virgules surnuméraires) après erreur: {e}")
+                    logger.warning(f"JSON réparé (virgules) après erreur: {e}")
                     return data
                 except json.JSONDecodeError:
                     pass
