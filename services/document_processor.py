@@ -710,6 +710,9 @@ Analyse ce texte et retourne le JSON structuré:"""
                 http_options=types.HttpOptions(timeout=max(1, int(appel.delai * 1000)),
                     retry_options=types.HttpRetryOptions(attempts=1)),
             )
+            logger.info(
+                f"Gemini extraction: max_sortie effectif={appel.max_sortie} "
+                f"(demande=4096)")
             if json_mode:
                 config_kwargs["response_mime_type"] = "application/json"
             response = self.gemini_client.models.generate_content(
