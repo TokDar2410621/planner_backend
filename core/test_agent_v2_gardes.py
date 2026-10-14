@@ -1064,6 +1064,25 @@ class ContournementsDeLaRevueTests(HarnaisGardes, TransactionTestCase):
         self.assertEqual(refus.donnees['date_passee'], '2025-09-18')
         self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 0)
 
+    def test_garde_date_passee_couvre_les_blocs(self):
+        # 2026-10-14 : « fin mai » dit en octobre donnait end_date=2026-05-31
+        # sur update_block, le garde ne voyait que schedule_task_at.
+        from services.agent_v2.outils import _date_passee
+        refus = _date_passee('update_block', {'end_date': '2020-05-31'})
+        self.assertIsNotNone(refus)
+        self.assertFalse(refus.success)
+        self.assertEqual(refus.data['date_passee'], '2020-05-31')
+        self.assertEqual(refus.data['champ'], 'end_date')
+        self.assertIn('2020-05-31', refus.message)
+        self.assertIn("aujourd'hui", refus.message)
+        refus = _date_passee('create_block', {'start_date': '2020-09-01'})
+        self.assertIsNotNone(refus)
+        self.assertEqual(refus.data['champ'], 'start_date')
+        # Futur ou vide : pas de blocage.
+        self.assertIsNone(_date_passee('update_block', {'end_date': '2099-05-31'}))
+        self.assertIsNone(_date_passee('update_block', {'end_date': ''}))
+        self.assertIsNone(_date_passee('update_block', {}))
+
     def test_la_question_des_ajouts_ne_nomme_que_le_retenu(self):
         brut = 'ajoute mes cours du matin'
         self.message_courant(brut)

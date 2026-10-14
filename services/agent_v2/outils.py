@@ -1566,18 +1566,35 @@ def _heure_dite_contredite(ctx: _Contexte, nom: str, kwargs: dict, prep: _Prepar
 
 
 def _date_passee(nom: str, kwargs: dict):
-    """schedule_task_at ne place jamais un evenement a une date deja passee:
-    sans date du jour, AGIR a deja reserve en 2025 (banc du 2026-09-14)."""
-    if nom != "schedule_task_at":
-        return None
-    jour = _date_iso(kwargs.get("date"))
+    """Aucune creation ni modification a une date deja passee.
+
+    schedule_task_at ne place jamais un evenement a une date deja passee
+    (sans date du jour, AGIR a deja reserve en 2025, banc du 2026-09-14).
+    Etendu 2026-10-14 aux blocs : « fin mai » dit en octobre donnait
+    end_date=2026-05-31, le garde ne voyait que schedule_task_at.
+
+    Forme OpenCode : refus type avec la raison, les valeurs et l'instruction
+    de corriger puis refaire l'appel. Pour fermer une serie, fin = aujourd'hui.
+    """
     aujourdhui = timezone.localdate()
-    if jour is None or jour >= aujourdhui:
+    if nom == "schedule_task_at":
+        bornes = [("date", kwargs.get("date"))]
+    elif nom in ("create_block", "update_block"):
+        bornes = [("start_date", kwargs.get("start_date")),
+                  ("end_date", kwargs.get("end_date"))]
+    else:
         return None
-    return ToolResult(
-        success=False, data={"date_passee": jour.isoformat()},
-        message=(f"Refuse par le code: {jour.isoformat()} est deja passe. Aujourd'hui, "
-                 f"c'est le {aujourdhui.isoformat()}. Verifie le jour et l'annee, puis refais l'appel."))
+    for champ, brut in bornes:
+        jour = _date_iso(brut)
+        if jour is None or jour >= aujourdhui:
+            continue
+        return ToolResult(
+            success=False, data={"date_passee": jour.isoformat(), "champ": champ},
+            message=(f"Refuse par le code : {champ} {jour.isoformat()} est deja passe. "
+                     f"Aujourd'hui, c'est le {aujourdhui.isoformat()}. "
+                     "Verifie le jour et l'annee, puis refais l'appel. "
+                     "Pour fermer une serie, mets la fin a aujourd'hui, pas dans le passe."))
+    return None
 
 
 # --------------------------------------------------- echeance sans jour choisi
