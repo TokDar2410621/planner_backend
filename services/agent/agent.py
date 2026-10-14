@@ -16,6 +16,7 @@ from django.contrib.auth.models import User
 
 from core.models import ConversationMessage, UploadedDocument
 from services.llm.base import LLMResponse
+from services.document_processor import PARSE_PROCESSING_ERROR
 
 try:
     # Provider factory (added by the LLM layer): selects a provider by name.
@@ -1211,6 +1212,24 @@ class PlannerAgent:
 
         if not attachment.processed:
             if attachment.processing_error:
+                if attachment.processing_error == PARSE_PROCESSING_ERROR:
+                    # Le fichier est bon, c'est notre modele qui a buggé
+                    # (JSON invalide après tous les essais). L'utilisateur
+                    # doit juste réessayer, pas renvoyer un fichier "plus
+                    # net". Tutoiement explicite et AUCUNE promesse de
+                    # resume automatique.
+                    return (
+                        f"[{header}]\n"
+                        "[L'ANALYSE DU DOCUMENT A ÉCHOUÉ pour un problème "
+                        "technique temporaire de notre côté : le fichier a "
+                        "bien été lu mais notre modèle n'a pas réussi à le "
+                        "structurer. Dis-le honnêtement, en TUTOYANT (comme "
+                        "partout dans l'app) : propose simplement de réessayer "
+                        "dans un instant. Son fichier n'est pas en cause, ne "
+                        "lui demande pas d'en renvoyer un autre ni plus net. "
+                        "Ne promets JAMAIS d'envoyer un résumé de toi-même : "
+                        "tu n'en as pas le moyen.]"
+                    )
                 # Echec constate (sortie anticipée de l'attente): ne PAS
                 # parler de "retard", ce serait un mensonge. Tutoiement
                 # explicite et AUCUNE promesse de resume automatique.

@@ -228,3 +228,16 @@ class AttachmentFailureContextTests(TestCase):
         )
         ctx = agent._build_attachment_context(doc)
         self.assertIn("ENCORE EN ANALYSE", ctx)
+
+    def test_erreur_parse_propose_reessai_pas_photo_plus_nette(self):
+        """Incident 2026-10-13 : le fichier est bon, c'est le modele qui a
+        buggé. L'utilisateur doit réessayer, pas renvoyer un fichier."""
+        agent = _agent_sans_llm()
+        doc = UploadedDocument(
+            file_name="horaire.pdf", processed=False,
+            processing_error=dp.PARSE_PROCESSING_ERROR,
+        )
+        ctx = agent._build_attachment_context(doc)
+        self.assertIn("ÉCHOUÉ", ctx)
+        self.assertIn("réessayer", ctx)
+        self.assertNotIn("photo plus nette", ctx)

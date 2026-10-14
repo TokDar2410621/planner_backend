@@ -51,9 +51,21 @@ GENERIC_PROCESSING_ERROR = (
     "Vérifiez le fichier et réessayez, ou contactez le support."
 )
 
+# Message persisted when every LLM provider answered but none produced valid
+# JSON. The file itself is fine: the failure is on our side, so the user
+# should simply retry, not resend a "clearer" file.
+PARSE_PROCESSING_ERROR = (
+    "L'analyse du document a échoué à cause d'un problème technique "
+    "temporaire de notre côté. Réessayez dans un instant."
+)
+
 
 class DocumentResolutionError(ValueError):
     """Refus métier sûr à afficher lors d'une précision documentaire."""
+
+
+class DocumentParseError(ValueError):
+    """Le LLM a répondu mais son JSON est invalide, après tous les essais."""
 
 try:
     from google import genai
@@ -664,12 +676,16 @@ Analyse ce texte et retourne le JSON structuré:"""
         return None
 
     @_retry_extraction(max_retries=3, base_delay=2.0)
-    def _call_gemini(self, contents):
+    def _call_gemini(self, contents, json_mode=False):
         """
         Call Gemini API with retry logic for rate limits.
 
         Args:
             contents: Content to send to Gemini (prompt + images)
+            json_mode: When True, force a JSON-only response
+                (response_mime_type="application/json"). The model can still
+                emit malformed JSON on rare occasions, so callers must keep
+                validating the parse.
 
         Returns:
             Response from Gemini
@@ -689,13 +705,16 @@ Analyse ce texte et retourne le JSON structuré:"""
                 raise ValueError('Format multimodal sans borne de jetons')
         with appel_fournisseur(phase='extraction', fournisseur='gemini',
                                jetons_entree=entree, max_sortie=4096) as appel:
+            config_kwargs = dict(
+                max_output_tokens=appel.max_sortie,
+                http_options=types.HttpOptions(timeout=max(1, int(appel.delai * 1000)),
+                    retry_options=types.HttpRetryOptions(attempts=1)),
+            )
+            if json_mode:
+                config_kwargs["response_mime_type"] = "application/json"
             response = self.gemini_client.models.generate_content(
                 model=self.gemini_model, contents=contents,
-                config=types.GenerateContentConfig(
-                    max_output_tokens=appel.max_sortie,
-                    http_options=types.HttpOptions(timeout=max(1, int(appel.delai * 1000)),
-                        retry_options=types.HttpRetryOptions(attempts=1)),
-                ),
+                config=types.GenerateContentConfig(**config_kwargs),
             )
             usage = getattr(response, 'usage_metadata', None)
             appel.terminer(usage={
@@ -905,12 +924,18 @@ Analyse ce texte et retourne le JSON structuré:"""
         except Exception as e:
             # Log the real cause server-side, but never persist/return the raw
             # exception string to the client (may leak paths, config, internals).
+            # A parse failure is our model's fault, not the file's: the user
+            # gets a "retry in a moment" message instead of being told to
+            # resend a "clearer" file.
+            public_error = (PARSE_PROCESSING_ERROR
+                            if isinstance(e, DocumentParseError)
+                            else GENERIC_PROCESSING_ERROR)
             logger.error("Document %s : traitement échoué (%s)", document.id, type(e).__name__)
             # Une tentative concurrente réussie garde son résultat.
             UploadedDocument.objects.filter(pk=document.pk, processed=False).update(
-                processing_error=GENERIC_PROCESSING_ERROR)
+                processing_error=public_error)
             document.refresh_from_db()
-            raise RuntimeError(GENERIC_PROCESSING_ERROR) from None
+            raise RuntimeError(public_error) from None
 
     def _materialize_document(self, document, data):
         trace = trace_courante.get()
@@ -931,7 +956,7 @@ Analyse ce texte et retourne le JSON structuré:"""
             document.refresh_from_db()
             return current.extracted_data
         if not isinstance(data, dict) or data.get('parse_error'):
-            raise ValueError('Extraction invalide')
+            raise DocumentParseError('Extraction invalide')
         # Les reçus d'une résolution humaine ne viennent jamais du modèle
         # ou d'un autre document réutilisé comme cache d'extraction.
         data.pop('_resolved_entries', None)
@@ -1067,18 +1092,8 @@ Analyse ce texte et retourne le JSON structuré:"""
             logger.info("Text extraction insufficient, falling back to VISION-BASED extraction")
             return self._process_pdf_vision(file_path, doc_type), "vision"
 
-    def _structure_text_with_llm(self, text: str, tables: list = None) -> Optional[str]:
-        """
-        Send extracted text to LLM for structuring into JSON.
-
-        Args:
-            text: Extracted text from PDF
-            tables: Extracted tables (optional)
-
-        Returns:
-            LLM response with structured JSON
-        """
-        # Build the prompt with extracted text
+    def _build_structuring_prompt(self, text: str, tables: list = None) -> str:
+        """Assemble le prompt de structuration texte -> JSON (sans l'envoyer)."""
         from django.utils import timezone as _tz
         prompt = self.TEXT_STRUCTURING_PROMPT.format(text=text[:15000])  # Limit to 15k chars
         prompt = prompt.replace('__TODAY__', _tz.localdate().isoformat())
@@ -1091,24 +1106,54 @@ Analyse ce texte et retourne le JSON structuré:"""
                 for row in table[:20]:  # Max 20 rows per table
                     table_text += " | ".join(str(cell) for cell in row) + "\n"
             prompt += table_text
+        return prompt
+
+    def _structure_text_with_llm(self, text: str, tables: list = None) -> Optional[str]:
+        """
+        Send extracted text to LLM for structuring into JSON.
+
+        Tries Gemini (JSON strict mode) first, then DeepSeek. A provider that
+        answers with malformed JSON does NOT count as a success: the other
+        provider is tried before giving up. Returns the last raw response when
+        both answered but neither produced valid JSON, so the caller can log
+        a parse_error instead of a generic crash.
+
+        Args:
+            text: Extracted text from PDF
+            tables: Extracted tables (optional)
+
+        Returns:
+            LLM response with structured JSON
+
+        Raises:
+            RuntimeError: when no provider could answer at all.
+        """
+        prompt = self._build_structuring_prompt(text, tables)
+        last_raw = None
 
         if self.gemini_client:
             try:
-                response = self._call_gemini(prompt)
-                return response.text
+                raw = self._call_gemini(prompt, json_mode=True).text
             except Exception as e:
                 # Structurer du TEXTE n'exige pas la vision: DeepSeek (cle deja
                 # en prod) peut sauver le coup quand Gemini tombe. On ne laisse
                 # tomber qu'apres avoir essaye les deux.
                 logger.error("Gemini text structuring failed (%s); trying DeepSeek", type(e).__name__)
-                fallback = self._structure_text_with_deepseek(prompt)
-                if fallback:
-                    return fallback
-                raise
+                raw = None
+            if raw and not self._parse_response(raw).get('parse_error'):
+                return raw
+            if raw:
+                last_raw = raw
+                logger.warning("Gemini a renvoyé un JSON invalide, essai DeepSeek")
 
         fallback = self._structure_text_with_deepseek(prompt)
         if fallback:
-            return fallback
+            if not self._parse_response(fallback).get('parse_error'):
+                return fallback
+            last_raw = fallback
+            logger.warning("DeepSeek a aussi renvoyé un JSON invalide")
+        if last_raw is not None:
+            return last_raw
         raise RuntimeError("No LLM available for text structuring")
 
     def _structure_text_with_deepseek(self, prompt: str) -> Optional[str]:
@@ -1180,7 +1225,7 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                         mime_type = 'image/png'
                     logger.info(f"Vision: page {idx + 1}: {img.width}x{img.height}px as {mime_type}")
                     parts.append(types.Part.from_bytes(data=img_bytes.getvalue(), mime_type=mime_type))
-                response = self._call_gemini(parts)
+                response = self._call_gemini(parts, json_mode=True)
                 return response.text
             except Exception as e:
                 logger.warning("Gemini vision failed (%s)", type(e).__name__)
@@ -1216,7 +1261,7 @@ IMPORTANT: Si l'emploi du temps s'étend sur plusieurs pages, fusionne toutes le
                 response = self._call_gemini([
                     prompt,
                     types.Part.from_bytes(data=img_bytes.getvalue(), mime_type='image/png')
-                ])
+                ], json_mode=True)
                 return response.text, "vision_gemini"
             except Exception as e:
                 logger.warning("Gemini vision failed (%s)", type(e).__name__)

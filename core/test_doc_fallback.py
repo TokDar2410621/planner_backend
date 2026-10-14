@@ -69,3 +69,43 @@ class DocTextFallbackTest(TestCase):
         with patch('services.llm.get_provider', return_value=_provider('{"shifts": []}')):
             out = proc._structure_text_with_llm("vendredi 18h resto")
         self.assertEqual(out, '{"shifts": []}')
+
+    def test_deepseek_retried_when_gemini_json_is_malformed(self):
+        """Incident 2026-10-13: Gemini a repondu un JSON invalide (pas
+        d'exception), l'ancien code ne retentait jamais DeepSeek."""
+        proc = DocumentProcessor.__new__(DocumentProcessor)
+        proc.gemini_client = MagicMock()
+        proc.hf_client = None
+        proc.hf_model = None
+        bad_json = '```json\n{"courses": [{"title": "Maths",}\n```'
+        proc._call_gemini = MagicMock(
+            return_value=SimpleNamespace(text=bad_json))
+        provider = _provider('{"courses": []}')
+        with patch('services.llm.get_provider', return_value=provider):
+            out = proc._structure_text_with_llm("Lundi 9h cours de maths")
+        self.assertEqual(out, '{"courses": []}')
+
+    def test_returns_last_raw_when_both_providers_malformed(self):
+        proc = DocumentProcessor.__new__(DocumentProcessor)
+        proc.gemini_client = MagicMock()
+        proc.hf_client = None
+        proc.hf_model = None
+        bad_json = '```json\n{"courses": [{"title": "Maths",}\n```'
+        proc._call_gemini = MagicMock(
+            return_value=SimpleNamespace(text=bad_json))
+        provider = _provider(bad_json)
+        with patch('services.llm.get_provider', return_value=provider):
+            out = proc._structure_text_with_llm("Lundi 9h cours de maths")
+        self.assertEqual(out, bad_json)
+
+    def test_gemini_json_mode_sets_response_mime_type(self):
+        proc = DocumentProcessor.__new__(DocumentProcessor)
+        proc.gemini_model = 'fixture'
+        proc.gemini_client = MagicMock()
+        proc.gemini_client.models.generate_content.return_value = SimpleNamespace(
+            text='{}', usage_metadata=None)
+        proc._verifier_echeance = lambda: None
+        # La trace est deja ouverte par setUp.
+        proc._call_gemini('texte', json_mode=True)
+        config = proc.gemini_client.models.generate_content.call_args.kwargs['config']
+        self.assertEqual(config.response_mime_type, 'application/json')
