@@ -931,6 +931,25 @@ class _Narrateur:
         if d.get("evenement_unique") and _titre_place_plus_loin(self.registre.actions, index, p):
             return
 
+        # 2026-10-14 : un refus date passee doit dire sa raison a
+        # l'utilisateur, sinon il ne voit que le generique « rien n'a
+        # change » (banc prod : 10 refus, 0 raison affichee, l'utilisateur
+        # a du demander « Pourquoi ? »). Raison lue depuis les donnees
+        # structurees, jamais depuis le message (regle du rendu).
+        if d.get("date_passee"):
+            libelle = {"date": "date", "start_date": "date de début",
+                       "end_date": "date de fin"}.get(d.get("champ"), "date")
+            # L'annee est TOUJOURS affichee ici, meme quand c'est l'annee
+            # courante (date_courte l'omettrait) : c'est elle qui est
+            # ambigue (« fin mai » = 2026 ou 2027 ?).
+            jour = _date(d["date_passee"])
+            quand = (f"{_jour_mois(jour)} {jour.year}" if jour is not None
+                     else _txt(d["date_passee"]))
+            self.ajouter_refus(
+                f"Je n'ai rien modifié : la {libelle} {quand} "
+                "est déjà passée. Dis-moi la bonne année.")
+            return
+
         # Echec sans donnee exploitable: on ne recopie JAMAIS le message (il
         # peut porter une exception brute ou un ordre au modele). Si la meme
         # intention a reussi plus loin dans le tour, l'echec etait une

@@ -152,6 +152,22 @@ class CreationDeBlocsTests(SimpleTestCase):
         self.assertIn("le lundi", sortie)
         self.assertEqual(marqueurs_bruts(sortie), [])
 
+    def test_refus_date_passee_dit_sa_raison(self):
+        # 2026-10-14 (prod) : 10 refus date passee, l'utilisateur n'a vu
+        # que le generique « rien n'a change » et a du demander « Pourquoi ? ».
+        # La raison vient des donnees structurees, jamais du message.
+        # L'annee est toujours affichee : c'est elle qui est ambigue.
+        r = registre(("update_block",
+                      {"block_id": 1600, "end_date": "2026-05-31"}, False,
+                      {"date_passee": "2026-05-31", "champ": "end_date"},
+                      "Refuse par le code : end_date 2026-05-31 est deja passe."))
+        sortie = faits(r)
+        self.assertIn("date de fin 31 mai 2026", sortie)
+        self.assertIn("bonne année", sortie)
+        self.assertNotIn("rien n'a changé", sortie)
+        self.assertNotIn("Refuse par le code", sortie)
+        self.assertEqual(marqueurs_bruts(sortie), [])
+
     def test_doublon(self):
         r = registre(("create_block",
                       {"title": "Philosophie", "days": ["mardi"], "start_time": "08:00",
