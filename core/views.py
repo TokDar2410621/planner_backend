@@ -1651,10 +1651,11 @@ class ConversationListView(APIView):
         from core.models import Conversation
         convs = (Conversation.objects
                  .filter(user=request.user, archivee=False)
-                 .order_by('-updated_at')[:50])
+                 .order_by('-epinglee', '-updated_at')[:50])
         return Response([{
             'id': c.pk,
             'titre': c.titre,
+            'epinglee': c.epinglee,
             'updated_at': c.updated_at.isoformat(),
             'created_at': c.created_at.isoformat(),
         } for c in convs])
@@ -1668,6 +1669,7 @@ class ConversationListView(APIView):
         return Response({
             'id': conv.pk,
             'titre': conv.titre,
+            'epinglee': conv.epinglee,
             'updated_at': conv.updated_at.isoformat(),
             'created_at': conv.created_at.isoformat(),
         }, status=status.HTTP_201_CREATED)
@@ -1687,8 +1689,11 @@ class ConversationDetailView(APIView):
             conv.titre = str(request.data['titre'])[:200] or conv.titre
         if 'archivee' in request.data:
             conv.archivee = bool(request.data['archivee'])
+        if 'epinglee' in request.data:
+            conv.epinglee = bool(request.data['epinglee'])
         conv.save()
-        return Response({'id': conv.pk, 'titre': conv.titre, 'archivee': conv.archivee})
+        return Response({'id': conv.pk, 'titre': conv.titre, 'archivee': conv.archivee,
+                         'epinglee': conv.epinglee})
 
     def delete(self, request, pk):
         from core.models import Conversation

@@ -52,3 +52,15 @@ class ConversationTests(TestCase):
                               format='json')
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()['titre'], 'Nouveau')
+
+    def test_epingler_remonte_en_haut(self):
+        c1 = Conversation.objects.create(user=self.user, titre='Ancienne')
+        c2 = Conversation.objects.create(user=self.user, titre='Recente')
+        r = self.client.patch(f'/api/conversations/{c1.pk}/', {'epinglee': True},
+                              format='json')
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()['epinglee'])
+        r = self.client.get('/api/conversations/')
+        ids = [c['id'] for c in r.json()]
+        self.assertEqual(ids[0], c1.pk)
+        self.assertEqual(ids[1], c2.pk)
