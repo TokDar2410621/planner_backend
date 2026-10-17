@@ -79,10 +79,10 @@ def chercher(besoin: str, outils: list, description_de) -> str:
     """
     termes = _mots(besoin)
     if not termes:
-        noms = ", ".join(sorted(o.name for o in outils)[:MAX_NOMS])
+        noms = ", ".join(sorted(o.NAME for o in outils)[:MAX_NOMS])
         return (f"Dis ce que tu cherches a faire. Outils disponibles ici: {noms}.")
 
-    classes = sorted(((_score(termes, o.name, description_de(o)), o.name, o)
+    classes = sorted(((_score(termes, o.NAME, description_de(o)), o.NAME, o)
                       for o in outils), key=lambda t: (-t[0], t[1]))
     # Seuls les outils proches du meilleur: servir trois schemas hors sujet
     # couterait ce que ce chargeur economise. Mesure du 2026-10-01:
@@ -91,7 +91,7 @@ def chercher(besoin: str, outils: list, description_de) -> str:
     seuil = max(1, (meilleur + 1) // 2)
     trouves = [(n, o) for s, n, o in classes if s >= seuil][:MAX_RESULTATS]
     if not trouves:
-        noms = ", ".join(sorted(o.name for o in outils)[:MAX_NOMS])
+        noms = ", ".join(sorted(o.NAME for o in outils)[:MAX_NOMS])
         return (f"Aucun outil ne correspond a « {besoin} ». "
                 f"Outils disponibles ici: {noms}.")
 
@@ -100,7 +100,7 @@ def chercher(besoin: str, outils: list, description_de) -> str:
     for nom, outil in trouves:
         lignes.append(f"\n{nom}")
         lignes.append(f"  {description_de(outil)}")
-        lignes.append(f"  parametres: {_schema_compact(outil.parameters)}")
+        lignes.append(f"  parametres: {_schema_compact(outil.PARAMETERS)}")
     return "\n".join(lignes)
 
 

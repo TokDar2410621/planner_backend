@@ -9,11 +9,10 @@ from rest_framework.test import APIClient
 
 from core.models import RecurringBlock, ScheduledBlock, Task, TaskHistory, UserPlace
 from services.ai_scheduler import AIScheduler
-from services.agent.tools.tasks import CompleteTaskTool
-from services.agent.tools.schedule import ScheduleTaskAtTool
 from services.ai_insights import AIInsightsService
 from services.replan import replan_after_delay
 from services.scheduling.placement import fixed_busy_intervals, place_day
+from services.agent.tools import complete_task, schedule_task_at, harnais
 
 
 MONDAY = date(2026, 7, 27)
@@ -206,7 +205,7 @@ def test_complete_task_tool_reconciles_scheduled_block_and_history():
         end_time=time(10),
     )
 
-    result = CompleteTaskTool().execute(user, task_id=task.id)
+    result = harnais.appeler(complete_task, user, dict(task_id=task.id))
 
     assert result.success
     task.refresh_from_db()
@@ -281,13 +280,10 @@ def test_schedule_task_at_can_displace_flexible_recurring_block():
     _profile(user)
     _block(user, "Sport", "sport", MONDAY.weekday(), time(10), time(12))
 
-    result = ScheduleTaskAtTool().execute(
-        user,
-        title="Urgence fixe",
+    result = harnais.appeler(schedule_task_at, user, dict(title="Urgence fixe",
         date=MONDAY.isoformat(),
         start_time="10:30",
-        end_time="11:00",
-    )
+        end_time="11:00",))
 
     assert result.success, result.message
     sport = _placement_by_title(place_day(user, MONDAY), "Sport")

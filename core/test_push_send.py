@@ -8,6 +8,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from core.models import PushSubscription
+from services.agent.tools import send_notification, harnais
 
 # VAPID factice: push_configured() doit répondre vrai pendant les tests,
 # l'envoi réel est toujours mocké.
@@ -78,16 +79,15 @@ class PushSendEndpointTest(APITestCase):
 @override_settings(**VAPID)
 class SendNotificationToolTest(TestCase):
     def setUp(self):
-        from services.agent.tools.notify import SendNotificationTool
         self.user = User.objects.create_user('tooluser', password='pw-tool-12345')
-        self.tool = SendNotificationTool()
+        self.tool = send_notification
 
     def test_tool_is_registered(self):
         from services.agent.tools import TOOL_MAP
         self.assertIn('send_notification', TOOL_MAP)
 
     def test_no_subscription_gives_honest_message(self):
-        result = self.tool.execute(self.user, body='Hello')
+        result = harnais.appeler(self.tool, self.user, dict(body='Hello'))
         self.assertFalse(result.success)
         self.assertIn('Aucun appareil abonné', result.message)
 
@@ -97,10 +97,10 @@ class SendNotificationToolTest(TestCase):
         )
         from services import push
         with patch.object(push, 'webpush'):
-            result = self.tool.execute(self.user, body='Ton créneau démarre.')
+            result = harnais.appeler(self.tool, self.user, dict(body='Ton créneau démarre.'))
         self.assertTrue(result.success)
         self.assertEqual(result.data['sent'], 1)
 
     def test_missing_body_fails(self):
-        result = self.tool.execute(self.user, body='  ')
+        result = harnais.appeler(self.tool, self.user, dict(body='  '))
         self.assertFalse(result.success)

@@ -9,6 +9,7 @@ from django.test import TestCase
 
 from core.models import Task
 from services.llm.base import FunctionCall, LLMResponse
+from services.agent.tools import create_task, harnais
 
 
 class _AlwaysDuplicatesProvider:
@@ -62,10 +63,9 @@ class CreateTaskIdempotencyTest(TestCase):
         self.user = User.objects.create_user('idem_user', password='pw-idem-1234')
 
     def test_same_title_not_duplicated(self):
-        from services.agent.tools.tasks import CreateTaskTool
-        tool = CreateTaskTool()
-        r1 = tool.execute(self.user, title="Réviser les maths")
-        r2 = tool.execute(self.user, title="  réviser les maths ")  # different case/space
+        tool = create_task
+        r1 = harnais.appeler(tool, self.user, dict(title="Réviser les maths"))
+        r2 = harnais.appeler(tool, self.user, dict(title="  réviser les maths "))  # different case/space
         self.assertTrue(r1.success)
         self.assertTrue(r2.success)  # returns the existing one, not an error
         self.assertEqual(
@@ -73,11 +73,10 @@ class CreateTaskIdempotencyTest(TestCase):
         )
 
     def test_completed_task_does_not_block_new_one(self):
-        from services.agent.tools.tasks import CreateTaskTool
-        tool = CreateTaskTool()
-        tool.execute(self.user, title="Courses")
+        tool = create_task
+        harnais.appeler(tool, self.user, dict(title="Courses"))
         Task.objects.filter(user=self.user, title="Courses").update(completed=True)
-        tool.execute(self.user, title="Courses")  # a new active one is allowed
+        harnais.appeler(tool, self.user, dict(title="Courses"))  # a new active one is allowed
         self.assertEqual(Task.objects.filter(user=self.user, title="Courses").count(), 2)
 
 
@@ -91,9 +90,8 @@ class CreateTaskDeadlineTest(TestCase):
 
     def test_string_deadline_succeeds_and_is_aware(self):
         from django.utils import timezone as tz
-        from services.agent.tools.tasks import CreateTaskTool
 
-        r = CreateTaskTool().execute(self.user, title="Réviser les maths", deadline="2026-07-22")
+        r = harnais.appeler(create_task, self.user, dict(title="Réviser les maths", deadline="2026-07-22"))
         self.assertTrue(r.success, msg=f"tool reported failure: {r.message}")
         self.assertTrue(r.data["task"]["deadline"].startswith("2026-07-22"))
 

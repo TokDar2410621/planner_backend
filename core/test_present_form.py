@@ -12,8 +12,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.test import SimpleTestCase
+from services.agent.tools import present_form, harnais
 
-from services.agent.tools.interactive import PresentFormTool
 
 USER = SimpleNamespace(id=1)
 
@@ -28,7 +28,7 @@ def _champ(**extra):
 
 
 def _run(*inputs):
-    return PresentFormTool().execute(USER, inputs=list(inputs))
+    return harnais.appeler(present_form, USER, dict(inputs=list(inputs)))
 
 
 def _seul(*inputs):
@@ -187,7 +187,7 @@ class DurationTests(SimpleTestCase):
 
 class DateTests(SimpleTestCase):
     def _presets(self, aujourdhui):
-        with patch("services.agent.tools.interactive.timezone.localdate", return_value=aujourdhui):
+        with patch("services.agent.tools.present_form.timezone.localdate", return_value=aujourdhui):
             return _seul(_champ(type="date"))["presets"]
 
     def test_presets_calcules_un_dimanche(self):
@@ -253,12 +253,12 @@ class ValidationTests(SimpleTestCase):
                 self.assertFalse(_run(_champ(id="x", type=t, options=[])).success)
 
     def test_aucun_champ_refuse(self):
-        result = PresentFormTool().execute(USER, inputs=[])
+        result = harnais.appeler(present_form, USER, dict(inputs=[]))
         self.assertFalse(result.success)
         self.assertEqual(result.message, "Aucun champ spécifié pour le formulaire.")
 
     def test_schema_documente_les_nouveaux_types(self):
-        item = PresentFormTool.parameters["properties"]["inputs"]["items"]
+        item = present_form.PARAMETERS["properties"]["inputs"]["items"]
         self.assertEqual(item["properties"]["type"]["enum"],
                          ["time_range", "time", "number", "checkbox", "select", "radio", "duration", "date"])
         self.assertIn("presets", item["properties"])
@@ -312,7 +312,7 @@ class PresetsInvalidesTests(SimpleTestCase):
 
     def test_date_invalides_retombent_sur_le_calcul(self):
         presets = [{"label": "Lundi", "value": "lundi prochain"}, {"label": "Mardi", "value": "2026-13-01"}]
-        with patch("services.agent.tools.interactive.timezone.localdate",
+        with patch("services.agent.tools.present_form.timezone.localdate",
                    return_value=datetime.date(2026, 8, 30)):
             champ = _seul(_champ(type="date", presets=presets))
         self.assertEqual(champ["presets"][0], {"label": "Aujourd'hui", "value": "2026-08-30"})
@@ -401,7 +401,7 @@ class DurationEntiersTests(SimpleTestCase):
         self.assertNotIn("default", _seul(_champ(type="number", default="huit")))
 
     def test_schema_precise_entiers_en_minutes(self):
-        props = PresentFormTool.parameters["properties"]["inputs"]["items"]["properties"]
+        props = present_form.PARAMETERS["properties"]["inputs"]["items"]["properties"]
         for cle in ("type", "default", "presets", "min", "max"):
             with self.subTest(cle=cle):
                 self.assertIn("entier", props[cle]["description"])

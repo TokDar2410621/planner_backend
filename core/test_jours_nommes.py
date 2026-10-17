@@ -23,7 +23,7 @@ from django.test import TestCase
 
 from core.models import RecurringBlock
 from services.agent.tools import execute_tool
-from services.agent.tools.blocks import normaliser_jours
+from services.agent.tools.commun import normaliser_jours
 
 JOURS = ('lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi', 'dimanche')
 
@@ -93,7 +93,7 @@ class CreationParNomTests(TestCase):
         """Si le schema ne le dit pas, le modele ne s'en servira jamais: la
         description EST l'interface."""
         from services.agent.tools import TOOL_MAP
-        desc = TOOL_MAP['create_block'].parameters['properties']['days']['description']
+        desc = TOOL_MAP['create_block'].PARAMETERS['properties']['days']['description']
         self.assertIn('samedi', desc.lower())
         self.assertIn('0=Lundi', desc)
 
@@ -102,7 +102,7 @@ class CreationParNomTests(TestCase):
         avant la prose enverrait encore des numeros, donc encore des erreurs
         de convention. Le type doit autoriser ce que la description conseille."""
         from services.agent.tools import TOOL_MAP
-        items = TOOL_MAP['create_block'].parameters['properties']['days']['items']
+        items = TOOL_MAP['create_block'].PARAMETERS['properties']['days']['items']
         self.assertEqual(items.get('type'), 'string')
 
 
@@ -183,7 +183,7 @@ class DeplacementParNomTests(TestCase):
 
     def test_le_schema_accepte_un_nom(self):
         from services.agent.tools import TOOL_MAP
-        champ = TOOL_MAP['update_block'].parameters['properties']['day_of_week']
+        champ = TOOL_MAP['update_block'].PARAMETERS['properties']['day_of_week']
         self.assertEqual(champ.get('type'), 'string')
         self.assertIn('samedi', champ['description'].lower())
 
@@ -232,6 +232,6 @@ class FiltresDeLectureTests(TestCase):
                            ('list_blocks', 'day_of_week'),
                            ('detect_conflicts', 'day_of_week')):
             with self.subTest(outil=nom):
-                p = TOOL_MAP[nom].parameters['properties'][champ]
+                p = TOOL_MAP[nom].PARAMETERS['properties'][champ]
                 type_reel = p['items']['type'] if p.get('type') == 'array' else p['type']
                 self.assertEqual(type_reel, 'string', f"{nom}.{champ}")

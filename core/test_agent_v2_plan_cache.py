@@ -69,7 +69,7 @@ class PlanCacheTests(TestCase):
     def test_second_propose_identique_ne_resout_pas(self):
         self._propose()
         with mock.patch(
-            "services.agent.tools.schedule.solve_placement",
+            "services.agent.tools.commun.solve_placement",
             side_effect=AssertionError("re-solve inattendu"),
         ):
             proposition, empreinte, arrangements = self._propose()
@@ -77,7 +77,7 @@ class PlanCacheTests(TestCase):
         self.assertEqual(len(arrangements), 7)
 
     def test_entrees_modifiees_invalident_le_cache(self):
-        import services.agent.tools.schedule as sched_module
+        import services.agent.tools.commun as sched_module
         _, empreinte_avant, _ = self._propose()
         self.bloc.start_time = time(8, 0)
         self.bloc.end_time = time(9, 0)
@@ -158,7 +158,7 @@ class PlanCacheTests(TestCase):
         # l'apply doit deplacer sans appeler le solveur.
         arrangements = [_arrangement_fixe(self.bloc.id, start_min=480)] + [[] for _ in range(6)]
         with mock.patch(
-            "services.agent.tools.schedule.solve_placement",
+            "services.agent.tools.commun.solve_placement",
             side_effect=AssertionError("re-solve inattendu a l'apply"),
         ):
             resultat = self.outil.execute(
@@ -174,7 +174,7 @@ class PlanCacheTests(TestCase):
     def test_apply_sans_arrangements_resout_comme_avant(self):
         """v1 et tout appelant historique: sans _arrangements, on resout."""
         with mock.patch(
-            "services.agent.tools.schedule.solve_placement",
+            "services.agent.tools.commun.solve_placement",
             side_effect=[_arrangement_fixe(self.bloc.id)] + [[] for _ in range(6)],
         ) as spy:
             resultat = self.outil.execute(self.user, start_date=LUNDI, apply=True)

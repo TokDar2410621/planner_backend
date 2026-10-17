@@ -14,8 +14,7 @@ from django.utils import timezone
 
 from core.models import Goal, ScheduledBlock, Task
 from services.agent.agent import _user_authorized_destructive
-from services.agent.tools.goals import CreateGoalTool, UpdateGoalTool
-from services.agent.tools.schedule import CancelScheduledBlockTool
+from services.agent.tools import cancel_scheduled_block, create_goal, update_goal, harnais
 
 
 class GoalDeadlineTests(TestCase):
@@ -23,26 +22,26 @@ class GoalDeadlineTests(TestCase):
         self.user = User.objects.create_user("goaler", password="pw-123456")
 
     def test_create_goal_with_deadline_string(self):
-        r = CreateGoalTool().execute(self.user, title="Diplôme", goal_type="long_term",
-                                     deadline="2026-09-01")
+        r = harnais.appeler(create_goal, self.user, dict(title="Diplôme", goal_type="long_term",
+                                     deadline="2026-09-01"))
         self.assertTrue(r.success, r.message)
         self.assertEqual(r.data["goal"]["deadline"], "2026-09-01")
         g = Goal.objects.get(id=r.data["goal"]["id"])
         self.assertEqual(g.deadline, date(2026, 9, 1))
 
     def test_create_goal_without_deadline(self):
-        r = CreateGoalTool().execute(self.user, title="Sport", goal_type="short_term")
+        r = harnais.appeler(create_goal, self.user, dict(title="Sport", goal_type="short_term"))
         self.assertTrue(r.success, r.message)
         self.assertIsNone(r.data["goal"]["deadline"])
 
     def test_create_goal_invalid_deadline_rejected(self):
-        r = CreateGoalTool().execute(self.user, title="X", goal_type="short_term",
-                                     deadline="pas-une-date")
+        r = harnais.appeler(create_goal, self.user, dict(title="X", goal_type="short_term",
+                                     deadline="pas-une-date"))
         self.assertFalse(r.success)
 
     def test_update_goal_deadline(self):
         g = Goal.objects.create(user=self.user, title="Y", goal_type="short_term")
-        r = UpdateGoalTool().execute(self.user, goal_id=g.id, deadline="2026-12-31")
+        r = harnais.appeler(update_goal, self.user, dict(goal_id=g.id, deadline="2026-12-31"))
         self.assertTrue(r.success, r.message)
         g.refresh_from_db()
         self.assertEqual(g.deadline, date(2026, 12, 31))
@@ -63,7 +62,7 @@ class DestructiveGuardTests(TestCase):
 class CancelScheduledBlockTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user("canceller", password="pw-123456")
-        self.tool = CancelScheduledBlockTool()
+        self.tool = cancel_scheduled_block
         self.day = timezone.localdate() + timedelta(days=1)
 
     def _sched(self, title, s, e, d=None):
@@ -74,20 +73,20 @@ class CancelScheduledBlockTests(TestCase):
 
     def test_cancel_single_event_removes_block_and_orphan_task(self):
         sb = self._sched("Dentiste", "10:00", "11:00")
-        r = self.tool.execute(self.user, date=self.day.isoformat())
+        r = harnais.appeler(self.tool, self.user, dict(date=self.day.isoformat()))
         self.assertTrue(r.success, r.message)
         self.assertFalse(ScheduledBlock.objects.filter(id=sb.id).exists())
         self.assertFalse(Task.objects.filter(id=sb.task_id).exists())  # orphan cleaned
 
     def test_not_found(self):
-        r = self.tool.execute(self.user, date=self.day.isoformat())
+        r = harnais.appeler(self.tool, self.user, dict(date=self.day.isoformat()))
         self.assertFalse(r.success)
         self.assertIn("Aucun", r.message)
 
     def test_ambiguous_asks_which(self):
         self._sched("Dentiste", "10:00", "11:00")
         self._sched("Médecin", "14:00", "15:00")
-        r = self.tool.execute(self.user, date=self.day.isoformat())
+        r = harnais.appeler(self.tool, self.user, dict(date=self.day.isoformat()))
         self.assertFalse(r.success)
         self.assertIn("Lequel", r.message)
         # both still present (nothing deleted on ambiguity)
@@ -96,7 +95,7 @@ class CancelScheduledBlockTests(TestCase):
     def test_title_disambiguates(self):
         self._sched("Dentiste", "10:00", "11:00")
         m = self._sched("Médecin", "14:00", "15:00")
-        r = self.tool.execute(self.user, date=self.day.isoformat(), title="Dentiste")
+        r = harnais.appeler(self.tool, self.user, dict(date=self.day.isoformat(), title="Dentiste"))
         self.assertTrue(r.success, r.message)
         self.assertTrue(ScheduledBlock.objects.filter(id=m.id).exists())  # Médecin kept
         self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 1)
@@ -107,6 +106,6 @@ class CancelScheduledBlockTests(TestCase):
                                       start_time=time(22, 0), end_time=time(23, 59))
         ScheduledBlock.objects.create(user=self.user, task=task, date=self.day + timedelta(days=1),
                                       start_time=time(0, 0), end_time=time(6, 0))
-        r = self.tool.execute(self.user, date=self.day.isoformat())
+        r = harnais.appeler(self.tool, self.user, dict(date=self.day.isoformat()))
         self.assertTrue(r.success, r.message)
         self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 0)  # both pieces gone

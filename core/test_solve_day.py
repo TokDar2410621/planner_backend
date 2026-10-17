@@ -9,8 +9,8 @@ from django.contrib.auth.models import User
 from django.test import TestCase
 
 from core.models import RecurringBlock
-from services.agent.tools.schedule import OrganizeDayTool
 from services.scheduling.solve_day import solve_day, solve_placement
+from services.agent.tools import organize_day, harnais
 
 MONDAY = date(2026, 7, 27)
 
@@ -37,7 +37,7 @@ class OrganizeDayToolTests(TestCase):
     def test_propose_changes_nothing(self):
         u = User.objects.create_user("org_propose", password="pw")
         s, r = self._setup(u)
-        res = OrganizeDayTool().execute(u, date=MONDAY.isoformat(), apply=False)
+        res = harnais.appeler(organize_day, u, dict(date=MONDAY.isoformat(), apply=False))
         self.assertTrue(res.success)
         self.assertFalse(res.data["applied"])
         s.refresh_from_db(); r.refresh_from_db()
@@ -48,7 +48,7 @@ class OrganizeDayToolTests(TestCase):
         u = User.objects.create_user("org_apply", password="pw")
         self._setup(u)
         before = list(RecurringBlock.objects.filter(user=u).values())
-        res = OrganizeDayTool().execute(u, date=MONDAY.isoformat(), apply=True)
+        res = harnais.appeler(organize_day, u, dict(date=MONDAY.isoformat(), apply=True))
         self.assertTrue(res.success, res.message)
         self.assertTrue(res.data["applied"])
         self.assertEqual(list(RecurringBlock.objects.filter(user=u).values()), before)
@@ -59,8 +59,8 @@ class OrganizeDayToolTests(TestCase):
     def test_deterministic(self):
         u = User.objects.create_user("org_det", password="pw")
         self._setup(u)
-        r1 = OrganizeDayTool().execute(u, date=MONDAY.isoformat(), apply=False)
-        r2 = OrganizeDayTool().execute(u, date=MONDAY.isoformat(), apply=False)
+        r1 = harnais.appeler(organize_day, u, dict(date=MONDAY.isoformat(), apply=False))
+        r2 = harnais.appeler(organize_day, u, dict(date=MONDAY.isoformat(), apply=False))
         self.assertEqual(r1.data["placed"], r2.data["placed"])
 
 

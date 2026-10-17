@@ -19,7 +19,7 @@ from core.models import (
     UserProfile, UserPlace, Task, ScheduledBlock, PushSubscription,
 )
 from services.geocoding import geocode_address
-from services.agent.tools.tasks import CreateTaskTool, UpdateTaskTool
+from services.agent.tools import create_task, update_task, harnais
 
 
 class _FakeResp:
@@ -191,9 +191,7 @@ class AgentTaskPlaceTests(TestCase):
 
     @patch("services.geocoding.geocode_address", return_value=(48.42, -71.05))
     def test_create_task_with_place_geocodes_and_attaches(self, _mock):
-        res = CreateTaskTool().execute(
-            self.user, title="Réunion M. YEPRI", place_name="UQAC", place_address="Chicoutimi"
-        )
+        res = harnais.appeler(create_task, self.user, dict(title="Réunion M. YEPRI", place_name="UQAC", place_address="Chicoutimi"))
         self.assertTrue(res.success, res.message)
         task = Task.objects.get(user=self.user, title="Réunion M. YEPRI")
         self.assertIsNotNone(task.place)
@@ -204,20 +202,20 @@ class AgentTaskPlaceTests(TestCase):
 
     @patch("services.geocoding.geocode_address", return_value=(48.42, -71.05))
     def test_place_reused_not_duplicated(self, _mock):
-        CreateTaskTool().execute(self.user, title="T1", place_name="UQAC")
-        CreateTaskTool().execute(self.user, title="T2", place_name="UQAC")
+        harnais.appeler(create_task, self.user, dict(title="T1", place_name="UQAC"))
+        harnais.appeler(create_task, self.user, dict(title="T2", place_name="UQAC"))
         self.assertEqual(UserPlace.objects.filter(user=self.user, name="UQAC").count(), 1)
 
     @patch("services.geocoding.geocode_address", return_value=None)
     def test_create_task_without_place(self, _mock):
-        res = CreateTaskTool().execute(self.user, title="Sans lieu")
+        res = harnais.appeler(create_task, self.user, dict(title="Sans lieu"))
         self.assertTrue(res.success)
         self.assertIsNone(Task.objects.get(user=self.user, title="Sans lieu").place)
 
     @patch("services.geocoding.geocode_address", return_value=(46.8, -71.2))
     def test_update_task_adds_place(self, _mock):
         task = Task.objects.create(user=self.user, title="Réunion")
-        res = UpdateTaskTool().execute(self.user, task_id=task.id, place_name="Bureau")
+        res = harnais.appeler(update_task, self.user, dict(task_id=task.id, place_name="Bureau"))
         self.assertTrue(res.success, res.message)
         task.refresh_from_db()
         self.assertEqual(task.place.name, "Bureau")

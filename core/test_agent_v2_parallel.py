@@ -48,7 +48,7 @@ class _FauxOutil:
     """
 
     def __init__(self, nom, piste, delai=0.25):
-        self.name = nom
+        self.NAME = nom
         self._piste = piste
         self._delai = delai
         self.appels = 0

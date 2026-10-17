@@ -17,6 +17,8 @@ from django.utils import timezone
 
 from core.models import ScheduledBlock, Task
 from services.scheduling.placement import fixed_busy_intervals
+from services.agent.tools import find_free_slots, harnais
+from services.agent.tools.commun import _first_conflicting_item
 
 DEMAIN = date.today() + timedelta(days=1)
 
@@ -55,7 +57,6 @@ class CompletedTaskFreesSlotTests(TestCase):
         self.assertEqual(murs[0], (18 * 60 + 40, 20 * 60 + 40))
 
     def test_le_conflit_nomme_ignore_les_taches_faites(self):
-        from services.agent.tools.schedule import _first_conflicting_item
         _place(self.user, self._task('Faite'), time(18, 0), time(20, 0), done=True)
         _place(self.user, self._task('Active'), time(19, 0), time(21, 0))
         hit = _first_conflicting_item(self.user, DEMAIN, 18 * 60, 22 * 60)
@@ -69,12 +70,10 @@ class FreeSlotsClampedToNowTests(TestCase):
 
     def _slots_at(self, hour, minute):
         """find_free_slots pour AUJOURD'HUI avec l'heure murale simulée."""
-        from services.agent.tools import schedule as mod
         aujourdhui = timezone.localtime()
         simule = aujourdhui.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        with patch.object(mod.timezone, 'localtime', return_value=simule):
-            tool = mod.FindFreeSlotsTool()
-            res = tool.execute(self.user, date=simule.date().isoformat(), min_duration_minutes=30)
+        with patch.object(find_free_slots.timezone, 'localtime', return_value=simule):
+            res = find_free_slots.execute(self.user, date=simule.date().isoformat(), min_duration_minutes=30)
         self.assertTrue(res.success, res.message)
         return res.data['free_slots']
 
@@ -92,8 +91,7 @@ class FreeSlotsClampedToNowTests(TestCase):
         self.assertEqual(slots[0]['start_time'], '07:00')
 
     def test_demain_n_est_pas_rogne(self):
-        from services.agent.tools.schedule import FindFreeSlotsTool
-        res = FindFreeSlotsTool().execute(
+        res = find_free_slots.execute(
             self.user, date=DEMAIN.isoformat(), min_duration_minutes=30
         )
         self.assertTrue(res.success)

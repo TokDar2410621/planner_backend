@@ -755,7 +755,7 @@ class DonneesDesOutilsTests(HarnaisGardes, TransactionTestCase):
     def test_le_sommeil_reporte_protege_le_matin(self):
         """Couture avec b2: le sommeil reporte apres un quart de nuit refuse
         la fenetre qu'il occupe, comme le sommeil place."""
-        with mock.patch('services.agent.tools.schedule.intervalles_sommeil_reporte',
+        with mock.patch('services.agent.tools.commun.intervalles_sommeil_reporte',
                         return_value=[(120, 600)]):
             r = execute_tool('schedule_task_at', self.user, {
                 'title': 'Café', 'date': '2026-09-18', 'start_time': '09:00', 'end_time': '09:30'})
@@ -767,9 +767,9 @@ class DonneesDesOutilsTests(HarnaisGardes, TransactionTestCase):
 class DescriptionsTests(SimpleTestCase):
 
     def test_descriptions_ne_poussent_plus_a_deviner(self):
-        planifier = TOOL_MAP['schedule_task_at'].description
-        creer = TOOL_MAP['create_block'].description
-        libres = TOOL_MAP['find_free_slots'].description
+        planifier = TOOL_MAP['schedule_task_at'].DESCRIPTION
+        creer = TOOL_MAP['create_block'].DESCRIPTION
+        libres = TOOL_MAP['find_free_slots'].DESCRIPTION
         self.assertNotIn('au lieu de lui demander', planifier)
         self.assertNotIn('DÈS que', creer)
         self.assertNotIn("ne demande pas l'heure", libres)

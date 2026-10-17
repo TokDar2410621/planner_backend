@@ -27,6 +27,7 @@ from core.models import (
     Task,
 )
 from services import apns
+from services.agent.tools import clear_all_blocks, harnais
 
 _CLE = ec.generate_private_key(ec.SECP256R1())
 CLE_PRIVEE_PEM = _CLE.private_bytes(
@@ -565,10 +566,9 @@ class ChevauxDeTroieUpdateTests(TestCase):
             user=self.user, title="Cours", block_type="course", day_of_week=0,
             start_time=dt_time(9, 0), end_time=dt_time(10, 0),
         )
-        from services.agent.tools.blocks import ClearAllBlocksTool
         with patch("services.apns.reveiller_utilisateur") as reveiller:
             with self.captureOnCommitCallbacks(execute=True):
-                resultat = ClearAllBlocksTool().execute(self.user, confirm=True)
+                resultat = harnais.appeler(clear_all_blocks, self.user, dict(confirm=True))
         self.assertTrue(resultat.success)
         reveiller.assert_called_once_with(self.user, "planning")
 

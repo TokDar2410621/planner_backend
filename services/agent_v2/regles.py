@@ -105,9 +105,9 @@ def _formulaire(nom: str) -> ToolResult:
     """Construit par l'outil present_form lui-meme: meme normalisation qu'un
     formulaire du modele. Plage horaire sans defaut ni raccourci: la regle ne
     part que si la lecture ne dit ni jour ni heure, rien n'est a pre-remplir."""
-    from services.agent.tools.interactive import PresentFormTool
+    from services.agent.tools import harnais, present_form
 
-    return PresentFormTool().execute(None, inputs=[
+    return harnais.appeler(present_form, None, {"inputs": [
         {"id": "jours", "type": "checkbox", "label": f"Jours de « {nom} »",
          "question": f"Quels jours as-tu « {nom} » ?",
          "options": [{"value": str(i), "label": jour} for i, jour in enumerate(JOURS)]},
@@ -117,7 +117,7 @@ def _formulaire(nom: str) -> ToolResult:
         # garde des heures dites imposait ce mauvais debut (banc du 2026-09-15).
         {"id": "heures", "type": "time_range", "label": "Plage horaire",
          "question": f"À quelle heure commence et finit « {nom} » ?"},
-    ])
+    ]})
 
 
 def appliquer_formulaire_cours(ldt: Optional[LectureDuTour], registre, *, attachment,
@@ -196,7 +196,7 @@ def appel_bloque_type(ldt: Optional[LectureDuTour]) -> Optional[dict]:
     debut, fin = _heure_ferme(element, "debut"), _heure_ferme(element, "fin")
     if debut is None or fin is None or len(element.heures) != 2 or fin <= debut:
         return None
-    from services.agent.tools.schedule import DAY_END_MIN, DAY_START_MIN
+    from services.agent.tools.commun import DAY_END_MIN, DAY_START_MIN
 
     # Hors de la journee ou cherchent les creneaux libres (7 h a 23 h), une
     # fenetre libre passerait pour occupee (relecture Codex, 23 h a 23 h 30).

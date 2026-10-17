@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - fallback if the factory is unavailable
         return GeminiProvider()
 
 from .context_builder import build_context
-from .tools.blocks import normaliser_jours
+from .tools.commun import normaliser_jours
 from .system_prompt import build_system_prompt
 from .tools import get_tools_for_claude, execute_tool, TOOL_MAP
 from .tools.base import ToolResult
@@ -236,7 +236,7 @@ def _chips_pour_fenetre(user, title: str, target, s_min: int, e_min: int):
         "result": {"success": False, "data": {"conflict": {"synthetic": True}}},
     }
     # la fenêtre demandée est-elle réellement occupée ?
-    from services.agent.tools.schedule import (
+    from services.agent.tools.commun import (
         DAY_START_MIN, DAY_END_MIN, _free_slots_from_intervals,
     )
     from services.scheduling.placement import open_intervals
@@ -259,7 +259,7 @@ def _ambiguous_scheduling_chips(user, tool_calls: list, user_message: str = ""):
     chips », garanti par le code comme la question de fin de récurrence.
     Retourne None si rien à forcer."""
     from datetime import datetime as _dt, timedelta as _td
-    from services.agent.tools.schedule import (
+    from services.agent.tools.commun import (
         DAY_START_MIN, DAY_END_MIN, _free_slots_from_intervals,
     )
     from services.scheduling.placement import open_intervals
@@ -953,7 +953,7 @@ class PlannerAgent:
                 _tool_obj = TOOL_MAP.get(fc.name)
                 if (
                     _tool_obj is not None
-                    and getattr(_tool_obj, "requires_confirmation", False)
+                    and getattr(_tool_obj, "REQUIRES_CONFIRMATION", False)
                     and not _user_authorized_destructive(message)
                 ):
                     logger.warning(f"Blocked unconfirmed destructive tool: {fc.name}")

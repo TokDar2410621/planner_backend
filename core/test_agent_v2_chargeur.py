@@ -48,7 +48,7 @@ class ExpositionTests(TransactionTestCase):
                     + len(json.dumps(schema_expose(t), ensure_ascii=False))
                     for t in outils.values())
         avant = sum(len(description_v2(t))
-                    + len(json.dumps(t.parameters, ensure_ascii=False))
+                    + len(json.dumps(t.PARAMETERS, ensure_ascii=False))
                     for t in ALL_TOOLS)
         self.assertLess(apres, avant)
         # Mesure du 2026-10-01: 31 105 car -> 22 597, soit 27 %. On verrouille
@@ -95,20 +95,20 @@ class ExpositionTests(TransactionTestCase):
     def test_chaque_outil_est_soit_expose_soit_joignable(self):
         """Aucun outil ne doit devenir inatteignable."""
         _, outils = self._outils()
-        caches = [o for o in ALL_TOOLS if o.name not in OUTILS_EXPOSES]
+        caches = [o for o in ALL_TOOLS if o.NAME not in OUTILS_EXPOSES]
         self.assertTrue(caches)
         for outil in caches:
-            with self.subTest(outil=outil.name):
-                self.assertNotIn(outil.name, outils)
+            with self.subTest(outil=outil.NAME):
+                self.assertNotIn(outil.NAME, outils)
                 # Joignable: son nom ressort d'une recherche sur son nom.
-                trouve = chargeur.chercher(outil.name.replace('_', ' '),
+                trouve = chargeur.chercher(outil.NAME.replace('_', ' '),
                                            caches, description_v2)
-                self.assertIn(outil.name, trouve)
+                self.assertIn(outil.NAME, trouve)
 
 
 class RechercheTests(TransactionTestCase):
     def setUp(self):
-        self.caches = [o for o in ALL_TOOLS if o.name not in OUTILS_EXPOSES]
+        self.caches = [o for o in ALL_TOOLS if o.NAME not in OUTILS_EXPOSES]
 
     def _noms(self, besoin):
         rendu = chargeur.chercher(besoin, self.caches, description_v2)

@@ -5,10 +5,10 @@ from django.contrib.auth.models import User
 from django.test import TestCase
 
 from core.models import RecurringBlock, RecurringBlockException, ScheduledBlock, Task
-from services.agent.tools.schedule import GetTodayScheduleTool, GetWeekScheduleTool, OrganizeDayTool
 from services.scheduling.day_view import effective_day_blocks
 from services.scheduling.placement import fixed_busy_intervals, open_intervals, place_day
 from services.scheduling.solve_day import solve_day, solve_placement
+from services.agent.tools import get_today_schedule, get_week_schedule, organize_day, harnais
 
 
 MONDAY = date(2099, 10, 12)
@@ -36,10 +36,10 @@ class EffectiveOccurrenceTests(TestCase):
         return ScheduledBlock.objects.create(**fields)
 
     def day(self):
-        return GetTodayScheduleTool().execute(self.user, date=MONDAY.isoformat()).data
+        return harnais.appeler(get_today_schedule, self.user, dict(date=MONDAY.isoformat())).data
 
     def week_day(self):
-        return GetWeekScheduleTool().execute(self.user, start_date=MONDAY.isoformat()).data["days"][0]
+        return harnais.appeler(get_week_schedule, self.user, dict(start_date=MONDAY.isoformat())).data["days"][0]
 
     def test_day_excludes_expired_and_future_fixed_recurrences(self):
         self.block("Expiré", end_date=MONDAY - timedelta(days=1))
@@ -146,13 +146,13 @@ class EffectiveOccurrenceTests(TestCase):
         self.block()
         self.block("Sport", block_type="sport")
         before = list(RecurringBlock.objects.filter(user=self.user).values())
-        result = OrganizeDayTool().execute(self.user, date=MONDAY.isoformat(), apply=True)
+        result = harnais.appeler(organize_day, self.user, dict(date=MONDAY.isoformat(), apply=True))
         self.assertTrue(result.success, result.message)
         self.assertTrue(result.data["applied"])
         self.assertEqual(list(RecurringBlock.objects.filter(user=self.user).values()), before)
         self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 0)
         self.assertEqual(Task.objects.filter(user=self.user).count(), 0)
         self.assertEqual(RecurringBlockException.objects.filter(user=self.user).count(), 0)
-        proposal = OrganizeDayTool().execute(self.user, date=MONDAY.isoformat(), apply=False)
+        proposal = harnais.appeler(organize_day, self.user, dict(date=MONDAY.isoformat(), apply=False))
         self.assertTrue(proposal.success)
         self.assertEqual(result.data["placed"], proposal.data["placed"])

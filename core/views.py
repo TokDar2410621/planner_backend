@@ -2100,12 +2100,12 @@ class SchedulePlaceView(APIView):
     n'existait AUCUN moyen hors chat de poser une tâche à une date."""
 
     def post(self, request):
-        from services.agent.tools.schedule import ScheduleTaskAtTool
+        from services.agent.tools import harnais, schedule_task_at
         allowed = ('title', 'date', 'start_time', 'end_time',
                    'task_type', 'priority', 'description')
         payload = {k: request.data.get(k) for k in allowed
                    if request.data.get(k) is not None}
-        result = ScheduleTaskAtTool().execute(request.user, **payload)
+        result = harnais.appeler(schedule_task_at, request.user, payload)
         return Response(
             {'success': result.success, 'message': result.message,
              'data': result.data},
