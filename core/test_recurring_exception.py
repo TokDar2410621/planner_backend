@@ -11,11 +11,7 @@ from django.urls import reverse
 from rest_framework.test import APIClient
 
 from core.models import RecurringBlock, RecurringBlockException
-from services.agent.tools.blocks import (
-    SkipBlockOccurrenceTool,
-    RestoreBlockOccurrenceTool,
-)
-from services.agent.tools.schedule import GetTodayScheduleTool, FindFreeSlotsTool
+from services.agent.tools import find_free_slots, get_today_schedule, restore_block_occurrence, skip_block_occurrence, harnais
 
 # 2026-07-20 is a Monday (weekday 0); deterministic base for weekday math.
 _MONDAY = date(2026, 7, 20)
@@ -37,9 +33,7 @@ class SkipToolTests(TestCase):
         self.friday = _weekday_on_or_after(4)
 
     def test_skip_creates_exception_by_date_and_type(self):
-        res = SkipBlockOccurrenceTool().execute(
-            self.user, date=self.friday.isoformat(), block_type="work"
-        )
+        res = harnais.appeler(skip_block_occurrence, self.user, dict(date=self.friday.isoformat(), block_type="work"))
         self.assertTrue(res.success, res.message)
         self.assertTrue(
             RecurringBlockException.objects.filter(
@@ -48,17 +42,15 @@ class SkipToolTests(TestCase):
         )
 
     def test_skip_is_idempotent(self):
-        tool = SkipBlockOccurrenceTool()
-        tool.execute(self.user, date=self.friday.isoformat(), block_type="work")
-        tool.execute(self.user, date=self.friday.isoformat(), block_type="work")
+        tool = skip_block_occurrence
+        harnais.appeler(tool, self.user, dict(date=self.friday.isoformat(), block_type="work"))
+        harnais.appeler(tool, self.user, dict(date=self.friday.isoformat(), block_type="work"))
         self.assertEqual(
             RecurringBlockException.objects.filter(user=self.user).count(), 1
         )
 
     def test_skip_zero_match_is_failure(self):
-        res = SkipBlockOccurrenceTool().execute(
-            self.user, date=self.friday.isoformat(), block_type="sport"
-        )
+        res = harnais.appeler(skip_block_occurrence, self.user, dict(date=self.friday.isoformat(), block_type="sport"))
         self.assertFalse(res.success)
         self.assertEqual(RecurringBlockException.objects.count(), 0)
 
@@ -67,9 +59,7 @@ class SkipToolTests(TestCase):
             user=self.user, title="Réunion", block_type="work",
             day_of_week=4, start_time=time(8, 0), end_time=time(9, 0),
         )
-        res = SkipBlockOccurrenceTool().execute(
-            self.user, date=self.friday.isoformat(), block_type="work"
-        )
+        res = harnais.appeler(skip_block_occurrence, self.user, dict(date=self.friday.isoformat(), block_type="work"))
         self.assertFalse(res.success)
         self.assertEqual(len(res.data.get("candidates", [])), 2)
         self.assertEqual(RecurringBlockException.objects.count(), 0)
@@ -79,9 +69,7 @@ class SkipToolTests(TestCase):
             user=self.user, title="Réunion", block_type="work",
             day_of_week=4, start_time=time(8, 0), end_time=time(9, 0),
         )
-        res = SkipBlockOccurrenceTool().execute(
-            self.user, date=self.friday.isoformat(), block_type="work", title="Travail"
-        )
+        res = harnais.appeler(skip_block_occurrence, self.user, dict(date=self.friday.isoformat(), block_type="work", title="Travail"))
         self.assertTrue(res.success, res.message)
         self.assertEqual(RecurringBlockException.objects.count(), 1)
 
@@ -89,19 +77,17 @@ class SkipToolTests(TestCase):
         RecurringBlockException.objects.create(
             user=self.user, recurring_block=self.work, date=self.friday
         )
-        res = RestoreBlockOccurrenceTool().execute(
-            self.user, date=self.friday.isoformat(), block_type="work"
-        )
+        res = harnais.appeler(restore_block_occurrence, self.user, dict(date=self.friday.isoformat(), block_type="work"))
         self.assertTrue(res.success, res.message)
         self.assertEqual(RecurringBlockException.objects.count(), 0)
 
     def test_invalid_date(self):
-        res = SkipBlockOccurrenceTool().execute(self.user, date="pas-une-date")
+        res = harnais.appeler(skip_block_occurrence, self.user, dict(date="pas-une-date"))
         self.assertFalse(res.success)
 
     def test_skip_never_needs_block_id(self):
         # The tool schema exposes no block_id: it must resolve server-side.
-        self.assertNotIn("block_id", SkipBlockOccurrenceTool().parameters["properties"])
+        self.assertNotIn("block_id", skip_block_occurrence.PARAMETERS["properties"])
 
 
 class ScheduleExclusionTests(TestCase):
@@ -118,19 +104,17 @@ class ScheduleExclusionTests(TestCase):
         RecurringBlockException.objects.create(
             user=self.user, recurring_block=self.course, date=self.friday
         )
-        res = GetTodayScheduleTool().execute(self.user, date=self.friday.isoformat())
+        res = harnais.appeler(get_today_schedule, self.user, dict(date=self.friday.isoformat()))
         self.assertNotIn("Cours", [b["title"] for b in res.data["blocks"]])
 
-        res_next = GetTodayScheduleTool().execute(
-            self.user, date=self.next_friday.isoformat()
-        )
+        res_next = harnais.appeler(get_today_schedule, self.user, dict(date=self.next_friday.isoformat()))
         self.assertIn("Cours", [b["title"] for b in res_next.data["blocks"]])
 
     def test_free_slots_open_up_on_skipped_date(self):
         RecurringBlockException.objects.create(
             user=self.user, recurring_block=self.course, date=self.friday
         )
-        res = FindFreeSlotsTool().execute(self.user, date=self.friday.isoformat())
+        res = harnais.appeler(find_free_slots, self.user, dict(date=self.friday.isoformat()))
         # No blocks left that day: the whole 07:00-23:00 window (16h) is free.
         self.assertEqual(res.data["total_free_minutes"], 16 * 60)
 

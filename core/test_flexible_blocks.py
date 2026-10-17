@@ -4,8 +4,8 @@ from django.contrib.auth.models import User
 from django.test import TestCase
 
 from core.models import RecurringBlock
-from services.agent.tools.blocks import CreateBlockTool
 from services.scheduling.overlap import find_recurring_conflicts
+from services.agent.tools import create_block, harnais
 
 
 class FlexibleRecurringBlockTest(TestCase):
@@ -132,14 +132,11 @@ class FlexibleRecurringBlockTest(TestCase):
             end_time=time(7, 0),
         )
 
-        result = CreateBlockTool().execute(
-            self.user,
-            title='Travail',
+        result = harnais.appeler(create_block, self.user, dict(title='Travail',
             block_type='work',
             days=[5],
             start_time='19:00',
-            end_time='07:00',
-        )
+            end_time='07:00',))
 
         self.assertTrue(result.success)
         self.assertEqual(len(result.data['created']), 1)

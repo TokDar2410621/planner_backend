@@ -15,6 +15,7 @@ from django.test import SimpleTestCase
 
 from services.agent_v2.mesure import epurer_reponse, fuites_reponse
 from services.agent_v2.redaction import ReponseDire
+from services.agent.tools import present_choices, harnais
 
 
 class GuillotineDeProseTests(SimpleTestCase):
@@ -316,7 +317,6 @@ class ExemptionParParticipeTests(SimpleTestCase):
     )
 
     def test_les_affirmations_deguisees_sont_coupees_partout(self):
-        from services.agent.tools.interactive import PresentChoicesTool
         from services.agent_v2.mesure import fuite_question
 
         class AvecQuestion(ReponseDire):
@@ -331,10 +331,9 @@ class ExemptionParParticipeTests(SimpleTestCase):
                 epuree, _ = epurer_reponse(ReponseDire(question=phrase, options=["14 h", "15 h"]))
                 self.assertEqual(epuree.question, "")
                 self.assertEqual(epuree.options, [])
-                r = PresentChoicesTool().execute(
-                    None, question=phrase if len(phrase) <= 140 else phrase[:139] + "?",
+                r = harnais.appeler(present_choices, None, dict(question=phrase if len(phrase) <= 140 else phrase[:139] + "?",
                     source="jours", options=[{"label": "Lundi", "value": "Lundi."},
-                                             {"label": "Jeudi", "value": "Jeudi."}])
+                                             {"label": "Jeudi", "value": "Jeudi."}]))
                 self.assertFalse(r.success)
 
     def test_les_vraies_questions_passent(self):
@@ -348,12 +347,10 @@ class ExemptionParParticipeTests(SimpleTestCase):
     def test_une_valeur_de_puce_a_l_imperatif_passe(self):
         """Le banc du 2026-09-14: « Place ma révision jeudi. » faisait refuser
         un choix de jours reel."""
-        from services.agent.tools.interactive import PresentChoicesTool
 
-        r = PresentChoicesTool().execute(
-            None, question="Quel jour pour ta révision ?", source="jours",
+        r = harnais.appeler(present_choices, None, dict(question="Quel jour pour ta révision ?", source="jours",
             options=[{"label": "Lundi (aujourd'hui)", "value": "Place ma révision aujourd'hui."},
-                     {"label": "Jeudi", "value": "Place ma révision jeudi."}])
+                     {"label": "Jeudi", "value": "Place ma révision jeudi."}]))
         self.assertTrue(r.success, r.message)
         epuree, n = epurer_reponse(ReponseDire(ouverture="Ton cours est placé."))
         self.assertEqual(n, 1)

@@ -37,7 +37,7 @@ class PariteDesOutilsTests(TestCase):
     def test_les_30_outils_sont_exposes(self):
         # Derive de ALL_TOOLS: le nombre d'outils change (present_choices), le
         # contrat est que CHAQUE outil est expose une fois, sans doublon.
-        attendus = {t.name for t in ALL_TOOLS}
+        attendus = {t.NAME for t in ALL_TOOLS}
         self.assertEqual(len(attendus), len(ALL_TOOLS), 'deux outils portent le meme nom')
         self.assertEqual(set(self.exposes), attendus)
 
@@ -49,16 +49,16 @@ class PariteDesOutilsTests(TestCase):
         # est un bug.
         surcharges = set(outils_v2.DESCRIPTIONS_V2) | set(outils_v2.COMPLEMENTS_V2)
         for outil in ALL_TOOLS:
-            with self.subTest(outil=outil.name):
-                if outil.name in surcharges:
+            with self.subTest(outil=outil.NAME):
+                if outil.NAME in surcharges:
                     self.assertEqual(
-                        self.exposes[outil.name].description,
+                        self.exposes[outil.NAME].description,
                         outils_v2.description_v2(outil),
                     )
                 else:
                     self.assertEqual(
-                        self.exposes[outil.name].description.encode('utf-8'),
-                        outil.description.encode('utf-8'),
+                        self.exposes[outil.NAME].description.encode('utf-8'),
+                        outil.DESCRIPTION.encode('utf-8'),
                     )
 
     def test_surcharges_v2_limitees_aux_outils_documentes(self):
@@ -79,24 +79,24 @@ class PariteDesOutilsTests(TestCase):
 
     def test_chaque_schema_serialise_est_identique(self):
         for outil in ALL_TOOLS:
-            with self.subTest(outil=outil.name):
-                expose = outils_v2.schema_expose(self.exposes[outil.name])
+            with self.subTest(outil=outil.NAME):
+                expose = outils_v2.schema_expose(self.exposes[outil.NAME])
                 self.assertEqual(
                     json.dumps(expose, sort_keys=True, ensure_ascii=False),
-                    json.dumps(outil.parameters, sort_keys=True, ensure_ascii=False),
+                    json.dumps(outil.PARAMETERS, sort_keys=True, ensure_ascii=False),
                 )
 
     def test_aucun_schema_n_est_vide(self):
         """Le piege exact de la sonde: un schema vide passerait le test de
         description tout en privant le modele de tous les parametres."""
-        avec_params = [t for t in ALL_TOOLS if t.parameters.get('properties')]
+        avec_params = [t for t in ALL_TOOLS if t.PARAMETERS.get('properties')]
         self.assertGreater(len(avec_params), 20)
         for outil in avec_params:
-            with self.subTest(outil=outil.name):
-                expose = outils_v2.schema_expose(self.exposes[outil.name])
+            with self.subTest(outil=outil.NAME):
+                expose = outils_v2.schema_expose(self.exposes[outil.NAME])
                 self.assertTrue(
                     expose.get('properties'),
-                    f'{outil.name} expose un schema sans proprietes',
+                    f'{outil.NAME} expose un schema sans proprietes',
                 )
 
 
@@ -111,8 +111,8 @@ class GardeDestructiveTests(TestCase):
     def test_les_outils_destructifs_portent_le_drapeau(self):
         for nom in ('clear_all_blocks', 'delete_task'):
             self.assertTrue(
-                getattr(TOOL_MAP[nom], 'requires_confirmation', False),
-                f'{nom} devrait porter requires_confirmation',
+                getattr(TOOL_MAP[nom], 'REQUIRES_CONFIRMATION', False),
+                f'{nom} devrait porter REQUIRES_CONFIRMATION',
             )
 
     def test_une_intention_claire_autorise(self):

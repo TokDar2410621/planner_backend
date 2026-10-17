@@ -13,11 +13,7 @@ from django.urls import reverse
 from rest_framework.test import APIClient
 
 from core.models import RecurringBlock, ScheduledBlock, Task
-from services.agent.tools.schedule import (
-    ScheduleTaskAtTool,
-    FindFreeSlotsTool,
-    GetTodayScheduleTool,
-)
+from services.agent.tools import find_free_slots, get_today_schedule, schedule_task_at, harnais
 
 _MONDAY = date(2026, 7, 20)  # Monday
 
@@ -38,7 +34,7 @@ class NightShiftFreeSlotsTests(TestCase):
         self.saturday = _weekday_on_or_after(5)
 
     def test_find_free_slots_respects_night_shift(self):
-        res = FindFreeSlotsTool().execute(self.user, date=self.saturday.isoformat())
+        res = harnais.appeler(find_free_slots, self.user, dict(date=self.saturday.isoformat()))
         slots = res.data["free_slots"]
         # The 19:00-23:00 evening is busy (working), so no free slot ends after 19:00.
         self.assertTrue(slots)
@@ -47,7 +43,7 @@ class NightShiftFreeSlotsTests(TestCase):
         self.assertEqual(res.data["total_free_minutes"], 720)
 
     def test_get_today_schedule_free_slots_respect_night_shift(self):
-        res = GetTodayScheduleTool().execute(self.user, date=self.saturday.isoformat())
+        res = harnais.appeler(get_today_schedule, self.user, dict(date=self.saturday.isoformat()))
         self.assertEqual(res.data["total_free_minutes"], 720)
         self.assertTrue(all(s["end_time"] <= "19:00" for s in res.data["free_slots"]))
 
@@ -69,7 +65,7 @@ class FlexiblePlacementReadToolTests(TestCase):
         )
 
     def test_get_today_schedule_shows_placed_flexible_sleep(self):
-        res = GetTodayScheduleTool().execute(self.user, date=self.sunday.isoformat())
+        res = harnais.appeler(get_today_schedule, self.user, dict(date=self.sunday.isoformat()))
 
         self.assertTrue(res.success, res.message)
         sleep = next(b for b in res.data["blocks"] if b["title"] == "Sommeil")
@@ -77,7 +73,7 @@ class FlexiblePlacementReadToolTests(TestCase):
         self.assertEqual(sleep["end_time"], "14:00")
 
     def test_find_free_slots_excludes_placed_sleep_window(self):
-        res = FindFreeSlotsTool().execute(self.user, date=self.sunday.isoformat())
+        res = harnais.appeler(find_free_slots, self.user, dict(date=self.sunday.isoformat()))
 
         self.assertTrue(res.success, res.message)
         self.assertEqual(
@@ -86,10 +82,8 @@ class FlexiblePlacementReadToolTests(TestCase):
         )
 
     def test_schedule_task_rejects_overlap_with_placed_sleep(self):
-        res = ScheduleTaskAtTool().execute(
-            self.user, title="Lecture", date=self.sunday.isoformat(),
-            start_time="08:00", end_time="09:00",
-        )
+        res = harnais.appeler(schedule_task_at, self.user, dict(title="Lecture", date=self.sunday.isoformat(),
+            start_time="08:00", end_time="09:00",))
 
         self.assertFalse(res.success)
         self.assertEqual(
@@ -110,10 +104,8 @@ class ScheduleTaskAtTests(TestCase):
         self.saturday = _weekday_on_or_after(5)
 
     def test_places_one_off_locked_block(self):
-        res = ScheduleTaskAtTool().execute(
-            self.user, title="Lecture", date=self.saturday.isoformat(),
-            start_time="09:00", end_time="11:00",
-        )
+        res = harnais.appeler(schedule_task_at, self.user, dict(title="Lecture", date=self.saturday.isoformat(),
+            start_time="09:00", end_time="11:00",))
         self.assertTrue(res.success, res.message)
         sb = ScheduledBlock.objects.get(user=self.user, date=self.saturday)
         self.assertEqual(sb.task.title, "Lecture")
@@ -122,37 +114,29 @@ class ScheduleTaskAtTests(TestCase):
         self.assertEqual(sb.end_time, time(11, 0))
 
     def test_rejects_overlap_with_night_shift(self):
-        res = ScheduleTaskAtTool().execute(
-            self.user, title="Lecture", date=self.saturday.isoformat(),
-            start_time="20:00", end_time="21:00",
-        )
+        res = harnais.appeler(schedule_task_at, self.user, dict(title="Lecture", date=self.saturday.isoformat(),
+            start_time="20:00", end_time="21:00",))
         self.assertFalse(res.success)
         self.assertIn("conflict", res.data)
         self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 0)
 
     def test_rejects_end_before_start(self):
-        res = ScheduleTaskAtTool().execute(
-            self.user, title="Lecture", date=self.saturday.isoformat(),
-            start_time="11:00", end_time="09:00",
-        )
+        res = harnais.appeler(schedule_task_at, self.user, dict(title="Lecture", date=self.saturday.isoformat(),
+            start_time="11:00", end_time="09:00",))
         self.assertFalse(res.success)
 
     def test_reuses_existing_task_no_duplicate(self):
         Task.objects.create(user=self.user, title="Lecture")
-        ScheduleTaskAtTool().execute(
-            self.user, title="Lecture", date=self.saturday.isoformat(),
-            start_time="09:00", end_time="10:00",
-        )
+        harnais.appeler(schedule_task_at, self.user, dict(title="Lecture", date=self.saturday.isoformat(),
+            start_time="09:00", end_time="10:00",))
         self.assertEqual(Task.objects.filter(user=self.user, title="Lecture").count(), 1)
 
     def test_invalid_date(self):
-        res = ScheduleTaskAtTool().execute(
-            self.user, title="X", date="pas-une-date", start_time="09:00", end_time="10:00",
-        )
+        res = harnais.appeler(schedule_task_at, self.user, dict(title="X", date="pas-une-date", start_time="09:00", end_time="10:00",))
         self.assertFalse(res.success)
 
     def test_tool_takes_no_block_id(self):
-        self.assertNotIn("block_id", ScheduleTaskAtTool().parameters["properties"])
+        self.assertNotIn("block_id", schedule_task_at.PARAMETERS["properties"])
 
 
 class SchedulePayloadPlacementTests(TestCase):

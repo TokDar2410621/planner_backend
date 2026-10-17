@@ -9,6 +9,7 @@ from services.scheduling.overlap import (
     parse_time,
     recurring_intervals,
 )
+from services.agent.tools import create_block, update_block, harnais
 
 
 # --- Unitaires purs (sans DB) ------------------------------------------------
@@ -70,14 +71,13 @@ def test_week_wraps_sunday_to_monday():
 
 def test_create_block_skips_overlap(user):
     from core.models import RecurringBlock
-    from services.agent.tools.blocks import CreateBlockTool
 
-    tool = CreateBlockTool()
-    r1 = tool.execute(user, title="A", block_type="work", days=[0],
-                      start_time="09:00", end_time="11:00")
+    tool = create_block
+    r1 = harnais.appeler(tool, user, dict(title="A", block_type="work", days=[0],
+                      start_time="09:00", end_time="11:00"))
     assert r1.success
-    r2 = tool.execute(user, title="B", block_type="work", days=[0],
-                      start_time="10:00", end_time="12:00")
+    r2 = harnais.appeler(tool, user, dict(title="B", block_type="work", days=[0],
+                      start_time="10:00", end_time="12:00"))
     assert r2.data["skipped"]
     assert not r2.data["created"]
     assert RecurringBlock.objects.filter(
@@ -87,30 +87,28 @@ def test_create_block_skips_overlap(user):
 
 def test_create_block_nightshift_overlap_not_bypassed(user):
     """Régression : un bloc de nuit ne doit PLUS contourner le contrôle."""
-    from services.agent.tools.blocks import CreateBlockTool
 
-    tool = CreateBlockTool()
-    tool.execute(user, title="Soir", block_type="work", days=[0],
-                 start_time="20:00", end_time="23:00")
-    r = tool.execute(user, title="Nuit", block_type="work", days=[0],
-                     start_time="22:00", end_time="06:00", is_night_shift=True)
+    tool = create_block
+    harnais.appeler(tool, user, dict(title="Soir", block_type="work", days=[0],
+                 start_time="20:00", end_time="23:00"))
+    r = harnais.appeler(tool, user, dict(title="Nuit", block_type="work", days=[0],
+                     start_time="22:00", end_time="06:00", is_night_shift=True))
     assert r.data["skipped"]
     assert not r.data["created"]
 
 
 def test_update_block_rejects_overlap(user):
     from core.models import RecurringBlock
-    from services.agent.tools.blocks import CreateBlockTool, UpdateBlockTool
 
-    create = CreateBlockTool()
-    create.execute(user, title="A", block_type="work", days=[0],
-                   start_time="09:00", end_time="10:00")
-    r = create.execute(user, title="B", block_type="work", days=[0],
-                       start_time="11:00", end_time="12:00")
+    create = create_block
+    harnais.appeler(create, user, dict(title="A", block_type="work", days=[0],
+                   start_time="09:00", end_time="10:00"))
+    r = harnais.appeler(create, user, dict(title="B", block_type="work", days=[0],
+                       start_time="11:00", end_time="12:00"))
     bid = r.data["created"][0]["id"]
 
-    res = UpdateBlockTool().execute(user, block_id=bid,
-                                    start_time="09:30", end_time="10:30")
+    res = harnais.appeler(update_block, user, dict(block_id=bid,
+                                    start_time="09:30", end_time="10:30"))
     assert not res.success
     # Inchangé
     assert RecurringBlock.objects.get(id=bid).start_time == time(11, 0)

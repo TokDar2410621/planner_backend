@@ -31,7 +31,7 @@ JEUDI = "2026-09-17"
 
 
 def _figer(instant=LUNDI_8H):
-    return patch("services.agent.tools.interactive._maintenant", return_value=instant)
+    return patch("services.agent.tools.present_choices._maintenant", return_value=instant)
 
 
 def _bloc(user, titre, jour, debut, fin, **extra):
@@ -44,21 +44,21 @@ def _bloc(user, titre, jour, debut, fin, **extra):
 class ExpositionTests(SimpleTestCase):
     def test_present_choices_expose(self):
         self.assertIn("present_choices", TOOL_MAP)
-        self.assertIn("present_choices", [t.name for t in ALL_TOOLS])
+        self.assertIn("present_choices", [t.NAME for t in ALL_TOOLS])
         self.assertNotIn("present_choices", [t["name"] for t in get_tools_for_claude()])
 
     def test_v1_garde_tous_les_autres_outils(self):
         noms_v1 = [t["name"] for t in get_tools_for_claude()]
-        attendus = [t.name for t in ALL_TOOLS if t.name not in V2_SEULEMENT]
+        attendus = [t.NAME for t in ALL_TOOLS if t.NAME not in V2_SEULEMENT]
         self.assertEqual(noms_v1, attendus)
         self.assertIn("present_form", noms_v1)
 
     def test_present_choices_suit_present_form(self):
-        noms = [t.name for t in ALL_TOOLS]
+        noms = [t.NAME for t in ALL_TOOLS]
         self.assertEqual(noms.index("present_choices"), noms.index("present_form") + 1)
 
     def test_schema_sans_source_autre(self):
-        schema = TOOL_MAP["present_choices"].parameters
+        schema = TOOL_MAP["present_choices"].PARAMETERS
         self.assertEqual(schema["required"], ["question", "options", "source"])
         self.assertEqual(schema["properties"]["source"]["enum"],
                          ["creneaux", "blocs", "taches", "jours"])

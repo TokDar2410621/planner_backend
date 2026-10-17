@@ -71,7 +71,7 @@ class PlanJourCacheTests(TestCase):
     def test_second_propose_identique_ne_resout_pas(self):
         premiere, _, _ = self._propose()
         with mock.patch(
-            "services.agent.tools.schedule.solve_placement",
+            "services.agent.tools.commun.solve_placement",
             side_effect=AssertionError("re-solve inattendu"),
         ):
             seconde, _, arrangement = self._propose()
@@ -80,7 +80,7 @@ class PlanJourCacheTests(TestCase):
         self.assertTrue(arrangement)
 
     def test_entrees_modifiees_invalident_le_cache(self):
-        import services.agent.tools.schedule as sched_module
+        import services.agent.tools.commun as sched_module
         _, entrees_avant, _ = self._propose()
         self.bloc.start_time = time(8, 0)
         self.bloc.end_time = time(9, 0)
@@ -163,7 +163,7 @@ class PlanJourCacheTests(TestCase):
         arrangement, _ = _arrangement_jour_cache(self.user, self.jour)
         self.assertIsNotNone(arrangement)
         with mock.patch(
-            "services.agent.tools.schedule.solve_placement",
+            "services.agent.tools.commun.solve_placement",
             side_effect=AssertionError("re-solve inattendu"),
         ):
             resultat = self.outil.execute(
@@ -175,7 +175,7 @@ class PlanJourCacheTests(TestCase):
 
     def test_apply_sans_arrangement_resout_comme_avant(self):
         """v1 / chemin historique: sans kwarg prive, on re-solve."""
-        import services.agent.tools.schedule as sched_module
+        import services.agent.tools.commun as sched_module
         with mock.patch.object(
             sched_module, "solve_placement", wraps=sched_module.solve_placement
         ) as spy:

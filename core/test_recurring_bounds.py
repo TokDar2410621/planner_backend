@@ -14,11 +14,8 @@ from django.test import TestCase
 from core.models import RecurringBlock, UploadedDocument
 from services.document_processor import DocumentProcessor
 from services.scheduling.day_view import effective_day_blocks
-from services.agent.tools.blocks import CreateBlockTool, UpdateBlockTool
-from services.agent.tools.schedule import (
-    FindFreeSlotsTool, GetWeekScheduleTool, ScheduleTaskAtTool,
-)
 from services.ical import build_calendar
+from services.agent.tools import create_block, find_free_slots, get_week_schedule, schedule_task_at, update_block, harnais
 
 
 def _mk(user, **kw):
@@ -61,25 +58,24 @@ class BoundsModelTest(TestCase):
         self.assertIsNone(b.end_date)
 
     def test_agent_tools_set_bounds(self):
-        res = CreateBlockTool().execute(
-            self.u, title='Natation', block_type='sport', days=[2],
-            start_time='07:00', end_time='08:00', start_date='2026-09-01')
+        res = harnais.appeler(create_block, self.u, dict(title='Natation', block_type='sport', days=[2],
+            start_time='07:00', end_time='08:00', start_date='2026-09-01'))
         self.assertTrue(res.success, res.message)
         b = RecurringBlock.objects.get(user=self.u, title='Natation')
         self.assertEqual(b.start_date, date(2026, 9, 1))
-        res = UpdateBlockTool().execute(self.u, block_id=b.id, end_date='2026-10-15')
+        res = harnais.appeler(update_block, self.u, dict(block_id=b.id, end_date='2026-10-15'))
         self.assertTrue(res.success, res.message)
         b.refresh_from_db()
         self.assertEqual(b.end_date, date(2026, 10, 15))
         # retrait de la borne par chaine vide
-        res = UpdateBlockTool().execute(self.u, block_id=b.id, end_date='')
+        res = harnais.appeler(update_block, self.u, dict(block_id=b.id, end_date=''))
         self.assertTrue(res.success, res.message)
         b.refresh_from_db()
         self.assertIsNone(b.end_date)
 
     def test_update_rejects_inverted_bounds(self):
         b = _mk(self.u, start_date=date(2026, 9, 1))
-        res = UpdateBlockTool().execute(self.u, block_id=b.id, end_date='2026-08-01')
+        res = harnais.appeler(update_block, self.u, dict(block_id=b.id, end_date='2026-08-01'))
         self.assertFalse(res.success)
         # 2026-10-14: le message doit donner les valeurs et l'action,
         # sinon le modele ne peut pas se corriger (fin mai 2026 prise
@@ -89,10 +85,9 @@ class BoundsModelTest(TestCase):
         self.assertIn('année', res.message)
 
     def test_create_rejects_inverted_bounds_with_values(self):
-        res = CreateBlockTool().execute(
-            self.u, title='Natation', block_type='sport', days=[2],
+        res = harnais.appeler(create_block, self.u, dict(title='Natation', block_type='sport', days=[2],
             start_time='07:00', end_time='08:00',
-            start_date='2026-10-14', end_date='2026-05-31')
+            start_date='2026-10-14', end_date='2026-05-31'))
         self.assertFalse(res.success)
         self.assertIn('2026-05-31', res.message)
         self.assertIn('2026-10-14', res.message)
@@ -108,28 +103,27 @@ class ErreursActionnablesTest(TestCase):
         self.u = User.objects.create_user('erreurs', password='<redacted>')
 
     def test_semaine_date_invalide_donne_la_valeur(self):
-        res = GetWeekScheduleTool().execute(self.u, start_date='31 mai')
+        res = harnais.appeler(get_week_schedule, self.u, dict(start_date='31 mai'))
         self.assertFalse(res.success)
         self.assertIn('31 mai', res.message)
         self.assertIn('YYYY-MM-DD', res.message)
 
     def test_creneaux_date_invalide_donne_la_valeur(self):
-        res = FindFreeSlotsTool().execute(self.u, date='demain')
+        res = harnais.appeler(find_free_slots, self.u, dict(date='demain'))
         self.assertFalse(res.success)
         self.assertIn('demain', res.message)
         self.assertIn('YYYY-MM-DD', res.message)
 
     def test_planification_heure_invalide_donne_les_valeurs(self):
-        res = ScheduleTaskAtTool().execute(
-            self.u, title='X', date='2026-10-15',
-            start_time='25:00', end_time='26:00')
+        res = harnais.appeler(schedule_task_at, self.u, dict(title='X', date='2026-10-15',
+            start_time='25:00', end_time='26:00'))
         self.assertFalse(res.success)
         self.assertIn('25:00', res.message)
         self.assertIn('26:00', res.message)
 
     def test_update_jour_invalide_donne_la_valeur(self):
         b = _mk(self.u, start_date=date(2026, 9, 1))
-        res = UpdateBlockTool().execute(self.u, block_id=b.id, day_of_week='nimporte')
+        res = harnais.appeler(update_block, self.u, dict(block_id=b.id, day_of_week='nimporte'))
         self.assertFalse(res.success)
         self.assertIn('nimporte', res.message)
 

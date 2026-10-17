@@ -43,12 +43,12 @@ def _demande(**extra):
 class ExpositionTests(SimpleTestCase):
     def test_pose_question_expose_v2_seulement(self):
         self.assertIn("poser_question", TOOL_MAP)
-        self.assertIn("poser_question", [t.name for t in ALL_TOOLS])
+        self.assertIn("poser_question", [t.NAME for t in ALL_TOOLS])
         self.assertIn("poser_question", V2_SEULEMENT)
         self.assertNotIn("poser_question", [t["name"] for t in get_tools_for_claude()])
 
     def test_schema_sans_ancrage(self):
-        schema = TOOL_MAP["poser_question"].parameters
+        schema = TOOL_MAP["poser_question"].PARAMETERS
         self.assertEqual(schema["required"], ["question", "options"])
         self.assertNotIn("source", schema["properties"])
         self.assertIn("label", schema["properties"]["options"]["items"]["properties"])

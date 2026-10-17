@@ -13,20 +13,20 @@ from django.test import TestCase
 
 from core.models import RecurringBlock
 from services.agent.agent import _claims_completed_mutation
-from services.agent.tools.blocks import CreateBlockTool, UpdateBlockTool
+from services.agent.tools import create_block, update_block, harnais
 
 
 class CreateBlockDedupTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user("dedup", password="pw-123456")
-        self.tool = CreateBlockTool()
+        self.tool = create_block
 
     def _create(self, title, bt, day, s, e, flex=None):
         kw = {"title": title, "block_type": bt, "days": [day],
               "start_time": s, "end_time": e}
         if flex:
             kw["flexibility"] = flex
-        return self.tool.execute(self.user, **kw)
+        return harnais.appeler(self.tool, self.user, dict(**kw))
 
     def test_exact_duplicate_flexible_is_skipped(self):
         r1 = self._create("Déjeuner", "meal", 0, "12:00", "12:30")
@@ -60,7 +60,7 @@ class UpdateBlockMoveTests(TestCase):
 
     def test_move_to_another_day_in_place(self):
         b = self._block("Programmation", "course", 0, "08:00", "10:00")
-        r = UpdateBlockTool().execute(self.user, block_id=b.id, day_of_week=1)
+        r = harnais.appeler(update_block, self.user, dict(block_id=b.id, day_of_week=1))
         self.assertTrue(r.success, r.message)
         b.refresh_from_db()
         self.assertEqual(b.day_of_week, 1)  # moved to mardi
@@ -72,14 +72,14 @@ class UpdateBlockMoveTests(TestCase):
         b = self._block("Sport", "sport", 0, "08:30", "10:00")
         # make Sport fixed so it would conflict
         b.flexibility = "fixed"; b.save()
-        r = UpdateBlockTool().execute(self.user, block_id=b.id, day_of_week=2, flexibility="fixed")
+        r = harnais.appeler(update_block, self.user, dict(block_id=b.id, day_of_week=2, flexibility="fixed"))
         self.assertFalse(r.success)
         b.refresh_from_db()
         self.assertEqual(b.day_of_week, 0)  # unchanged
 
     def test_invalid_day_rejected(self):
         b = self._block("X", "other", 0, "08:00", "09:00")
-        r = UpdateBlockTool().execute(self.user, block_id=b.id, day_of_week=9)
+        r = harnais.appeler(update_block, self.user, dict(block_id=b.id, day_of_week=9))
         self.assertFalse(r.success)
 
 

@@ -86,9 +86,9 @@ def _textes_envoyes_au_modele() -> dict:
     textes = {nom: getattr(prompts, nom) for nom in ("REGLES_AGIR", "PREMIER_CONTACT", "PROSE_BOUCLE")}
     textes["ReponseDire"] = json.dumps(ReponseDire.model_json_schema(), ensure_ascii=False)
     for outil in ALL_TOOLS:
-        textes[f"outil {outil.name}"] = (
-            f"{outil.name}\n{outil.description}\n"
-            f"{json.dumps(outil.parameters, ensure_ascii=False)}")
+        textes[f"outil {outil.NAME}"] = (
+            f"{outil.NAME}\n{outil.DESCRIPTION}\n"
+            f"{json.dumps(outil.PARAMETERS, ensure_ascii=False)}")
     return textes
 
 
@@ -157,8 +157,8 @@ class P2RegleTests(SimpleTestCase):
 
     def test_les_descriptions_disent_la_regle(self):
         from services.agent.tools import TOOL_MAP
-        self.assertIn("sans mot de récurrence", TOOL_MAP["create_block"].description)
-        self.assertIn("sans mot de récurrence", TOOL_MAP["schedule_task_at"].description)
+        self.assertIn("sans mot de récurrence", TOOL_MAP["create_block"].DESCRIPTION)
+        self.assertIn("sans mot de récurrence", TOOL_MAP["schedule_task_at"].DESCRIPTION)
 
     def test_lecture_des_mots_de_recurrence(self):
         from services.agent_v2 import outils as outils_v2

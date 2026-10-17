@@ -118,7 +118,7 @@ class ConsultationPrioritaireTests(TransactionTestCase):
 
     def test_echec_lecture_demandee_ne_rend_pas_une_liste_sans_rapport(self):
         from services.agent.tools.base import ToolResult
-        with patch('services.agent.tools.schedule.GetTodayScheduleTool.execute',
+        with patch('services.agent.tools.get_today_schedule.execute',
                    return_value=ToolResult(success=False, message='Lecture indisponible')):
             texte, meta = self.executer([('list_tasks', {})])
         self.assertNotIn('Ta liste de tâches est vide', texte)

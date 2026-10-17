@@ -14,8 +14,7 @@ from unittest.mock import patch
 import pytest
 
 from core.models import RecurringBlock, Task
-from services.agent.tools.blocks import CreateBlockTool, ClearAllBlocksTool
-from services.agent.tools.tasks import CreateTaskTool, DeleteTaskTool
+from services.agent.tools import clear_all_blocks, create_block, create_task, delete_task, harnais
 
 
 # --- D5: enum validation at the tool layer -------------------------------
@@ -23,15 +22,12 @@ from services.agent.tools.tasks import CreateTaskTool, DeleteTaskTool
 @pytest.mark.django_db
 def test_create_block_rejects_out_of_enum_block_type(user):
     """An out-of-enum block_type is rejected and NOT written to the DB."""
-    tool = CreateBlockTool()
-    result = tool.execute(
-        user,
-        title="Bloc bidon",
+    tool = create_block
+    result = harnais.appeler(tool, user, dict(title="Bloc bidon",
         block_type="not_a_real_type",  # not in BLOCK_TYPE_CHOICES
         days=[0],
         start_time="09:00",
-        end_time="10:00",
-    )
+        end_time="10:00",))
 
     assert result.success is False
     assert "block_type" in result.message
@@ -42,8 +38,8 @@ def test_create_block_rejects_out_of_enum_block_type(user):
 @pytest.mark.django_db
 def test_create_task_rejects_out_of_enum_task_type(user):
     """An out-of-enum task_type is rejected and NOT written to the DB."""
-    tool = CreateTaskTool()
-    result = tool.execute(user, title="T", task_type="wizardry")
+    tool = create_task
+    result = harnais.appeler(tool, user, dict(title="T", task_type="wizardry"))
 
     assert result.success is False
     assert "task_type" in result.message
@@ -53,15 +49,12 @@ def test_create_task_rejects_out_of_enum_task_type(user):
 @pytest.mark.django_db
 def test_create_block_rejects_overlong_title(user):
     """A title longer than max_length is rejected before create()."""
-    tool = CreateBlockTool()
-    result = tool.execute(
-        user,
-        title="x" * 5000,
+    tool = create_block
+    result = harnais.appeler(tool, user, dict(title="x" * 5000,
         block_type="work",
         days=[0],
         start_time="09:00",
-        end_time="10:00",
-    )
+        end_time="10:00",))
 
     assert result.success is False
     assert "title" in result.message
@@ -71,15 +64,12 @@ def test_create_block_rejects_overlong_title(user):
 @pytest.mark.django_db
 def test_create_block_valid_input_still_works(user):
     """A valid create is unaffected by the new validation."""
-    tool = CreateBlockTool()
-    result = tool.execute(
-        user,
-        title="Travail",
+    tool = create_block
+    result = harnais.appeler(tool, user, dict(title="Travail",
         block_type="work",
         days=[0, 1],
         start_time="09:00",
-        end_time="10:00",
-    )
+        end_time="10:00",))
 
     assert result.success is True
     assert RecurringBlock.objects.filter(user=user, active=True).count() == 2
@@ -90,7 +80,7 @@ def test_create_block_valid_input_still_works(user):
 @pytest.mark.django_db
 def test_create_block_multiday_failure_midway_leaves_no_partial_rows(user):
     """If a create fails midway through a multi-day create, nothing persists."""
-    tool = CreateBlockTool()
+    tool = create_block
 
     real_create = RecurringBlock.objects.create
     calls = {"n": 0}
@@ -102,14 +92,11 @@ def test_create_block_multiday_failure_midway_leaves_no_partial_rows(user):
         return real_create(**kwargs)
 
     with patch.object(RecurringBlock.objects, "create", side_effect=flaky_create):
-        result = tool.execute(
-            user,
-            title="Travail",
+        result = harnais.appeler(tool, user, dict(title="Travail",
             block_type="work",
             days=[0, 1],  # day 0 succeeds, day 1 raises
             start_time="09:00",
-            end_time="10:00",
-        )
+            end_time="10:00",))
 
     assert result.success is False
     assert calls["n"] == 2  # it did attempt the second create
@@ -123,15 +110,15 @@ def test_create_block_multiday_failure_midway_leaves_no_partial_rows(user):
 def test_delete_task_requires_confirmation(user):
     """DeleteTaskTool refuses to delete without explicit confirm=true."""
     task = Task.objects.create(user=user, title="Ne me supprime pas")
-    tool = DeleteTaskTool()
+    tool = delete_task
 
     # Without confirm: refused, task still present.
-    result = tool.execute(user, task_id=task.id)
+    result = harnais.appeler(tool, user, dict(task_id=task.id))
     assert result.success is False
     assert Task.objects.filter(id=task.id).exists()
 
     # Explicit confirm=False also refused.
-    result = tool.execute(user, task_id=task.id, confirm=False)
+    result = harnais.appeler(tool, user, dict(task_id=task.id, confirm=False))
     assert result.success is False
     assert Task.objects.filter(id=task.id).exists()
 
@@ -139,18 +126,18 @@ def test_delete_task_requires_confirmation(user):
 @pytest.mark.django_db
 def test_delete_task_declares_requires_confirmation(user):
     """DeleteTaskTool advertises it needs out-of-band confirmation + schema requires confirm."""
-    tool = DeleteTaskTool()
-    assert getattr(tool, "requires_confirmation", False) is True
-    assert "confirm" in tool.parameters["required"]
+    tool = delete_task
+    assert getattr(tool, "REQUIRES_CONFIRMATION", False) is True
+    assert "confirm" in tool.PARAMETERS["required"]
 
 
 @pytest.mark.django_db
 def test_delete_task_with_confirmation_deletes(user):
     """With confirm=true the task is deleted (scoped to the owner)."""
     task = Task.objects.create(user=user, title="Adieu")
-    tool = DeleteTaskTool()
+    tool = delete_task
 
-    result = tool.execute(user, task_id=task.id, confirm=True)
+    result = harnais.appeler(tool, user, dict(task_id=task.id, confirm=True))
     assert result.success is True
     assert not Task.objects.filter(id=task.id).exists()
 
@@ -160,9 +147,9 @@ def test_delete_task_is_user_scoped(user, django_user_model):
     """A user cannot delete another user's task even with confirm=true."""
     other = django_user_model.objects.create_user(username="other", password="x")
     other_task = Task.objects.create(user=other, title="Tâche de l'autre")
-    tool = DeleteTaskTool()
+    tool = delete_task
 
-    result = tool.execute(user, task_id=other_task.id, confirm=True)
+    result = harnais.appeler(tool, user, dict(task_id=other_task.id, confirm=True))
     assert result.success is False
     assert Task.objects.filter(id=other_task.id).exists()
 
@@ -178,9 +165,9 @@ def test_clear_all_blocks_is_soft_and_reversible(user):
         user=user, title="B", block_type="work", day_of_week=1,
         start_time=time(9, 0), end_time=time(10, 0),
     )
-    tool = ClearAllBlocksTool()
+    tool = clear_all_blocks
 
-    result = tool.execute(user, confirm=True)
+    result = harnais.appeler(tool, user, dict(confirm=True))
     assert result.success is True
     assert result.data.get("reversible") is True
     # Rows still exist in the DB (soft-delete), just deactivated -> restorable.
@@ -198,9 +185,9 @@ def test_clear_all_blocks_requires_confirm(user):
         user=user, title="A", block_type="work", day_of_week=0,
         start_time=time(9, 0), end_time=time(10, 0),
     )
-    tool = ClearAllBlocksTool()
+    tool = clear_all_blocks
 
-    result = tool.execute(user)
+    result = harnais.appeler(tool, user, dict())
     assert result.success is False
     assert RecurringBlock.objects.filter(user=user, active=True).count() == 1
-    assert getattr(tool, "requires_confirmation", False) is True
+    assert getattr(tool, "REQUIRES_CONFIRMATION", False) is True

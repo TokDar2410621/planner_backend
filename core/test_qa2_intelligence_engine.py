@@ -15,12 +15,11 @@ from rest_framework.test import APIClient
 
 from core.models import RecurringBlock, ScheduledBlock, Task
 from services.agent.agent import PlannerAgent, _schedule_reality_footer
-from services.agent.tools.blocks import CreateBlockTool, UpdateBlockTool
-from services.agent.tools.schedule import ScheduleTaskAtTool
 from services.llm.base import FunctionCall, LLMProvider, LLMResponse
 from services.replan import replan_after_delay
 from services.scheduling.day_view import effective_day_blocks
 from services.scheduling.placement import fixed_busy_intervals, place_day
+from services.agent.tools import create_block, schedule_task_at, update_block, harnais
 
 
 MONDAY = date(2026, 7, 27)
@@ -71,25 +70,19 @@ class ScheduleTaskAtIdempotenceTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user("qa2_oneoff", password="pw")
         self.target_date = MONDAY
-        self.tool = ScheduleTaskAtTool()
+        self.tool = schedule_task_at
 
     def test_same_one_off_event_is_idempotent_not_a_conflict(self):
-        first = self.tool.execute(
-            self.user,
-            title="Lecture",
+        first = harnais.appeler(self.tool, self.user, dict(title="Lecture",
             date=self.target_date.isoformat(),
             start_time="09:00",
-            end_time="09:30",
-        )
+            end_time="09:30",))
         self.assertTrue(first.success, first.message)
 
-        second = self.tool.execute(
-            self.user,
-            title="Lecture",
+        second = harnais.appeler(self.tool, self.user, dict(title="Lecture",
             date=self.target_date.isoformat(),
             start_time="09:00",
-            end_time="09:30",
-        )
+            end_time="09:30",))
 
         self.assertTrue(second.success, second.message)
         self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 1)
@@ -99,22 +92,16 @@ class ScheduleTaskAtIdempotenceTests(TestCase):
         )
 
     def test_same_one_off_event_duration_refinement_updates_existing_block(self):
-        first = self.tool.execute(
-            self.user,
-            title="Lecture",
+        first = harnais.appeler(self.tool, self.user, dict(title="Lecture",
             date=self.target_date.isoformat(),
             start_time="09:00",
-            end_time="09:30",
-        )
+            end_time="09:30",))
         self.assertTrue(first.success, first.message)
 
-        refined = self.tool.execute(
-            self.user,
-            title="Lecture",
+        refined = harnais.appeler(self.tool, self.user, dict(title="Lecture",
             date=self.target_date.isoformat(),
             start_time="09:00",
-            end_time="09:45",
-        )
+            end_time="09:45",))
 
         self.assertTrue(refined.success, refined.message)
         self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 1)
@@ -129,13 +116,12 @@ class OvernightScheduleTaskAtTests(TestCase):
 
     def setUp(self):
         self.user = User.objects.create_user("qa2_overnight", password="pw")
-        self.tool = ScheduleTaskAtTool()
+        self.tool = schedule_task_at
         self.tuesday = MONDAY + timedelta(days=1)
 
     def test_overnight_one_off_creates_two_within_day_pieces(self):
-        res = self.tool.execute(
-            self.user, title="Quart de nuit", date=MONDAY.isoformat(),
-            start_time="22:00", end_time="06:00")
+        res = harnais.appeler(self.tool, self.user, dict(title="Quart de nuit", date=MONDAY.isoformat(),
+            start_time="22:00", end_time="06:00"))
 
         self.assertTrue(res.success, res.message)
         self.assertTrue(res.data["scheduled_block"]["overnight"])
@@ -155,9 +141,8 @@ class OvernightScheduleTaskAtTests(TestCase):
             user=self.user, title="Cours", block_type="course",
             day_of_week=self.tuesday.weekday(), start_time=time(5, 0), end_time=time(8, 0))
 
-        res = self.tool.execute(
-            self.user, title="Quart de nuit", date=MONDAY.isoformat(),
-            start_time="22:00", end_time="06:00")
+        res = harnais.appeler(self.tool, self.user, dict(title="Quart de nuit", date=MONDAY.isoformat(),
+            start_time="22:00", end_time="06:00"))
 
         self.assertFalse(res.success)  # le morceau 00:00-06:00 chevauche 05:00-08:00
         self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 0)
@@ -165,20 +150,17 @@ class OvernightScheduleTaskAtTests(TestCase):
     def test_invalid_task_type_is_coerced_not_rejected(self):
         # Le LLM envoie souvent 'work' (invalide) pour un quart de nuit: on ne doit
         # PAS rejeter toute la planification pour un champ optionnel.
-        res = self.tool.execute(
-            self.user, title="Quart", date=MONDAY.isoformat(),
-            start_time="09:00", end_time="10:00", task_type="work")
+        res = harnais.appeler(self.tool, self.user, dict(title="Quart", date=MONDAY.isoformat(),
+            start_time="09:00", end_time="10:00", task_type="work"))
 
         self.assertTrue(res.success, res.message)
         self.assertEqual(Task.objects.get(user=self.user, title="Quart").task_type, "shallow")
 
     def test_overnight_upsert_does_not_duplicate(self):
-        first = self.tool.execute(
-            self.user, title="Quart", date=MONDAY.isoformat(), start_time="22:00", end_time="06:00")
+        first = harnais.appeler(self.tool, self.user, dict(title="Quart", date=MONDAY.isoformat(), start_time="22:00", end_time="06:00"))
         self.assertTrue(first.success)
 
-        second = self.tool.execute(
-            self.user, title="Quart", date=MONDAY.isoformat(), start_time="22:00", end_time="05:00")
+        second = harnais.appeler(self.tool, self.user, dict(title="Quart", date=MONDAY.isoformat(), start_time="22:00", end_time="05:00"))
 
         self.assertTrue(second.success, second.message)
         self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 2)
@@ -188,9 +170,8 @@ class OvernightScheduleTaskAtTests(TestCase):
     def test_end_at_midnight_is_same_day_no_phantom_next_day(self):
         # Blocker (revue): 22:00->00:00 ne doit PAS créer un [00:00,00:00] le
         # lendemain (fixed_busy_intervals le lirait comme un mur toute la journée).
-        res = self.tool.execute(
-            self.user, title="Fin minuit", date=MONDAY.isoformat(),
-            start_time="22:00", end_time="00:00")
+        res = harnais.appeler(self.tool, self.user, dict(title="Fin minuit", date=MONDAY.isoformat(),
+            start_time="22:00", end_time="00:00"))
 
         self.assertTrue(res.success, res.message)
         self.assertFalse(res.data["scheduled_block"]["overnight"])
@@ -203,13 +184,11 @@ class OvernightScheduleTaskAtTests(TestCase):
     def test_adjusting_overnight_to_same_day_removes_orphan_tail(self):
         # Blocker (revue): ajuster un overnight en même-jour doit supprimer le
         # morceau [00:00,end] du lendemain (sinon bloc fantôme verrouillé).
-        first = self.tool.execute(
-            self.user, title="Quart", date=MONDAY.isoformat(), start_time="22:00", end_time="06:00")
+        first = harnais.appeler(self.tool, self.user, dict(title="Quart", date=MONDAY.isoformat(), start_time="22:00", end_time="06:00"))
         self.assertTrue(first.success)
         self.assertEqual(ScheduledBlock.objects.filter(user=self.user).count(), 2)
 
-        second = self.tool.execute(
-            self.user, title="Quart", date=MONDAY.isoformat(), start_time="22:00", end_time="23:00")
+        second = harnais.appeler(self.tool, self.user, dict(title="Quart", date=MONDAY.isoformat(), start_time="22:00", end_time="23:00"))
 
         self.assertTrue(second.success, second.message)
         blocks = list(ScheduledBlock.objects.filter(user=self.user))
@@ -431,9 +410,8 @@ class ScheduleRealityFooterTests(TestCase):
     def test_footer_lists_real_blocks_for_a_dated_write(self):
         user = User.objects.create_user("qa2_footer", password="pw")
         self._saturated_monday(user)
-        ScheduleTaskAtTool().execute(
-            user, title="Etude", date=MONDAY.isoformat(),
-            start_time="17:00", end_time="18:00")
+        harnais.appeler(schedule_task_at, user, dict(title="Etude", date=MONDAY.isoformat(),
+            start_time="17:00", end_time="18:00"))
         tool_calls = [{"tool": "schedule_task_at", "result": {"success": True},
                        "args": {"date": MONDAY.isoformat()}}]
 
@@ -448,9 +426,8 @@ class ScheduleRealityFooterTests(TestCase):
 
     def test_no_footer_when_day_has_a_single_block(self):
         user = User.objects.create_user("qa2_footer_single", password="pw")
-        ScheduleTaskAtTool().execute(
-            user, title="Lecture", date=MONDAY.isoformat(),
-            start_time="09:00", end_time="10:00")
+        harnais.appeler(schedule_task_at, user, dict(title="Lecture", date=MONDAY.isoformat(),
+            start_time="09:00", end_time="10:00"))
         tool_calls = [{"tool": "schedule_task_at", "result": {"success": True},
                        "args": {"date": MONDAY.isoformat()}}]
         self.assertEqual(_schedule_reality_footer(user, tool_calls), "")
@@ -480,9 +457,8 @@ class ScheduleRealityFooterTests(TestCase):
         # peu chargée mais que la prose annonce plusieurs créneaux. Deux
         # schedule_task_at tentés pour la même date forcent le footer (vérité).
         user = User.objects.create_user("qa2_footer_attempts", password="pw")
-        ScheduleTaskAtTool().execute(
-            user, title="Lecture", date=MONDAY.isoformat(),
-            start_time="09:00", end_time="10:00")
+        harnais.appeler(schedule_task_at, user, dict(title="Lecture", date=MONDAY.isoformat(),
+            start_time="09:00", end_time="10:00"))
         tool_calls = [
             {"tool": "schedule_task_at", "result": {"success": True}, "args": {"date": MONDAY.isoformat()}},
             {"tool": "schedule_task_at", "result": {"success": False}, "args": {"date": MONDAY.isoformat()}},
@@ -536,7 +512,7 @@ class RecurringProtectionToolTests(TestCase):
         )
         self.assertTrue(sport.is_flexible)
 
-        locked = UpdateBlockTool().execute(user, block_id=sport.id, flexibility="fixed")
+        locked = harnais.appeler(update_block, user, dict(block_id=sport.id, flexibility="fixed"))
 
         self.assertTrue(locked.success, locked.message)
         sport.refresh_from_db()
@@ -544,14 +520,11 @@ class RecurringProtectionToolTests(TestCase):
         self.assertEqual(fixed_busy_intervals(user, WED), [(18 * 60, 19 * 60)])
         self.assertEqual(place_day(user, WED), [])
 
-        conflict = CreateBlockTool().execute(
-            user,
-            title="Travail conflit",
+        conflict = harnais.appeler(create_block, user, dict(title="Travail conflit",
             block_type="work",
             days=[2],
             start_time="18:00",
-            end_time="20:00",
-        )
+            end_time="20:00",))
 
         self.assertFalse(conflict.success)
         self.assertEqual(conflict.data["created"], [])

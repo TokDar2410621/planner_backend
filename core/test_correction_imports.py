@@ -16,6 +16,7 @@ from services.agent_v2.importation import document_du_tour, message_import, resu
 from services.document_processor import DocumentProcessor, GENERIC_PROCESSING_ERROR
 from services.agent_v2.budget_tour import ouvrir_trace, fermer_trace
 from services.agent_v2.trace_tour import trace_courante
+from services.agent.tools import process_uploaded_document, resolve_document_entry, harnais
 
 
 class CorrectionImportsTests(TestCase):
@@ -381,16 +382,15 @@ class CorrectionImportsTests(TestCase):
 
 class OutilDocumentEtatsTests(TestCase):
     def setUp(self):
-        from services.agent.tools.documents import ProcessUploadedDocumentTool
         self.user = get_user_model().objects.create_user(username='doc-outil')
         self.other = get_user_model().objects.create_user(username='doc-outil-autre')
-        self.tool = ProcessUploadedDocumentTool()
+        self.tool = process_uploaded_document
 
     def document(self, **kwargs):
         return UploadedDocument.objects.create(user=self.user, file_name='horaire.pdf', **kwargs)
 
     def test_absent_est_introuvable(self):
-        result = self.tool.execute(self.user)
+        result = harnais.appeler(self.tool, self.user, dict())
         self.assertFalse(result.success)
         self.assertEqual(result.data, {})
         self.assertIn('Aucun document', result.message)
@@ -398,7 +398,7 @@ class OutilDocumentEtatsTests(TestCase):
     def test_document_autre_compte_ne_revele_pas_son_etat(self):
         private = UploadedDocument.objects.create(user=self.other,
             file_name='prive.pdf', processed=True, extracted_data={'private': 'texte confidentiel'})
-        result = self.tool.execute(self.user, document_id=private.pk)
+        result = harnais.appeler(self.tool, self.user, dict(document_id=private.pk))
         self.assertFalse(result.success)
         self.assertEqual(result.data, {})
         self.assertNotIn('confidentiel', result.message)
@@ -406,13 +406,13 @@ class OutilDocumentEtatsTests(TestCase):
 
     def test_analyse_en_cours_sans_erreur(self):
         doc = self.document(processed=False)
-        result = self.tool.execute(self.user, document_id=doc.pk)
+        result = harnais.appeler(self.tool, self.user, dict(document_id=doc.pk))
         self.assertFalse(result.success)
         self.assertEqual(result.data['status'], 'processing')
 
     def test_erreur_prioritaire_sur_processing_et_message_sur(self):
         doc = self.document(processed=False, processing_error='https://provider.invalid/?key=secret-fixture')
-        result = self.tool.execute(self.user, document_id=doc.pk)
+        result = harnais.appeler(self.tool, self.user, dict(document_id=doc.pk))
         self.assertFalse(result.success)
         self.assertEqual(result.data['status'], 'failed')
         self.assertIn('échoué', result.message)
@@ -425,7 +425,7 @@ class OutilDocumentEtatsTests(TestCase):
                    'missing_fields': ['end_time']}
         doc = self.document(processed=True, extracted_data={
             '_import_receipt_version': 1, '_pending_entries': [pending]})
-        result = self.tool.execute(self.user, document_id=doc.pk)
+        result = harnais.appeler(self.tool, self.user, dict(document_id=doc.pk))
         self.assertTrue(result.success)
         self.assertEqual(result.data['status'], 'needs_clarification')
         self.assertEqual(result.data['pending_count'], 1)
@@ -439,7 +439,7 @@ class OutilDocumentEtatsTests(TestCase):
         RecurringBlock.all_objects.create(user=self.user, source_document=doc,
             title='Cours', day_of_week=0, start_time='09:00', end_time='10:00',
             status=RecurringBlock.STATUS_PENDING)
-        result = self.tool.execute(self.user, document_id=doc.pk)
+        result = harnais.appeler(self.tool, self.user, dict(document_id=doc.pk))
         self.assertTrue(result.success)
         self.assertEqual(result.data['status'], 'needs_confirmation')
         self.assertEqual(result.data['pending_count'], 0)
@@ -449,7 +449,7 @@ class OutilDocumentEtatsTests(TestCase):
         doc = self.document(processed=True)
         RecurringBlock.objects.create(user=self.user, source_document=doc,
             title='Maths', day_of_week=0, start_time='09:00', end_time='10:00')
-        result = self.tool.execute(self.user, document_id=doc.pk)
+        result = harnais.appeler(self.tool, self.user, dict(document_id=doc.pk))
         self.assertTrue(result.success)
         self.assertEqual(result.data['status'], 'processed')
         self.assertEqual(result.data['pending_count'], 0)
@@ -469,9 +469,8 @@ class ResolutionDocumentTests(TestCase):
         self.doc.save(update_fields=['processed'])
 
     def resolve(self, **fields):
-        from services.agent.tools.documents import ResolveDocumentEntryTool
-        return ResolveDocumentEntryTool().execute(self.user, document_id=self.doc.pk,
-                                                  source='events', index=0, **fields)
+        return harnais.appeler(resolve_document_entry, self.user, dict(document_id=self.doc.pk,
+                                                  source='events', index=0, **fields))
 
     def test_contexte_recent_exclut_autre_evenement_et_presente_precision(self):
         from services.agent.agent import PlannerAgent
@@ -507,9 +506,8 @@ class ResolutionDocumentTests(TestCase):
         self.assertEqual(result.data['resolution']['targets'][0]['id'], sb.pk)
 
     def test_document_etranger_refuse(self):
-        from services.agent.tools.documents import ResolveDocumentEntryTool
-        result = ResolveDocumentEntryTool().execute(self.other, document_id=self.doc.pk,
-            source='events', index=0, start_time='18:00', end_time='20:00')
+        result = harnais.appeler(resolve_document_entry, self.other, dict(document_id=self.doc.pk,
+            source='events', index=0, start_time='18:00', end_time='20:00'))
         self.assertFalse(result.success)
         self.assertFalse(ScheduledBlock.objects.exists())
         self.assertNotIn('Match', result.message)
@@ -555,10 +553,9 @@ class ResolutionDocumentTests(TestCase):
         self.assertEqual(list(ScheduledBlock.objects.values_list('task__title', flat=True)), ['Match'])
 
     def test_champ_connu_et_index_invalide_ne_sont_pas_modifies(self):
-        from services.agent.tools.documents import ResolveDocumentEntryTool
         self.assertFalse(self.resolve(date='2099-01-01').success)
-        result = ResolveDocumentEntryTool().execute(self.user, document_id=self.doc.pk,
-            source='events', index=5, start_time='18:00')
+        result = harnais.appeler(resolve_document_entry, self.user, dict(document_id=self.doc.pk,
+            source='events', index=5, start_time='18:00'))
         self.assertFalse(result.success)
         self.assertFalse(ScheduledBlock.objects.exists())
 
@@ -596,9 +593,8 @@ class ResolutionDocumentTests(TestCase):
     def test_jour_recurrent_manquant_est_resolu_sans_evenement_date(self):
         self.data = {'courses': [{'name': 'Maths', 'start_time': '08:00', 'end_time': '09:00'}]}
         self.proc._create_recurring_blocks(self.doc, self.data)
-        from services.agent.tools.documents import ResolveDocumentEntryTool
-        result = ResolveDocumentEntryTool().execute(self.user, document_id=self.doc.pk,
-            source='courses', index=0, day='lundi')
+        result = harnais.appeler(resolve_document_entry, self.user, dict(document_id=self.doc.pk,
+            source='courses', index=0, day='lundi'))
         self.assertTrue(result.success)
         self.assertFalse(ScheduledBlock.objects.exists())
         self.assertEqual(RecurringBlock.all_objects.get(source_document=self.doc).day_of_week, 0)

@@ -10,9 +10,9 @@ from django.contrib.auth.models import User
 from django.test import TestCase
 
 from core.models import RecurringBlock, RecurringBlockOverride
-from services.agent.tools.schedule import OptimizeWeekTool
 from services.scheduling.day_view import effective_day_entries
 from services.scheduling.occurrences import recurring_occurrences
+from services.agent.tools import optimize_week, harnais
 
 
 MONDAY = date(2026, 8, 3)  # un lundi
@@ -28,14 +28,13 @@ def _rb(user, title, bt, dow, s, e, flex):
 class OptimizeWeekToolTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user("weekopt", password="pw-123456")
-        self.tool = OptimizeWeekTool()
+        self.tool = optimize_week
 
     def test_propose_does_not_mutate(self):
         _rb(self.user, "Travail", "work", 0, time(9, 0), time(17, 0), "fixed")
         sport = _rb(self.user, "Sport", "sport", 0, time(16, 0), time(17, 0), "flexible")
 
-        result = self.tool.execute(
-            self.user, start_date=MONDAY.isoformat(), apply=False)
+        result = harnais.appeler(self.tool, self.user, dict(start_date=MONDAY.isoformat(), apply=False))
 
         self.assertTrue(result.success)
         self.assertFalse(result.data["applied"])
@@ -56,8 +55,7 @@ class OptimizeWeekToolTests(TestCase):
         series_before = list(RecurringBlock.objects.filter(user=self.user).values())
         before = next(b for b in effective_day_entries(self.user, MONDAY) if b["id"] == sport.pk)
 
-        result = self.tool.execute(
-            self.user, start_date=MONDAY.isoformat(), apply=True)
+        result = harnais.appeler(self.tool, self.user, dict(start_date=MONDAY.isoformat(), apply=True))
 
         self.assertTrue(result.success)
         self.assertTrue(result.data["applied"])
@@ -84,7 +82,7 @@ class OptimizeWeekToolTests(TestCase):
         work = _rb(self.user, "Travail", "work", 0, time(9, 0), time(17, 0), "fixed")
         _rb(self.user, "Sport", "sport", 0, time(10, 0), time(11, 0), "flexible")
 
-        self.tool.execute(self.user, start_date=MONDAY.isoformat(), apply=True)
+        harnais.appeler(self.tool, self.user, dict(start_date=MONDAY.isoformat(), apply=True))
 
         work.refresh_from_db()
         self.assertEqual(work.start_time, time(9, 0))
@@ -96,8 +94,7 @@ class OptimizeWeekToolTests(TestCase):
             _rb(self.user, f"Cours{dow}", "course", dow, time(9, 0), time(12, 0), "fixed")
             _rb(self.user, f"Lecture{dow}", "study", dow, time(10, 0), time(11, 0), "flexible")
 
-        result = self.tool.execute(
-            self.user, start_date=MONDAY.isoformat(), apply=False)
+        result = harnais.appeler(self.tool, self.user, dict(start_date=MONDAY.isoformat(), apply=False))
 
         self.assertEqual(len(result.data["days"]), 7)
         dates = [d["date"] for d in result.data["days"]]
@@ -109,10 +106,10 @@ class OptimizeWeekToolTests(TestCase):
         self.assertGreaterEqual(len(with_placed), 2)
 
     def test_invalid_date_is_rejected(self):
-        result = self.tool.execute(self.user, start_date="pas-une-date")
+        result = harnais.appeler(self.tool, self.user, dict(start_date="pas-une-date"))
         self.assertFalse(result.success)
 
     def test_default_start_is_today_and_empty_week_is_honest(self):
-        result = self.tool.execute(self.user)
+        result = harnais.appeler(self.tool, self.user, dict())
         self.assertTrue(result.success)
         self.assertIn("rien à replacer", result.message)

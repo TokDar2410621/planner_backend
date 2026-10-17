@@ -8,16 +8,14 @@ from django.test import TestCase, TransactionTestCase
 
 from core.models import RecurringBlock, RecurringBlockException, RecurringBlockOverride
 from core.test_agent_v2_gardes import HarnaisGardes, puces
-from services.agent.tools.schedule import (
-    OrganizeDayTool, OptimizeWeekTool, GetTodayScheduleTool, GetWeekScheduleTool,
-    _window_conflict,
-)
 from services.scheduling.day_view import effective_day_entries
 from services.scheduling.occurrences import recurring_occurrences
 from services.scheduling.placement import fixed_busy_intervals, open_intervals, place_day
 from services.scheduling.solve_day import (
     empreinte_entrees_jour, empreinte_entrees_semaine, solve_placement, solve_day,
 )
+from services.agent.tools import get_today_schedule, get_week_schedule, optimize_week, organize_day, harnais
+from services.agent.tools.commun import _window_conflict
 
 
 MONDAY = date(2026, 10, 19)
@@ -35,7 +33,7 @@ class DatedOptimizationTests(TestCase):
             start_time=time(10), end_time=time(11), flexibility="flexible")
 
     def test_day_applies_date_and_preserves_series(self):
-        result = OrganizeDayTool().execute(self.user, date=MONDAY.isoformat(), apply=True)
+        result = harnais.appeler(organize_day, self.user, dict(date=MONDAY.isoformat(), apply=True))
         self.assertTrue(result.success, result.message)
         self.assertTrue(result.data["applied"])
         self.block.refresh_from_db()
@@ -46,7 +44,7 @@ class DatedOptimizationTests(TestCase):
 
     def test_week_applies_dates_and_preserves_series(self):
         before = list(RecurringBlock.objects.filter(user=self.user).values())
-        result = OptimizeWeekTool().execute(self.user, start_date=MONDAY.isoformat(), apply=True)
+        result = harnais.appeler(optimize_week, self.user, dict(start_date=MONDAY.isoformat(), apply=True))
         self.assertTrue(result.success, result.message)
         self.assertTrue(result.data["applied"])
         self.assertEqual(list(RecurringBlock.objects.filter(user=self.user).values()), before)
@@ -59,22 +57,21 @@ class DatedOptimizationTests(TestCase):
                  "skipped": False, "overnight_kept": False, "preferred": False, "shrunk": False}]
 
     def apply(self, arrangement=None, **kwargs):
-        return OrganizeDayTool().execute(
-            self.user, date=MONDAY.isoformat(), apply=True,
-            _arrangement=self.arrangement() if arrangement is None else arrangement, **kwargs)
+        return harnais.appeler(organize_day, self.user, dict(date=MONDAY.isoformat(), apply=True,
+            _arrangement=self.arrangement() if arrangement is None else arrangement, **kwargs))
 
     def test_proposal_writes_nothing_and_bad_date_is_rejected(self):
-        for tool, kwargs in [(OrganizeDayTool(), {"date": MONDAY.isoformat()}),
-                             (OptimizeWeekTool(), {"start_date": MONDAY.isoformat()})]:
+        for tool, kwargs in [(organize_day, {"date": MONDAY.isoformat()}),
+                             (optimize_week, {"start_date": MONDAY.isoformat()})]:
             self.assertTrue(tool.execute(self.user, apply=False, **kwargs).success)
-        self.assertFalse(OrganizeDayTool().execute(self.user, date="invalid", apply=True).success)
+        self.assertFalse(organize_day.execute(self.user, date="invalid", apply=True).success)
         self.assertFalse(RecurringBlockOverride.objects.exists())
 
     def test_day_week_availability_and_solver_share_confirmed_hours(self):
         self.assertTrue(self.apply().success)
         self.assertEqual(RecurringBlockOverride.objects.get().date, MONDAY)
-        current = GetTodayScheduleTool().execute(self.user, date=MONDAY.isoformat()).data
-        week = GetWeekScheduleTool().execute(self.user, start_date=MONDAY.isoformat()).data
+        current = get_today_schedule.execute(self.user, date=MONDAY.isoformat()).data
+        week = get_week_schedule.execute(self.user, start_date=MONDAY.isoformat()).data
         self.assertEqual(current["blocks"], week["days"][0]["detail"])
         sport = next(b for b in current["blocks"] if b["id"] == self.block.pk)
         self.assertEqual((sport["start_time"], sport["end_time"]), ("13:00", "14:00"))
@@ -130,10 +127,10 @@ class DatedOptimizationTests(TestCase):
 
     def test_renamed_block_invalidates_cached_inputs(self):
         from services.agent_v2.outils import _plan_propose_jour
-        first, before, _ = _plan_propose_jour(OrganizeDayTool(), self.user, {"date": MONDAY.isoformat()})
+        first, before, _ = _plan_propose_jour(organize_day, self.user, {"date": MONDAY.isoformat()})
         self.block.title = "Natation"
         self.block.save(update_fields=["title"])
-        second, after, _ = _plan_propose_jour(OrganizeDayTool(), self.user, {"date": MONDAY.isoformat()})
+        second, after, _ = _plan_propose_jour(organize_day, self.user, {"date": MONDAY.isoformat()})
         self.assertNotEqual(before, after)
         self.assertEqual(first.data["placed"][0]["title"], "Sport")
         self.assertEqual(second.data["placed"][0]["title"], "Natation")
@@ -146,14 +143,14 @@ class DatedOptimizationTests(TestCase):
         self.assertEqual(open_intervals(self.user, MONDAY, 840, 870), [(840, 870)])
 
     def test_week_rejects_invalid_later_day_without_partial_write(self):
-        result = OptimizeWeekTool().execute(
+        result = optimize_week.execute(
             self.user, start_date=MONDAY.isoformat(), apply=True,
             _arrangements=[self.arrangement(), self.arrangement(), [], [], [], [], []])
         self.assertFalse(result.success)
         self.assertFalse(RecurringBlockOverride.objects.exists())
 
     def test_failed_postcondition_rolls_back_actual_override(self):
-        from services.agent.tools import schedule
+        from services.agent.tools import commun as schedule
         original = schedule.effective_day_entries
 
         def read(user, day):

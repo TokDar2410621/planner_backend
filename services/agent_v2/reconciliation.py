@@ -94,7 +94,7 @@ def _attendu(resultat, parametres, champs):
             if k in ("description", "location") and valeur == "":
                 valeur = None
             if k == "day_of_week":
-                from services.agent.tools.blocks import normaliser_jours
+                from services.agent.tools.commun import normaliser_jours
                 jours = normaliser_jours([valeur])
                 if len(jours) != 1:
                     raise ValueError("jour non vérifiable")
@@ -117,7 +117,7 @@ def _objets(user, action, modele, serialiser, entrees, champs, identifiant=None)
         objet = cibles.first()
         parametres = dict(action.parametres)
         if modele.__name__ == "Task" and parametres.get("deadline"):
-            from services.agent.tools.tasks import _deadline_iso, _parse_deadline
+            from services.agent.tools.commun import _deadline_iso, _parse_deadline
             parametres["deadline"] = _deadline_iso(_parse_deadline(parametres["deadline"]))
         # Une création dédoublonnée constate l'objet existant ; les autres
         # paramètres n'ont pas été appliqués et ne doivent pas l'être au reçu.
@@ -220,9 +220,9 @@ def _plan(user, action):
 
 def _postconditions(user, action):
     from core.models import Goal, RecurringBlock, ScheduledBlock, Task, UploadedDocument, UserProfile
-    from services.agent.tools.blocks import _block_to_dict
-    from services.agent.tools.goals import _goal_to_dict
-    from services.agent.tools.tasks import _task_to_dict
+    from services.agent.tools.commun import _block_to_dict
+    from services.agent.tools.commun import _goal_to_dict
+    from services.agent.tools.commun import _task_to_dict
 
     outil, d, p = action.outil, action.donnees, action.parametres
     sans_mutation = False

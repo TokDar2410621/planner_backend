@@ -53,6 +53,7 @@ from django.utils import timezone
 from pydantic_ai.tools import Tool
 
 from services.agent.tools import ALL_TOOLS, TOOL_MAP
+from services.agent.tools import harnais
 from services.agent.tools.base import ToolResult
 from services.agent.tools.base import ISSUE_ECHEC, ISSUE_EFFET_A_VERIFIER
 from services.agent_v2 import demandes as dem
@@ -641,7 +642,7 @@ def _analyser(ctx: _Contexte, nom: str, kwargs: dict):
                       _options_confirmer(nom, {"block_id": block.id}, cible))
 
     if nom == "skip_block_occurrence":
-        from services.agent.tools.blocks import VALID_BLOCK_TYPES, _resolve_day_blocks
+        from services.agent.tools.commun import VALID_BLOCK_TYPES, _resolve_day_blocks
 
         jour = _date_iso(kwargs.get("date"))
         block_type = kwargs.get("block_type") or None
@@ -899,7 +900,7 @@ def _plan_propose(outil, user, kwargs: dict):
     pas par un re-calcul systematique.
     """
     from django.core.cache import cache
-    from services.agent.tools.schedule import _resoudre_semaine, _resultat_semaine
+    from services.agent.tools.commun import _resoudre_semaine, _resultat_semaine
     from services.scheduling.solve_day import empreinte_entrees_semaine
 
     parametres = {k: v for k, v in kwargs.items() if k not in ("plan_hash", "_arrangements")}
@@ -974,7 +975,7 @@ def _plan_propose_jour(outil, user, kwargs: dict):
     _arrangement_jour_cache.
     """
     from django.core.cache import cache
-    from services.agent.tools import schedule as _sched
+    from services.agent.tools import commun as _sched
 
     jour = _jour_organize(kwargs.get("date"))
     if jour is None:
@@ -1001,7 +1002,7 @@ def _proposition_optimisation(outil, user, kwargs):
     """Plan, identité confirmable et entrées vérifiées au moment de l'écriture."""
     from services.scheduling.solve_day import empreinte_entrees_semaine
 
-    if outil.name == "organize_day":
+    if outil.NAME == "organize_day":
         proposition, entrees, arrangement = _plan_propose_jour(outil, user, kwargs)
         empreinte = (hashlib.sha1(f"{kwargs.get('date')}:{entrees}:{_empreinte_plan(proposition.data or {})}".encode()).hexdigest()[:12]
                      if entrees is not None else None)
@@ -1033,19 +1034,19 @@ def _demande_optimisation(kwargs: dict, empreinte: str, proposition: ToolResult,
 
 
 def _garde_optimisation(ctx: _Contexte, outil, kwargs: dict, garde: _Garde):
-    autorise, demande, _en_suspens = _reponse(ctx, garde.cles, outil.name)
+    autorise, demande, _en_suspens = _reponse(ctx, garde.cles, outil.NAME)
     proposition, empreinte, arrangements, entrees = _proposition_optimisation(outil, ctx.user, kwargs)
     if empreinte is None:
         return None  # l'outil echouera de lui-meme, rien a proteger
     if autorise and (demande.get("parametres") or {}).get("plan_hash") == empreinte:
         # Plan confirme a l'identique: l'execution reutilise l'arrangement
         # valide au lieu de re-resoudre (kwarg prive, retire apres l'appel).
-        kwargs["_arrangement" if outil.name == "organize_day" else "_arrangements"] = arrangements
+        kwargs["_arrangement" if outil.NAME == "organize_day" else "_arrangements"] = arrangements
         kwargs["_expected_entries"] = entrees
         return None
     if demande is not None and not autorise:
         return MESSAGE_DEJA_TRANCHE
-    return _refus(_demande_optimisation(kwargs, empreinte, proposition, outil.name), destructif=False)
+    return _refus(_demande_optimisation(kwargs, empreinte, proposition, outil.NAME), destructif=False)
 
 
 # ----------------------------------------------------------- heure refusee
@@ -1053,7 +1054,7 @@ def _garde_optimisation(ctx: _Contexte, outil, kwargs: dict, garde: _Garde):
 def _creneaux(user, jour: date, duree: int, debut_min: int) -> list[tuple[int, int]]:
     """Deux ou trois vrais creneaux libres de la meme duree, les plus proches
     de l'heure demandee, dans la fenetre eveillee de find_free_slots."""
-    from services.agent.tools.schedule import (DAY_END_MIN, DAY_START_MIN,
+    from services.agent.tools.commun import (DAY_END_MIN, DAY_START_MIN,
                                                _free_slots_from_intervals)
     from services.scheduling.placement import open_intervals
 
@@ -1120,7 +1121,7 @@ def _demande_chevauchement(nom: str, kwargs: dict, titre: str, dow: int, debut, 
 
 def _cibles_creation(ctx: _Contexte, nom: str, kwargs: dict, prep: _Preparation):
     """(dates, jours, recurrent, debut) d'un appel createur, ou None."""
-    from services.agent.tools.blocks import normaliser_jours
+    from services.agent.tools.commun import normaliser_jours
 
     if nom == "schedule_task_at":
         jour = _date_iso(kwargs.get("date"))
@@ -1742,7 +1743,7 @@ def _reponse_a_une_habitude(ctx: _Contexte) -> bool:
 def _evenement_unique(ctx: _Contexte, nom: str, kwargs: dict):
     """create_block d'une activite lance sur un jour nomme sans recurrence:
     le code le retient et dit d'appeler schedule_task_at a la bonne date."""
-    from services.agent.tools.blocks import normaliser_jours
+    from services.agent.tools.commun import normaliser_jours
 
     if nom != "create_block" or str(kwargs.get("block_type") or "") in _TYPES_QUI_REVIENNENT:
         return None
@@ -1937,7 +1938,7 @@ def _question_deja_posee(ctx: _Contexte, nom: str, kwargs: dict):
 
 
 def _garde_creations(ctx: _Contexte, nom: str, kwargs: dict):
-    from services.agent.tools.blocks import normaliser_jours
+    from services.agent.tools.commun import normaliser_jours
 
     if nom not in CREATEURS:
         return None
@@ -2221,7 +2222,7 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
     ou d'un choix de l'utilisateur execute par le code (choix non nul).
     Synchrone: il tourne dans un thread d'executeur, verrou du tour tenu
     pour les MUTATIONS seulement (voir _fabriquer)."""
-    nom = outil.name
+    nom = outil.NAME
     kwargs = dict(kwargs or {})
     registre = ctx.registre
     etat = ctx.etat
@@ -2409,14 +2410,21 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
     # Journal d'execution (audit 2026-10-13): duree mesuree autour de
     # l'execution reelle, consignee avec l'action.
     t0_outil = time.perf_counter()
+    # Validation du schema type AVANT execute (harnais, style OpenCode
+    # decodeInput) : l'outil recoit des donnees deja valides. Les gardes
+    # ci-dessus ont deja repondu en francais quand elles le pouvaient ;
+    # ceci est le filet. Les kwargs prives (_) traversent sans validation.
+    valides, erreur_validation = harnais.valider(outil, kwargs)
     try:
-        if nom == "optimize_week" and not kwargs.get("apply"):
+        if erreur_validation is not None:
+            resultat = erreur_validation
+        elif nom == "optimize_week" and not valides.get("apply"):
             # La proposition passe par _plan_propose pour ALIMENTER le cache
             # inter-tours: a la confirmation, le plan est resservi sans
             # re-resoudre si les entrees sont inchangees. Resultat identique
             # a l'execution directe (memes helpers de mise en forme).
-            resultat, _, _ = _plan_propose(outil, ctx.user, kwargs)
-        elif nom == "organize_day" and not kwargs.get("apply"):
+            resultat, _, _ = _plan_propose(outil, ctx.user, valides)
+        elif nom == "organize_day" and not valides.get("apply"):
             # La proposition passe par _plan_propose_jour pour ALIMENTER le
             # cache inter-tours: a l'apply, l'arrangement est reutilise sans
             # re-resoudre si les entrees sont inchangees. Resultat identique
@@ -2427,13 +2435,13 @@ def _executer_appel(ctx: _Contexte, outil, kwargs: dict, choix: dict | None = No
                 raise TimeoutError('Tour expire avant execution')
             if nom in OUTILS_DE_MUTATION:
                 with transaction.atomic():
-                    resultat = outil.execute(ctx.user, **kwargs)
+                    resultat = outil.execute(ctx.user, **valides)
                     # Un outil synchrone peut continuer apres annulation asyncio.
                     # Ses ecritures restent dans cette transaction et sont annulees.
                     if _tour_expire(registre):
                         raise TimeoutError('Tour expire pendant execution')
             else:
-                resultat = outil.execute(ctx.user, **kwargs)
+                resultat = outil.execute(ctx.user, **valides)
     except Exception as e:  # noqa: BLE001
         # v1 degrade une exception d'outil en ToolResult d'echec. Sans
         # cela, l'exception avorterait le run ET le registre ne garderait
@@ -2528,7 +2536,7 @@ def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
     ctx = _Contexte(user=user, registre=registre, tache=tache,
                     texte=message_brut if message_brut is not None else (message_du_tour or ""),
                     signaler=signaler, tap=tap)
-    est_mutation = outil.name in OUTILS_DE_MUTATION
+    est_mutation = outil.NAME in OUTILS_DE_MUTATION
 
     def _appel_ferme(kwargs):
         """L'ORM tourne dans un thread du pool d'asgiref, hors du cycle de
@@ -2554,7 +2562,7 @@ def _fabriquer(outil, user: User, registre: Registre, message_du_tour: str,
         resultat = await executer_sync(kwargs)
         return borner_resultat_modele(resultat)
 
-    executer.__name__ = outil.name
+    executer.__name__ = outil.NAME
     return executer
 
 
@@ -2725,12 +2733,12 @@ COMPLEMENTS_V2 = {
 
 def description_v2(outil) -> str:
     """La description effective d'un outil dans la boucle V2."""
-    if outil.name in DESCRIPTIONS_V2:
-        return DESCRIPTIONS_V2[outil.name]
-    complement = COMPLEMENTS_V2.get(outil.name)
+    if outil.NAME in DESCRIPTIONS_V2:
+        return DESCRIPTIONS_V2[outil.NAME]
+    complement = COMPLEMENTS_V2.get(outil.NAME)
     if complement:
-        return f"{outil.description} {complement}"
-    return outil.description
+        return f"{outil.DESCRIPTION} {complement}"
+    return outil.DESCRIPTION
 
 
 def outils_pour(user: User, registre: Registre, message_du_tour: str = "",
@@ -2756,15 +2764,15 @@ def _outil_pydantic(outil, user, registre, message_du_tour, tache,
     return Tool.from_schema(
         _fabriquer(outil, user, registre, message_du_tour, tache, None,
                    signaler, message_brut, tap),
-        outil.name,
+        outil.NAME,
         description_v2(outil),
-        outil.parameters,
+        outil.PARAMETERS,
         # Une mutation dans le batch force TOUT le batch en sequentiel
         # (pydantic-ai): les lectures pures, elles, partent en parallele.
         # Les outils de question aussi (voir OUTILS_QUESTION): deux
         # questions du modele ne doivent jamais s'executer en parallele.
-        sequential=(outil.name in OUTILS_DE_MUTATION
-                    or outil.name in OUTILS_QUESTION),
+        sequential=(outil.NAME in OUTILS_DE_MUTATION
+                    or outil.NAME in OUTILS_QUESTION),
     )
 
 
@@ -2784,8 +2792,8 @@ def outils_pour_le_modele(user: User, registre: Registre, message_du_tour: str =
     """
     lecture_seule = getattr(registre, 'lecture_seule', False)
     interdits = OUTILS_DE_MUTATION | {'send_notification'} if lecture_seule else set()
-    autorises = [o for o in ALL_TOOLS if o.name not in interdits]
-    caches = [o for o in autorises if o.name not in OUTILS_EXPOSES]
+    autorises = [o for o in ALL_TOOLS if o.NAME not in interdits]
+    caches = [o for o in autorises if o.NAME not in OUTILS_EXPOSES]
 
     async def chercher_outils(besoin: str = "") -> str:
         return chargeur.chercher(besoin, caches, description_v2)
@@ -2797,7 +2805,7 @@ def outils_pour_le_modele(user: User, registre: Registre, message_du_tour: str =
             return 'Ce tour autorise seulement une consultation.'
         outil = TOOL_MAP.get(vise)
         if outil is None:
-            connus = ", ".join(sorted(o.name for o in caches))
+            connus = ", ".join(sorted(o.NAME for o in caches))
             return (f"Outil inconnu: {vise!r}. Cherche-le d'abord avec "
                     f"{NOM_CHERCHEUR}. Disponibles ici: {connus}.")
         if vise in OUTILS_EXPOSES:
@@ -2806,7 +2814,7 @@ def outils_pour_le_modele(user: User, registre: Registre, message_du_tour: str =
         lus, erreur = chargeur.lire_parametres(parametres)
         if erreur:
             return f"Refuse par le code: {erreur}"
-        manque = chargeur.requis_manquants(outil.parameters, lus)
+        manque = chargeur.requis_manquants(outil.PARAMETERS, lus)
         if manque:
             return (f"Refuse par le code: {vise} exige "
                     f"{', '.join(manque)}. Relance avec ces parametres.")
@@ -2818,7 +2826,7 @@ def outils_pour_le_modele(user: User, registre: Registre, message_du_tour: str =
 
     exposes = [_outil_pydantic(o, user, registre, message_du_tour, tache,
                                signaler, message_brut, tap)
-               for o in autorises if o.name in OUTILS_EXPOSES]
+               for o in autorises if o.NAME in OUTILS_EXPOSES]
     return exposes + [
         Tool.from_schema(chercher_outils, NOM_CHERCHEUR, DESCRIPTION_CHERCHEUR,
                          SCHEMA_CHERCHEUR),
@@ -3082,10 +3090,10 @@ def _appliquer(ctx: _Contexte) -> list[dict]:
         decisions[cle] = codes[cle] = DECISION_EXECUTE
         retour = _executer_appel(ctx, outil, dict(effet["parametres"]), choix=demande)
         action = next((a for a in reversed(ctx.registre.actions)
-                       if a.outil == outil.name and a.donnees.get("cle_demande") == cle), None)
+                       if a.outil == outil.NAME and a.donnees.get("cle_demande") == cle), None)
         action_id = action.id if action is not None else None
         titre = _ascii((demande.get("cible") or {}).get("titre") or "")
-        sujet = f"{outil.name} {titre}".strip()
+        sujet = f"{outil.NAME} {titre}".strip()
         if retour == DEJA_FAIT:
             resume = f"DEJA FAIT PAR LE CODE ({action_id}): {sujet}, ne le refais pas"
         elif action is not None and action.succes:

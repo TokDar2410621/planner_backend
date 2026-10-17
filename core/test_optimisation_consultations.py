@@ -98,7 +98,7 @@ class ConsultationDirecteTests(TransactionTestCase):
         self.assertNotIn('Cours témoin', done['response'])
 
     def test_echec_outil_ne_devient_pas_planning_vide(self):
-        with patch('services.agent.tools.schedule.GetTodayScheduleTool.execute',
+        with patch('services.agent.tools.get_today_schedule.execute',
                    return_value=ToolResult(success=False, message='Erreur confidentielle')):
             done, meta, _, _ = self.executer()
         self.assertIn('réessayer', done['response'])
@@ -107,7 +107,7 @@ class ConsultationDirecteTests(TransactionTestCase):
         self.assertFalse(meta['actions'][0]['succes'])
 
     def test_date_retournee_doit_correspondre_a_la_date_demandee(self):
-        with patch('services.agent.tools.schedule.GetTodayScheduleTool.execute',
+        with patch('services.agent.tools.get_today_schedule.execute',
                    return_value=ToolResult(success=True, data={
                        'date': (self.jour + timedelta(days=1)).isoformat(), 'blocks': [], 'tasks': []})):
             done, meta, _, _ = self.executer()
@@ -136,7 +136,7 @@ class ConsultationDirecteTests(TransactionTestCase):
             instance._trace.echeance = time.monotonic() - 1
             return decision
         with patch.object(AgentConversation, '_decider', expirer), \
-             patch('services.agent.tools.schedule.GetTodayScheduleTool.execute') as read:
+             patch('services.agent.tools.get_today_schedule.execute') as read:
             done, _, _, _ = self.executer()
         read.assert_not_called()
         self.assertIn('réessayer', done['response'])
