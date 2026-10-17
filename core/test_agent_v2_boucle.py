@@ -61,7 +61,8 @@ class BoucleTests(TransactionTestCase):
         # guillotine. L'affirmation d'action sans recu est coupee; la
         # garantie de securite tient (aucune action affirmee sans recu).
         self.assertNotIn("J'ai supprime", res['response'])
-        self.assertTrue(res['response'].strip())
+        # Style OpenCode : plus de repli « je n'ai pas compris ». Un tour qui
+        # ne produit rien d'exploitable rend une reponse vide, pas un mensonge.
 
     def test_un_recit_vrai_survit(self):
         """Contre-epreuve: sans elle, un agent qui supprime tout passerait.

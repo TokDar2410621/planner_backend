@@ -177,7 +177,6 @@ PRIORITE = [
 ]
 CHIPS_MAX = 4
 
-REPLI_QUESTION = "Je n'ai pas compris. Tu veux ajouter, déplacer ou voir quelque chose ?"
 # Audit 2026-10-13 (#6): des actions ont ete tentees mais aucun rendu ne les
 # a couvertes. Ce n'est pas de l'incomprehension, c'est un trou de rendu:
 # on le dit honnetement au lieu d'accuser la demande.
@@ -226,6 +225,10 @@ PROSE_REPRISE = "Il me faut juste cette précision avant de toucher à ton horai
 PROSE_ANNULEE = "D'accord, je ne change rien."
 PROSE_DELAI = ("J'ai mis trop de temps à te répondre, je m'arrête ici. "
                "Ce qui est déjà fait est affiché plus haut.")
+# Style OpenCode : quand la boucle tombe en panne (tous les fournisseurs ont
+# echoue), on le dit honnetement au lieu de pretendre ne pas avoir compris.
+PROSE_PANNE = ("J'ai eu un problème technique en traitant ta demande. "
+               "Rien n'a été modifié. Réessaie dans un moment.")
 PROSE_BUDGET_JOUR = ("J'ai atteint ma limite d'IA pour aujourd'hui, "
                      "je ne peux pas traiter ça maintenant. Réessaie demain.")
 # Compte anonyme au plafond resserre : on suggere la sortie, pas l'attente.
@@ -502,7 +505,6 @@ class PlannerAgentV2:
         # Les regles de la garde (confirmation, heure dite, portee d'un jour)
         # lisent le message TAPE, jamais sa version enrichie du document.
         brut = self._message_brut if self._message_brut is not None else message
-        decision = getattr(self, '_decision_tour', None)
         outils = outils_pour_le_modele(
             user, registre, message_du_tour=message, tache=self._tache,
             signaler=self.signaler_outil, message_brut=brut, tap=self._tap)
@@ -514,7 +516,7 @@ class PlannerAgentV2:
         from services.agent_v2.budget_tour import modele_borne, BudgetEpuise
         agent = Agent(
             modele_borne(modele_agir(), 'planning'),
-            instructions=prompt_planification(user, decision) if decision else prompt_agir(user),
+            instructions=prompt_agir(user),
             tools=outils,
             output_type=ReponseDire,
             # Reflexion activee (2026-10-17) : le modele reflechit avant d'agir.
@@ -561,39 +563,85 @@ class PlannerAgentV2:
 
     @staticmethod
     def _executer_boucle(agent, message, **kwargs):
-        """La boucle, avec UNE reprise bornee sur stream vide.
+        """La boucle, avec retry facon OpenCode.
 
-        Defaut observe en prod le 2026-09-29: un fournisseur rend un stream
-        vide (« Streamed response ended without content or tool calls ») et
-        le tour meurt sans action. Un seul reessai, pas d'acharnement: la
-        resilience reste assuree par la chaine de repli (FallbackModel).
+        - Backoff exponentiel 2s, 4s, 8s puis 10s ; max 10 tentatives.
+        - `retry-after` honore, plafonne a 15 min.
+        - Timeouts : max 3 essais.
+        - Seules les erreurs reessayables (transport, rate limit, 5xx) sont
+          retentees ; les 4xx et erreurs de validation remontent aussitot.
+        - Le stream vide (« Streamed response ended without content or tool
+          calls », defaut prod du 2026-09-29) est reessayable.
         """
+        from services.agent_v2 import retry as _retry
         delai = kwargs.pop('delai', None)
-        if delai is not None:
-            async def executer():
-                # Meme compteur et meme deadline y compris en cas de reprise.
+
+        async def _exec_async():
+            from services.agent_v2.modeles import fermer_modele
+            timeouts = 0
+            derniere = None
+            for tentative in range(1, _retry.TENTATIVES_MAX + 1):
                 try:
-                    try:
-                        return await agent.run(message, **kwargs)
-                    except Exception as exc:
-                        if 'without content or tool calls' not in str(exc):
+                    return await agent.run(message, **kwargs)
+                except Exception as exc:  # noqa: BLE001
+                    derniere = exc
+                    vide = 'without content or tool calls' in str(exc)
+                    if not vide and not _retry.est_reessayable(exc):
+                        raise
+                    if _retry.est_timeout(exc):
+                        timeouts += 1
+                        if timeouts >= _retry.TENTATIVES_MAX_TIMEOUT:
                             raise
-                        return await agent.run(message, **kwargs)
+                    if tentative >= _retry.TENTATIVES_MAX:
+                        raise
+                    attente = _retry.delai_avant_reessai(tentative, exc)
+                    logger.warning("Boucle: echec tentative %d/%d type=%s, reessai dans %.1fs",
+                                   tentative, _retry.TENTATIVES_MAX,
+                                   type(exc).__name__, attente)
+                    await asyncio.sleep(attente)
                 finally:
-                    from services.agent_v2.modeles import fermer_modele
                     await fermer_modele(getattr(agent, 'model', None))
-            return asyncio.run(asyncio.wait_for(executer(), timeout=max(0.0, delai)))
-        try:
-            return agent.run_sync(message, **kwargs)
-        except Exception as e:  # noqa: BLE001
-            if "without content or tool calls" not in str(e):
-                raise
-            logger.warning("Boucle: stream vide, une reprise bornee")
-            return agent.run_sync(message, **kwargs)
+            raise derniere
+
+        def _exec_sync():
+            from services.agent_v2.modeles import fermer_modele
+            timeouts = 0
+            derniere = None
+            for tentative in range(1, _retry.TENTATIVES_MAX + 1):
+                try:
+                    return agent.run_sync(message, **kwargs)
+                except Exception as exc:  # noqa: BLE001
+                    derniere = exc
+                    vide = 'without content or tool calls' in str(exc)
+                    if not vide and not _retry.est_reessayable(exc):
+                        raise
+                    if _retry.est_timeout(exc):
+                        timeouts += 1
+                        if timeouts >= _retry.TENTATIVES_MAX_TIMEOUT:
+                            raise
+                    if tentative >= _retry.TENTATIVES_MAX:
+                        raise
+                    attente = _retry.delai_avant_reessai(tentative, exc)
+                    logger.warning("Boucle: echec tentative %d/%d type=%s, reessai dans %.1fs",
+                                   tentative, _retry.TENTATIVES_MAX,
+                                   type(exc).__name__, attente)
+                    import time as _time
+                    _time.sleep(attente)
+                finally:
+                    try:
+                        import asyncio as _aio
+                        _aio.run(fermer_modele(getattr(agent, 'model', None)))
+                    except Exception:  # noqa: BLE001
+                        pass
+            raise derniere
+
+        if delai is not None:
+            return asyncio.run(asyncio.wait_for(_exec_async(), timeout=max(0.0, delai)))
+        return _exec_sync()
 
     def process_message_stream(
         self, user, message, attachment=None, *, use_streaming=True,
-        generate_quick_replies=False, tap=None,
+        generate_quick_replies=False, tap=None, conversation_id=None,
     ):
         from services.agent_v2.trace_tour import trace_courante
         from services.agent_v2.budget_tour import ouvrir_trace, fermer_trace, BudgetIndisponible
@@ -614,13 +662,34 @@ class PlannerAgentV2:
         jeton = trace_courante.set(trace)
         try:
             yield from self._process_message_stream(user, message, attachment,
-                use_streaming=use_streaming, generate_quick_replies=generate_quick_replies, tap=tap)
+                use_streaming=use_streaming, generate_quick_replies=generate_quick_replies, tap=tap,
+                conversation_id=conversation_id)
         finally:
             try:
                 if proprietaire:
                     fermer_trace(trace)
             finally:
                 trace_courante.reset(jeton)
+
+    def _resoudre_conversation(self, user, conversation_id=None):
+        """La conversation du tour : celle demandee (si elle appartient a
+        l'utilisateur), sinon la plus recente non archivee, sinon une neuve."""
+        from core.models import Conversation
+        if conversation_id:
+            try:
+                conv = Conversation.objects.get(pk=conversation_id, user=user)
+                conv.save(update_fields=['updated_at'])
+                return conv
+            except (Conversation.DoesNotExist, ValueError):
+                pass
+        conv = (Conversation.objects
+                .filter(user=user, archivee=False)
+                .order_by('-updated_at').first())
+        if conv is None:
+            conv = Conversation.objects.create(user=user)
+        else:
+            conv.save(update_fields=['updated_at'])
+        return conv
 
     def _process_message_stream(
         self,
@@ -631,6 +700,7 @@ class PlannerAgentV2:
         use_streaming: bool = True,
         generate_quick_replies: bool = False,
         tap: Optional[dict] = None,
+        conversation_id=None,
     ):
         """Contrat SSE additif: status, thinking, tool, delta, done. Les deltas
         arrivent dans l'ordre final (faits, prose, question) et done.response
@@ -648,14 +718,18 @@ class PlannerAgentV2:
         # garde et les boutons forces.
         self._message_brut = message
         self._tap = tap if isinstance(tap, dict) and tap.get("demande") and tap.get("option") else None
+        # La conversation du tour (le sous-classe l'a deja resolue ; ici on
+        # s'assure qu'elle existe pour les appels directs).
+        if getattr(self, '_conversation', None) is None:
+            self._conversation = self._resoudre_conversation(user, conversation_id)
         # Verdict du juge plombe en pre-boucle (voie rapide sociale): la question
         # consultation, consultee a un autre moment du tour, decide si une
         # lecture reussie s'affiche. Reinitialise a chaque tour: sans verdict
         # frais, jamais de masquage.
-        decision = getattr(self, '_decision_tour', None)
-        self._verdict_consultation = ({'statut': _jugement.STATUT_DECISION,
-                                      'valeur': decision.consultation, 'confiance': 1.0}
-                                     if decision else {})
+        # Style OpenCode : plus de verdict pre-boucle. Sans classification
+        # prealable, une lecture reussie s'affiche toujours (les mutations ne
+        # sont jamais masquees de toute facon).
+        self._verdict_consultation = {}
         self._journaliser_reponse_formulaire(user, message)
 
         # Persiste d'abord, puis exclut CETTE ligne de l'historique par son id.
@@ -664,15 +738,23 @@ class PlannerAgentV2:
         # structurellement impossible.
         courant = ConversationMessage.objects.create(
             user=user, role="user", content=message,
+            conversation=self._conversation,
             metadata={"tap": self._tap} if self._tap else {})
         self._exclu = courant.pk
+        # Titre auto : le premier message donne son nom à la conversation
+        # (style OpenCode : génération de titre, ici déterministe).
+        if (self._conversation and self._conversation.titre in ("Nouvelle conversation", "Conversation")
+                and not ConversationMessage.objects.filter(
+                    conversation=self._conversation, role="user").exclude(pk=courant.pk).exists()):
+            self._conversation.titre = message.strip()[:60] or "Nouvelle conversation"
+            self._conversation.save(update_fields=['titre', 'updated_at'])
         # Identifie CE tour pour les cles d'idempotence: deux tours
         # distincts peuvent legitimement refaire la meme action, un meme
         # tour rejoue ne doit l'executer qu'une fois.
         self._tache = f"{user.pk}:{courant.pk}"
 
         registre = Registre()
-        registre.lecture_seule = bool(decision and not decision.autoriser_modifications)
+        registre.lecture_seule = False
         registre.echeance = time.monotonic() + self._delai_restant()
         self._registre_courant = registre
 
@@ -705,19 +787,13 @@ class PlannerAgentV2:
 
         # Commande memoire deterministe (memoire.py): « souviens-toi que... »,
         # « oublie... », « que sais-tu de moi ? ». Executee par le code AVANT
-        # AGIR, comme l'import: memoriser, oublier ou lister ne demande aucun
-        # appel au modele. Le resultat entre au registre pour que DIRE
-        # l'annonce; AGIR ne recoit que le reste eventuel du message.
+        # AGIR, sans passer par le modele. Le resultat entre au registre pour
+        # que DIRE l'annonce; AGIR ne recoit que le reste eventuel du message.
         # Un tap structure (chip d'une question en attente) n'est jamais une
         # commande memoire.
         try:
-            if decision:
-                commande_memoire = (memoire_prefs.CommandeMemoire(
-                    decision.memoire_action, decision.enonce, decision.objectif)
-                    if decision.memoire_action else None)
-            else:
-                commande_memoire = (memoire_prefs.interpreter(message)
-                                    if self._tap is None else None)
+            commande_memoire = (memoire_prefs.interpreter(message)
+                                if self._tap is None else None)
         except Exception:  # noqa: BLE001 - une commande illisible ne casse pas le tour
             commande_memoire = None
             logger.error("Interpretation memoire impossible", exc_info=True)
@@ -743,27 +819,23 @@ class PlannerAgentV2:
                 logger.error("Commande memoire non executee", exc_info=True)
 
         # La reponse a une question du tour precedent s'execute par le CODE,
-        # avant AGIR: un tap sur « Tous les jeudis » supprime la serie sans
+        # avant AGIR : un tap sur « Tous les jeudis » supprime la serie sans
         # qu'un modele ait a le refaire (ni a pouvoir le rater). AGIR recoit
         # le bilan pour ne pas le rejouer; le message brut reste intact.
+        # Sans decideur pre-boucle, on tente toujours d'appliquer : sans
+        # demande en attente ou sans correspondance, c'est un no-op.
         self._file_pensees = queue.Queue()
         choix: list = []
-        nouvelle_requete = (
-            self._tap is None
-            and decision is not None
-            and getattr(decision, "relation_attente", "aucune") == "nouvelle_requete"
-        )
-        if not nouvelle_requete:
-            try:
-                # `tap` seulement s'il existe: les simulations de tests et tout
-                # remplacant sans ce parametre restent valides.
-                extra_tap = {"tap": self._tap} if self._tap else {}
-                choix = list(_charger_appliquer_choix()(
-                    user, registre, message, tache=self._tache,
-                    signaler=self.signaler_outil, **extra_tap) or [])
-            except Exception:  # noqa: BLE001 - un choix non applique se redemande
-                logger.error("Choix en attente non appliques", exc_info=True)
-                choix = []
+        try:
+            # `tap` seulement s'il existe: les simulations de tests et tout
+            # remplacant sans ce parametre restent valides.
+            extra_tap = {"tap": self._tap} if self._tap else {}
+            choix = list(_charger_appliquer_choix()(
+                user, registre, message, tache=self._tache,
+                signaler=self.signaler_outil, **extra_tap) or [])
+        except Exception:  # noqa: BLE001 - un choix non applique se redemande
+            logger.error("Choix en attente non appliques", exc_info=True)
+            choix = []
         yield from self._vider_file()
         choix = [c for c in choix if isinstance(c, dict)]
         choix_code = sum(1 for c in choix if c.get("action_id"))
@@ -798,7 +870,7 @@ class PlannerAgentV2:
         # tranche, jamais une liste de mots. La reponse breve entre dans un
         # ReponseDire pour suivre le chemin de composition normal.
         voie_rapide = (
-            decision is None and not par_le_code and not budget_jour_epuise
+            not par_le_code and not budget_jour_epuise
             and self._voie_rapide_sociale(user, message, attachment)
         )
         if voie_rapide:
@@ -1009,10 +1081,14 @@ class PlannerAgentV2:
                 question, motif = REPLI_LISTE, "dire"
                 chips = [dict(c) for c in CHIPS_LISTE]
             elif not registre.actions:
-                # Vraie indetermination: rien n'a ete tente et le modele n'a
-                # rien dit d'exploitable. Seul cas qui autorise encore
-                # « Je n'ai pas compris » (audit 2026-10-13, #6).
-                question, motif, chips = REPLI_QUESTION, "dire", []
+                # Style OpenCode : aucun repli « je n'ai pas compris ». Si la
+                # boucle est tombee en panne, on le dit honnetement. Si le
+                # modele n'a simplement rien produit d'exploitable, le tour
+                # s'arrete sans mentir : un tour vide vaut mieux qu'un faux
+                # aveu d'incomprehension.
+                if panne is not None:
+                    prose = PROSE_PANNE
+                    motif = "panne"
             else:
                 question, motif, chips = REPLI_RESULTAT, "dire", []
 
@@ -1099,7 +1175,7 @@ class PlannerAgentV2:
 
         metadonnees = {
             "agent": "v2",
-            "contrat_tour": decision.mode if decision else 'legacy',
+            "contrat_tour": 'boucle',
             "usage": list(getattr(getattr(self, '_trace', None), 'usages', []))
                      or [{**cout, 'phase': 'planning'}],
             "en_reponse_a": self._exclu,
@@ -1141,17 +1217,15 @@ class PlannerAgentV2:
             ],
         }
         metadonnees.update(metadonnees_lire)
-        if decision:
-            metadonnees['consultation'] = decision.consultation
-            metadonnees['date_consultation'] = (
-                decision.date_consultation.isoformat() if decision.date_consultation else None)
         assistant = ConversationMessage.objects.create(
             user=user, role="assistant", content=response,
+            conversation=self._conversation,
             metadata=_json_sur(metadonnees))
 
         evenement = {
             "type": "done",
             "assistant_message_id": assistant.pk,
+            "conversation_id": self._conversation.pk if self._conversation else None,
             "response": response,
             "quick_replies": quick_replies,
             "blocks_created": self._crees(registre, "create_block", "created"),
@@ -1407,48 +1481,10 @@ class PlannerAgentV2:
             and float(verdict.get("confiance") or 0) >= 0.9
         )
 
-    def _cible_consultation(self):
-        """Traduit uniquement le contrat typé en outil et paramètres de lecture."""
-        decision = getattr(self, '_decision_tour', None)
-        if decision is None:
-            return None
-        genre = decision.consultation
-        if genre == 'taches':
-            return 'list_tasks', {}
-        jour = decision.date_consultation
-        if genre == 'demain' and jour is None:
-            jour = timezone.localdate() + timedelta(days=1)
-        if jour is None:
-            return None
-        if genre in ('journee', 'demain'):
-            return 'get_today_schedule', {'date': jour.isoformat()}
-        if genre == 'semaine':
-            return 'get_week_schedule', {'start_date': jour.isoformat()}
-        return None
-
     def _assurer_consultation(self, user: User, message: str, registre: Registre) -> Registre:
-        """La vue demandée prime sur une lecture auxiliaire, sans effacer l'audit."""
-        cible = self._cible_consultation()
-        if cible is None or any(a.succes and a.est_mutation for a in registre.actions):
-            return registre
-        outil, parametres = cible
-        cle_date = 'week_start' if outil == 'get_week_schedule' else 'date'
-        jour = parametres.get('start_date') or parametres.get('date')
-
-        def correspond(action):
-            return (action.succes and action.outil == outil
-                    and (jour is None or (action.donnees or {}).get(cle_date) == jour))
-
-        choisie = next((a for a in reversed(registre.actions) if correspond(a)), None)
-        if choisie is None:
-            # Une lecture réussie d'autre chose ou d'une autre date ne remplit
-            # pas le contrat. Le même chemin borné exécute la lecture manquante.
-            self._lecture_de_secours(user, message, registre)
-            choisie = next((a for a in reversed(registre.actions) if correspond(a)), None)
-        affichage = copy(registre)
-        affichage.actions = [a for a in registre.actions
-                             if a.outil not in LECTURES_RENDUES or a is choisie]
-        return affichage
+        """Sans decideur pre-boucle, rien a assurer : le modele lit ce qu'il
+        veut via ses outils, et le registre reflete ce qui a ete execute."""
+        return registre
 
     def _lecture_de_secours(self, user: User, message: str,
                             registre: Registre) -> str:
@@ -1469,17 +1505,14 @@ class PlannerAgentV2:
             "taches": ("list_tasks", {}),
         }
         try:
-            if getattr(self, '_decision_tour', None):
-                choix = self._cible_consultation()
-            else:
-                resultats = _jugement.juger(
-                    message, {"consultation": _jugement.q_consultation()})
-                rep = (resultats or {}).get("consultation") or {}
-                if rep.get("statut") != _jugement.STATUT_DECISION:
-                    return ""
-                if float(rep.get("confiance") or 0) < 0.9:
-                    return ""
-                choix = outil_de.get(str(rep.get("valeur") or ""))
+            resultats = _jugement.juger(
+                message, {"consultation": _jugement.q_consultation()})
+            rep = (resultats or {}).get("consultation") or {}
+            if rep.get("statut") != _jugement.STATUT_DECISION:
+                return ""
+            if float(rep.get("confiance") or 0) < 0.9:
+                return ""
+            choix = outil_de.get(str(rep.get("valeur") or ""))
             if choix is None:
                 return ""
             outil, parametres = choix
@@ -1691,6 +1724,7 @@ class PlannerAgentV2:
         attachment: Optional[UploadedDocument] = None,
         generate_quick_replies: bool = True,
         tap: Optional[dict] = None,
+        conversation_id=None,
     ) -> dict:
         """Enveloppe non streamee: draine le flux, seule source de verite."""
         done: dict = {}
@@ -1699,6 +1733,7 @@ class PlannerAgentV2:
             use_streaming=False,
             generate_quick_replies=generate_quick_replies,
             tap=tap,
+            conversation_id=conversation_id,
         ):
             if event.get("type") == "done":
                 done = {k: v for k, v in event.items() if k != "type"}
@@ -1777,8 +1812,12 @@ class PlannerAgentV2:
             yield None, recent
 
     def _historique(self, user: User) -> list:
+        conversation = getattr(self, '_conversation', None)
+        filtre = {'user': user}
+        if conversation is not None:
+            filtre['conversation'] = conversation
         lignes = (ConversationMessage.objects
-                  .filter(user=user).exclude(pk=getattr(self, "_exclu", None))
+                  .filter(**filtre).exclude(pk=getattr(self, "_exclu", None))
                   .order_by("-created_at")[:HISTORIQUE_MAX])
         messages = []
         restant = 16000

@@ -712,11 +712,14 @@ class NarrateurUniqueTests(NarrateurBase):
             self.assertNotIn("Dis-moi si tu veux autre chose", done["response"])
             self.assertEqual("".join(self.deltas(evts)), done["response"])
         with self.subTest("sans faits"):
+            # Style OpenCode : une panne de boucle se dit honnetement, elle ne
+            # pretend plus ne pas avoir compris.
             evts, done = self.tour(dire_effet=RuntimeError("502"))
             self.assertEqual(done["response"],
-                             "Je n'ai pas compris. Tu veux ajouter, déplacer ou voir quelque chose ?")
-            self.assertEqual(done["question_motif"], "dire")
-            self.assertTrue(done["question_posee"])
+                             "J'ai eu un problème technique en traitant ta demande. "
+                             "Rien n'a été modifié. Réessaie dans un moment.")
+            self.assertEqual(done["question_motif"], "panne")
+            self.assertFalse(done["question_posee"])
             self.assertEqual(done["quick_replies"], [])
             self.assertEqual("".join(self.deltas(evts)), done["response"])
 
