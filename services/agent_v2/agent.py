@@ -51,8 +51,7 @@ from services.agent_v2 import lecture, regles
 from services.agent_v2 import memoire as memoire_prefs
 from services.agent_v2 import jugement as _jugement
 from services.agent_v2.mesure import verifier_prose
-from services.agent_v2.modeles import (REGLAGES_BOUCLE_SANS_RAISONNEMENT,
-                                       modele_agir)
+from services.agent_v2.modeles import modele_agir
 from services.agent_v2.outils import outils_pour, outils_pour_le_modele
 from services.agent_v2.prompts import prompt_agir, prompt_planification
 from services.agent_v2.reconciliation import detecter_ecarts, reconcilier
@@ -518,10 +517,10 @@ class PlannerAgentV2:
             instructions=prompt_planification(user, decision) if decision else prompt_agir(user),
             tools=outils,
             output_type=ReponseDire,
-            # DeepSeek refuse tool_choice=required (la sortie structuree)
-            # en mode thinking: mesure du 2026-08-24, gardee pour la boucle
-            # qui rend elle aussi une sortie structuree.
-            model_settings=REGLAGES_BOUCLE_SANS_RAISONNEMENT,
+            # Reflexion activee (2026-10-17) : le modele reflechit avant d'agir.
+            # Note : mesure du 2026-08-24, DeepSeek refusait tool_choice=required
+            # en mode thinking ; si la sortie structuree casse sur DeepSeek,
+            # le repli (FallbackModel) passe a Gemini.
         )
 
         depart = time.perf_counter()
