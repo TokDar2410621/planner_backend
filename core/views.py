@@ -1360,6 +1360,15 @@ class ChatView(APIView):
             agent = _agent_pour(request.user)
             tap = _tap_de(request)
             extra = {'tap': tap} if tap and getattr(agent, 'accepte_tap', False) else {}
+            # V2 accepte conversation_id ; V1 l'ignore (pas de conversations).
+            import inspect as _inspect
+            conversation_id = request.data.get('conversation_id')
+            if conversation_id:
+                try:
+                    if 'conversation_id' in _inspect.signature(agent.process_message).parameters:
+                        extra['conversation_id'] = conversation_id
+                except (TypeError, ValueError):
+                    pass
             result = agent.process_message(
                 request.user,
                 message or "J'ai uploadé un document.",
@@ -1388,7 +1397,8 @@ class ChatView(APIView):
         # Relayes des qu'ils sont presents, meme faux ou vides: une question
         # vide est celle d'un formulaire, et le client doit savoir qu'une
         # question a ete posee pour ne pas demander de suggestions par-dessus.
-        for cle in ('question_posee', 'question', 'question_motif', 'assistant_message_id'):
+        for cle in ('question_posee', 'question', 'question_motif', 'assistant_message_id',
+                    'conversation_id'):
             if cle in result:
                 response_data[cle] = result[cle]
 
@@ -1523,6 +1533,17 @@ class ChatStreamView(APIView):
             try:
                 agent = _agent_pour(user)
                 extra = {'tap': tap} if tap and getattr(agent, 'accepte_tap', False) else {}
+                import inspect as _inspect2
+                conversation_id = request.data.get('conversation_id')
+                if conversation_id:
+                    try:
+                        if 'conversation_id' in _inspect2.signature(agent.process_message_stream).parameters:
+                            extra['conversation_id'] = conversation_id
+                    except (TypeError, ValueError):
+                        pass
+                conversation_id = request.data.get('conversation_id')
+                if conversation_id:
+                    extra['conversation_id'] = conversation_id
                 for event in agent.process_message_stream(user, final_message, attachment, **extra):
                     if event.get('type') == 'done':
                         if not isinstance(event.get('response'), str):
@@ -1617,6 +1638,93 @@ class ChatTranscriptionView(APIView):
             return Response({'error': 'La transcription est indisponible pour le moment.'},
                             status=status.HTTP_503_SERVICE_UNAVAILABLE)
         return Response({'texte': texte})
+
+
+# ============== Conversation Views ==============
+# Style OpenCode : chaque conversation a son fil d'historique. « Nouvelle
+# conversation » = nouveau fil, historique vierge.
+
+class ConversationListView(APIView):
+    """Liste les conversations de l'utilisateur + en crée une neuve."""
+
+    def get(self, request):
+        from core.models import Conversation
+        convs = (Conversation.objects
+                 .filter(user=request.user, archivee=False)
+                 .order_by('-updated_at')[:50])
+        return Response([{
+            'id': c.pk,
+            'titre': c.titre,
+            'updated_at': c.updated_at.isoformat(),
+            'created_at': c.created_at.isoformat(),
+        } for c in convs])
+
+    def post(self, request):
+        from core.models import Conversation
+        conv = Conversation.objects.create(
+            user=request.user,
+            titre=str(request.data.get('titre') or "Nouvelle conversation")[:200],
+        )
+        return Response({
+            'id': conv.pk,
+            'titre': conv.titre,
+            'updated_at': conv.updated_at.isoformat(),
+            'created_at': conv.created_at.isoformat(),
+        }, status=status.HTTP_201_CREATED)
+
+
+class ConversationDetailView(APIView):
+    """Renomme ou archive une conversation."""
+
+    def patch(self, request, pk):
+        from core.models import Conversation
+        try:
+            conv = Conversation.objects.get(pk=pk, user=request.user)
+        except Conversation.DoesNotExist:
+            return Response({'error': 'Conversation introuvable.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        if 'titre' in request.data:
+            conv.titre = str(request.data['titre'])[:200] or conv.titre
+        if 'archivee' in request.data:
+            conv.archivee = bool(request.data['archivee'])
+        conv.save()
+        return Response({'id': conv.pk, 'titre': conv.titre, 'archivee': conv.archivee})
+
+    def delete(self, request, pk):
+        from core.models import Conversation
+        try:
+            conv = Conversation.objects.get(pk=pk, user=request.user)
+        except Conversation.DoesNotExist:
+            return Response({'error': 'Conversation introuvable.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        conv.archivee = True
+        conv.save(update_fields=['archivee', 'updated_at'])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ConversationMessagesView(APIView):
+    """Historique d'une conversation (pour rouvrir un fil)."""
+
+    def get(self, request, pk):
+        from core.models import Conversation, ConversationMessage
+        try:
+            conv = Conversation.objects.get(pk=pk, user=request.user)
+        except Conversation.DoesNotExist:
+            return Response({'error': 'Conversation introuvable.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        msgs = (ConversationMessage.objects
+                .filter(conversation=conv)
+                .order_by('created_at')[:200])
+        return Response({
+            'conversation': {'id': conv.pk, 'titre': conv.titre},
+            'messages': [{
+                'id': m.pk,
+                'role': m.role,
+                'content': m.content,
+                'created_at': m.created_at.isoformat(),
+                'metadata': m.metadata or {},
+            } for m in msgs],
+        })
 
 
 # ============== Document Views ==============

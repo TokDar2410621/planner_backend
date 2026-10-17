@@ -867,7 +867,7 @@ def _dire_scripte(sortie: dict):
 
 
 _VOLATILES = {"id", "block_id", "pk", "en_reponse_a", "emise_le", "cle", "task_id",
-              "created_at", "updated_at"}
+              "created_at", "updated_at", "conversation_id", "assistant_message_id"}
 
 
 def _normaliser(valeur):

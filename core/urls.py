@@ -44,6 +44,9 @@ from .views import (
     ChatQuickRepliesView,
     ChatStreamView,
     ChatTranscriptionView,
+    ConversationListView,
+    ConversationDetailView,
+    ConversationMessagesView,
     DailyBriefView,
     # ViewSets
     DocumentViewSet,
@@ -145,6 +148,10 @@ urlpatterns = [
     path('chat/quick-replies/', ChatQuickRepliesView.as_view(), name='chat-quick-replies'),
     path('chat/stream/', ChatStreamView.as_view(), name='chat-stream'),
     path('chat/transcrire/', ChatTranscriptionView.as_view(), name='chat-transcrire'),
+    # Conversations (style OpenCode : un fil d'historique par conversation)
+    path('conversations/', ConversationListView.as_view(), name='conversations'),
+    path('conversations/<int:pk>/', ConversationDetailView.as_view(), name='conversation-detail'),
+    path('conversations/<int:pk>/messages/', ConversationMessagesView.as_view(), name='conversation-messages'),
 
     # Schedule endpoints
     path('schedule/', ScheduleView.as_view(), name='schedule'),
