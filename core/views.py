@@ -1078,15 +1078,33 @@ class _FermetureBudget:
 
 
 def _ouvrir_budget_chat(user, turn):
-    from services.agent_v2.budget_tour import ouvrir_trace, BudgetEpuise, BudgetIndisponible
+    from services.agent_v2.budget_tour import ouvrir_trace, BudgetEpuise, BudgetIndisponible, statut_usage
     try:
         return ouvrir_trace(user), None
     except BudgetIndisponible as exc:
         code = 429 if isinstance(exc, BudgetEpuise) else 503
-        texte = ("Ton budget de traitement est atteint. Réessaie plus tard."
-                 if code == 429 else "Le contrôle du budget est indisponible. Réessaie plus tard.")
-        payload = chat_turns.finish(turn, {'error': texte, 'code': 'budget_unavailable'}, code)
+        if code == 429:
+            from services.agent_v2.agent import prose_budget_jour
+            usage = statut_usage(user)
+            motif = exc.motif
+            payload_data = {
+                'error': prose_budget_jour(user, motif),
+                'code': 'quota_mesure_epuise' if motif == 'quota_mesure' else 'garde_cout_atteint',
+                'reprise_a': usage['reprise_a'],
+            }
+        else:
+            payload_data = {'error': 'Le contrôle du budget est indisponible. Réessaie plus tard.',
+                            'code': 'budget_unavailable'}
+        payload = chat_turns.finish(turn, payload_data, code)
         return None, Response(payload, status=code)
+
+
+class ChatUsageView(APIView):
+    """Usage mesuré du jour pour la jauge des conversations."""
+
+    def get(self, request):
+        from services.agent_v2.budget_tour import statut_usage
+        return Response(statut_usage(request.user))
 
 
 def _create_chat_attachment(request, attachment_file):

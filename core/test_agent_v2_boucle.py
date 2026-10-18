@@ -10,7 +10,7 @@ supprime tout passerait le premier test.
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
-from django.test import TestCase, TransactionTestCase, override_settings
+from django.test import TransactionTestCase, override_settings
 
 from core.models import ConversationMessage, RecurringBlock
 from services.agent.tools import execute_tool
@@ -171,7 +171,7 @@ class PersistanceTests(TransactionTestCase):
 
 
 @override_settings(DEEPSEEK_API_KEY='factice')
-class ReglagesTests(TestCase):
+class ReglagesTests(TransactionTestCase):
     """Le test de construction verifiait que la constante vaut ce qu'elle vaut.
     Ici on verifie qu'elle atteint VRAIMENT l'agent de la boucle: sans ce
     reglage, DeepSeek refuse tool_choice=required en mode thinking et la
@@ -222,9 +222,10 @@ class ResilienceTests(TransactionTestCase):
         from services.agent_v2.budget_tour import BudgetEpuise
         from pydantic_ai.models.test import TestModel
         with patch.object(module_agent, 'modele_agir', return_value=TestModel()), \
-             patch.object(self.Agent, '_executer_boucle', side_effect=BudgetEpuise):
+             patch.object(self.Agent, '_executer_boucle',
+                          side_effect=BudgetEpuise('quota atteint', 'quota_mesure')):
             res = self.Agent().process_message(self.user, 'fais tout')
-        self.assertIn('limite de jetons', res['response'])
+        self.assertIn('quota de jetons mesurés', res['response'])
         self.assertNotIn("trop d'étapes", res['response'])
 
     def test_arret_budget_sdk_identifie_les_etapes(self):

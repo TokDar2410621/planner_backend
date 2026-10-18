@@ -60,7 +60,7 @@ class _FauxOutil:
         finally:
             self._piste.sortie()
             self.appels += 1
-        return ToolResult(success=True, message=f"{self.name} ok", data={})
+        return ToolResult(success=True, message=f"{self.NAME} ok", data={})
 
 
 def _lancer(outils_fabriques):

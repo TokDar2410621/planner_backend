@@ -84,6 +84,7 @@ class ReservationBudgetTests(TransactionTestCase):
             appel.terminer({'entree': 100, 'sortie': 20}, True)
         fermer_trace(trace)
         self.assertEqual(self.compteur().jetons, 120)
+        self.assertEqual(self.compteur().jetons_mesures, 120)
         self.assertEqual(self.compteur().jetons_reserves, 0)
         self.assertEqual(trace.total_jetons, 120)
         self.assertEqual(len(trace.usages), 1)
@@ -130,7 +131,7 @@ class ReservationBudgetTests(TransactionTestCase):
         self.assertEqual(self.compteur().jetons, 0)
         self.assertEqual(trace.usages, [])
 
-    @override_settings(AGENT_V2_BUDGET_JETONS_JOUR=15000)
+    @override_settings(AGENT_V2_BUDGET_JETONS_JOUR=15000, AGENT_V2_GARDE_COUT_JOUR=15000)
     def test_extension_refusee_avant_appel(self):
         trace = self.ouvrir()
         with self.assertRaises(BudgetEpuise):
@@ -139,7 +140,7 @@ class ReservationBudgetTests(TransactionTestCase):
         self.assertEqual(self.compteur().jetons, 0)
         self.assertEqual(trace.usages, [])
 
-    @override_settings(AGENT_V2_BUDGET_JETONS_JOUR=15000)
+    @override_settings(AGENT_V2_BUDGET_JETONS_JOUR=15000, AGENT_V2_GARDE_COUT_JOUR=15000)
     def test_solde_inferieur_reservation_initiale_est_utilisable(self):
         BudgetJetonsJournalier.objects.create(user=self.user, jour=timezone.localdate(), jetons=10000)
         trace = self.ouvrir()
@@ -150,7 +151,7 @@ class ReservationBudgetTests(TransactionTestCase):
         fermer_trace(trace)
         self.assertEqual(self.compteur().jetons, 10120)
 
-    @override_settings(AGENT_V2_BUDGET_JETONS_JOUR=12000)
+    @override_settings(AGENT_V2_BUDGET_JETONS_JOUR=12000, AGENT_V2_GARDE_COUT_JOUR=12000)
     def test_admissions_concurrentes_ne_depassent_pas_le_plafond(self):
         BudgetJetonsJournalier.objects.create(user=self.user, jour=timezone.localdate())
         barriere = threading.Barrier(2)
@@ -304,7 +305,7 @@ class ReservationBudgetTests(TransactionTestCase):
         self.assertEqual(trace.usages, [])
         self.assertEqual(self.compteur().jetons, 0)
 
-    @override_settings(AGENT_V2_BUDGET_JETONS_JOUR=20000)
+    @override_settings(AGENT_V2_BUDGET_JETONS_JOUR=20000, AGENT_V2_GARDE_COUT_JOUR=20000)
     def test_usage_inconnu_reduit_admission_suivante(self):
         trace = self.ouvrir()
         with appel_fournisseur(phase='planning', fournisseur='local',
@@ -321,3 +322,40 @@ class ReservationBudgetTests(TransactionTestCase):
         finally:
             trace_courante.reset(token)
             fermer_trace(suivant)
+
+    @override_settings(AGENT_V2_BUDGET_JETONS_JOUR=10000, AGENT_V2_GARDE_COUT_JOUR=30000)
+    def test_usage_inconnu_reussi_reste_hors_jauge(self):
+        from services.agent_v2.budget_tour import statut_usage
+        trace = self.ouvrir()
+        with appel_fournisseur(phase='planning', fournisseur='local',
+                              jetons_entree=4000, max_sortie=1000) as appel:
+            appel.terminer({}, True)
+        fermer_trace(trace)
+        self.assertEqual(self.compteur().jetons, 5000)
+        self.assertEqual(self.compteur().jetons_mesures, 0)
+        self.assertEqual(statut_usage(self.user)['appels_non_mesures'], 1)
+        self.assertIsNone(statut_usage(self.user)['bloque_par'])
+
+    @override_settings(AGENT_V2_BUDGET_JETONS_JOUR=1000, AGENT_V2_GARDE_COUT_JOUR=30000)
+    def test_quota_mesure_et_garde_sont_deux_blocages_distincts(self):
+        trace = self.ouvrir()
+        with appel_fournisseur(phase='planning', fournisseur='local',
+                              jetons_entree=2000, max_sortie=1000) as appel:
+            appel.terminer({'total': 1000}, True)
+        fermer_trace(trace)
+        self.assertEqual(self.compteur().jetons_mesures, 1000)
+        with self.assertRaises(BudgetEpuise) as blocage:
+            ouvrir_trace(self.user)
+        self.assertEqual(blocage.exception.motif, 'quota_mesure')
+
+    @override_settings(AGENT_V2_BUDGET_JETONS_JOUR=10000, AGENT_V2_GARDE_COUT_JOUR=12000)
+    def test_garde_de_cout_bloque_sans_epuiser_quota_mesure(self):
+        from services.agent_v2.budget_tour import statut_usage
+        BudgetJetonsJournalier.objects.create(
+            user=self.user, jour=timezone.localdate(), jetons=12000,
+            jetons_mesures=0,
+        )
+        self.assertEqual(statut_usage(self.user)['bloque_par'], 'garde_cout')
+        with self.assertRaises(BudgetEpuise) as blocage:
+            ouvrir_trace(self.user)
+        self.assertEqual(blocage.exception.motif, 'garde_cout')

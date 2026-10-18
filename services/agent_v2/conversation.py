@@ -27,18 +27,21 @@ class AgentConversation(PlannerAgentV2):
                                use_streaming=True, generate_quick_replies=False, tap=None,
                                conversation_id=None):
         from services.agent_v2.trace_tour import TraceTour, trace_courante
-        from services.agent_v2.budget_tour import ouvrir_trace, fermer_trace, BudgetIndisponible
+        from services.agent_v2.budget_tour import ouvrir_trace, fermer_trace, BudgetEpuise, BudgetIndisponible
         self._trace = trace_courante.get()
         proprietaire = self._trace is None
         self._admission_refusee = False
+        self._motif_admission = None
         if proprietaire:
             try:
                 self._trace = ouvrir_trace(user)
-            except BudgetIndisponible:
+            except BudgetIndisponible as exc:
                 self._admission_refusee = True
+                self._motif_admission = exc.motif if isinstance(exc, BudgetEpuise) else 'indisponible'
                 self._trace = TraceTour(time.monotonic())
         elif self._trace.reservation is None or self._trace.reservation.user_id != user.pk:
             self._admission_refusee = True
+            self._motif_admission = 'indisponible'
         jeton = trace_courante.set(self._trace)
         try:
             yield from self._traiter_tour(user, message, attachment,
@@ -73,7 +76,7 @@ class AgentConversation(PlannerAgentV2):
             courant = ConversationMessage.objects.create(
                 user=user, role='user', content=message, conversation=self._conversation)
             courant.attachments.set(getattr(self, '_chat_attachments', []) or ([attachment] if attachment else []))
-            texte = sans_tiret_long(prose_budget_jour(user))
+            texte = sans_tiret_long(prose_budget_jour(user, self._motif_admission))
             metadata = {'agent': 'v2', 'contrat_tour': 'budget',
                         'en_reponse_a': courant.pk, 'actions': [], 'quick_replies': [],
                         'question_posee': False, 'usage': []}

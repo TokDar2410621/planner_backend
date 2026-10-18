@@ -250,9 +250,9 @@ class BudgetAnonymeTest(APITestCase):
         anon = _creer_anonyme('device-budget-02')
         normal = User.objects.create_user('normal-budget2', password='pw-1234567')
         BudgetJetonsJournalier.objects.create(
-            user=anon, jour=timezone.localdate(), jetons=400000)
+            user=anon, jour=timezone.localdate(), jetons_mesures=400000)
         BudgetJetonsJournalier.objects.create(
-            user=normal, jour=timezone.localdate(), jetons=400000)
+            user=normal, jour=timezone.localdate(), jetons_mesures=400000)
         self.assertTrue(module_agent._budget_jour_epuise(anon))
         self.assertFalse(module_agent._budget_jour_epuise(normal))
 
@@ -267,7 +267,7 @@ class BudgetAnonymeTest(APITestCase):
         """Budget anonyme epuise : le tour propose de creer un compte."""
         anon = _creer_anonyme('device-budget-04')
         BudgetJetonsJournalier.objects.create(
-            user=anon, jour=timezone.localdate(), jetons=400000)
+            user=anon, jour=timezone.localdate(), jetons_mesures=400000)
         with patch.object(PlannerAgentV2, '_boucle',
                           side_effect=AssertionError("la boucle ne doit pas tourner")):
             res = PlannerAgentV2().process_message(anon, "bonjour")
@@ -277,9 +277,9 @@ class BudgetAnonymeTest(APITestCase):
         from services.agent_v2.conversation import AgentConversation
         anon = _creer_anonyme('device-budget-conversation')
         BudgetJetonsJournalier.objects.create(
-            user=anon, jour=timezone.localdate(), jetons=400000)
-        with patch('services.agent_v2.conversation.modele_agir',
-                   side_effect=AssertionError('aucun appel payant')):
+            user=anon, jour=timezone.localdate(), jetons_mesures=400000)
+        with patch.object(AgentConversation, '_boucle',
+                          side_effect=AssertionError('aucun appel payant')):
             res = AgentConversation().process_message(anon, 'bonjour')
         self.assertIn('Crée un compte', res['response'])
 

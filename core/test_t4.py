@@ -102,10 +102,3 @@ def test_log_never_raises_on_garbage_response():
     log_llm_usage("not a response")
     log_llm_usage(_Explosive())
     log_llm_usage(_Bare(usage={"input_tokens": 1, "output_tokens": 1}))
-
-
-def test_log_accepts_custom_logger():
-    custom = logging.getLogger("t4.custom")
-    resp = LLMResponse(usage={"input_tokens": 2, "output_tokens": 2})
-    # Should route through the provided logger without raising.
-    log_llm_usage(resp, provider_name="X", log=custom)

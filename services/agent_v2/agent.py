@@ -149,7 +149,12 @@ def _budget_jour_epuise(user) -> bool:
             user=user, jour=timezone.localdate()).first()
     except Exception:  # noqa: BLE001
         return True
-    return ligne is not None and (ligne.jetons + ligne.jetons_reserves) >= _budget_jetons_jour(user)
+    if ligne is None:
+        return False
+    from services.agent_v2.budget_tour import plafond_garde_cout
+    plafond = _budget_jetons_jour(user)
+    return (ligne.jetons_mesures >= plafond or
+            ligne.jetons + ligne.jetons_reserves >= plafond_garde_cout(user, plafond))
 
 
 def _enregistrer_jetons(user, total: int) -> None:
@@ -229,16 +234,23 @@ PROSE_DELAI = ("J'ai mis trop de temps à te répondre, je m'arrête ici. "
 # echoue), on le dit honnetement au lieu de pretendre ne pas avoir compris.
 PROSE_PANNE = ("J'ai eu un problème technique en traitant ta demande. "
                "Rien n'a été modifié. Réessaie dans un moment.")
-PROSE_BUDGET_JOUR = ("J'ai atteint ma limite d'IA pour aujourd'hui, "
-                     "je ne peux pas traiter ça maintenant. Réessaie demain.")
-# Compte anonyme au plafond resserre : on suggere la sortie, pas l'attente.
-PROSE_BUDGET_JOUR_ANON = ("J'ai atteint ma limite d'IA pour aujourd'hui. "
-                          "Crée un compte gratuit pour continuer sans limite.")
-
-
-def prose_budget_jour(user):
+def prose_budget_jour(user, motif=None):
     from core.anonyme import est_anonyme
-    return PROSE_BUDGET_JOUR_ANON if est_anonyme(user) else PROSE_BUDGET_JOUR
+    if motif is None:
+        from services.agent_v2.budget_tour import statut_usage
+        try:
+            motif = statut_usage(user)['bloque_par']
+        except Exception:
+            motif = 'indisponible'
+    if motif == 'indisponible':
+        return "Le contrôle du budget est indisponible. Réessaie plus tard."
+    cause = ("ton quota de jetons mesurés" if motif == 'quota_mesure'
+             else "le garde de coût des appels non mesurés")
+    texte = (f"J'ai atteint ma limite d'IA pour aujourd'hui : {cause}. "
+             "Réessaie demain à 0 h, heure de Toronto.")
+    if est_anonyme(user):
+        texte += " Crée un compte gratuit pour accéder à un quota plus élevé."
+    return texte
 
 # POOL DE THREADS REUTILISES, et le mot « reutilises » porte tout le poids.
 #
@@ -540,9 +552,9 @@ class PlannerAgentV2:
                                          **_limites_jetons(_budget_jetons_agir())),
                 event_stream_handler=self._sur_evenements,
             )
-        except BudgetEpuise:
+        except BudgetEpuise as exc:
             registre.budget_epuise = True
-            registre.motif_budget = "jetons"
+            registre.motif_budget = exc.motif
             return None
         except UsageLimitExceeded:
             # Le tour est tronque, pas rate: les outils deja executes ont
@@ -663,8 +675,10 @@ class PlannerAgentV2:
         if proprietaire:
             try:
                 trace = ouvrir_trace(user)
-            except BudgetIndisponible:
-                prose = prose_budget_jour(user)
+            except BudgetIndisponible as exc:
+                from services.agent_v2.budget_tour import BudgetEpuise
+                prose = prose_budget_jour(user, exc.motif if isinstance(exc, BudgetEpuise)
+                                          else 'indisponible')
                 yield {'type': 'delta', 'text': prose}
                 yield {'type': 'done', 'response': prose, 'quick_replies': [],
                        'blocks_created': [], 'tasks_created': [], 'raisonnement': ''}
@@ -1086,11 +1100,7 @@ class PlannerAgentV2:
             # on le dit plutot que de laisser un silence. Un compte anonyme
             # au plafond resserre se voit proposer la sortie (creer un
             # compte), pas l'attente.
-            from core.anonyme import est_anonyme
-            if est_anonyme(user):
-                prose, motif = PROSE_BUDGET_JOUR_ANON, "budget_jour"
-            else:
-                prose, motif = PROSE_BUDGET_JOUR, "budget_jour"
+            prose, motif = prose_budget_jour(user), "budget_jour"
         elif not faits and not prose and not question and not formulaire:
             # La boucle a repondu mais n'a ni lu ni mute, et sa prose est
             # tombee: avant de dire qu'on n'a pas compris, le code lit ce que
