@@ -10,6 +10,8 @@ from .models import (
     UploadedDocument,
     RecurringBlock,
     Task,
+    Reminder,
+    RecurrenceSeries,
     ScheduledBlock,
     ConversationMessage,
 )
@@ -57,6 +59,20 @@ class TaskAdmin(admin.ModelAdmin):
     list_display = ['title', 'user', 'task_type', 'priority', 'deadline', 'completed']
     list_filter = ['task_type', 'completed', 'priority']
     search_fields = ['title', 'user__username', 'related_course']
+
+
+@admin.register(Reminder)
+class ReminderAdmin(admin.ModelAdmin):
+    list_display = ['title', 'user', 'due_at', 'status', 'delivered_count']
+    list_filter = ['status', 'due_at']
+    search_fields = ['title', 'user__username']
+
+
+@admin.register(RecurrenceSeries)
+class RecurrenceSeriesAdmin(admin.ModelAdmin):
+    list_display = ['title', 'user', 'kind', 'frequency', 'interval', 'active']
+    list_filter = ['kind', 'frequency', 'active']
+    search_fields = ['title', 'user__username']
 
 
 @admin.register(ScheduledBlock)

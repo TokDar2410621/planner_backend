@@ -30,6 +30,7 @@ OUTILS_DE_MUTATION = {
     # comme une autre, et le bloc factuel doit la raconter.
     "import_document",
     "resolve_document_entry",
+    "manage_reminder", "manage_recurrence",
 }
 
 

@@ -44,7 +44,10 @@ class Parametres(commun.ChampsLieu):
     )
     deadline: str | None = Field(
         default=None,
-        description="Date limite au format YYYY-MM-DD (optionnel)",
+        description="Échéance YYYY-MM-DD ou YYYY-MM-DDTHH:MM (heure précise si dite)",
+    )
+    alert_at: str | None = Field(
+        default=None, description="Alerte YYYY-MM-DDTHH:MM si elle doit précéder l'échéance",
     )
     estimated_duration_minutes: int | None = Field(
         default=None, ge=5,
@@ -74,9 +77,25 @@ def execute(user: User, **kwargs) -> ToolResult:
         travel_minutes=kwargs.get("travel_minutes"),
     )
 
-    existing = Task.objects.filter(
-        user=user, completed=False, title__iexact=title.strip()
-    ).first()
+    deadline = commun._parse_deadline(kwargs.get('deadline'))
+    if kwargs.get('deadline') and deadline is None:
+        return ToolResult(False, message='Échéance invalide.', public='Précise le jour et l’heure de la tâche.')
+    alert_at = commun._parse_deadline(kwargs.get('alert_at'))
+    if kwargs.get('alert_at') and alert_at is None:
+        return ToolResult(False, message='Alerte invalide.', public='Précise l’heure de l’alerte.')
+    # Un jour seul n'autorise pas une alerte. Une heure explicite, oui.
+    has_hour = bool(kwargs.get('deadline') and ('T' in kwargs['deadline'] or ' ' in kwargs['deadline']))
+    if alert_at is None and has_hour:
+        alert_at = deadline
+    if alert_at and (not deadline or alert_at > deadline):
+        return ToolResult(False, message='Alerte après échéance.',
+                          public="L’alerte doit arriver au plus tard à l’heure de la tâche.")
+    existing_qs = Task.objects.filter(user=user, completed=False, title__iexact=title.strip())
+    if deadline is not None:
+        existing_qs = existing_qs.filter(deadline=deadline)
+    else:
+        existing_qs = existing_qs.filter(deadline__isnull=True)
+    existing = existing_qs.first()
     if existing is not None:
         # N'attache le lieu à la tâche existante que s'il n'en a pas encore un.
         if place is not None and existing.place_id is None:
@@ -94,7 +113,8 @@ def execute(user: User, **kwargs) -> ToolResult:
         task_type=kwargs.get("task_type", "shallow"),
         priority=kwargs.get("priority", 5),
         description=kwargs.get("description", ""),
-        deadline=commun._parse_deadline(kwargs.get("deadline")),
+        deadline=deadline,
+        alert_at=alert_at,
         estimated_duration_minutes=kwargs.get("estimated_duration_minutes"),
         place=place,
     )

@@ -45,6 +45,11 @@ from . import suggest_schedule_optimization
 from . import detect_conflicts
 from . import get_productivity_stats
 from . import send_notification
+from . import manage_reminder
+from . import list_reminders
+from . import manage_recurrence
+from . import list_recurrences
+from . import read_planning_skill
 from . import process_uploaded_document
 from . import resolve_document_entry
 from . import present_form
@@ -93,6 +98,11 @@ ALL_OUTILS = [
     get_productivity_stats,
     # Notifications
     send_notification,
+    manage_reminder,
+    list_reminders,
+    manage_recurrence,
+    list_recurrences,
+    read_planning_skill,
     # Documents : lecture et cloture des precisions d'un import.
     process_uploaded_document,
     resolve_document_entry,
@@ -116,6 +126,8 @@ TOOL_MAP = OUTIL_MAP
 # boutons. Ils restent dans ALL_OUTILS (v2 les expose via
 # services/agent_v2/outils.py) mais sortent de toute liste offerte a v1.
 V2_SEULEMENT = {"present_choices", "poser_question",
+                "manage_reminder", "list_reminders", "manage_recurrence",
+                "list_recurrences", "read_planning_skill",
                 # Outil compose ajoute pour la boucle unique: v2 le rend en une
                 # ligne de faits, v1 ne le connait pas.
                 "replace_block_occurrence", "resolve_document_entry"}

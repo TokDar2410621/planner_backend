@@ -365,17 +365,22 @@ class FluxTourAbandonneTests(TransactionTestCase):
         client = APIClient()
         client.force_authenticate(user)
         liberer = threading.Event()
-        sauve = threading.Event()
+        futurs = []
+
+        def lancer_et_suivre(*args, **kwargs):
+            flux, futur = lancer_flux(*args, **kwargs)
+            futurs.append(futur)
+            return flux, futur
 
         def generateur():
             yield {"type": "status", "text": "Réflexion..."}
             liberer.wait(10)
             ConversationMessage.objects.create(
                 user=user, role="assistant", content="ok")
-            sauve.set()
             yield {"type": "done", "response": "ok"}
 
-        with patch.object(AgentConversation, "process_message_stream",
+        with patch("core.views.lancer_flux", side_effect=lancer_et_suivre), \
+             patch.object(AgentConversation, "process_message_stream",
                           side_effect=lambda u, m, a: generateur()):
             reponse = client.post("/api/chat/stream/", {"message": "salut"})
             self.assertEqual(reponse["Content-Type"], "text/event-stream")
@@ -391,7 +396,8 @@ class FluxTourAbandonneTests(TransactionTestCase):
             with self.assertLogs("core.views", "WARNING"):
                 premier = asyncio.run(partir())
             liberer.set()
-            self.assertTrue(sauve.wait(5))
+            self.assertEqual(len(futurs), 1)
+            futurs[0].result(timeout=5)
 
         self.assertIn(b'"type": "status"', premier)
         self.assertEqual(self._assistant(), 1)

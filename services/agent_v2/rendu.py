@@ -623,6 +623,28 @@ class _Narrateur:
             texte += f" (pour {date_courte(t['deadline'], self.auj)})"
         self.ajouter_fait(_Fait(texte + ".", "tache_ajoutee", titre))
 
+    def _ok_manage_reminder(self, a, d, p):
+        reminder = _dict(d.get('reminder'))
+        titre = _txt(reminder.get('title')) or 'Rappel'
+        action = p.get('action')
+        if action == 'cancel':
+            texte = f"Rappel annulé : {titre}."
+        else:
+            quand = self.quand(reminder.get('due_at'))
+            try:
+                from django.utils import timezone as tz
+                heure = tz.localtime(datetime.fromisoformat(reminder['due_at'])).strftime('%H h %M')
+            except (ValueError, TypeError, KeyError):
+                heure = ''
+            texte = f"Rappel {'créé' if action == 'create' else 'mis à jour'} : {titre} {quand} à {heure}."
+        self.ajouter_fait(_Fait(texte, 'rappel', titre))
+
+    def _ok_manage_recurrence(self, a, d, p):
+        series = _dict(d.get('series'))
+        titre = _txt(series.get('title')) or 'Répétition'
+        verb = {'create': 'créée', 'update': 'mise à jour', 'stop': 'arrêtée'}.get(p.get('action'), 'traitée')
+        self.ajouter_fait(_Fait(f"Répétition {verb} : {titre}.", 'repetition', titre))
+
     def _ok_update_task(self, a, d, p):
         t = _dict(d.get("task"))
         titre = _txt(t.get("title")) or _txt(p.get("title")) or "Cette tâche"
@@ -1127,6 +1149,10 @@ def _objet_abandonne(demande: dict) -> str:
         return "le vidage de ton planning"
     if outil == "delete_task":
         return f"la suppression de la tâche {titre}" if titre else "la suppression de cette tâche"
+    if outil == "manage_reminder":
+        return f"l'annulation du rappel {titre}" if titre else "l'annulation de ce rappel"
+    if outil == "manage_recurrence":
+        return f"l'arrêt de la répétition {titre}" if titre else "l'arrêt de cette répétition"
     if outil == "cancel_scheduled_block":
         return f"l'annulation de {titre}" if titre else "l'annulation de cet événement"
     if outil == "update_block":
@@ -1159,6 +1185,10 @@ def _objet_retenu(outil: str, titre: str, motif: str = "") -> str:
         return f"arrêté {titre}" if titre else "arrêté ce créneau"
     if outil == "delete_task":
         return f"supprimé {titre}" if titre else "supprimé cette tâche"
+    if outil == "manage_reminder":
+        return f"annulé le rappel {titre}" if titre else "annulé ce rappel"
+    if outil == "manage_recurrence":
+        return f"arrêté la répétition {titre}" if titre else "arrêté cette répétition"
     if outil == "optimize_week":
         return "appliqué le plan de la semaine"
     if outil == "schedule_task_at":
@@ -1820,6 +1850,10 @@ def _objet_destructif(demande, auj) -> str:
         return "vider tout ton planning"
     if outil == "delete_task":
         return f"supprimer la tâche {titre}" if titre else "supprimer cette tâche"
+    if outil == "manage_reminder":
+        return f"annuler le rappel {titre}" if titre else "annuler ce rappel"
+    if outil == "manage_recurrence":
+        return f"arrêter la répétition {titre}" if titre else "arrêter cette répétition"
     if outil == "cancel_scheduled_block":
         quand = _quand(cible.get("date"), auj)
         ids = cible.get("ids")

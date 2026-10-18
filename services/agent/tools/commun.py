@@ -308,6 +308,9 @@ def _task_to_dict(task: Task) -> dict:
         "task_type": task.task_type,
         "priority": task.priority,
         "deadline": _deadline_iso(task.deadline),
+        "alert_at": _deadline_iso(task.alert_at),
+        "recurrence_id": task.recurrence_id,
+        "occurrence_date": task.occurrence_date.isoformat() if task.occurrence_date else None,
         "estimated_duration_minutes": task.estimated_duration_minutes,
         "completed": task.completed,
     }

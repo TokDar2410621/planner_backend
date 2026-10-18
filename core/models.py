@@ -502,6 +502,14 @@ class Task(models.Model):
     title = models.CharField(max_length=200)
     description = models.TextField(blank=True)
     deadline = models.DateTimeField(null=True, blank=True)
+    # Une date seule reste une echeance; alert_at n'est pose que si une
+    # notification a une heure a ete demandee ou deduite d'une heure precise.
+    alert_at = models.DateTimeField(null=True, blank=True)
+    recurrence = models.ForeignKey(
+        'RecurrenceSeries', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='tasks',
+    )
+    occurrence_date = models.DateField(null=True, blank=True)
     estimated_duration_minutes = models.PositiveIntegerField(null=True, blank=True)
     # Lieu du rendez-vous (rappels de départ basés sur la localisation, Phase 0/1):
     # une tâche "Réunion 14h à l'UQAC" porte un UserPlace -> trajet + coords.
@@ -658,7 +666,73 @@ class Task(models.Model):
                 condition=models.Q(priority__gte=1) & models.Q(priority__lte=10),
                 name='task_priority_between_1_and_10',
             ),
+            models.UniqueConstraint(
+                fields=['recurrence', 'occurrence_date'],
+                name='unique_task_occurrence',
+            ),
         ]
+
+
+class RecurrenceSeries(models.Model):
+    """Regle ouverte ou bornee qui produit des occurrences independantes."""
+
+    KIND_CHOICES = [('task', 'Tache'), ('reminder', 'Rappel')]
+    FREQUENCY_CHOICES = [
+        ('daily', 'Quotidien'), ('weekly', 'Hebdomadaire'),
+        ('monthly', 'Mensuel'),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='recurrence_series')
+    kind = models.CharField(max_length=10, choices=KIND_CHOICES)
+    title = models.CharField(max_length=200)
+    start_date = models.DateField()
+    end_date = models.DateField(null=True, blank=True)
+    frequency = models.CharField(max_length=10, choices=FREQUENCY_CHOICES)
+    interval = models.PositiveSmallIntegerField(default=1)
+    weekdays = models.JSONField(default=list, blank=True)
+    day_of_month = models.PositiveSmallIntegerField(null=True, blank=True)
+    due_time = models.TimeField(null=True, blank=True)
+    alert_time = models.TimeField(null=True, blank=True)
+    generated_through = models.DateField(null=True, blank=True)
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['start_date', 'id']
+        indexes = [models.Index(fields=['user', 'active'])]
+
+    def __str__(self):
+        return f'{self.title} ({self.frequency})'
+
+
+class Reminder(models.Model):
+    """Une alerte autonome, avec son etat de livraison propre."""
+
+    STATUS_CHOICES = [
+        ('pending', 'A venir'), ('sent', 'Envoye'),
+        ('missed', 'Manque'), ('cancelled', 'Annule'),
+    ]
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='reminders')
+    title = models.CharField(max_length=200)
+    due_at = models.DateTimeField(db_index=True)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
+    recurrence = models.ForeignKey(
+        RecurrenceSeries, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='reminders',
+    )
+    occurrence_date = models.DateField(null=True, blank=True)
+    delivered_count = models.PositiveSmallIntegerField(default=0)
+    sent_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['due_at', 'id']
+        constraints = [models.UniqueConstraint(
+            fields=['recurrence', 'occurrence_date'], name='unique_reminder_occurrence',
+        )]
+
+    def __str__(self):
+        return f'{self.title} @ {self.due_at}'
 
 
 class ScheduledBlock(models.Model):
@@ -1221,6 +1295,7 @@ class PushSendLog(models.Model):
         ('block_leave', 'Bloc depart'),
         ('task_prep', 'Tache preparation'),
         ('task_leave', 'Tache depart'),
+        ('task_alert', 'Alerte de tache'),
     ]
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='push_send_logs')
@@ -1291,6 +1366,7 @@ class AppareilPush(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     last_seen_at = models.DateTimeField(auto_now=True)
     derniere_erreur = models.CharField(max_length=200, blank=True)
+    notifications_autorisees = models.BooleanField(default=False)
 
     class Meta:
         ordering = ['-last_seen_at']

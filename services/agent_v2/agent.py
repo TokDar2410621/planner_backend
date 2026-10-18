@@ -1225,6 +1225,19 @@ class PlannerAgentV2:
             "question_posee": question_posee,
             "question": question_affichee,
             "question_motif": motif or "",
+            "activation_notifications": any(
+                (a.outil == 'send_notification' and a.cause == 'aucun_appareil')
+                or (a.succes and a.outil in ('manage_reminder', 'manage_recurrence')
+                    and (a.outil == 'manage_reminder'
+                         and a.parametres.get('action') in ('create', 'update')
+                         or a.outil == 'manage_recurrence'
+                         and a.parametres.get('action') == 'create'
+                         and (a.parametres.get('kind') == 'reminder'
+                              or bool(a.parametres.get('due_time')))))
+                or (a.succes and a.outil in ('create_task', 'update_task')
+                    and bool((a.donnees.get('task') or {}).get('alert_at')))
+                for a in registre.actions
+            ),
             # SEULEMENT les demandes rendues dans la question gagnante: une
             # demande que l'utilisateur n'a pas vue ne doit jamais pouvoir
             # etre autorisee par sa reponse.
@@ -1258,6 +1271,9 @@ class PlannerAgentV2:
             ],
         }
         metadonnees.update(metadonnees_lire)
+        if metadonnees['activation_notifications']:
+            from services.notification_delivery import has_device
+            metadonnees['activation_notifications'] = not has_device(user)
         assistant = ConversationMessage.objects.create(
             user=user, role="assistant", content=response,
             conversation=self._conversation,
@@ -1269,6 +1285,7 @@ class PlannerAgentV2:
             "conversation_id": self._conversation.pk if self._conversation else None,
             "response": response,
             "quick_replies": quick_replies,
+            "activation_notifications": metadonnees['activation_notifications'],
             "blocks_created": self._crees(registre, "create_block", "created"),
             "tasks_created": self._crees(registre, "create_task", "task"),
             "raisonnement": raisonnement,

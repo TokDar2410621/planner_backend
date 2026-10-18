@@ -1,6 +1,7 @@
 """
 Serializers for Planner AI backend.
 """
+from datetime import timedelta
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from django.db.models import Count, Q
@@ -15,6 +16,8 @@ from .models import (
     RecurringBlockCompletion,
     RecurringBlockException,
     Task,
+    Reminder,
+    RecurrenceSeries,
     ScheduledBlock,
     ConversationMessage,
     SharedSchedule,
@@ -427,6 +430,9 @@ class TaskSerializer(serializers.ModelSerializer):
             'depends_on',
             'is_blocked',
             'deadline',
+            'alert_at',
+            'recurrence',
+            'occurrence_date',
             'estimated_duration_minutes',
             'task_type',
             'task_type_display',
@@ -439,7 +445,16 @@ class TaskSerializer(serializers.ModelSerializer):
             'created_at',
         ]
         read_only_fields = ['id', 'completed_at', 'created_at', 'task_type_display',
-                            'place_detail', 'is_blocked']
+                            'place_detail', 'is_blocked', 'recurrence', 'occurrence_date']
+
+    def validate(self, attrs):
+        deadline = attrs.get('deadline', getattr(self.instance, 'deadline', None))
+        alert = attrs.get('alert_at', getattr(self.instance, 'alert_at', None))
+        if alert and not deadline:
+            raise serializers.ValidationError({'alert_at': "Une alerte exige une échéance."})
+        if alert and deadline and alert > deadline:
+            raise serializers.ValidationError({'alert_at': "L'alerte suit l'échéance."})
+        return attrs
 
     def validate_priority(self, value):
         if value < 1 or value > 10:
@@ -488,6 +503,58 @@ class TaskSerializer(serializers.ModelSerializer):
                 courant = courant.depends_on
                 pas += 1
         return value
+
+
+class ReminderSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Reminder
+        fields = ['id', 'title', 'due_at', 'status', 'recurrence',
+                  'occurrence_date', 'delivered_count', 'sent_at', 'created_at']
+        read_only_fields = ['id', 'status', 'recurrence', 'occurrence_date',
+                            'delivered_count', 'sent_at', 'created_at']
+
+    def validate_due_at(self, value):
+        if value <= timezone.now():
+            raise serializers.ValidationError('Choisis une heure future.')
+        return value
+
+    def validate(self, attrs):
+        due_at = attrs.get('due_at', getattr(self.instance, 'due_at', None))
+        if due_at and due_at <= timezone.now():
+            raise serializers.ValidationError({'due_at': 'Choisis une heure future.'})
+        return attrs
+
+
+class RecurrenceSeriesSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RecurrenceSeries
+        fields = ['id', 'kind', 'title', 'start_date', 'end_date', 'frequency',
+                  'interval', 'weekdays', 'day_of_month', 'due_time',
+                  'alert_time', 'active', 'created_at']
+        read_only_fields = ['id', 'active', 'created_at']
+
+    def validate(self, attrs):
+        from services.reminder_series import validate_series
+        current = self.instance
+        if current is not None and ('kind' in attrs and attrs['kind'] != current.kind
+                                    or 'start_date' in attrs and attrs['start_date'] != current.start_date):
+            raise serializers.ValidationError("Le type et la date de début d'une série ne changent pas.")
+        def field(name, fallback=None):
+            return attrs.get(name, getattr(current, name, fallback))
+        start = field('start_date')
+        if start < timezone.localdate() - timedelta(days=365):
+            raise serializers.ValidationError({'start_date': 'Début trop ancien.'})
+        try:
+            validate_series(
+                kind=field('kind'), start_date=start,
+                end_date=field('end_date'), frequency=field('frequency'),
+                interval=field('interval', 1), weekdays=field('weekdays', []),
+                day_of_month=field('day_of_month'), due_time=field('due_time'),
+                alert_time=field('alert_time'),
+            )
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc)) from exc
+        return attrs
 
 
 class TaskCompleteSerializer(serializers.Serializer):

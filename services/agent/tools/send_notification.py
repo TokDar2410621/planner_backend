@@ -2,16 +2,15 @@
 from django.contrib.auth.models import User
 from pydantic import BaseModel, ConfigDict, Field
 
-from core.models import PushSubscription
 from .base import (
-    ISSUE_TERMINEE, ISSUE_BESOIN_PRECISION, ISSUE_CAPACITE_ABSENTE, ISSUE_ECHEC,
+    ISSUE_TERMINEE, ISSUE_BESOIN_PRECISION, ISSUE_ECHEC,
     ToolResult,
 )
 
 NAME = "send_notification"
 DESCRIPTION = (
     "Envoie immédiatement une notification push sur les appareils de "
-    "l'utilisateur (PWA installée, notifications activées). Pour une info "
+    "l'utilisateur (application iPhone ou PWA installée et autorisée). Pour une info "
     "qu'il doit voir même hors de l'app; jamais pour répéter ta réponse "
     "du chat. Ne programme PAS de rappel futur."
 )
@@ -40,7 +39,7 @@ PARAMETERS = Parametres.model_json_schema()
 
 
 def execute(user: User, **kwargs) -> ToolResult:
-    from services.push import push_configured, send_to_user
+    from services.notification_delivery import has_device, send_visible
 
     title = (kwargs.get("title") or "").strip() or "Planner AI"
     body = (kwargs.get("body") or "").strip()
@@ -52,30 +51,21 @@ def execute(user: User, **kwargs) -> ToolResult:
             public="Il me faut le texte de la notification pour l'envoyer.",
         )
 
-    if not push_configured():
-        return ToolResult(
-            success=False, data={},
-            message="Web push non configuré côté serveur: rien n'est parti.",
-            issue=ISSUE_CAPACITE_ABSENTE, cause="push_non_configure",
-            public="Les notifications ne sont pas configurées : rien n'est parti.",
-        )
-
     # Distinguer "aucun appareil abonné" (l'utilisateur n'a rien activé)
     # d'un échec d'envoi: le message doit guider vers la vraie action.
-    if not PushSubscription.objects.filter(user=user).exists():
+    if not has_device(user):
         return ToolResult(
             success=False,
             data={"sent": 0},
             message=(
-                "Aucun appareil abonné aux notifications: "
-                "active-les dans ton profil."
+                "Aucun appareil abonné et autorisé pour les notifications: rien n'est parti."
             ),
             issue=ISSUE_ECHEC, cause="aucun_appareil",
-            public=("Aucun appareil n'est abonné aux notifications : "
-                    "active-les dans ton profil pour recevoir celle-ci."),
+            public=("Aucune notification n'a été envoyée. Active les notifications "
+                    "avec le bouton ci-dessous, puis redemande l'envoi."),
         )
 
-    sent = send_to_user(user, title, body, url="/")
+    sent = send_visible(user, title, body, url="/")
     if sent == 0:
         return ToolResult(
             success=False, data={"sent": 0},
