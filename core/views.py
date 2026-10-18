@@ -3167,8 +3167,9 @@ class PushSubscribeView(APIView):
                 "user_agent": request.META.get("HTTP_USER_AGENT", "")[:300],
             },
         )
+        from services.push import push_configured
         return Response(
-            {"ok": True, "created": created},
+            {"ok": True, "created": created, "active": push_configured()},
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
         )
 
@@ -3183,6 +3184,40 @@ class PushUnsubscribeView(APIView):
             user=request.user, endpoint=endpoint
         ).delete()
         return Response({"deleted": deleted})
+
+
+class PushDeviceStatusView(APIView):
+    """Statut du terminal courant, sans mettre son jeton dans l'URL."""
+
+    def post(self, request):
+        from core.models import AppareilPush, PushSubscription
+        from services.apns import apns_configured
+        from services.push import push_configured
+
+        platform = request.data.get('platform')
+        if platform == 'ios':
+            token = request.data.get('token')
+            if not isinstance(token, str) or not token.strip():
+                return Response({'error': 'token requis.'}, status=status.HTTP_400_BAD_REQUEST)
+            device = AppareilPush.objects.filter(user=request.user, token=token.strip()).first()
+            configured = apns_configured()
+            registered = device is not None
+            authorized = bool(device and device.notifications_autorisees)
+        elif platform == 'web':
+            endpoint = request.data.get('endpoint')
+            if not isinstance(endpoint, str) or not endpoint.strip():
+                return Response({'error': 'endpoint requis.'}, status=status.HTTP_400_BAD_REQUEST)
+            registered = PushSubscription.objects.filter(
+                user=request.user, endpoint=endpoint.strip()).exists()
+            configured = push_configured()
+            authorized = registered
+        else:
+            return Response({'error': 'platform invalide.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        active = registered and authorized and configured
+        reason = ('ready' if active else 'not_registered' if not registered
+                  else 'permission_missing' if not authorized else 'server_unconfigured')
+        return Response({'active': active, 'reason': reason})
 
 
 class AppareilPushEnregistrerView(APIView):
@@ -3216,8 +3251,9 @@ class AppareilPushEnregistrerView(APIView):
             "appareil push enregistre: user=%s cree=%s app=%s jeton=%s...",
             request.user.pk, created, request.data.get("app_version") or "?", token.strip()[:8],
         )
+        from services.apns import apns_configured
         return Response(
-            {"ok": True, "created": created},
+            {"ok": True, "created": created, "active": authorized and apns_configured()},
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
         )
 

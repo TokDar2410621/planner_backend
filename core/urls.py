@@ -19,6 +19,7 @@ from .views import (
     PushPublicKeyView,
     PushSubscribeView,
     PushUnsubscribeView,
+    PushDeviceStatusView,
     PushTestView,
     PushSendView,
     AppareilPushEnregistrerView,
@@ -121,6 +122,7 @@ urlpatterns = [
     path('push/vapid-key/', PushPublicKeyView.as_view(), name='push-vapid-key'),
     path('push/subscribe/', PushSubscribeView.as_view(), name='push-subscribe'),
     path('push/unsubscribe/', PushUnsubscribeView.as_view(), name='push-unsubscribe'),
+    path('push/device-status/', PushDeviceStatusView.as_view(), name='push-device-status'),
     path('push/test/', PushTestView.as_view(), name='push-test'),
     path('push/send/', PushSendView.as_view(), name='push-send'),
     # Reveil silencieux iOS (APNs): l'app enregistre son token d'appareil
