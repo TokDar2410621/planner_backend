@@ -183,8 +183,9 @@ class ReglagesTests(TestCase):
         from services.agent_v2 import PlannerAgentV2
         self.Agent = PlannerAgentV2
 
-    def test_la_boucle_laisse_le_raisonnement_actif(self):
+    def test_la_boucle_coupe_le_raisonnement(self):
         from services.agent_v2 import agent as module_agent
+        from services.agent_v2.modeles import REGLAGES_BOUCLE_SANS_RAISONNEMENT
         from pydantic_ai.models.test import TestModel
 
         vus = {}
@@ -201,10 +202,7 @@ class ReglagesTests(TestCase):
              patch.object(self.Agent, '_executer_boucle', return_value=Resultat()):
             self.Agent().process_message(self.user, "bonjour")
 
-        reglages = vus.get('model_settings') or {}
-        desactive = (reglages.get('extra_body') or {}).get('thinking', {}).get('type')
-        self.assertNotEqual(desactive, 'disabled',
-                            "la boucle ne doit plus couper le raisonnement")
+        self.assertEqual(vus.get('model_settings'), REGLAGES_BOUCLE_SANS_RAISONNEMENT)
 
 class ResilienceTests(TransactionTestCase):
     def setUp(self):

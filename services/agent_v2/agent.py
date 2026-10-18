@@ -514,15 +514,17 @@ class PlannerAgentV2:
         # et a place une revision en 2025 (banc du 2026-09-14). Les
         # instructions partent a chaque requete.
         from services.agent_v2.budget_tour import modele_borne, BudgetEpuise
+        from services.agent_v2.modeles import REGLAGES_BOUCLE_SANS_RAISONNEMENT
         agent = Agent(
             modele_borne(modele_agir(), 'planning'),
             instructions=prompt_agir(user),
             tools=outils,
             output_type=ReponseDire,
-            # Reflexion activee (2026-10-17) : le modele reflechit avant d'agir.
-            # Note : mesure du 2026-08-24, DeepSeek refusait tool_choice=required
-            # en mode thinking ; si la sortie structuree casse sur DeepSeek,
-            # le repli (FallbackModel) passe a Gemini.
+            # Reflexion coupee : mesure du 2026-08-24, DeepSeek refusait
+            # tool_choice=required (sortie structuree) en mode thinking.
+            # Reactive le 2026-10-17 (PR #25), casse a nouveau le 2026-10-17
+            # soir : FallbackExceptionGroup sur tous les providers.
+            model_settings=REGLAGES_BOUCLE_SANS_RAISONNEMENT,
         )
 
         depart = time.perf_counter()
