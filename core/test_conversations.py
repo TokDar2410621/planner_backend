@@ -27,6 +27,8 @@ class ConversationTests(TestCase):
             user=self.user, conversation=conv, role='user', content='salut')
         r = self.client.get(f'/api/conversations/{conv.pk}/messages/')
         self.assertEqual(r.status_code, 200)
+        self.assertEqual(set(r.json()), {'conversation', 'messages'})
+        self.assertEqual(r.json()['conversation']['id'], conv.pk)
         msgs = r.json()['messages']
         self.assertEqual(len(msgs), 1)
         self.assertEqual(msgs[0]['content'], 'salut')
@@ -52,3 +54,22 @@ class ConversationTests(TestCase):
                               format='json')
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()['titre'], 'Nouveau')
+
+    def test_epingler_et_trier(self):
+        ancien = Conversation.objects.create(user=self.user, titre='Ancien')
+        Conversation.objects.create(user=self.user, titre='Recent')
+        r = self.client.patch(f'/api/conversations/{ancien.pk}/', {'epinglee': True}, format='json')
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()['epinglee'])
+        liste = self.client.get('/api/conversations/').json()
+        self.assertEqual(liste[0]['id'], ancien.pk)
+        self.assertTrue(liste[0]['epinglee'])
+
+    def test_supprimer_efface_le_fil_et_ses_messages(self):
+        conv = Conversation.objects.create(user=self.user, titre='À supprimer')
+        ConversationMessage.objects.create(user=self.user, conversation=conv, role='user', content='privé')
+        r = self.client.delete(f'/api/conversations/{conv.pk}/')
+        self.assertEqual(r.status_code, 204)
+        self.assertFalse(Conversation.objects.filter(pk=conv.pk).exists())
+        self.assertFalse(ConversationMessage.objects.filter(conversation_id=conv.pk).exists())
+        self.assertEqual(self.client.get(f'/api/conversations/{conv.pk}/messages/').status_code, 404)
