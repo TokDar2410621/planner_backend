@@ -41,6 +41,8 @@ LECTURES: dict[str, str] = {
     "update_goal": "list_goals",
     "import_document": "list_blocks",
     "resolve_document_entry": "process_uploaded_document",
+    "manage_reminder": "list_reminders",
+    "manage_recurrence": "list_recurrences",
 }
 
 # Ou trouver la date obtenue, par outil. Chemins verifies dans le code v1.
@@ -119,6 +121,9 @@ def _objets(user, action, modele, serialiser, entrees, champs, identifiant=None)
         if modele.__name__ == "Task" and parametres.get("deadline"):
             from services.agent.tools.commun import _deadline_iso, _parse_deadline
             parametres["deadline"] = _deadline_iso(_parse_deadline(parametres["deadline"]))
+        if modele.__name__ == 'Task' and parametres.get('alert_at'):
+            from services.agent.tools.commun import _deadline_iso, _parse_deadline
+            parametres['alert_at'] = _deadline_iso(_parse_deadline(parametres['alert_at']))
         # Une création dédoublonnée constate l'objet existant ; les autres
         # paramètres n'ont pas été appliqués et ne doivent pas l'être au reçu.
         if action.outil == "create_task" and action.donnees.get("deja_presente"):
@@ -219,13 +224,30 @@ def _plan(user, action):
 
 
 def _postconditions(user, action):
-    from core.models import Goal, RecurringBlock, ScheduledBlock, Task, UploadedDocument, UserProfile
+    from core.models import Goal, RecurringBlock, ScheduledBlock, Task, UploadedDocument, UserProfile, Reminder, RecurrenceSeries
     from services.agent.tools.commun import _block_to_dict
     from services.agent.tools.commun import _goal_to_dict
     from services.agent.tools.commun import _task_to_dict
 
     outil, d, p = action.outil, action.donnees, action.parametres
     sans_mutation = False
+    if outil == 'manage_reminder':
+        item = d.get('reminder') or {}
+        reminder = Reminder.objects.filter(user=user, pk=item.get('id')).first()
+        attendu = {k: v for k, v in item.items() if k in ('id', 'title', 'due_at', 'status')}
+        observe = ({'id': reminder.pk, 'title': reminder.title,
+                    'due_at': reminder.due_at.isoformat(), 'status': reminder.status}
+                   if reminder else None)
+        return [_preuve('Reminder', {'id': item.get('id'), 'user_id': user.pk},
+                        attendu, observe)], False
+    if outil == 'manage_recurrence':
+        item = d.get('series') or {}
+        series = RecurrenceSeries.objects.filter(user=user, pk=item.get('id')).first()
+        attendu = {k: v for k, v in item.items() if k in ('id', 'title', 'kind', 'active')}
+        observe = ({'id': series.pk, 'title': series.title, 'kind': series.kind,
+                    'active': series.active} if series else None)
+        return [_preuve('RecurrenceSeries', {'id': item.get('id'), 'user_id': user.pk},
+                        attendu, observe)], False
     if outil == 'resolve_document_entry':
         from services.agent_v2.importation import resume_precision
         observed = resume_precision(user, p.get('document_id'), p.get('source'), p.get('index'))
@@ -240,7 +262,7 @@ def _postconditions(user, action):
         return preuves, False
     if outil in ("create_task", "update_task", "complete_task"):
         preuves = _objets(user, action, Task, _task_to_dict, [d.get("task", {})],
-                         {"title", "description", "task_type", "priority", "deadline",
+                         {"title", "description", "task_type", "priority", "deadline", "alert_at",
                           "estimated_duration_minutes", "completed", "place"}, "task_id")
         if outil == "complete_task" and preuves:
             preuve = preuves[0]

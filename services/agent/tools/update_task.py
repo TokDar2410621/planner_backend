@@ -34,8 +34,9 @@ class Parametres(commun.ChampsLieu):
     )
     deadline: str | None = Field(
         default=None,
-        description="Nouvelle deadline (YYYY-MM-DD)",
+        description="Nouvelle échéance YYYY-MM-DD ou YYYY-MM-DDTHH:MM",
     )
+    alert_at: str | None = Field(default=None, description='Nouvelle alerte YYYY-MM-DDTHH:MM')
     description: str | None = Field(
         default=None,
     )
@@ -64,6 +65,17 @@ def execute(user: User, **kwargs) -> ToolResult:
             setattr(task, field, kwargs[field])
     if kwargs.get("deadline") is not None:
         task.deadline = commun._parse_deadline(kwargs["deadline"])
+        if task.deadline is None:
+            return ToolResult(False, message='Échéance invalide.', public='Précise une date valide.')
+        if 'alert_at' not in kwargs:
+            task.alert_at = task.deadline if ('T' in kwargs['deadline'] or ' ' in kwargs['deadline']) else None
+    if kwargs.get('alert_at') is not None:
+        task.alert_at = commun._parse_deadline(kwargs['alert_at'])
+        if task.alert_at is None:
+            return ToolResult(False, message='Alerte invalide.', public='Précise une heure valide.')
+    if task.alert_at and (not task.deadline or task.alert_at > task.deadline):
+        return ToolResult(False, message='Alerte après échéance.',
+                          public="L’alerte doit arriver au plus tard à l’heure de la tâche.")
 
     if kwargs.get("place_name") or kwargs.get("place_address"):
         place = commun._resolve_place(

@@ -96,9 +96,11 @@ MESSAGE_DEJA_TRANCHE = (
 )
 DEJA_FAIT = "Deja fait par le code ce tour."
 
-DESTRUCTIFS = {"delete_block", "clear_all_blocks", "delete_task", "cancel_scheduled_block"}
+DESTRUCTIFS = {"delete_block", "clear_all_blocks", "delete_task", "cancel_scheduled_block",
+              "manage_reminder", "manage_recurrence"}
 CREATEURS = {"create_block", "schedule_task_at", "create_task",
-             "replace_block_occurrence", "resolve_document_entry"}
+             "replace_block_occurrence", "resolve_document_entry",
+             "manage_reminder", "manage_recurrence"}
 # Au-dela de cinq creations dans un tour, on demande avant de continuer.
 SEUIL_CREATIONS = 5
 
@@ -301,6 +303,12 @@ def _cle_destructive(nom: str, params: dict):
     if nom == "delete_task":
         tid = _entier(params.get("task_id"))
         return None if tid is None else dem.cle_demande("delete_task", {"task_id": tid})
+    if nom == "manage_reminder" and params.get("action") == "cancel":
+        rid = _entier(params.get("reminder_id"))
+        return None if rid is None else dem.cle_demande("manage_reminder:cancel", {"reminder_id": rid})
+    if nom == "manage_recurrence" and params.get("action") == "stop":
+        sid = _entier(params.get("series_id"))
+        return None if sid is None else dem.cle_demande("manage_recurrence:stop", {"series_id": sid})
     if nom == "cancel_scheduled_block":
         jour = _date_iso(params.get("date"))
         if jour is None:
@@ -337,7 +345,8 @@ def _bloc_de_demande(demande: dict):
 
 # Les champs d'etat compares. « date » n'en est pas: elle vient du message.
 _CHAMPS_CIBLE = ("titre", "jour", "debut", "fin", "block_type", "complete", "echeance",
-                 "ids", "nombre", "evenements", "debut_serie", "fin_serie")
+                 "ids", "nombre", "evenements", "debut_serie", "fin_serie",
+                 "statut", "frequence", "intervalle", "jours_semaine", "jour_du_mois")
 
 MESSAGE_CIBLE_CHANGEE = (
     "La cible a change depuis la question: le code n'a rien execute et laisse la "
@@ -350,6 +359,19 @@ def _cible_tache(task) -> dict:
         "complete": bool(task.completed),
         "echeance": task.deadline.isoformat() if task.deadline else None,
     }
+
+
+def _cible_rappel(reminder) -> dict:
+    return {"titre": reminder.title, "echeance": reminder.due_at.isoformat(),
+            "statut": reminder.status}
+
+
+def _cible_recurrence(series) -> dict:
+    return {"titre": series.title, "debut_serie": series.start_date.isoformat(),
+            "fin_serie": series.end_date.isoformat() if series.end_date else None,
+            "frequence": series.frequency, "intervalle": series.interval,
+            "jours_semaine": series.weekdays, "jour_du_mois": series.day_of_month,
+            "statut": "active" if series.active else "stopped"}
 
 
 def _evenements(user, jour, titre: str) -> list:
@@ -388,7 +410,7 @@ def _cible_planning(user) -> dict:
 def _cible_actuelle(user, demande: dict):
     """L'etat COURANT de la cible d'une demande destructive, dans la forme de
     demande.cible, ou None quand elle n'existe plus (ou plus active)."""
-    from core.models import RecurringBlock, Task
+    from core.models import RecurringBlock, Reminder, RecurrenceSeries, Task
 
     outil = demande.get("outil")
     parametres = demande.get("parametres") or {}
@@ -402,6 +424,14 @@ def _cible_actuelle(user, demande: dict):
         tid = _entier(parametres.get("task_id"))
         task = Task.objects.filter(id=tid, user=user).first() if tid is not None else None
         return _cible_tache(task) if task is not None else None
+    if outil == "manage_reminder" and parametres.get("action") == "cancel":
+        rid = _entier(parametres.get("reminder_id"))
+        reminder = Reminder.objects.filter(pk=rid, user=user).first() if rid is not None else None
+        return _cible_rappel(reminder) if reminder is not None else None
+    if outil == "manage_recurrence" and parametres.get("action") == "stop":
+        sid = _entier(parametres.get("series_id"))
+        series = RecurrenceSeries.objects.filter(pk=sid, user=user).first() if sid is not None else None
+        return _cible_recurrence(series) if series is not None else None
     if outil == "cancel_scheduled_block":
         jour = _date_iso(parametres.get("date"))
         if jour is None:
@@ -439,6 +469,10 @@ def _ligne_cible_changee(demande: dict) -> str:
         sujet, verbe = "Ton planning", "supprimé"
     elif outil == "delete_task":
         sujet, verbe = (f"La tâche {titre}" if titre else "Cette tâche"), "supprimé"
+    elif outil == "manage_reminder":
+        sujet, verbe = (f"Le rappel {titre}" if titre else "Ce rappel"), "annulé"
+    elif outil == "manage_recurrence":
+        sujet, verbe = (f"La répétition {titre}" if titre else "Cette répétition"), "arrêté"
     elif outil == "cancel_scheduled_block":
         sujet, verbe = (titre or "Cet événement"), "annulé"
     elif outil == "update_block":
@@ -615,7 +649,7 @@ def _garde_changement(ctx: _Contexte, kwargs: dict):
 def _analyser(ctx: _Contexte, nom: str, kwargs: dict):
     """La garde destructive d'un appel, ou None. Une garde inactive sert
     seulement a reconnaitre ce que le code a deja fait ce tour."""
-    from core.models import RecurringBlock, Task
+    from core.models import RecurringBlock, Reminder, RecurrenceSeries, Task
 
     user, texte = ctx.user, ctx.texte
     if nom == "delete_block":
@@ -681,6 +715,32 @@ def _analyser(ctx: _Contexte, nom: str, kwargs: dict):
         cible = _cible_tache(task)
         return _Garde("destructif", cle, {cle}, nom, {"task_id": tid}, cible,
                       _options_confirmer(nom, {"task_id": tid, "confirm": True}, cible))
+
+    if nom == "manage_reminder" and kwargs.get("action") == "cancel":
+        rid = _entier(kwargs.get("reminder_id"))
+        if rid is None:
+            return None
+        params = {"action": "cancel", "reminder_id": rid}
+        cle = _cle_destructive(nom, params)
+        reminder = Reminder.objects.filter(pk=rid, user=user).first()
+        if reminder is None or reminder.status == "cancelled":
+            return _Garde("destructif", cle, {cle}, nom, actif=False)
+        cible = _cible_rappel(reminder)
+        return _Garde("destructif", cle, {cle}, nom, params, cible,
+                      _options_confirmer(nom, params, cible))
+
+    if nom == "manage_recurrence" and kwargs.get("action") == "stop":
+        sid = _entier(kwargs.get("series_id"))
+        if sid is None:
+            return None
+        params = {"action": "stop", "series_id": sid}
+        cle = _cle_destructive(nom, params)
+        series = RecurrenceSeries.objects.filter(pk=sid, user=user).first()
+        if series is None or not series.active:
+            return _Garde("destructif", cle, {cle}, nom, actif=False)
+        cible = _cible_recurrence(series)
+        return _Garde("destructif", cle, {cle}, nom, params, cible,
+                      _options_confirmer(nom, params, cible))
 
     if nom == "cancel_scheduled_block":
         jour = _date_iso(kwargs.get("date"))
@@ -775,7 +835,9 @@ def _fin_de_recurrence_repondue(user, block, fin, aujourdhui, tache: str = "") -
 def _garde_critique(nom: str, kwargs: dict) -> bool:
     """Si la garde elle-meme tombe en panne, ces appels sont refuses."""
     return (
-        nom in DESTRUCTIFS
+        (nom in DESTRUCTIFS and nom not in {"manage_reminder", "manage_recurrence"})
+        or (nom == "manage_reminder" and kwargs.get("action") == "cancel")
+        or (nom == "manage_recurrence" and kwargs.get("action") == "stop")
         or nom == "skip_block_occurrence"
         or (nom == "update_block" and bool(str(kwargs.get("end_date") or "").strip()))
         or (nom == "update_block" and bool(str(kwargs.get("start_date") or "").strip()))
@@ -1864,6 +1926,12 @@ def _crees_ce_tour(registre: Registre) -> tuple[int, list[str]]:
         elif a.outil == "create_task" and not donnees.get("deja_presente"):
             tache = donnees.get("task") or {}
             _noter(("tache", tache.get("id") or a.id), tache.get("title"))
+        elif a.outil == 'manage_reminder' and a.parametres.get('action') == 'create':
+            reminder = donnees.get('reminder') or {}
+            _noter(('rappel', reminder.get('id') or a.id), reminder.get('title'))
+        elif a.outil == 'manage_recurrence' and a.parametres.get('action') == 'create':
+            series = donnees.get('series') or {}
+            _noter(('serie', series.get('id') or a.id), series.get('title'))
         elif a.outil == "resolve_document_entry" and not donnees.get("already_resolved"):
             for cible in (donnees.get("resolution") or {}).get("targets", []):
                 genre = "bloc" if cible.get("model") == "RecurringBlock" else "evenement"
@@ -1940,7 +2008,8 @@ def _question_deja_posee(ctx: _Contexte, nom: str, kwargs: dict):
 def _garde_creations(ctx: _Contexte, nom: str, kwargs: dict):
     from services.agent.tools.commun import normaliser_jours
 
-    if nom not in CREATEURS:
+    if nom not in CREATEURS or (nom in ('manage_reminder', 'manage_recurrence')
+                               and kwargs.get('action') != 'create'):
         return None
     deja, titres = _crees_ce_tour(ctx.registre)
     prospectif = len(normaliser_jours(kwargs.get("days"))) if nom == "create_block" else 1
@@ -2605,6 +2674,7 @@ OUTILS_EXPOSES = frozenset({
     "delete_task",
     # questions posees par le modele, relayees par le code
     "present_form", "present_choices", "poser_question",
+    "read_planning_skill",
 })
 NOM_CHERCHEUR = "chercher_outils"
 NOM_APPEL = "appeler_outil"

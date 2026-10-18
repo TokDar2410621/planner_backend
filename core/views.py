@@ -45,6 +45,8 @@ from .models import (
     RecurringBlockCompletion,
     RecurringBlockException,
     Task,
+    Reminder,
+    RecurrenceSeries,
     ScheduledBlock,
     ConversationMessage,
     TaskHistory,
@@ -62,6 +64,8 @@ from .serializers import (
     RecurringBlockCompletionSerializer,
     RecurringBlockExceptionSerializer,
     TaskSerializer,
+    ReminderSerializer,
+    RecurrenceSeriesSerializer,
     TaskCompleteSerializer,
     ScheduledBlockSerializer,
     ConversationMessageSerializer,
@@ -1954,6 +1958,13 @@ class RecurringBlockViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
 
+    def perform_update(self, serializer):
+        # Reporter un rappel manque ou deja envoye le remet en attente.
+        if 'due_at' in serializer.validated_data:
+            serializer.save(status='pending', sent_at=None, delivered_count=0)
+        else:
+            serializer.save()
+
     @action(detail=False, methods=['get'])
     def pending(self, request):
         """List blocks awaiting confirmation (low-confidence extractions)."""
@@ -2185,6 +2196,68 @@ class GoalViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
+
+
+class ReminderViewSet(viewsets.ModelViewSet):
+    """Rappels autonomes de l'utilisateur, dont les occurrences recurrentes."""
+
+    serializer_class = ReminderSerializer
+
+    def get_queryset(self):
+        queryset = Reminder.objects.filter(user=self.request.user)
+        wanted = self.request.query_params.get('status')
+        return queryset.filter(status=wanted) if wanted else queryset.exclude(status='cancelled')
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
+
+    def perform_update(self, serializer):
+        reminder = serializer.save(status='pending', sent_at=None, delivered_count=0)
+        return reminder
+
+    def perform_destroy(self, instance):
+        instance.status = 'cancelled'
+        instance.save(update_fields=['status'])
+
+
+class RecurrenceSeriesViewSet(viewsets.ModelViewSet):
+    """Gestion explicite d'une serie, sans effacer ses occurrences passees."""
+
+    serializer_class = RecurrenceSeriesSerializer
+
+    def get_queryset(self):
+        return RecurrenceSeries.objects.filter(user=self.request.user, active=True)
+
+    def perform_create(self, serializer):
+        from services.reminder_series import materialize
+        series = serializer.save(user=self.request.user)
+        materialize(series, timezone.localdate() + timedelta(days=35))
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        from services.reminder_series import materialize
+        series = serializer.instance
+        today = timezone.localdate()
+        Reminder.objects.filter(
+            recurrence=series, occurrence_date__gte=today, status='pending',
+        ).delete()
+        Task.objects.filter(
+            recurrence=series, occurrence_date__gte=today, completed=False,
+        ).delete()
+        series = serializer.save(generated_through=today - timedelta(days=1))
+        materialize(series, today + timedelta(days=35))
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        today = timezone.localdate()
+        instance.active = False
+        instance.save(update_fields=['active'])
+        Reminder.objects.filter(
+            recurrence=instance, occurrence_date__gte=today, status='pending',
+        ).update(status='cancelled')
+        Task.objects.filter(
+            recurrence=instance, occurrence_date__gte=today, completed=False,
+        ).delete()
 
 
 class TaskViewSet(viewsets.ModelViewSet):
@@ -3123,6 +3196,10 @@ class AppareilPushEnregistrerView(APIView):
         token = request.data.get("token")
         if not isinstance(token, str) or not token.strip():
             return Response({"error": "token requis."}, status=status.HTTP_400_BAD_REQUEST)
+        authorized = request.data.get('notifications_autorisees', False)
+        if not isinstance(authorized, bool):
+            return Response({'error': 'notifications_autorisees doit être un booléen.'},
+                            status=status.HTTP_400_BAD_REQUEST)
         _, created = AppareilPush.objects.update_or_create(
             token=token.strip()[:200],
             defaults={
@@ -3130,6 +3207,7 @@ class AppareilPushEnregistrerView(APIView):
                 "plateforme": str(request.data.get("plateforme") or "ios")[:10],
                 "app_version": str(request.data.get("app_version") or "")[:20],
                 "user_agent": request.META.get("HTTP_USER_AGENT", "")[:300],
+                'notifications_autorisees': authorized,
             },
         )
         # La seule trace qu'un telephone est inscrit (le guide la cherche);
@@ -3203,7 +3281,7 @@ class PushSendView(APIView):
     """Send an arbitrary push notification to the current user's devices.
 
     Porte d'entrée unique pour l'agent IA et les clients MCP: un POST
-    {title?, body} part vers TOUS les abonnements Web Push de l'utilisateur.
+    {title?, body} part vers tous les appareils autorises de l'utilisateur.
     """
 
     # Bornes partagées avec l'outil agent send_notification: un seul contrat
@@ -3212,7 +3290,7 @@ class PushSendView(APIView):
     MAX_BODY = 500
 
     def post(self, request):
-        from services.push import push_configured, send_to_user
+        from services.notification_delivery import send_visible
 
         # Titre par défaut: la notification reste identifiable même si
         # l'appelant n'en fournit pas.
@@ -3234,12 +3312,7 @@ class PushSendView(APIView):
                 {"error": f"body trop long (max {self.MAX_BODY} caractères)."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if not push_configured():
-            return Response(
-                {"error": "Web push non configuré (VAPID)."},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-        sent = send_to_user(request.user, title, body, url="/")
+        sent = send_visible(request.user, title, body, url="/")
         return Response({"sent": sent})
 
 

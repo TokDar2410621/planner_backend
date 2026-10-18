@@ -120,6 +120,54 @@ def _poster(appareil, raison: str):
         return client.post(f"{hote}/3/device/{appareil.token}", headers=en_tetes, json=corps)
 
 
+def envoyer_alerte(appareil, title: str, body: str, url: str) -> bool:
+    """Envoie une alerte visible, distincte du reveil silencieux du planning."""
+    if not apns_configured() or not appareil.notifications_autorisees:
+        return False
+    for tentative in (1, 2):
+        hote = HOTE_SANDBOX if appareil.environnement == 'sandbox' else HOTE_PRODUCTION
+        payload = {'aps': {'alert': {'title': title, 'body': body}, 'sound': 'default'},
+                   'url': url}
+        try:
+            headers = {
+                'authorization': f'bearer {jeton_apns()}',
+                'apns-topic': settings.APNS_BUNDLE_ID,
+                'apns-push-type': 'alert',
+                'apns-priority': '10',
+                # Une alerte arrive a l'heure ou elle ne part pas: jamais de
+                # livraison tardive lors de la reconnexion du telephone.
+                'apns-expiration': '0',
+            }
+            with httpx.Client(http2=True, timeout=TIMEOUT_SECONDES) as client:
+                response = client.post(f'{hote}/3/device/{appareil.token}',
+                                       headers=headers, json=payload)
+        except Exception as error:  # noqa: BLE001 - panne APNs, jamais une panne du worker
+            logger.warning('Alerte APNs indisponible: appareil %s cause %s',
+                           appareil.pk, type(error).__name__)
+            return False
+        if response.status_code == 200:
+            _noter_erreur(appareil, '')
+            return True
+        reason = _motif(response)
+        if response.status_code == 400 and reason == 'BadDeviceToken' and tentative == 1:
+            if appareil.environnement == 'production':
+                from core.models import AppareilPush
+                AppareilPush.objects.filter(pk=appareil.pk).update(environnement='sandbox')
+                appareil.environnement = 'sandbox'
+                continue
+        if response.status_code == 410 or reason == 'BadDeviceToken':
+            appareil.delete()
+        elif response.status_code == 403:
+            invalider_jeton()
+            _noter_erreur(appareil, '403 APNs')
+        else:
+            _noter_erreur(appareil, f'{response.status_code} {reason}')
+        logger.warning('Alerte APNs refusee: appareil %s statut %s',
+                       appareil.pk, response.status_code)
+        return False
+    return False
+
+
 def envoyer_reveil(appareil, raison: str = "planning") -> bool:
     """Un push background a un appareil. True si Apple l'a accepte. Ne leve jamais.
 
