@@ -753,6 +753,8 @@ class PlannerAgentV2:
             user=user, role="user", content=message,
             conversation=self._conversation,
             metadata={"tap": self._tap} if self._tap else {})
+        documents = getattr(self, '_chat_attachments', None) or ([attachment] if attachment else [])
+        courant.attachments.set(documents)
         self._exclu = courant.pk
         # Titre auto : le premier message donne son nom à la conversation
         # (style OpenCode : génération de titre, ici déterministe).
@@ -781,11 +783,23 @@ class PlannerAgentV2:
         # compte comme « traite ce tour » (equivalence avec v1 detaillee dans
         # la docstring de boutons_forces).
         deja_traite = attachment is not None and attachment.processed
-        for evenement, complement in self._contexte_document(user, attachment):
-            if evenement:
-                yield evenement
-            if complement:
-                message_enrichi = f"{message_enrichi}\n\n{complement}"
+        attente_fin = time.monotonic() + getattr(settings, "ATTACHMENT_WAIT_SECONDS", 45)
+        for index, document in enumerate(documents):
+            attente_restante = max(0, attente_fin - time.monotonic())
+            for evenement, complement in self._contexte_document(
+                user, document, wait_seconds=attente_restante,
+                include_recent=index == len(documents) - 1,
+            ):
+                if evenement:
+                    yield evenement
+                if complement:
+                    message_enrichi = f"{message_enrichi}\n\n{complement}"
+        if not documents:
+            for evenement, complement in self._contexte_document(user, None):
+                if evenement:
+                    yield evenement
+                if complement:
+                    message_enrichi = f"{message_enrichi}\n\n{complement}"
         attachment_traite_ce_tour = (
             attachment is not None and not deja_traite and attachment.processed)
 
@@ -794,7 +808,11 @@ class PlannerAgentV2:
         # propose de renvoyer l'horaire qui vient d'etre importe (deux tours
         # reels le 2026-09-01). Detail dans importation.py.
         try:
-            inscrire_import(registre, user, attachment)
+            if documents:
+                for document in documents:
+                    inscrire_import(registre, user, document)
+            else:
+                inscrire_import(registre, user, None)
         except Exception:  # noqa: BLE001 - un recap absent vaut mieux qu'un tour tombe
             logger.error("Import du document non inscrit au registre", exc_info=True)
 
@@ -1781,7 +1799,7 @@ class PlannerAgentV2:
     # ------------------------------------------------------------------ util
 
     @staticmethod
-    def _contexte_document(user: User, attachment):
+    def _contexte_document(user: User, attachment, *, wait_seconds=None, include_recent=True):
         """Rend des couples (evenement a emettre, complement de message).
 
         Les deux formateurs viennent de v1 et sont repris tels quels: ils
@@ -1799,7 +1817,8 @@ class PlannerAgentV2:
                 # gevent avec monkey.patch_all(), ce sommeil ne suspend que
                 # cette conversation. Une reponse vraie en un tour vaut mieux
                 # qu'une promesse cassee en trois secondes.
-                attente = getattr(settings, "ATTACHMENT_WAIT_SECONDS", 45)
+                attente = (getattr(settings, "ATTACHMENT_WAIT_SECONDS", 45)
+                           if wait_seconds is None else wait_seconds)
                 if attente:
                     yield {"type": "status", "text": "J'analyse ton document..."}, None
                     for tic in range(int(attente * 2)):
@@ -1820,9 +1839,10 @@ class PlannerAgentV2:
         # Vaut AVEC ou SANS piece jointe: un « c'est bon ? » au tour suivant
         # doit voir l'import, sinon l'agent invente une limitation et dit a
         # l'utilisateur l'inverse de la verite.
-        recent = v1._recent_import_context(user)
-        if recent:
-            yield None, recent
+        if include_recent:
+            recent = v1._recent_import_context(user)
+            if recent:
+                yield None, recent
 
     def _historique(self, user: User) -> list:
         conversation = getattr(self, '_conversation', None)

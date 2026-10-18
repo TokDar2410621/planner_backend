@@ -55,6 +55,34 @@ class PieceJointeTests(TestCase):
         self.assertIn('Physique', message)
         self.assertIn('horaire.pdf', message)
 
+    def test_deux_documents_rejoignent_le_meme_message_et_le_modele(self):
+        from core.models import ConversationMessage
+        premier = UploadedDocument.objects.create(
+            user=self.user, file_name='cours.pdf', processed=True,
+            extracted_data={'courses': [{'name': 'Physique'}]})
+        second = UploadedDocument.objects.create(
+            user=self.user, file_name='travail.docx', processed=True,
+            extracted_data={'shifts': [{'name': 'Samedi'}]})
+        vus = {}
+
+        def boucle(agent, user, message, registre):
+            vus['message'] = message
+            if False:
+                yield None
+            return ReponseDire(ouverture='Ok.'), None, ''
+
+        agent = self.Agent()
+        agent._chat_attachments = [premier, second]
+        with patch.object(self.Agent, '_boucle_en_fond', boucle), patch(
+            'services.agent_v2.agent._charger_appliquer_choix',
+            return_value=lambda *args, **kwargs: [],
+        ):
+            agent.process_message(self.user, 'Analyse tout', premier)
+        self.assertIn('Physique', vus['message'])
+        self.assertIn('Samedi', vus['message'])
+        message = ConversationMessage.objects.filter(user=self.user, role='user').latest('pk')
+        self.assertEqual(set(message.attachments.values_list('pk', flat=True)), {premier.pk, second.pk})
+
     def test_un_document_encore_en_analyse_est_annonce_comme_tel(self):
         """Ne jamais laisser croire que le contenu est lu quand il ne l'est pas."""
         doc = UploadedDocument.objects.create(

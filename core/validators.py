@@ -6,6 +6,7 @@ bytes so an attacker cannot smuggle an executable/SVG/HTML payload past a
 simple extension check (stored-XSS / DoS).
 """
 import os
+from zipfile import BadZipFile, ZipFile
 
 from rest_framework.exceptions import ValidationError
 
@@ -16,7 +17,11 @@ MAX_UPLOAD_SIZE = 8 * 1024 * 1024
 # heic/heif: photos iPhone. Acceptees depuis le fix extraction-horaires:
 # avant, une photo iPhone etait rejetee en 400 alors que c'est le cas
 # d'usage principal de l'envoi d'horaires en photo.
-ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg', 'webp', 'heic', 'heif'}
+ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg', 'webp', 'heic', 'heif', 'doc', 'docx'}
+
+WORD_OLE_HEADER = b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'
+MAX_WORD_ARCHIVE_BYTES = 64 * 1024 * 1024
+MAX_WORD_ARCHIVE_ENTRIES = 512
 
 # Marques (brands) ISO BMFF reconnues comme HEIC/HEIF: les 4 octets a
 # l'offset 8 quand les octets 4-8 valent 'ftyp'.
@@ -98,7 +103,7 @@ def is_heic_header(header: bytes) -> bool:
 
 
 def sniff_kind(header: bytes) -> str:
-    """Return 'pdf' or 'image' from a file's leading magic bytes.
+    """Return the extraction path from a file's leading magic bytes.
 
     Documents are stored on Cloudinary with a neutral extension (a real .pdf
     public_id is blocked from delivery), so the processor can no longer trust
@@ -109,6 +114,10 @@ def sniff_kind(header: bytes) -> str:
     """
     if header[:5] == b'%PDF-':
         return 'pdf'
+    if header[:4] == b'PK\x03\x04':
+        return 'docx'
+    if header[:8] == WORD_OLE_HEADER:
+        return 'doc'
     if (header[:8] == b'\x89PNG\r\n\x1a\n'
             or header[:3] == b'\xff\xd8\xff'
             or (header[:4] == b'RIFF' and header[8:12] == b'WEBP')
@@ -156,6 +165,29 @@ def validate_upload_file(file):
 
     # --- Magic bytes ---
     header = _read_header(file)
+    if ext == 'doc':
+        if not header.startswith(WORD_OLE_HEADER):
+            raise ValidationError("Le contenu du fichier ne correspond pas à son extension.")
+        return 'doc'
+    if ext == 'docx':
+        if not header.startswith(b'PK\x03\x04'):
+            raise ValidationError("Le contenu du fichier ne correspond pas à son extension.")
+        position = file.tell()
+        try:
+            file.seek(0)
+            with ZipFile(file) as archive:
+                infos = archive.infolist()
+                noms = {info.filename for info in infos}
+                if ('[Content_Types].xml' not in noms or 'word/document.xml' not in noms
+                        or len(infos) > MAX_WORD_ARCHIVE_ENTRIES
+                        or sum(info.file_size for info in infos) > MAX_WORD_ARCHIVE_BYTES
+                        or any(info.flag_bits & 1 for info in infos)):
+                    raise ValidationError("Document Word invalide ou trop volumineux.")
+        except (BadZipFile, OSError, ValueError):
+            raise ValidationError("Document Word invalide.") from None
+        finally:
+            file.seek(position)
+        return 'docx'
     magic_key = EXTENSION_TO_MAGIC[ext]
     if not _matches_signature(header, MAGIC_SIGNATURES[magic_key]):
         raise ValidationError(

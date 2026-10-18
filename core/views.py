@@ -4,6 +4,8 @@ API Views for Planner AI backend.
 import concurrent.futures
 import json
 import logging
+import mimetypes
+import os
 import queue
 import threading
 import time
@@ -15,7 +17,7 @@ from typing import AsyncGenerator, Iterator
 from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.contrib.auth import authenticate
-from django.http import StreamingHttpResponse
+from django.http import FileResponse, StreamingHttpResponse
 from django.contrib.auth.models import User
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db import close_old_connections, transaction
@@ -1137,6 +1139,81 @@ def _create_chat_attachment(request, attachment_file):
     return doc, None
 
 
+def _validate_chat_files(files):
+    """Validate a whole batch before a turn can create any document."""
+    from core.validators import validate_upload_file
+    from rest_framework.exceptions import ValidationError as DRFValidationError
+    if len(files) > 5:
+        return Response({'error': 'Maximum 5 fichiers par message.'}, status=400)
+    if sum(file.size for file in files) > 20 * 1024 * 1024:
+        return Response({'error': 'Le lot dépasse 20 Mo.'}, status=400)
+    for index, file in enumerate(files):
+        try:
+            validate_upload_file(file)
+        except DRFValidationError as exc:
+            return Response({'error': 'Fichier invalide.', 'file_index': index,
+                             'file_name': file.name, 'detail': exc.detail}, status=400)
+    return None
+
+
+def _create_chat_files(request, files, fermeture):
+    docs = []
+    try:
+        for file in files:
+            doc, error = _create_chat_attachment(request, file)
+            if error is not None:
+                for created in docs:
+                    created.delete()
+                return [], error
+            docs.append(doc)
+            fermeture.suivre(getattr(doc, '_processing_future', None))
+    except Exception:
+        for doc in docs:
+            doc.delete()
+        raise
+    return docs, None
+
+
+def _chat_doc_data(doc, *, refresh=False):
+    if refresh:
+        doc.refresh_from_db()
+    return {
+        'id': doc.pk,
+        'file_name': doc.file_name,
+        'file': f'/chat/documents/{doc.pk}/file/',
+        'document_type': doc.document_type,
+        'extracted_data': doc.extracted_data,
+        'processed': doc.processed,
+        'processing_error': doc.processing_error,
+        'status': 'failed' if doc.processing_error else 'ready' if doc.processed else 'processing',
+        'text_preview': doc.text_preview,
+        'uploaded_at': doc.uploaded_at.isoformat(),
+    }
+
+
+class ChatDocumentView(APIView):
+    """Owner-scoped status and authenticated original-file access."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk, original=False):
+        try:
+            doc = UploadedDocument.objects.get(pk=pk, user=request.user)
+        except UploadedDocument.DoesNotExist:
+            return Response({'error': 'Document introuvable.'}, status=404)
+        if not original:
+            return Response(_chat_doc_data(doc))
+        kind, _ = mimetypes.guess_type(doc.file_name)
+        try:
+            source = doc.file.open('rb')
+        except Exception:
+            logger.warning('Chat document %s unavailable', pk)
+            return Response({'error': 'Fichier momentanément indisponible.'}, status=503)
+        inline = (kind or '').startswith('image/') or kind == 'application/pdf'
+        return FileResponse(source, as_attachment=not inline,
+                            filename=os.path.basename(doc.file_name),
+                            content_type=kind or 'application/octet-stream')
+
+
 # ============== Flux de chat detache ==============
 #
 # UN TOUR SE TERMINE COTE SERVEUR, que le client reste ou non.
@@ -1312,19 +1389,22 @@ class ChatView(APIView):
             return denied
         logger.debug("Chat POST received from user %s", request.user.id)
         message = request.data.get('message', '')
-        attachment_file = request.FILES.get('attachment')
+        attachment_files = request.FILES.getlist('attachment')
         logger.debug(
             "Chat message len=%s attachment=%s",
             len(message) if message else 0,
-            bool(attachment_file),
+            bool(attachment_files),
         )
 
-        if not message and not attachment_file:
+        if not message and not attachment_files:
             return Response(
                 {'error': 'Message ou fichier requis.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        invalid = _validate_chat_files(attachment_files)
+        if invalid is not None:
+            return invalid
         turn, prior_response = chat_turns.admit(request)
         if prior_response is not None:
             return prior_response
@@ -1334,14 +1414,13 @@ class ChatView(APIView):
         fermeture = _FermetureBudget(trace)
         try:
             with _contexte_budget(trace):
-                return self._post_admis(request, turn, message, attachment_file, fermeture)
+                return self._post_admis(request, turn, message, attachment_files, fermeture)
         finally:
             fermeture.terminer_requete()
 
-    def _post_admis(self, request, turn, message, attachment_file, fermeture):
+    def _post_admis(self, request, turn, message, attachment_files, fermeture):
         try:
-            attachment, error_response = _create_chat_attachment(request, attachment_file)
-            fermeture.suivre(getattr(attachment, '_processing_future', None))
+            docs, error_response = _create_chat_files(request, attachment_files, fermeture)
         except Exception:
             return Response(chat_turns.fail(turn), status=500)
         if error_response is not None:
@@ -1358,6 +1437,7 @@ class ChatView(APIView):
         # Generate chat response via PlannerAgent
         try:
             agent = _agent_pour(request.user)
+            agent._chat_attachments = docs
             tap = _tap_de(request)
             extra = {'tap': tap} if tap and getattr(agent, 'accepte_tap', False) else {}
             # V2 accepte conversation_id ; V1 l'ignore (pas de conversations).
@@ -1371,8 +1451,9 @@ class ChatView(APIView):
                     pass
             result = agent.process_message(
                 request.user,
-                message or "J'ai uploadé un document.",
-                attachment,
+                message or ("J'ai envoyé plusieurs documents." if len(docs) > 1
+                            else "J'ai envoyé un document."),
+                docs[0] if docs else None,
                 generate_quick_replies=not defer_quick_replies,
                 **extra,
             )
@@ -1386,6 +1467,8 @@ class ChatView(APIView):
         response_data = {
             'response': result['response'],
         }
+        if docs:
+            response_data['attachments'] = [_chat_doc_data(doc, refresh=True) for doc in docs]
         if result.get('quick_replies'):
             response_data['quick_replies'] = result['quick_replies']
         if result.get('interactive_inputs'):
@@ -1489,13 +1572,16 @@ class ChatStreamView(APIView):
         if denied is not None:
             return denied
         message = request.data.get('message', '')
-        attachment_file = request.FILES.get('attachment')
-        if not message and not attachment_file:
+        attachment_files = request.FILES.getlist('attachment')
+        if not message and not attachment_files:
             return Response(
                 {'error': 'Message ou fichier requis.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        invalid = _validate_chat_files(attachment_files)
+        if invalid is not None:
+            return invalid
         turn, prior_response = chat_turns.admit(request)
         if prior_response is not None:
             return prior_response
@@ -1505,8 +1591,7 @@ class ChatStreamView(APIView):
         fermeture = _FermetureBudget(trace)
         try:
             with _contexte_budget(trace):
-                attachment, error_response = _create_chat_attachment(request, attachment_file)
-                fermeture.suivre(getattr(attachment, '_processing_future', None))
+                docs, error_response = _create_chat_files(request, attachment_files, fermeture)
             tap = _tap_de(request)
         except Exception:
             fermeture.terminer_requete()
@@ -1517,7 +1602,8 @@ class ChatStreamView(APIView):
             return error_response
 
         user = request.user
-        final_message = message or "J'ai uploadé un document."
+        final_message = message or ("J'ai envoyé plusieurs documents." if len(docs) > 1
+                                    else "J'ai envoyé un document.")
         # Lu ICI, dans le thread de la requete: le drain tourne detache et ne
         # doit plus toucher request.data.
 
@@ -1532,6 +1618,7 @@ class ChatStreamView(APIView):
             completed = False
             try:
                 agent = _agent_pour(user)
+                agent._chat_attachments = docs
                 extra = {'tap': tap} if tap and getattr(agent, 'accepte_tap', False) else {}
                 import inspect as _inspect2
                 conversation_id = request.data.get('conversation_id')
@@ -1544,11 +1631,13 @@ class ChatStreamView(APIView):
                 conversation_id = request.data.get('conversation_id')
                 if conversation_id:
                     extra['conversation_id'] = conversation_id
-                for event in agent.process_message_stream(user, final_message, attachment, **extra):
+                for event in agent.process_message_stream(user, final_message, docs[0] if docs else None, **extra):
                     if event.get('type') == 'done':
                         if not isinstance(event.get('response'), str):
                             raise ValueError('Invalid terminal event')
                         # Sauver AVANT d'émettre : une coupure ne perd pas le résultat.
+                        if docs:
+                            event['attachments'] = [_chat_doc_data(doc, refresh=True) for doc in docs]
                         event = chat_turns.finish(turn, event)
                         completed = True
                         yield event
@@ -1720,6 +1809,8 @@ class ConversationMessagesView(APIView):
                             status=status.HTTP_404_NOT_FOUND)
         msgs = (ConversationMessage.objects
                 .filter(conversation=conv)
+                .select_related('attachment')
+                .prefetch_related('attachments')
                 .order_by('created_at')[:200])
         return Response({
             'conversation': {'id': conv.pk, 'titre': conv.titre},
@@ -1729,6 +1820,9 @@ class ConversationMessagesView(APIView):
                 'content': m.content,
                 'created_at': m.created_at.isoformat(),
                 'metadata': m.metadata or {},
+                'attachments': [_chat_doc_data(doc) for doc in
+                                (sorted(m.attachments.all(), key=lambda doc: doc.pk)
+                                 or ([m.attachment] if m.attachment else []))],
             } for m in msgs],
         })
 

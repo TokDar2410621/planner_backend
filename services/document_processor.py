@@ -33,6 +33,9 @@ from services.pdf_extractor import (
     MAX_RENDER_PIXELS,
     max_zoom_for_page,
 )
+from services.word_extractor import (
+    WordExtractionError, WordServiceUnavailable, extract_word_text,
+)
 
 # S4: cap the streamed download size and the vision rasterization zoom.
 MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
@@ -58,6 +61,8 @@ PARSE_PROCESSING_ERROR = (
     "L'analyse du document a échoué à cause d'un problème technique "
     "temporaire de notre côté. Réessayez dans un instant."
 )
+WORD_PROCESSING_ERROR = "Impossible de lire ce document Word. Vérifie qu'il n'est pas protégé ou endommagé."
+WORD_SERVICE_ERROR = "La lecture des anciens fichiers .doc est momentanément indisponible. Réessaie plus tard."
 
 
 class DocumentResolutionError(ValueError):
@@ -835,10 +840,14 @@ Analyse ce texte et retourne le JSON structuré:"""
             return self._process_document(document)
         except Exception as exc:
             logger.error('Import %s échoué (%s)', document.pk, type(exc).__name__)
+            public_error = (str(exc) if isinstance(exc, RuntimeError) and str(exc) in (
+                GENERIC_PROCESSING_ERROR, PARSE_PROCESSING_ERROR,
+                WORD_PROCESSING_ERROR, WORD_SERVICE_ERROR,
+            ) else GENERIC_PROCESSING_ERROR)
             UploadedDocument.objects.filter(pk=document.pk, processed=False).update(
-                processing_error=GENERIC_PROCESSING_ERROR)
+                processing_error=public_error)
             document.refresh_from_db()
-            raise RuntimeError(GENERIC_PROCESSING_ERROR) from None
+            raise RuntimeError(public_error) from None
         finally:
             if owns_trace and trace is not None:
                 fermer_trace(trace)
@@ -875,6 +884,11 @@ Analyse ce texte et retourne le JSON structuré:"""
                 from core.validators import sniff_kind
                 with open(file_path, 'rb') as _fh:
                     file_kind = sniff_kind(_fh.read(16))
+                word_text = None
+                if file_kind in ('doc', 'docx'):
+                    word_text = extract_word_text(file_path, file_kind)
+                    document.text_preview = word_text
+                    document.save(update_fields=['text_preview'])
 
                 # Step 0: Compute file hash and check cache
                 content_hash = self._compute_file_hash(file_path)
@@ -900,6 +914,9 @@ Analyse ce texte et retourne le JSON structuré:"""
                 if file_kind == 'pdf':
                     # Try text extraction first (pdfplumber), vision fallback.
                     response_text, extraction_method = self._process_pdf_smart(file_path, document.document_type)
+                elif word_text is not None:
+                    response_text = self._structure_text_with_llm(word_text)
+                    extraction_method = f'text_{file_kind}'
                 else:
                     # Images always use vision.
                     response_text, extraction_method = self._process_image(file_path, document.document_type)
@@ -935,8 +952,9 @@ Analyse ce texte et retourne le JSON structuré:"""
             # A parse failure is our model's fault, not the file's: the user
             # gets a "retry in a moment" message instead of being told to
             # resend a "clearer" file.
-            public_error = (PARSE_PROCESSING_ERROR
-                            if isinstance(e, DocumentParseError)
+            public_error = (PARSE_PROCESSING_ERROR if isinstance(e, DocumentParseError)
+                            else WORD_SERVICE_ERROR if isinstance(e, WordServiceUnavailable)
+                            else WORD_PROCESSING_ERROR if isinstance(e, WordExtractionError)
                             else GENERIC_PROCESSING_ERROR)
             logger.error("Document %s : traitement échoué (%s)", document.id, type(e).__name__)
             # Une tentative concurrente réussie garde son résultat.
