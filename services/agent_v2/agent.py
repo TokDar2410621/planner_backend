@@ -514,56 +514,17 @@ class PlannerAgentV2:
         # et a place une revision en 2025 (banc du 2026-09-14). Les
         # instructions partent a chaque requete.
         from services.agent_v2.budget_tour import modele_borne, BudgetEpuise
-        from services.agent_v2.redaction import ReponseDire
-        from pydantic_ai import Tool
-
-        # La reponse structuree passe par un OUTIL, pas par output_type :
-        # output_type utilise tool_choice=required, incompatible avec le mode
-        # thinking (mesure 2026-08-24 sur DeepSeek, casse 2026-10-17 sur tous
-        # les providers). Avec un outil normal, le modele reflechit PUIS
-        # appelle rendre_reponse a la fin. La reflexion reste active.
-        reponse_capturee: list = []
-
-        async def rendre_reponse(
-            ouverture: str = "",
-            suite: str = "",
-            question: str = "",
-            options: list[str] | None = None,
-            refs: list[str] | None = None,
-        ) -> str:
-            """Termine le tour en rendant la reponse structuree.
-
-            Appelle-moi UNE fois a la fin, quand tu as fini d'utiliser les
-            autres outils. Ne mets de prose dans ouverture/suite que si aucun
-            outil n'a agi : sinon le code rend les faits verifies.
-            Au plus UNE question (finit par '?'), avec 0 ou 2 a 4 options
-            courtes tirees des vraies entites du registre.
-            """
-            reponse_capturee.append(ReponseDire(
-                ouverture=ouverture or "",
-                suite=suite or "",
-                question=question or "",
-                options=options or [],
-                refs=refs or [],
-            ))
-            return "Reponse enregistree."
-
-        outil_reponse = Tool(
-            rendre_reponse,
-            name="rendre_reponse",
-            description=rendre_reponse.__doc__,
-        )
-
+        from services.agent_v2.modeles import REGLAGES_BOUCLE_SANS_RAISONNEMENT
         agent = Agent(
             modele_borne(modele_agir(), 'planning'),
-            instructions=prompt_agir(user) + (
-                "\n\nQuand tu as termine, appelle l'outil rendre_reponse UNE fois "
-                "avec ta reponse structuree. C'est obligatoire pour terminer le tour."
-            ),
-            tools=outils + [outil_reponse],
-            # Pas de output_type : la structure passe par rendre_reponse.
-            # La reflexion reste active (les outils normaux sont compatibles
-            # avec le mode thinking, contrairement a tool_choice=required).
+            instructions=prompt_agir(user),
+            tools=outils,
+            output_type=ReponseDire,
+            # Reflexion coupee : mesure du 2026-08-24, DeepSeek refusait
+            # tool_choice=required (sortie structuree) en mode thinking.
+            # Reactive le 2026-10-17 (PR #25), casse a nouveau le 2026-10-17
+            # soir : FallbackExceptionGroup sur tous les providers.
+            model_settings=REGLAGES_BOUCLE_SANS_RAISONNEMENT,
         )
 
         depart = time.perf_counter()
@@ -599,11 +560,8 @@ class PlannerAgentV2:
             if resultat is None and not usage.total_tokens:
                 self._cout_boucle.update(usage_connu=False, entree=None, sortie=None,
                                         raisonnement=None, cache=None)
-        # La reponse structuree vient de l'outil rendre_reponse, pas de
-        # output_type (voir ci-dessus : thinking + tool_choice=required).
-        if reponse_capturee:
-            return reponse_capturee[-1]
-        return None
+        sortie = getattr(resultat, "output", None)
+        return sortie if isinstance(sortie, ReponseDire) else None
 
     @staticmethod
     def _executer_boucle(agent, message, **kwargs):
