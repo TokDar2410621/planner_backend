@@ -183,9 +183,9 @@ class ReglagesTests(TestCase):
         from services.agent_v2 import PlannerAgentV2
         self.Agent = PlannerAgentV2
 
-    def test_la_boucle_garde_le_raisonnement_et_rend_via_outil(self):
-        """La reflexion reste active : la structure passe par l'outil
-        rendre_reponse, pas par output_type (incompatible avec thinking)."""
+    def test_la_boucle_garde_le_raisonnement_sans_output_type(self):
+        """Facon OpenCode : reflexion active, pas de output_type.
+        Le modele rend du texte libre, le code filtre via verifier_prose."""
         from services.agent_v2 import agent as module_agent
         from pydantic_ai.models.test import TestModel
 
@@ -196,22 +196,20 @@ class ReglagesTests(TestCase):
                 vus.update(kw)
 
         class Resultat:
-            output = None
+            output = "Salut, comment ca va ?"
 
         with patch.object(module_agent, 'Agent', AgentEspion), \
              patch.object(module_agent, 'modele_agir', return_value=TestModel()), \
              patch.object(self.Agent, '_executer_boucle', return_value=Resultat()):
             self.Agent().process_message(self.user, "bonjour")
 
-        # Pas de output_type, pas de model_settings qui coupe le raisonnement
+        # Pas de output_type (incompatible avec thinking)
         self.assertNotIn('output_type', vus)
+        # Pas de model_settings qui coupe le raisonnement
         reglages = vus.get('model_settings') or {}
         desactive = (reglages.get('extra_body') or {}).get('thinking', {}).get('type')
         self.assertNotEqual(desactive, 'disabled',
                             "la boucle ne doit pas couper le raisonnement")
-        # L'outil rendre_reponse est present
-        noms_outils = [getattr(t, 'name', '') for t in vus.get('tools', [])]
-        self.assertIn('rendre_reponse', noms_outils)
 
 class ResilienceTests(TransactionTestCase):
     def setUp(self):
