@@ -183,9 +183,10 @@ class ReglagesTests(TestCase):
         from services.agent_v2 import PlannerAgentV2
         self.Agent = PlannerAgentV2
 
-    def test_la_boucle_coupe_le_raisonnement(self):
+    def test_la_boucle_garde_le_raisonnement_sans_output_type(self):
+        """Facon OpenCode : reflexion active, pas de output_type.
+        Le modele rend du texte libre, le code filtre via verifier_prose."""
         from services.agent_v2 import agent as module_agent
-        from services.agent_v2.modeles import REGLAGES_BOUCLE_SANS_RAISONNEMENT
         from pydantic_ai.models.test import TestModel
 
         vus = {}
@@ -195,14 +196,20 @@ class ReglagesTests(TestCase):
                 vus.update(kw)
 
         class Resultat:
-            output = ReponseDire(ouverture="Salut.")
+            output = "Salut, comment ca va ?"
 
         with patch.object(module_agent, 'Agent', AgentEspion), \
              patch.object(module_agent, 'modele_agir', return_value=TestModel()), \
              patch.object(self.Agent, '_executer_boucle', return_value=Resultat()):
             self.Agent().process_message(self.user, "bonjour")
 
-        self.assertEqual(vus.get('model_settings'), REGLAGES_BOUCLE_SANS_RAISONNEMENT)
+        # Pas de output_type (incompatible avec thinking)
+        self.assertNotIn('output_type', vus)
+        # Pas de model_settings qui coupe le raisonnement
+        reglages = vus.get('model_settings') or {}
+        desactive = (reglages.get('extra_body') or {}).get('thinking', {}).get('type')
+        self.assertNotEqual(desactive, 'disabled',
+                            "la boucle ne doit pas couper le raisonnement")
 
 class ResilienceTests(TransactionTestCase):
     def setUp(self):

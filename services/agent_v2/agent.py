@@ -513,18 +513,18 @@ class PlannerAgentV2:
         # boucle tournait sans date, sans table de decision ni semaine type,
         # et a place une revision en 2025 (banc du 2026-09-14). Les
         # instructions partent a chaque requete.
+        # Facon OpenCode : pas de output_type (la sortie structuree forcee via
+        # tool_choice=required est incompatible avec le mode thinking sur tous
+        # les providers). La reflexion reste ACTIVE. Le modele agit librement
+        # avec ses outils ; son texte final passe par les filtres existants
+        # (verifier_prose retire la prose quand des outils ont agi, le code
+        # rend les faits depuis le registre).
         from services.agent_v2.budget_tour import modele_borne, BudgetEpuise
-        from services.agent_v2.modeles import REGLAGES_BOUCLE_SANS_RAISONNEMENT
         agent = Agent(
             modele_borne(modele_agir(), 'planning'),
             instructions=prompt_agir(user),
             tools=outils,
-            output_type=ReponseDire,
-            # Reflexion coupee : mesure du 2026-08-24, DeepSeek refusait
-            # tool_choice=required (sortie structuree) en mode thinking.
-            # Reactive le 2026-10-17 (PR #25), casse a nouveau le 2026-10-17
-            # soir : FallbackExceptionGroup sur tous les providers.
-            model_settings=REGLAGES_BOUCLE_SANS_RAISONNEMENT,
+            # Pas de output_type, pas de model_settings : thinking actif.
         )
 
         depart = time.perf_counter()
@@ -560,8 +560,19 @@ class PlannerAgentV2:
             if resultat is None and not usage.total_tokens:
                 self._cout_boucle.update(usage_connu=False, entree=None, sortie=None,
                                         raisonnement=None, cache=None)
-        sortie = getattr(resultat, "output", None)
-        return sortie if isinstance(sortie, ReponseDire) else None
+        # Facon OpenCode : le modele rend du texte libre (pas de output_type).
+        # On l'emballe dans un ReponseDire minimal : la prose passe par
+        # verifier_prose (retiree si des outils ont agi), les questions par
+        # les outils poser_question/present_choices, les faits par le registre.
+        # Le champ lecture reste vide : les regles typees ne s'activent pas,
+        # le systeme fonctionne sans elles.
+        from services.agent_v2.redaction import ReponseDire
+        texte = getattr(resultat, "output", None)
+        if isinstance(texte, str) and texte.strip():
+            return ReponseDire(ouverture=texte.strip())
+        if isinstance(texte, ReponseDire):
+            return texte
+        return None
 
     @staticmethod
     def _executer_boucle(agent, message, **kwargs):
