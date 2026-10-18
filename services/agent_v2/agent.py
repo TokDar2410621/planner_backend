@@ -1226,7 +1226,7 @@ class PlannerAgentV2:
             "question": question_affichee,
             "question_motif": motif or "",
             "activation_notifications": any(
-                (a.outil == 'send_notification' and a.cause == 'aucun_appareil')
+                a.outil == 'send_notification'
                 or (a.succes and a.outil in ('manage_reminder', 'manage_recurrence')
                     and (a.outil == 'manage_reminder'
                          and a.parametres.get('action') in ('create', 'update')
@@ -1271,9 +1271,9 @@ class PlannerAgentV2:
             ],
         }
         metadonnees.update(metadonnees_lire)
-        if metadonnees['activation_notifications']:
-            from services.notification_delivery import has_device
-            metadonnees['activation_notifications'] = not has_device(user)
+        # Le serveur connait l'ensemble des appareils du compte, pas celui
+        # qui affiche ce chat. Le frontend verifie CE terminal avant de montrer
+        # le bouton. Un navigateur abonne ne doit pas masquer le bouton iPhone.
         assistant = ConversationMessage.objects.create(
             user=user, role="assistant", content=response,
             conversation=self._conversation,
