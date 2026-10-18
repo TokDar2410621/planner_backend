@@ -883,6 +883,7 @@ class Conversation(models.Model):
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='conversations')
     titre = models.CharField(max_length=200, default="Nouvelle conversation")
+    epinglee = models.BooleanField(default=False)
     archivee = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

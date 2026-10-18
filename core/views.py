@@ -1651,10 +1651,11 @@ class ConversationListView(APIView):
         from core.models import Conversation
         convs = (Conversation.objects
                  .filter(user=request.user, archivee=False)
-                 .order_by('-updated_at')[:50])
+                 .order_by('-epinglee', '-updated_at')[:50])
         return Response([{
             'id': c.pk,
             'titre': c.titre,
+            'epinglee': c.epinglee,
             'updated_at': c.updated_at.isoformat(),
             'created_at': c.created_at.isoformat(),
         } for c in convs])
@@ -1668,6 +1669,7 @@ class ConversationListView(APIView):
         return Response({
             'id': conv.pk,
             'titre': conv.titre,
+            'epinglee': conv.epinglee,
             'updated_at': conv.updated_at.isoformat(),
             'created_at': conv.created_at.isoformat(),
         }, status=status.HTTP_201_CREATED)
@@ -1687,8 +1689,13 @@ class ConversationDetailView(APIView):
             conv.titre = str(request.data['titre'])[:200] or conv.titre
         if 'archivee' in request.data:
             conv.archivee = bool(request.data['archivee'])
+        if 'epinglee' in request.data:
+            if not isinstance(request.data['epinglee'], bool):
+                return Response({'error': 'epinglee doit être un booléen.'}, status=status.HTTP_400_BAD_REQUEST)
+            conv.epinglee = request.data['epinglee']
         conv.save()
-        return Response({'id': conv.pk, 'titre': conv.titre, 'archivee': conv.archivee})
+        return Response({'id': conv.pk, 'titre': conv.titre, 'archivee': conv.archivee,
+                         'epinglee': conv.epinglee})
 
     def delete(self, request, pk):
         from core.models import Conversation
@@ -1697,8 +1704,7 @@ class ConversationDetailView(APIView):
         except Conversation.DoesNotExist:
             return Response({'error': 'Conversation introuvable.'},
                             status=status.HTTP_404_NOT_FOUND)
-        conv.archivee = True
-        conv.save(update_fields=['archivee', 'updated_at'])
+        conv.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
