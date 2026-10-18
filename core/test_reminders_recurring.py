@@ -11,6 +11,8 @@ from rest_framework.test import APITestCase
 
 from core.models import RecurrenceSeries, Reminder, Task
 from services.agent.tools import create_task, manage_reminder, manage_recurrence
+from services.agent_v2.reconciliation import reconcilier
+from services.agent_v2.registre import Registre
 from services.reminder_series import materialize
 
 TZ = ZoneInfo('America/Toronto')
@@ -48,6 +50,39 @@ class RecurrenceTests(TestCase):
         self.assertTrue(result.success)
         self.assertEqual(Task.objects.filter(user=self.user).count(), 2)
         self.assertEqual(timezone.localtime(Task.objects.get(pk=result.data['task']['id']).alert_at).hour, 17)
+
+    def test_reminder_receipt_compares_the_same_instant_across_timezones(self):
+        due_at = datetime(2027, 1, 5, 10, 40, tzinfo=TZ)
+        result = manage_reminder.execute(
+            self.user, action='create', title='Acheter du lait', due_at=due_at.isoformat())
+        self.assertTrue(result.success)
+
+        registre = Registre()
+        registre.ajouter('manage_reminder', {
+            'action': 'create', 'title': 'Acheter du lait', 'due_at': due_at.isoformat(),
+        }, result)
+        reconcilier(self.user, registre)
+        self.assertTrue(registre.par_id('a1').etat_verifie)
+
+        Reminder.objects.filter(pk=result.data['reminder']['id']).update(title='Autre titre')
+        registre = Registre()
+        registre.ajouter('manage_reminder', {
+            'action': 'create', 'title': 'Acheter du lait', 'due_at': due_at.isoformat(),
+        }, result)
+        reconcilier(self.user, registre)
+        self.assertFalse(registre.par_id('a1').etat_verifie)
+
+    def test_timed_task_and_alert_receipt_compares_instants(self):
+        result = create_task.execute(
+            self.user, title='Sortir les poubelles', deadline='2027-01-05T20:00')
+        self.assertTrue(result.success)
+
+        registre = Registre()
+        registre.ajouter('create_task', {
+            'title': 'Sortir les poubelles', 'deadline': '2027-01-05T20:00',
+        }, result)
+        reconcilier(self.user, registre)
+        self.assertTrue(registre.par_id('a1').etat_verifie)
 
     def test_series_tool_creates_independent_reminders(self):
         day = timezone.localdate() + timedelta(days=2)
