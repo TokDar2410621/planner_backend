@@ -69,7 +69,7 @@ def _lire(donnees: dict, chemin: tuple):
 
 
 def _egal(champ, a, b):
-    if champ == "deadline" and a and b:
+    if champ in ("deadline", "alert_at", "due_at") and a and b:
         try:
             return datetime.fromisoformat(str(a)) == datetime.fromisoformat(str(b))
         except ValueError:
