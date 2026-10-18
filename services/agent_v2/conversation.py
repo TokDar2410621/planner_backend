@@ -72,6 +72,7 @@ class AgentConversation(PlannerAgentV2):
             # direct, sans boucle.
             courant = ConversationMessage.objects.create(
                 user=user, role='user', content=message, conversation=self._conversation)
+            courant.attachments.set(getattr(self, '_chat_attachments', []) or ([attachment] if attachment else []))
             texte = sans_tiret_long(prose_budget_jour(user))
             metadata = {'agent': 'v2', 'contrat_tour': 'budget',
                         'en_reponse_a': courant.pk, 'actions': [], 'quick_replies': [],

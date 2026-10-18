@@ -242,6 +242,7 @@ class UploadedDocument(models.Model):
         default='other'
     )
     extracted_data = models.JSONField(default=dict, blank=True)
+    text_preview = models.TextField(blank=True, default='')
     processed = models.BooleanField(default=False)
     processing_error = models.TextField(null=True, blank=True)
     uploaded_at = models.DateTimeField(auto_now_add=True)
@@ -917,6 +918,8 @@ class ConversationMessage(models.Model):
         blank=True,
         related_name='messages'
     )
+    attachments = models.ManyToManyField(
+        UploadedDocument, blank=True, related_name='conversation_messages')
     metadata = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 

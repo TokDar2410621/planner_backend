@@ -725,9 +725,11 @@ class PlannerAgent:
             return
 
         # 1. Save user message
-        ConversationMessage.objects.create(
-            user=user, role="user", content=message
+        courant = ConversationMessage.objects.create(
+            user=user, role="user", content=message, attachment=attachment
         )
+        documents = getattr(self, '_chat_attachments', None) or ([attachment] if attachment else [])
+        courant.attachments.set(documents)
 
         # 2. Build context and system prompt
         context = build_context(user)
@@ -750,38 +752,31 @@ class PlannerAgent:
         # If a document is attached, include its extracted content in the context
         # as clearly-delimited DATA (never as instructions) (B8 / S9).
         attachment_processed_this_turn = False
-        if attachment:
+        if documents:
             # Le traitement (vision/pdfplumber) prend ~5-15s et tourne en
             # arriere-plan. Avant: l'agent repondait AVANT la fin avec une
             # promesse de resume que rien ne livrait jamais (vecu audit: blocs
             # crees a t=10s, ecran muet 120s). On ATTEND la fin (borne 45s)
             # avec des statuts vivants: une reponse vraie en un tour vaut
             # mieux qu'une promesse cassee en 3 secondes.
-            if not attachment.processed:
-                wait_s = getattr(settings, "ATTACHMENT_WAIT_SECONDS", 45)
-                if wait_s:
-                    yield {"type": "status", "text": "J'analyse ton document…"}
-                for tick in range(int(wait_s * 2)):
-                    # NE BLOQUE PAS LE WORKER: gunicorn -k gevent fait
-                    # monkey.patch_all() au boot (ggevent.patch), ce sleep est
-                    # cooperatif et ne suspend que cette conversation. Verifie
-                    # le 2026-08-19 apres une alerte d'audit externe erronee.
-                    time.sleep(0.5)
-                    attachment.refresh_from_db()
-                    if attachment.processed:
-                        # Cadrage deterministe: le LLM voit les blocs deja en
-                        # base (crees par le pipeline pendant cette attente) et
-                        # les presente volontiers comme « deja enregistres »,
-                        # ce qui seme le doute juste apres un envoi. Ce prefixe
-                        # etablit la verite quoi que raconte le modele.
-                        attachment_processed_this_turn = True
-                        break
-                    if attachment.processing_error:
-                        # Echec constate: on n'attend pas la borne pour rien.
-                        break
-                    if tick and tick % 16 == 0:
-                        yield {"type": "status", "text": "J'analyse ton document… (presque fini)"}
-            history[-1]["content"] = f"{history[-1]['content']}\n\n{self._build_attachment_context(attachment)}"
+            deadline = time.monotonic() + getattr(settings, "ATTACHMENT_WAIT_SECONDS", 45)
+            for document in documents:
+                if not document.processed:
+                    wait_s = max(0, deadline - time.monotonic())
+                    if wait_s:
+                        yield {"type": "status", "text": f"J'analyse {document.file_name}…"}
+                    for tick in range(int(wait_s * 2)):
+                        time.sleep(0.5)
+                        document.refresh_from_db()
+                        if document.processed:
+                            if document.pk == getattr(attachment, 'pk', None):
+                                attachment_processed_this_turn = True
+                            break
+                        if document.processing_error:
+                            break
+                        if tick and tick % 16 == 0:
+                            yield {"type": "status", "text": f"J'analyse {document.file_name}… (presque fini)"}
+                history[-1]["content"] = f"{history[-1]['content']}\n\n{self._build_attachment_context(document)}"
             # Le contexte d'import (liste des blocs crees, bornes, mention
             # « RECURRENT SANS DATE DE FIN ») s'ajoute AUSSI sur le tour
             # d'upload: c'est lui qui declenche la question de fin de

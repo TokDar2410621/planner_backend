@@ -13,20 +13,20 @@ from core.models import ChatTurn
 
 
 def _fingerprint(request):
-    attachment = request.FILES.get('attachment')
-    file_data = None
-    if attachment is not None:
+    file_data = []
+    for attachment in request.FILES.getlist('attachment'):
         digest = hashlib.sha256()
         position = attachment.tell()
         for chunk in attachment.chunks():
             digest.update(chunk)
         attachment.seek(position)
-        file_data = [attachment.name, attachment.size, attachment.content_type, digest.hexdigest()]
+        file_data.append([attachment.name, attachment.size, attachment.content_type, digest.hexdigest()])
     # SSE diffère toujours les suggestions; ce détail de transport ne change
     # pas l'instruction. Les champs de confirmation, eux, font partie du tour.
     payload = {
         'message': request.data.get('message', ''),
         'document_type': request.data.get('document_type', 'other'),
+        'conversation_id': request.data.get('conversation_id', ''),
         'tap_demande': request.data.get('tap_demande', ''),
         'tap_option': request.data.get('tap_option', ''),
         'attachment': file_data,

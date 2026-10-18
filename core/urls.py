@@ -43,6 +43,7 @@ from .views import (
     ChatTurnView,
     ChatQuickRepliesView,
     ChatStreamView,
+    ChatDocumentView,
     ChatTranscriptionView,
     ConversationListView,
     ConversationDetailView,
@@ -147,6 +148,8 @@ urlpatterns = [
     path('chat/turns/<uuid:turn_id>/', ChatTurnView.as_view(), name='chat-turn'),
     path('chat/quick-replies/', ChatQuickRepliesView.as_view(), name='chat-quick-replies'),
     path('chat/stream/', ChatStreamView.as_view(), name='chat-stream'),
+    path('chat/documents/<int:pk>/', ChatDocumentView.as_view(), name='chat-document'),
+    path('chat/documents/<int:pk>/file/', ChatDocumentView.as_view(), {'original': True}, name='chat-document-file'),
     path('chat/transcrire/', ChatTranscriptionView.as_view(), name='chat-transcrire'),
     # Conversations (style OpenCode : un fil d'historique par conversation)
     path('conversations/', ConversationListView.as_view(), name='conversations'),
