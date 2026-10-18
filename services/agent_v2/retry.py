@@ -88,6 +88,7 @@ def est_reessayable(erreur: Exception) -> bool:
     marqueurs_definitifs = (
         "invalid", "validation", "bad request", "unauthorized",
         "forbidden", "not found", "authentication",
+        "budget", "epuise", "exhausted", "quota",
     )
     if any(m in texte for m in marqueurs_definitifs):
         return False
