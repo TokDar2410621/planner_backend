@@ -163,8 +163,9 @@ urlpatterns = [
     path('schedule/reset-day/', ScheduleResetDayView.as_view(), name='schedule-reset-day'),
     path('schedule/<int:block_id>/', ScheduledBlockView.as_view(), name='schedule-block'),
 
-    # Conversation history
-    path('conversations/', ConversationView.as_view(), name='conversations'),
+    # Ancienne route historique (messages globaux) : supprimee, le systeme de
+    # conversations (ci-dessus) la remplace. Gardée en commentaire pour mémoire.
+    # path('conversations/', ConversationView.as_view(), name='conversations'),
 
     # AI Insights endpoints
     path('insights/daily-brief/', DailyBriefView.as_view(), name='daily-brief'),
