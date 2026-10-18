@@ -1320,18 +1320,22 @@ class ReveilPlanning(models.Model):
 
 
 class BudgetJetonsJournalier(models.Model):
-    """Compteur de jetons LLM par utilisateur et par jour (agent v2).
+    """Quota mesuré et garde de coût par utilisateur et par jour.
 
-    Garde-fou facture: quand le compteur atteint AGENT_V2_BUDGET_JETONS_JOUR,
-    les phases LLM du tour (AGIR, DIRE, LIRE) sont sautees et le tour se
-    degrade vers registre + repli. Le chemin rapide du code (D6) reste
-    utilisable: il ne coute aucun jeton.
+    `jetons_mesures` reçoit uniquement l'usage confirmé par le fournisseur.
+    `jetons` conserve le coût estimé des appels sans mesure et le coût réel
+    des appels mesurés. Les deux limites sont indépendantes.
     """
     user = models.ForeignKey(
         User, on_delete=models.CASCADE, related_name='budgets_jetons'
     )
     jour = models.DateField()
     jetons = models.PositiveIntegerField(default=0)
+    # Usage confirme par le fournisseur. `jetons` reste le garde de cout
+    # conservateur, qui inclut les appels dont l'usage est inconnu.
+    jetons_mesures = models.PositiveIntegerField(default=0)
+    appels_non_mesures = models.PositiveIntegerField(default=0)
+    mesure_partielle = models.BooleanField(default=False)
     jetons_reserves = models.PositiveIntegerField(default=0)
     mis_a_jour = models.DateTimeField(auto_now=True)
 

@@ -6,6 +6,7 @@ Elle ne peut pas être remboursée sans savoir si le fournisseur a facturé.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, time as heure, timedelta
 from contextlib import contextmanager, asynccontextmanager
 import json
 import logging
@@ -29,7 +30,9 @@ class BudgetIndisponible(RuntimeError):
 
 
 class BudgetEpuise(BudgetIndisponible):
-    pass
+    def __init__(self, message, motif='garde_cout'):
+        super().__init__(message)
+        self.motif = motif
 
 
 def _entier(nom, defaut):
@@ -53,12 +56,13 @@ def _plafond_sortie(phase):
 
 
 def borne_texte(*parties):
-    """Borne prudente texte : octets UTF-8, plus la structure fournisseur.
+    """Estimation prudente : environ trois octets UTF-8 par jeton.
 
     Aucun contenu n'est conservé. Images et fichiers exigent une borne dédiée.
     """
-    return 1024 + sum(len((p if isinstance(p, str) else json.dumps(
+    octets = sum(len((p if isinstance(p, str) else json.dumps(
         p, ensure_ascii=False, default=str)).encode('utf-8')) for p in parties)
+    return 1024 + (octets + 2) // 3
 
 
 def _models():
@@ -66,12 +70,48 @@ def _models():
     return BudgetJetonsJournalier, ReservationBudgetJetons
 
 
+def plafond_garde_cout(user, plafond_mesure):
+    """Plafond interne distinct du quota affiché, configurable par catégorie."""
+    from core.anonyme import est_anonyme
+    nom = ('AGENT_V2_GARDE_COUT_JOUR_ANON' if est_anonyme(user)
+           else 'AGENT_V2_GARDE_COUT_JOUR')
+    return _entier(nom, max(plafond_mesure * 2, plafond_mesure + 120000))
+
+
+def statut_usage(user):
+    """Le contrat public du quota : aucune provision ne gonfle la jauge."""
+    from services.agent_v2.agent import _budget_jetons_jour
+    Budget, _ = _models()
+    jour = timezone.localdate()
+    ligne = Budget.objects.filter(user=user, jour=jour).first()
+    limite = _budget_jetons_jour(user)
+    garde = plafond_garde_cout(user, limite)
+    utilises = ligne.jetons_mesures if ligne else 0
+    provisionnes = (ligne.jetons + ligne.jetons_reserves) if ligne else 0
+    motif = ('quota_mesure' if utilises >= limite else
+             'garde_cout' if provisionnes >= garde else None)
+    retour = timezone.make_aware(
+        datetime.combine(jour + timedelta(days=1), heure.min),
+        timezone.get_current_timezone(),
+    )
+    return {
+        'jour': jour.isoformat(),
+        'jetons_mesures': utilises,
+        'limite_jetons': limite,
+        'appels_non_mesures': ligne.appels_non_mesures if ligne else 0,
+        'mesure_partielle': ligne.mesure_partielle if ligne else False,
+        'bloque_par': motif,
+        'reprise_a': retour.isoformat(),
+    }
+
+
 class ReservationTour:
-    def __init__(self, ligne, plafond):
+    def __init__(self, ligne, plafond, garde_plafond):
         self.pk = ligne.pk
         self.budget_id = ligne.budget_id
         self.user_id = ligne.budget.user_id
         self.plafond = plafond
+        self.garde_plafond = garde_plafond
         self.disponible = ligne.jetons_reserves
         self.fermee = False
         self.verrou = threading.RLock()
@@ -85,11 +125,15 @@ class ReservationTour:
             supplement = max(0, montant - self.disponible)
             try:
                 with transaction.atomic():
-                    if supplement and not Budget.objects.filter(
+                    if not Budget.objects.filter(
                             pk=self.budget_id,
-                            jetons__lte=self.plafond - F('jetons_reserves') - supplement
+                            jetons_mesures__lt=self.plafond,
+                            jetons__lte=self.garde_plafond - F('jetons_reserves') - supplement,
                     ).update(jetons_reserves=F('jetons_reserves') + supplement):
-                        raise BudgetEpuise('budget journalier insuffisant')
+                        budget = Budget.objects.get(pk=self.budget_id)
+                        motif = ('quota_mesure' if budget.jetons_mesures >= self.plafond
+                                 else 'garde_cout')
+                        raise BudgetEpuise('budget journalier insuffisant', motif)
                     if not Reservation.objects.filter(pk=self.pk, cloturee=False).update(
                             jetons_reserves=F('jetons_reserves') + supplement - montant,
                             jetons_factures=F('jetons_factures') + montant):
@@ -107,12 +151,19 @@ class ReservationTour:
         """Un retour connu rembourse sa provision, même après la fin du flux."""
         Budget, Reservation = _models()
         ecart = reel - montant
-        if not ecart:
-            return
         with self.verrou, transaction.atomic():
-            Budget.objects.filter(pk=self.budget_id).update(jetons=F('jetons') + ecart)
+            Budget.objects.filter(pk=self.budget_id).update(
+                jetons=F('jetons') + ecart,
+                jetons_mesures=F('jetons_mesures') + reel,
+            )
             Reservation.objects.filter(pk=self.pk).update(
                 jetons_factures=F('jetons_factures') + ecart)
+
+    def noter_usage_inconnu(self):
+        Budget, _ = _models()
+        with self.verrou:
+            Budget.objects.filter(pk=self.budget_id).update(
+                appels_non_mesures=F('appels_non_mesures') + 1)
 
     def fermer(self):
         Budget, Reservation = _models()
@@ -136,25 +187,32 @@ def ouvrir_trace(user, delai=None):
     Budget, Reservation = _models()
     plafond = _budget_jetons_jour(user)
     if plafond <= 0:
-        raise BudgetEpuise('budget désactivé')
-    montant = min(plafond, _entier('AGENT_RESERVATION_INITIALE', 12000))
+        raise BudgetEpuise('budget désactivé', 'quota_mesure')
+    garde_plafond = plafond_garde_cout(user, plafond)
+    montant = min(garde_plafond, _entier('AGENT_RESERVATION_INITIALE', 12000))
     trace = TraceTour(time.monotonic() + (_delai_tour() if delai is None else delai))
     try:
         budget, _ = Budget.objects.get_or_create(user=user, jour=timezone.localdate())
-        montant = min(montant, plafond - budget.jetons - budget.jetons_reserves)
+        if budget.jetons_mesures >= plafond:
+            raise BudgetEpuise('quota journalier mesuré atteint', 'quota_mesure')
+        montant = min(montant, garde_plafond - budget.jetons - budget.jetons_reserves)
         if montant <= 0:
-            raise BudgetEpuise('budget journalier insuffisant')
+            raise BudgetEpuise('garde de coût journalier atteint')
         with transaction.atomic():
             if not Budget.objects.filter(pk=budget.pk,
-                    jetons__lte=plafond - F('jetons_reserves') - montant).update(
+                    jetons_mesures__lt=plafond,
+                    jetons__lte=garde_plafond - F('jetons_reserves') - montant).update(
                         jetons_reserves=F('jetons_reserves') + montant):
-                raise BudgetEpuise('budget journalier insuffisant')
+                budget.refresh_from_db()
+                motif = ('quota_mesure' if budget.jetons_mesures >= plafond
+                         else 'garde_cout')
+                raise BudgetEpuise('budget journalier insuffisant', motif)
             ligne = Reservation.objects.create(budget=budget, jetons_reserves=montant)
     except BudgetIndisponible:
         raise
     except Exception as exc:
         raise BudgetIndisponible('admission indisponible') from exc
-    trace.reservation = ReservationTour(ligne, plafond)
+    trace.reservation = ReservationTour(ligne, plafond, garde_plafond)
     return trace
 
 
@@ -180,7 +238,7 @@ class AppelFournisseur:
         self.max_sortie = min(max(1, int(max_sortie)), _plafond_sortie(phase))
         self.provision = max(1, int(jetons_entree)) + self.max_sortie
         if self.provision > _entier('AGENT_MAX_JETONS_APPEL', 120000):
-            raise BudgetEpuise('contexte fournisseur trop volumineux')
+            raise BudgetEpuise('contexte fournisseur trop volumineux', 'appel_trop_volumineux')
         self.phase, self.fournisseur = phase, fournisseur
         self.depart = time.monotonic()
         self.termine = False
@@ -216,6 +274,15 @@ class AppelFournisseur:
                 except Exception as exc:
                     logger.warning('rapprochement budget indisponible type=%s', type(exc).__name__)
                     facture = self.provision
+            elif succes:
+                logger.warning(
+                    'usage fournisseur absent apres succes phase=%s fournisseur=%s provision=%d duree=%.2f',
+                    self.phase, self.fournisseur, self.provision, time.monotonic() - self.depart,
+                )
+                try:
+                    self.reservation.noter_usage_inconnu()
+                except Exception as exc:
+                    logger.warning('mesure inconnue non enregistree type=%s', type(exc).__name__)
             self.trace.remplacer(self.index, {**usage, 'phase': self.phase, 'fournisseur': self.fournisseur,
                 'usage_connu': connu, 'total': total if connu else None,
                 'jetons_provisionnes': self.provision, 'jetons_factures': facture,
@@ -270,8 +337,9 @@ class ModeleBorne(WrapperModel):
         self.phase = phase
 
     async def _ouvrir(self, messages, reglages, parametres):
-        entree = len(ModelMessagesTypeAdapter.dump_json(messages)) + len(
-            _PARAMETRES.dump_json(parametres)) + 2048
+        octets = len(ModelMessagesTypeAdapter.dump_json(messages)) + len(
+            _PARAMETRES.dump_json(parametres))
+        entree = (octets + 2) // 3 + 2048
         reglages = dict(reglages or {})
         appel = await asyncio.to_thread(_operation_db, AppelFournisseur, self.phase, self.system,
                                         entree, reglages.get('max_tokens', 4096))

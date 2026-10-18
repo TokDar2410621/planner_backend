@@ -1,6 +1,7 @@
 """Contrat HTTP du tour durable, sans fournisseur ni stockage externe."""
 from unittest.mock import Mock, patch
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from tempfile import TemporaryDirectory
 from threading import Event
 from datetime import timedelta
 from uuid import uuid4
@@ -12,7 +13,7 @@ from django.core.cache import cache
 from django.db import IntegrityError, connection, close_old_connections, transaction
 from django.utils import timezone
 from rest_framework.test import APIClient
-from core.models import ChatTurn
+from core.models import ChatTurn, UploadedDocument
 
 
 class DurableTransportTests(TestCase):
@@ -103,20 +104,26 @@ class DurableTransportTests(TestCase):
 
     def test_upload_retry_is_deduplicated_before_storage(self):
         turn_id = str(uuid4())
-        with patch('core.views._create_chat_attachment', return_value=(None, None)) as upload:
+        future = Future()
+        future.set_result(None)
+        with TemporaryDirectory() as media, override_settings(MEDIA_ROOT=media), patch(
+            'core.views.DocumentProcessor.process_document_async', return_value=future,
+        ) as process:
             for _ in range(2):
                 response = self.client.post('/api/chat/', {
                     'turn_id': turn_id, 'message': 'importe',
-                    'attachment': SimpleUploadedFile('horaire.txt', b'same bytes', content_type='text/plain'),
+                    'attachment': SimpleUploadedFile('horaire.pdf', b'%PDF-same bytes', content_type='application/pdf'),
                 })
                 self.assertEqual(response.status_code, 200)
-            self.assertEqual(upload.call_count, 1)
+            self.assertEqual(UploadedDocument.objects.filter(user=self.user).count(), 1)
+            self.assertEqual(process.call_count, 1)
             mismatch = self.client.post('/api/chat/', {
                 'turn_id': turn_id, 'message': 'importe',
-                'attachment': SimpleUploadedFile('horaire.txt', b'different', content_type='text/plain'),
+                'attachment': SimpleUploadedFile('horaire.pdf', b'%PDF-different', content_type='application/pdf'),
             })
             self.assertEqual(mismatch.status_code, 409)
-            self.assertEqual(upload.call_count, 1)
+            self.assertEqual(UploadedDocument.objects.filter(user=self.user).count(), 1)
+            self.assertEqual(process.call_count, 1)
 
     @override_settings(CHAT_TURN_STALE_SECONDS=10)
     def test_abandoned_worker_is_reported_without_blind_retry(self):

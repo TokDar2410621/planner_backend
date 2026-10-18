@@ -1442,7 +1442,13 @@ def rendre_faits(registre: Registre, aujourdhui: date | None = None,
 
     lignes = n.lignes_de_faits() + n.refus + n.retenues
     if registre.budget_epuise:
-        if registre.motif_budget == "jetons":
+        if registre.motif_budget == "quota_mesure":
+            lignes.append("Je me suis arrêté : ton quota de jetons mesurés est atteint. Réessaie demain à 0 h, heure de Toronto.")
+        elif registre.motif_budget == "garde_cout":
+            lignes.append("Je me suis arrêté : le garde de coût des appels non mesurés est atteint. Réessaie demain à 0 h, heure de Toronto.")
+        elif registre.motif_budget == "appel_trop_volumineux":
+            lignes.append("Je me suis arrêté : cette demande dépasse la taille maximale d'un appel. Raccourcis-la ou retire une pièce jointe.")
+        elif registre.motif_budget == "jetons":
             lignes.append("Je me suis arrêté : la limite de jetons ne permettait pas un autre appel.")
         else:
             lignes.append("Je me suis arrêté avant la fin : il restait trop d'étapes.")

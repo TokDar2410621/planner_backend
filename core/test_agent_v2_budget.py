@@ -172,7 +172,7 @@ class BudgetJetonsTests(TestCase):
     def test_budget_jour_bloque_les_phases_llm(self):
         """Compteur epuise: la boucle ne tourne pas, le tour le dit."""
         BudgetJetonsJournalier.objects.create(
-            user=self.user, jour=timezone.localdate(), jetons=2000000)
+            user=self.user, jour=timezone.localdate(), jetons_mesures=2000000)
         with patch.object(PlannerAgentV2, '_boucle',
                           side_effect=AssertionError("la boucle ne doit pas tourner")):
             res = PlannerAgentV2().process_message(self.user, "bonjour")

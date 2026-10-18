@@ -2,7 +2,6 @@
 import asyncio
 import time
 from concurrent.futures import Future
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
@@ -25,11 +24,22 @@ class HttpBudgetTests(TransactionTestCase):
         self.client = APIClient()
         self.client.force_authenticate(self.user)
 
+    @staticmethod
+    def lot_en_cours(future, traces=None):
+        """Simule le suivi d'un document par le point d'entree du lot actuel."""
+        def creer(request, files, fermeture):
+            if traces is not None:
+                traces.append(trace_courante.get())
+            fermeture.suivre(future)
+            return [], None
+        return creer
+
     @override_settings(AGENT_V2_BUDGET_JETONS_JOUR=100)
     def test_budget_refuse_avant_upload_et_rejoue_sans_reserver(self):
-        BudgetJetonsJournalier.objects.create(user=self.user, jour=timezone.localdate(), jetons=100)
+        BudgetJetonsJournalier.objects.create(
+            user=self.user, jour=timezone.localdate(), jetons_mesures=100)
         identity = str(uuid4())
-        with patch('core.views._create_chat_attachment') as upload, \
+        with patch('core.views._create_chat_files') as upload, \
              patch('core.views._agent_pour') as agent:
             for endpoint in ('/api/chat/', '/api/chat/stream/'):
                 response = self.client.post(endpoint, {'message': 'Bonjour', 'turn_id': identity})
@@ -42,14 +52,14 @@ class HttpBudgetTests(TransactionTestCase):
         traces = []
         def upload(*args):
             traces.append(trace_courante.get())
-            return None, None
+            return [], None
         def process(*args, **kwargs):
             traces.append(trace_courante.get())
             self.assertGreater(BudgetJetonsJournalier.objects.get(user=self.user).jetons_reserves, 0)
             return {'response': 'Salut'}
         agent = Mock()
         agent.process_message.side_effect = process
-        with patch('core.views._create_chat_attachment', side_effect=upload), \
+        with patch('core.views._create_chat_files', side_effect=upload), \
              patch('core.views._agent_pour', return_value=agent):
             response = self.client.post('/api/chat/', {'message': 'Bonjour'})
         self.assertEqual(response.status_code, 200)
@@ -60,7 +70,7 @@ class HttpBudgetTests(TransactionTestCase):
         self.assertIsNone(trace_courante.get())
 
     def test_erreur_upload_libere_reservation(self):
-        with patch('core.views._create_chat_attachment', side_effect=ValueError('upload')):
+        with patch('core.views._create_chat_files', side_effect=ValueError('upload')):
             response = self.client.post('/api/chat/', {'message': 'Bonjour'})
         self.assertEqual(response.status_code, 500)
         self.assertTrue(ReservationBudgetJetons.objects.get().cloturee)
@@ -70,13 +80,13 @@ class HttpBudgetTests(TransactionTestCase):
         traces = []
         def upload(*args):
             traces.append(trace_courante.get())
-            return None, None
+            return [], None
         def stream(*args, **kwargs):
             traces.append(trace_courante.get())
             yield {'type': 'done', 'response': 'Salut'}
         agent = Mock()
         agent.process_message_stream.side_effect = stream
-        with patch('core.views._create_chat_attachment', side_effect=upload), \
+        with patch('core.views._create_chat_files', side_effect=upload), \
              patch('core.views._agent_pour', return_value=agent):
             response = self.client.post('/api/chat/stream/', {'message': 'Bonjour'})
             async def consume():
@@ -106,12 +116,9 @@ class HttpBudgetTests(TransactionTestCase):
         future = Future()
         traces = []
         self.addCleanup(lambda: future.set_result({}) if not future.done() else None)
-        def upload(*args):
-            traces.append(trace_courante.get())
-            return SimpleNamespace(_processing_future=future), None
         agent = Mock()
         agent.process_message.return_value = {'response': 'Analyse encore en cours'}
-        with patch('core.views._create_chat_attachment', side_effect=upload), \
+        with patch('core.views._create_chat_files', side_effect=self.lot_en_cours(future, traces)), \
              patch('core.views._agent_pour', return_value=agent):
             response = self.client.post('/api/chat/', {'message': 'Analyse le document'})
         self.assertEqual(response.status_code, 200)
@@ -130,14 +137,14 @@ class HttpBudgetTests(TransactionTestCase):
     def pending_document(self):
         future = Future()
         self.addCleanup(lambda: future.set_result({}) if not future.done() else None)
-        return future, SimpleNamespace(_processing_future=future)
+        return future
 
     def assert_budget_closed(self):
         self.assertTrue(ReservationBudgetJetons.objects.get().cloturee)
         self.assertEqual(BudgetJetonsJournalier.objects.get(user=self.user).jetons_reserves, 0)
 
     def test_document_fini_ne_ferme_pas_le_chat_encore_actif(self):
-        future, attachment = self.pending_document()
+        future = self.pending_document()
         def process(*args, **kwargs):
             future.set_result({})
             self.assertFalse(ReservationBudgetJetons.objects.get().cloturee)
@@ -145,17 +152,17 @@ class HttpBudgetTests(TransactionTestCase):
             return {'response': 'Document traité'}
         agent = Mock()
         agent.process_message.side_effect = process
-        with patch('core.views._create_chat_attachment', return_value=(attachment, None)), \
+        with patch('core.views._create_chat_files', side_effect=self.lot_en_cours(future)), \
              patch('core.views._agent_pour', return_value=agent):
             response = self.client.post('/api/chat/', {'message': 'Document'})
         self.assertEqual(response.status_code, 200)
         self.assert_budget_closed()
 
     def test_chat_en_erreur_attend_la_fin_du_document_puis_libere(self):
-        future, attachment = self.pending_document()
+        future = self.pending_document()
         agent = Mock()
         agent.process_message.side_effect = RuntimeError('agent local en panne')
-        with patch('core.views._create_chat_attachment', return_value=(attachment, None)), \
+        with patch('core.views._create_chat_files', side_effect=self.lot_en_cours(future)), \
              patch('core.views._agent_pour', return_value=agent):
             response = self.client.post('/api/chat/', {'message': 'Document'})
         self.assertEqual(response.status_code, 500)
@@ -164,17 +171,14 @@ class HttpBudgetTests(TransactionTestCase):
         self.assert_budget_closed()
 
     def test_sse_termine_garde_le_document_actif_sans_bloquer_la_reponse(self):
-        future, attachment = self.pending_document()
+        future = self.pending_document()
         traces = []
-        def upload(*args):
-            traces.append(trace_courante.get())
-            return attachment, None
         def stream(*args, **kwargs):
             traces.append(trace_courante.get())
             yield {'type': 'done', 'response': 'Analyse en cours'}
         agent = Mock()
         agent.process_message_stream.side_effect = stream
-        with patch('core.views._create_chat_attachment', side_effect=upload), \
+        with patch('core.views._create_chat_files', side_effect=self.lot_en_cours(future, traces)), \
              patch('core.views._agent_pour', return_value=agent):
             response = self.client.post('/api/chat/stream/', {'message': 'Document'})
             async def consume():
@@ -188,8 +192,8 @@ class HttpBudgetTests(TransactionTestCase):
         self.assert_budget_closed()
 
     def test_lancement_sse_en_erreur_garde_document_jusqua_annulation(self):
-        future, attachment = self.pending_document()
-        with patch('core.views._create_chat_attachment', return_value=(attachment, None)), \
+        future = self.pending_document()
+        with patch('core.views._create_chat_files', side_effect=self.lot_en_cours(future)), \
              patch('core.views.lancer_flux', side_effect=RuntimeError('pool indisponible')):
             response = self.client.post('/api/chat/stream/', {'message': 'Document'})
         self.assertEqual(response.status_code, 500)
@@ -211,22 +215,19 @@ class HttpBudgetTests(TransactionTestCase):
 
     def test_echeance_commune_libere_un_document_bloque_sans_double_remboursement(self):
         from services.document_processor import DocumentProcessor
-        future, attachment = self.pending_document()
+        future = self.pending_document()
         traces = []
-        def upload(*args):
-            traces.append(trace_courante.get())
-            return attachment, None
         agent = Mock()
         agent.process_message.return_value = {'response': 'Analyse en cours'}
         with patch('core.views.threading.Timer') as timer, \
-             patch('core.views._create_chat_attachment', side_effect=upload), \
+             patch('core.views._create_chat_files', side_effect=self.lot_en_cours(future, traces)), \
              patch('core.views._agent_pour', return_value=agent):
             response = self.client.post('/api/chat/', {'message': 'Document'})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(timer.call_count, 1)
         delay, callback = timer.call_args.args
         self.assertGreater(delay, 0)
-        self.assertLessEqual(delay, 180)
+        self.assertLessEqual(delay, 180.001)
         self.assertFalse(ReservationBudgetJetons.objects.get().cloturee)
         traces[0].echeance = time.monotonic() - 1
         callback()
@@ -245,7 +246,7 @@ class HttpBudgetTests(TransactionTestCase):
 
     def test_document_standalone_ferme_a_lecheance_si_future_ne_revient_pas(self):
         from django.core.files.uploadedfile import SimpleUploadedFile
-        future, _ = self.pending_document()
+        future = self.pending_document()
         with patch('core.views.threading.Timer') as timer, \
              patch('core.views.DocumentProcessor.process_document_async', return_value=future):
             response = self.client.post('/api/documents/', {

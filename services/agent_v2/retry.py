@@ -64,6 +64,9 @@ def _retry_after(erreur: Exception) -> float | None:
 
 def est_reessayable(erreur: Exception) -> bool:
     """Transport, rate limit et 5xx : oui. 4xx (hors 429) et validation : non."""
+    from services.agent_v2.budget_tour import BudgetIndisponible
+    if isinstance(erreur, BudgetIndisponible):
+        return False
     texte = str(erreur).lower()
     statut = getattr(erreur, "status_code", None) or getattr(erreur, "status", None)
     try:

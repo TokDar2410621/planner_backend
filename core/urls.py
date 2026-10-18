@@ -40,6 +40,7 @@ from .views import (
     OnboardingStatusView,
     # Chat
     ChatView,
+    ChatUsageView,
     ChatTurnView,
     ChatQuickRepliesView,
     ChatStreamView,
@@ -145,6 +146,7 @@ urlpatterns = [
 
     # Chat endpoint
     path('chat/', ChatView.as_view(), name='chat'),
+    path('chat/usage/', ChatUsageView.as_view(), name='chat-usage'),
     path('chat/turns/<uuid:turn_id>/', ChatTurnView.as_view(), name='chat-turn'),
     path('chat/quick-replies/', ChatQuickRepliesView.as_view(), name='chat-quick-replies'),
     path('chat/stream/', ChatStreamView.as_view(), name='chat-stream'),
