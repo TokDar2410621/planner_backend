@@ -233,11 +233,11 @@ class DateTests(SimpleTestCase):
 
 class ValidationTests(SimpleTestCase):
     def test_type_inconnu_refuse(self):
-        result = _run(_champ(id="x", type="text"))
+        result = _run(_champ(id="x", type="url"))
         self.assertFalse(result.success)
-        self.assertIn("'text'", result.message)
+        self.assertIn("'url'", result.message)
         self.assertIn("'x'", result.message)
-        for t in ("time_range", "time", "number", "checkbox", "select", "radio", "duration", "date"):
+        for t in ("time_range", "time", "number", "checkbox", "select", "radio", "duration", "date", "text"):
             self.assertIn(t, result.message)
 
     def test_type_absent_refuse(self):
@@ -260,7 +260,7 @@ class ValidationTests(SimpleTestCase):
     def test_schema_documente_les_nouveaux_types(self):
         item = present_form.PARAMETERS["properties"]["inputs"]["items"]
         self.assertEqual(item["properties"]["type"]["enum"],
-                         ["time_range", "time", "number", "checkbox", "select", "radio", "duration", "date"])
+                         ["time_range", "time", "number", "checkbox", "select", "radio", "duration", "date", "text"])
         self.assertIn("presets", item["properties"])
         self.assertIn("duration", item["properties"]["min"]["description"])
 

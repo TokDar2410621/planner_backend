@@ -21,6 +21,7 @@ from core.test_agent_v2_jugement import juger_script
 from services.agent.tools import ALL_TOOLS
 from services.agent_v2 import chargeur
 from services.agent_v2.outils import (NOM_APPEL, NOM_CHERCHEUR, OUTILS_EXPOSES,
+                                      OUTILS_QUESTION_ANCIENS,
                                       description_v2, outils_pour_le_modele,
                                       schema_expose)
 from services.agent_v2.redaction import question_code
@@ -95,7 +96,8 @@ class ExpositionTests(TransactionTestCase):
     def test_chaque_outil_est_soit_expose_soit_joignable(self):
         """Aucun outil ne doit devenir inatteignable."""
         _, outils = self._outils()
-        caches = [o for o in ALL_TOOLS if o.NAME not in OUTILS_EXPOSES]
+        caches = [o for o in ALL_TOOLS if o.NAME not in OUTILS_EXPOSES
+                  and o.NAME not in OUTILS_QUESTION_ANCIENS]
         self.assertTrue(caches)
         for outil in caches:
             with self.subTest(outil=outil.NAME):
@@ -108,7 +110,8 @@ class ExpositionTests(TransactionTestCase):
 
 class RechercheTests(TransactionTestCase):
     def setUp(self):
-        self.caches = [o for o in ALL_TOOLS if o.NAME not in OUTILS_EXPOSES]
+        self.caches = [o for o in ALL_TOOLS if o.NAME not in OUTILS_EXPOSES
+                       and o.NAME not in OUTILS_QUESTION_ANCIENS]
 
     def _noms(self, besoin):
         rendu = chargeur.chercher(besoin, self.caches, description_v2)
@@ -136,7 +139,7 @@ class RechercheTests(TransactionTestCase):
         self.assertIn('clear_all_blocks', rendu)
 
     def test_le_schema_rendu_nomme_les_parametres_requis(self):
-        rendu = chargeur.chercher('supprimer une tache', self.caches, description_v2)
+        rendu = chargeur.chercher('modifier une tache', self.caches, description_v2)
         self.assertIn('task_id', rendu)
         self.assertIn('requis', rendu)
 

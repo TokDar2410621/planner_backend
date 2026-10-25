@@ -52,7 +52,7 @@ LECTURES_RENDUES = ("get_week_schedule", "get_today_schedule", "list_blocks",
 
 # Jamais racontes: un formulaire et un choix sont des questions, un import
 # recent est du contexte pour DIRE.
-_IGNORES = frozenset({"present_form", "present_choices", "import_recent"})
+_IGNORES = frozenset({"present_form", "present_choices", "ask_question_custom", "import_recent"})
 
 # Audit 2026-10-13 (#3): lignes honnetes pour les lectures ratees, quand
 # l'outil n'a pas ecrit son propre texte affichable (`public`). On nomme

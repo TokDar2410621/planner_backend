@@ -57,7 +57,7 @@ class ExpositionTests(SimpleTestCase):
     def test_prompt_agir_documente_l_outil(self):
         # Doctrine 2026-09-29: l'usage des outils vit dans leurs descriptions,
         # pas dans le prompt.
-        self.assertIn("present_choices", REGLES_AGIR)
+        self.assertIn("ask_question_custom", REGLES_AGIR)
         from services.agent.tools import TOOL_MAP
         from services.agent_v2.outils import description_v2
         self.assertIn("choix libre", description_v2(TOOL_MAP["poser_question"]))

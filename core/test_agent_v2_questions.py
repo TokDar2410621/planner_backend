@@ -312,7 +312,7 @@ class PromptsTests(TestCase):
                          "cette semaine je veux lire plus"):
             with self.subTest(interdit=interdit):
                 self.assertNotIn(interdit, REGLES_AGIR)
-        for requis in ("present_choices", "rendez-vous", "SUITE AU CHOIX",
+        for requis in ("ask_question_custom", "rendez-vous", "SUITE AU CHOIX",
                        "Une heure donnee par l'utilisateur ne se change jamais sans lui demander",
                        "Quand un outil te repond qu'une question est posee par le code, n'agis "
                        "pas sur ce point et ne repose pas la question",
@@ -332,7 +332,7 @@ class PromptsTests(TestCase):
     def test_table_de_decision_nomme_les_cas_a_demander(self):
         from services.agent_v2.prompts import REGLES_AGIR
         for mot in ("DEVINE", "DEMANDE", "cours", "quart", "reunion", "lecon",
-                    "plus", "davantage", "mieux", "planning vide", "present_form"):
+                    "plus", "davantage", "mieux", "planning vide", "ask_question_custom"):
             with self.subTest(mot=mot):
                 self.assertIn(mot, REGLES_AGIR)
 
@@ -392,7 +392,7 @@ class PromptsTests(TestCase):
         unique (plus de PROMPT_DIRE separe)."""
         from services.agent_v2.prompts import prompt_agir
         prompt = prompt_agir(self.user)
-        for requis in ("TA REPONSE FINALE", "UNE question", "refs",
+        for requis in ("TA REPONSE FINALE", "UNE question", "ask_question_custom",
                        "Si le systeme pose deja une question ce tour",
                        "tutoiement", "Deux ou trois phrases",
                        "Ne complete jamais"):

@@ -117,6 +117,18 @@ def _tap_de(request):
     return {'demande': demande, 'option': option}
 
 
+def _reponse_question_de(request):
+    """Charge le postback de formulaire; sa validite est verifiee dans le tour."""
+    brut = request.data.get('question_answer')
+    if not brut:
+        return None
+    try:
+        charge = json.loads(brut) if isinstance(brut, str) else brut
+    except (TypeError, ValueError):
+        return {"id": "", "values": None}
+    return charge if isinstance(charge, dict) else {"id": "", "values": None}
+
+
 def _as_bool(value):
     """Coerce a request value (bool, int, or string) to a boolean.
 
@@ -1462,6 +1474,9 @@ class ChatView(APIView):
             agent._chat_attachments = docs
             tap = _tap_de(request)
             extra = {'tap': tap} if tap and getattr(agent, 'accepte_tap', False) else {}
+            answer = _reponse_question_de(request)
+            if answer is not None and getattr(agent, 'accepte_tap', False):
+                extra['question_answer'] = answer
             # V2 accepte conversation_id ; V1 l'ignore (pas de conversations).
             import inspect as _inspect
             conversation_id = request.data.get('conversation_id')
@@ -1615,6 +1630,8 @@ class ChatStreamView(APIView):
             with _contexte_budget(trace):
                 docs, error_response = _create_chat_files(request, attachment_files, fermeture)
             tap = _tap_de(request)
+            answer = _reponse_question_de(request)
+            conversation_id = request.data.get('conversation_id')
         except Exception:
             fermeture.terminer_requete()
             return Response(chat_turns.fail(turn), status=500)
@@ -1642,17 +1659,15 @@ class ChatStreamView(APIView):
                 agent = _agent_pour(user)
                 agent._chat_attachments = docs
                 extra = {'tap': tap} if tap and getattr(agent, 'accepte_tap', False) else {}
+                if answer is not None and getattr(agent, 'accepte_tap', False):
+                    extra['question_answer'] = answer
                 import inspect as _inspect2
-                conversation_id = request.data.get('conversation_id')
                 if conversation_id:
                     try:
                         if 'conversation_id' in _inspect2.signature(agent.process_message_stream).parameters:
                             extra['conversation_id'] = conversation_id
                     except (TypeError, ValueError):
                         pass
-                conversation_id = request.data.get('conversation_id')
-                if conversation_id:
-                    extra['conversation_id'] = conversation_id
                 for event in agent.process_message_stream(user, final_message, docs[0] if docs else None, **extra):
                     if event.get('type') == 'done':
                         if not isinstance(event.get('response'), str):

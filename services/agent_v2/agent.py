@@ -1,11 +1,10 @@
 """
 La boucle unique (2026-09-29): COMPRENDRE+OUTILLER, RECONCILIER, RENDRE.
 
-La difference de fond avec v1 tient en une phrase: le recit d'action n'est
-plus produit par le modele. La boucle outille et alimente un registre ecrit
-par le runtime; le code rend un compte rendu factuel depuis ce registre; la
-prose du modele ne survit que contre des refs verifiees (verifier_prose), et
-toute affirmation d'action qui n'existe pas est ecartee avant l'assemblage.
+La boucle outille et alimente un registre ecrit par le runtime. Apres une
+lecture ou un echec d'outil, le modele repond a la personne. Apres une mutation
+reussie, le code rend son recu verifie. Les affirmations d'effet non confirmees
+sont ecartees avant l'assemblage.
 
 Depuis le 2026-09-14 (lots 1 a 3), un tour s'affiche en trois sections
 streamees dans leur ordre final: FAITS (code), PROSE (boucle verifiee),
@@ -39,7 +38,7 @@ from django.contrib.auth.models import User
 from django.db import close_old_connections
 from django.db.models import F
 from django.utils import timezone
-from pydantic_ai import Agent
+from pydantic_ai import Agent, ModelRetry
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (ModelRequest, ModelResponse, PartDeltaEvent,
                                   PartStartEvent, TextPart,
@@ -62,6 +61,7 @@ from services.agent_v2.redaction import (LECTURES_RENDUES, ReponseDire,
                                          contient_question, marqueurs_bruts,
                                          question_code, sans_tiret_long)
 from services.agent_v2.registre import Registre
+from services.agent_v2.validation_sortie import retour_validation
 
 logger = logging.getLogger(__name__)
 
@@ -528,16 +528,46 @@ class PlannerAgentV2:
         # Facon OpenCode : pas de output_type (la sortie structuree forcee via
         # tool_choice=required est incompatible avec le mode thinking sur tous
         # les providers). La reflexion reste ACTIVE. Le modele agit librement
-        # avec ses outils ; son texte final passe par les filtres existants
-        # (verifier_prose retire la prose quand des outils ont agi, le code
-        # rend les faits depuis le registre).
+        # avec ses outils ; sa reponse aux lectures et aux echecs passe par
+        # verifier_prose. Le code rend les recus des mutations confirmees.
         from services.agent_v2.budget_tour import modele_borne, BudgetEpuise
         agent = Agent(
             modele_borne(modele_agir(), 'planning'),
             instructions=prompt_agir(user),
             tools=outils,
+            output_retries=2,
             # Pas de output_type, pas de model_settings : thinking actif.
         )
+
+        reprises_sortie = 0
+
+        async def valider_sortie(_contexte, sortie: str) -> str:
+            nonlocal reprises_sortie
+            if registre.mutations():
+                # La relecture est faite AVANT la décision finale. Elle est
+                # répétée après la boucle pour le rendu et les écarts.
+                from asgiref.sync import sync_to_async
+                try:
+                    await sync_to_async(reconcilier, thread_sensitive=True)(user, registre)
+                except Exception as exc:  # noqa: BLE001 - le reçu reste non confirmé
+                    logger.warning("agent_v2 relecture avant sortie impossible type=%s",
+                                   type(exc).__name__)
+            faits_controle = (bloc_factuel(registre)
+                             if self._lecture_sans_demande(registre) else "")
+            retour = retour_validation(sortie, registre,
+                                       faits_controle=faits_controle)
+            if retour and reprises_sortie < 2:
+                reprises_sortie += 1
+                logger.info("agent_v2 sortie rejetee reprise=%d actions=%d",
+                            reprises_sortie, len(registre.actions))
+                raise ModelRetry(retour)
+            # Le garde final reste actif si la limite de reprises est atteinte.
+            return sortie
+
+        # Les doubles de test anciens n'implémentent pas le décorateur.
+        enregistrer = getattr(agent, "output_validator", None)
+        if callable(enregistrer):
+            enregistrer(valider_sortie)
 
         depart = time.perf_counter()
         usage = RunUsage()
@@ -574,8 +604,8 @@ class PlannerAgentV2:
                                         raisonnement=None, cache=None)
         # Facon OpenCode : le modele rend du texte libre (pas de output_type).
         # On l'emballe dans un ReponseDire minimal : la prose passe par
-        # verifier_prose (retiree si des outils ont agi), les questions par
-        # les outils poser_question/present_choices, les faits par le registre.
+        # verifier_prose, les questions par poser_question/present_choices,
+        # les recus des mutations par le registre.
         # Le champ lecture reste vide : les regles typees ne s'activent pas,
         # le systeme fonctionne sans elles.
         from services.agent_v2.redaction import ReponseDire
@@ -666,7 +696,7 @@ class PlannerAgentV2:
 
     def process_message_stream(
         self, user, message, attachment=None, *, use_streaming=True,
-        generate_quick_replies=False, tap=None, conversation_id=None,
+        generate_quick_replies=False, tap=None, conversation_id=None, question_answer=None,
     ):
         from services.agent_v2.trace_tour import trace_courante
         from services.agent_v2.budget_tour import ouvrir_trace, fermer_trace, BudgetIndisponible
@@ -690,7 +720,7 @@ class PlannerAgentV2:
         try:
             yield from self._process_message_stream(user, message, attachment,
                 use_streaming=use_streaming, generate_quick_replies=generate_quick_replies, tap=tap,
-                conversation_id=conversation_id)
+                conversation_id=conversation_id, question_answer=question_answer)
         finally:
             try:
                 if proprietaire:
@@ -728,6 +758,7 @@ class PlannerAgentV2:
         generate_quick_replies: bool = False,
         tap: Optional[dict] = None,
         conversation_id=None,
+        question_answer=None,
     ):
         """Contrat SSE additif: status, thinking, tool, delta, done. Les deltas
         arrivent dans l'ordre final (faits, prose, question) et done.response
@@ -793,6 +824,34 @@ class PlannerAgentV2:
         # document (defaut observe le 2026-08-26 sur un tour reel). L'envoi
         # d'horaire est le premier chemin d'entree du produit.
         message_enrichi = message
+        if question_answer is not None:
+            from services.agent_v2.reponse_question import (consommer_reponse,
+                                                            ReponseQuestionRefusee)
+            try:
+                precise = consommer_reponse(user, self._conversation, courant, question_answer)
+            except ReponseQuestionRefusee as exc:
+                texte_refus = str(exc)
+                question_reposee = getattr(exc, "question", None)
+                assistant = ConversationMessage.objects.create(
+                    user=user, role="assistant", content=texte_refus,
+                    conversation=self._conversation,
+                    metadata={"agent": "v2", "en_reponse_a": courant.pk,
+                              "question_posee": bool(question_reposee), "quick_replies": [],
+                              "question_custom": question_reposee,
+                              "interactive_inputs": question_reposee.get("fields", []) if question_reposee else []})
+                yield {"type": "delta", "text": texte_refus}
+                resultat_refus = {"type": "done", "assistant_message_id": assistant.pk,
+                                  "conversation_id": self._conversation.pk if self._conversation else None,
+                                  "response": texte_refus, "quick_replies": [],
+                                  "question_posee": bool(question_reposee),
+                                  "blocks_created": [], "tasks_created": [], "raisonnement": ""}
+                if question_reposee:
+                    resultat_refus["question_custom"] = question_reposee
+                    resultat_refus["interactive_inputs"] = question_reposee.get("fields", [])
+                yield resultat_refus
+                return
+            message_enrichi += "\n\nRÉPONSE VALIDÉE AU FORMULAIRE : " + json.dumps(
+                precise, ensure_ascii=False)
         # Lu AVANT l'attente: seul un document qui bascule pendant ce tour
         # compte comme « traite ce tour » (equivalence avec v1 detaillee dans
         # la docstring de boutons_forces).
@@ -1004,6 +1063,7 @@ class PlannerAgentV2:
         if reste:
             faits = f"{faits}\n{reste}" if faits else reste
         faits = sans_tiret_long(faits or "")
+        faits_pour_controle = faits
 
         # LIRE n'est pas MONTRER. Une lecture reussie pour raisonner (le
         # modele a lu sans que personne ne demande a voir) ne s'affiche
@@ -1025,13 +1085,6 @@ class PlannerAgentV2:
                 faits = f"{faits}\n{reste}" if faits else reste
                 faits = sans_tiret_long(faits or "")
 
-        # Les faits partent AVANT la redaction: ils sont deja vrais, et
-        # l'utilisateur n'a pas a attendre l'enrobage pour les voir.
-        emis: list[str] = []
-        if faits:
-            emis.append(faits)
-            yield {"type": "delta", "text": faits}
-
         supprimees = 0
         fuites: list[str] = []
         # Chemin rapide et budget journalier epuise: la boucle n'a pas tourne,
@@ -1048,12 +1101,43 @@ class PlannerAgentV2:
             brut, supprimees, fuites = verifier_prose(
                 brut, registre, autoriser_conversation=voie_rapide,
                 sans_faits=not faits)
-            compo = composer(brut, registre, faits, gagnant)
+            # Une lecture masquée ne doit pas réapparaître dans la prose du
+            # modèle. On la fournit au dédoublonneur comme preuve de contrôle,
+            # tout en n'émettant que les faits autorisés plus bas.
+            compo = composer(brut, registre,
+                             faits_pour_controle if lecture_masquee else faits,
+                             gagnant)
         else:
             # La boucle n'a rien rendu (panne, budget d'etapes): les faits
             # parlent, et le repli aussi (plus bas).
             compo = composer(None, registre, faits, gagnant)
+
+        # Une lecture ou un échec d'outil a déjà été renvoyé au modèle. Sa
+        # réponse finale prend la place du résumé `public` si elle survit aux
+        # gardes. Le rendu déterministe reste le repli lorsque le modèle n'a
+        # rien produit d'utilisable. Les mutations réussies gardent leurs
+        # reçus relus et les questions du code gardent leur priorité.
+        mutation_reussie = any(a.succes and a.est_mutation for a in registre.actions)
+        modele_prioritaire = bool(
+            reponse_boucle is not None and not par_le_code and not budget_jour_epuise
+            and not registre.budget_epuise and not lecture_masquee and not reemises
+            and not mutation_reussie and not gagnant and not faits
+            and not prose_regle)
+        lecture_repondue_par_modele = False
+        if modele_prioritaire:
+            # Composer directement sans résumé évite qu'un dédoublonneur
+            # retire la liste demandée puis laisse seulement un commentaire.
+            candidate = composer(brut, registre, "", None)
+            if candidate.prose or candidate.question:
+                faits = ""
+                compo = candidate
+                lecture_repondue_par_modele = True
         duree_verif = time.perf_counter() - t0_verif
+
+        emis: list[str] = []
+        if faits:
+            emis.append(faits)
+            yield {"type": "delta", "text": faits}
 
         # Zero tiret long dans ce que lit l'utilisateur, quelle que soit la
         # source (banc du round 3, s06-1).
@@ -1061,7 +1145,6 @@ class PlannerAgentV2:
         motif, chips = compo.motif, compo.chips
         if prose_regle:
             prose = sans_tiret_long(prose_regle)
-        mutation_reussie = any(a.succes and a.est_mutation for a in registre.actions)
         if reemises and par_demande and cles_posees & {d.get("cle") for d in reemises}:
             # Revue de lisibilite du round 4: DIRE lisait une reponse de garde
             # et ecrivait « D'accord, je garde ta chimie. » juste avant la
@@ -1152,7 +1235,8 @@ class PlannerAgentV2:
         # Un masquage voulu n'est pas le defaut « lu sans rien montrer »:
         # il a son compteur propre, sinon la metrique deviendrait aveugle.
         lecture_sans_liste = (compo.lecture_sans_liste
-                              or (lecture_reussie and not faits)) and not lecture_masquee
+                              or (lecture_reussie and not faits
+                                  and not lecture_repondue_par_modele)) and not lecture_masquee
         try:
             marqueurs = list(marqueurs_bruts(response))
         except Exception:  # noqa: BLE001 - une mesure ne casse pas un tour
@@ -1211,6 +1295,18 @@ class PlannerAgentV2:
         )
 
         question_affichee = "" if motif == "formulaire" else question
+        question_custom = None
+        if gagnant:
+            for action in reversed(registre.actions):
+                candidate = (action.donnees or {}).get("question_custom")
+                if action.outil != "ask_question_custom" or not action.succes or not candidate:
+                    continue
+                if candidate.get("kind") in ("form", "text") and formulaire:
+                    question_custom = candidate
+                    break
+                if candidate.get("kind") == "choice" and question_affichee == candidate.get("question"):
+                    question_custom = candidate
+                    break
 
         # Les appels réconcilient leur propre provision. Aucun second débit par phase.
 
@@ -1225,6 +1321,7 @@ class PlannerAgentV2:
             "question_posee": question_posee,
             "question": question_affichee,
             "question_motif": motif or "",
+            "question_custom": question_custom,
             "activation_notifications": any(
                 a.outil == 'send_notification'
                 or (a.succes and a.outil in ('manage_reminder', 'manage_recurrence')
@@ -1292,6 +1389,7 @@ class PlannerAgentV2:
             "question_posee": question_posee,
             "question": question_affichee,
             "question_motif": motif or "",
+            "question_custom": question_custom,
         }
         if formulaire:
             evenement["interactive_inputs"] = formulaire
@@ -1771,7 +1869,7 @@ class PlannerAgentV2:
         du resultat. Sans ce releve, v2 presenterait des formulaires que
         l'utilisateur ne verrait jamais."""
         for a in reversed(registre.actions):
-            if a.outil == "present_form" and a.succes:
+            if a.outil in ("present_form", "ask_question_custom") and a.succes:
                 return (a.donnees or {}).get("interactive_inputs")
         return None
 
@@ -1783,15 +1881,18 @@ class PlannerAgentV2:
         generate_quick_replies: bool = True,
         tap: Optional[dict] = None,
         conversation_id=None,
+        question_answer=None,
     ) -> dict:
         """Enveloppe non streamee: draine le flux, seule source de verite."""
         done: dict = {}
+        question_extra = {"question_answer": question_answer} if question_answer is not None else {}
         for event in self.process_message_stream(
             user, message, attachment,
             use_streaming=False,
             generate_quick_replies=generate_quick_replies,
             tap=tap,
             conversation_id=conversation_id,
+            **question_extra,
         ):
             if event.get("type") == "done":
                 done = {k: v for k, v in event.items() if k != "type"}
