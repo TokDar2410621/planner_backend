@@ -25,7 +25,7 @@ class AgentConversation(PlannerAgentV2):
 
     def process_message_stream(self, user, message, attachment=None, *,
                                use_streaming=True, generate_quick_replies=False, tap=None,
-                               conversation_id=None):
+                               conversation_id=None, question_answer=None):
         from services.agent_v2.trace_tour import TraceTour, trace_courante
         from services.agent_v2.budget_tour import ouvrir_trace, fermer_trace, BudgetEpuise, BudgetIndisponible
         self._trace = trace_courante.get()
@@ -46,7 +46,7 @@ class AgentConversation(PlannerAgentV2):
         try:
             yield from self._traiter_tour(user, message, attachment,
                 use_streaming=use_streaming, generate_quick_replies=generate_quick_replies, tap=tap,
-                conversation_id=conversation_id)
+                conversation_id=conversation_id, question_answer=question_answer)
         finally:
             try:
                 if proprietaire:
@@ -56,7 +56,7 @@ class AgentConversation(PlannerAgentV2):
 
     def _traiter_tour(self, user, message, attachment=None, *,
                                use_streaming=True, generate_quick_replies=False, tap=None,
-                               conversation_id=None):
+                               conversation_id=None, question_answer=None):
         self.user = user
         self._depart_admission = time.perf_counter()
         self._decision_tour = None
@@ -67,7 +67,7 @@ class AgentConversation(PlannerAgentV2):
             yield from super().process_message_stream(
                 user, message, attachment, use_streaming=use_streaming,
                 generate_quick_replies=False, tap=tap,
-                conversation_id=conversation_id)
+                conversation_id=conversation_id, question_answer=question_answer)
             return
 
         if self._admission_refusee or _budget_jour_epuise(user):
@@ -98,7 +98,7 @@ class AgentConversation(PlannerAgentV2):
         yield from super().process_message_stream(
             user, message, attachment, use_streaming=use_streaming,
             generate_quick_replies=generate_quick_replies, tap=tap,
-            conversation_id=conversation_id)
+            conversation_id=conversation_id, question_answer=question_answer)
 
     @staticmethod
     def _tap_valide(user, tap):

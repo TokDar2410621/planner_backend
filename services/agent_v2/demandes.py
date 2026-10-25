@@ -649,7 +649,13 @@ def heures_dites_positions(message_brut) -> list[tuple[str, int]]:
                     continue
             else:
                 h, mn = int(m.group(3)), int(m.group(4))
-            if _AVANT_DUREE.search(plat[:m.start()]) or _LIBELLE_DUREE.search(plat[:m.start()]):
+            # Le libelle « Heures de ... » indique une duree pour « 4 h »,
+            # mais « 15:00 - 17:00 » est une plage d'horloge. Le premier
+            # horaire du formulaire etait sinon efface, puis la garde d'outil
+            # refusait l'heure pourtant envoyee par l'utilisateur.
+            if (_AVANT_DUREE.search(plat[:m.start()])
+                    or (m.group(1) is not None
+                        and _LIBELLE_DUREE.search(plat[:m.start()]))):
                 continue
             valeur = f"{h:02d}:{mn:02d}"
         sortie.append((valeur, m.start()))

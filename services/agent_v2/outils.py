@@ -1616,7 +1616,8 @@ def _heure_dite_contredite(ctx: _Contexte, nom: str, kwargs: dict, prep: _Prepar
             consigne = (f"l'utilisateur a dit {dite} pour {_ascii(titre)}. "
                         f"Refais l'appel avec start_time={dite}. Si cette heure ne convient pas")
         return ToolResult(
-            success=False, data={"heure_dite": dite},
+            success=False, data={"heure_dite": dite,
+                                 "heure_ambigue": len(lectures) > 1},
             message=f"Retenu par le code: {consigne}, pose la question au lieu de changer l'heure.")
     demande = _demande_heure_refusee(ctx, nom, kwargs, titre, jour_cible, dite, fin_dite,
                                      None, recurrent=recurrent)
