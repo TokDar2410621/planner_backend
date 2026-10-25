@@ -104,14 +104,14 @@ class P1FuiteDuBancTests(SimpleTestCase):
     def test_la_liste_couvre_tous_les_textes(self):
         textes = _textes_envoyes_au_modele()
         self.assertIn("outil create_block", textes)
-        self.assertIn("outil present_choices", textes)
+        self.assertIn("outil ask_question_custom", textes)
         self.assertIn("outil cancel_scheduled_block", textes)
         self.assertIn("PROSE_BOUCLE", textes)
 
     def test_les_regles_restent(self):
         from services.agent_v2.prompts import REGLES_AGIR
         for requis in ("COURS EXISTANT",
-                       'present_choices (source "blocs") avec ces seuls cours',
+                       'ask_question_custom kind=choice (source "blocs") avec ces seuls cours',
                        "echeance sans jour choisi"):
             with self.subTest(requis=requis):
                 self.assertIn(requis, REGLES_AGIR)

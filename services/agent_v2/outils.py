@@ -1992,12 +1992,18 @@ def _question_deja_posee(ctx: _Contexte, nom: str, kwargs: dict):
     demande de motif choix_modele ou question_libre emise ce tour, le second
     appel est refuse avec une consigne, pas execute: deux questions ne se
     rendent pas, et la seconde ecraserait la premiere au tap."""
-    if nom not in ("poser_question", "present_choices"):
+    if nom not in ("poser_question", "present_choices", "present_form", "ask_question_custom"):
         return None
     for a in ctx.registre.actions:
         demande = (a.donnees or {}).get("demande")
-        if (isinstance(demande, dict)
-                and demande.get("motif") in MOTIFS_QUESTION_MODELE):
+        if nom == "ask_question_custom" and isinstance(demande, dict) and not a.succes:
+            return ToolResult(
+                success=False,
+                message="Question non posee : une action est deja retenue par le code. "
+                        "Attends sa confirmation avant une autre question.")
+        if a.succes and (a.outil in ("present_form", "ask_question_custom")
+                         or isinstance(demande, dict)
+                         and demande.get("motif") in MOTIFS_QUESTION_MODELE):
             return ToolResult(
                 success=False,
                 message=("Question non posee : tu as deja pose une question ce tour. "
@@ -2673,7 +2679,7 @@ OUTILS_EXPOSES = frozenset({
     "cancel_scheduled_block", "delete_block", "create_task", "complete_task",
     "delete_task",
     # questions posees par le modele, relayees par le code
-    "present_form", "present_choices", "poser_question",
+    "ask_question_custom",
     "read_planning_skill",
 })
 NOM_CHERCHEUR = "chercher_outils"
@@ -2723,7 +2729,8 @@ DESCRIPTION_APPEL = (
     "direct: une suppression demande toujours sa confirmation."
 )
 
-OUTILS_QUESTION = frozenset({"poser_question", "present_choices"})
+OUTILS_QUESTION = frozenset({"poser_question", "present_choices", "present_form", "ask_question_custom"})
+OUTILS_QUESTION_ANCIENS = frozenset({"poser_question", "present_choices", "present_form"})
 
 
 # Descriptions V2 (doctrine 2026-09-29): le modele choisit l'outil par sa
@@ -2863,7 +2870,8 @@ def outils_pour_le_modele(user: User, registre: Registre, message_du_tour: str =
     lecture_seule = getattr(registre, 'lecture_seule', False)
     interdits = OUTILS_DE_MUTATION | {'send_notification'} if lecture_seule else set()
     autorises = [o for o in ALL_TOOLS if o.NAME not in interdits]
-    caches = [o for o in autorises if o.NAME not in OUTILS_EXPOSES]
+    caches = [o for o in autorises if o.NAME not in OUTILS_EXPOSES
+              and o.NAME not in OUTILS_QUESTION_ANCIENS]
 
     async def chercher_outils(besoin: str = "") -> str:
         return chargeur.chercher(besoin, caches, description_v2)
@@ -2874,6 +2882,8 @@ def outils_pour_le_modele(user: User, registre: Registre, message_du_tour: str =
         if vise in interdits:
             return 'Ce tour autorise seulement une consultation.'
         outil = TOOL_MAP.get(vise)
+        if vise in OUTILS_QUESTION_ANCIENS:
+            return 'Utilise ask_question_custom pour poser une question.'
         if outil is None:
             connus = ", ".join(sorted(o.NAME for o in caches))
             return (f"Outil inconnu: {vise!r}. Cherche-le d'abord avec "

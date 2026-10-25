@@ -46,7 +46,7 @@ class RegleCoursExistantTests(SimpleTestCase):
 
     def test_la_designation_ambigue_reste_un_choix_entre_vrais_cours(self):
         from services.agent_v2.prompts import REGLES_AGIR
-        self.assertIn('present_choices (source "blocs") avec ces seuls cours', REGLES_AGIR)
+        self.assertIn('ask_question_custom kind=choice (source "blocs") avec ces seuls cours', REGLES_AGIR)
         self.assertIn("Jamais d'option inventee", REGLES_AGIR)
 
 

@@ -55,6 +55,7 @@ from . import resolve_document_entry
 from . import present_form
 from . import present_choices
 from . import poser_question
+from . import ask_question_custom
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,7 @@ ALL_OUTILS = [
     present_form,
     present_choices,
     poser_question,
+    ask_question_custom,
 ]
 
 # Index par nom pour recherche rapide.
@@ -125,7 +127,7 @@ TOOL_MAP = OUTIL_MAP
 # done.quick_replies; v1 n'a pas ce relais et poserait une question sans
 # boutons. Ils restent dans ALL_OUTILS (v2 les expose via
 # services/agent_v2/outils.py) mais sortent de toute liste offerte a v1.
-V2_SEULEMENT = {"present_choices", "poser_question",
+V2_SEULEMENT = {"present_choices", "poser_question", "ask_question_custom",
                 "manage_reminder", "list_reminders", "manage_recurrence",
                 "list_recurrences", "read_planning_skill",
                 # Outil compose ajoute pour la boucle unique: v2 le rend en une

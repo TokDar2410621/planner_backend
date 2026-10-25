@@ -12,7 +12,7 @@ from . import commun
 from .base import ToolResult
 from .commun import _fold, _iso_date
 
-FIELD_TYPES = ("time_range", "time", "number", "checkbox", "select", "radio", "duration", "date")
+FIELD_TYPES = ("time_range", "time", "number", "checkbox", "select", "radio", "duration", "date", "text")
 CHOICE_TYPES = ("checkbox", "select", "radio")
 DEFAULT_DURATION_PRESETS = (30, 60, 90, 120)
 WEEKDAYS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
@@ -24,7 +24,7 @@ CLOCK_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 
 # Source de verite : FIELD_TYPES. Le Literal ci-dessous est le miroir type
 # du schema ; l'assertion garde les deux synchronises.
-TypeChamp = Literal["time_range", "time", "number", "checkbox", "select", "radio", "duration", "date"]
+TypeChamp = Literal["time_range", "time", "number", "checkbox", "select", "radio", "duration", "date", "text"]
 assert set(TypeChamp.__args__) == set(FIELD_TYPES), \
     "derive entre le schema type et FIELD_TYPES"
 

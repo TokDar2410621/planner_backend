@@ -50,10 +50,10 @@ class ActionCitee(BaseModel):
 class ReponseDire(BaseModel):
     ouverture: str = Field(
         default="",
-        description="Laisse vide sur un tour outillé : le code rend les faits vérifiés.")
+        description="Réponds à la demande après les résultats d'outils, y compris une valeur absente ou un échec. N'annonce aucun effet non vérifié.")
     suite: str = Field(
         default="",
-        description="Laisse vide sur un tour outillé : le code rend les faits vérifiés.")
+        description="Précision utile à la réponse. Donne la liste lue si elle est demandée; n'affirme pas d'action sans reçu vérifié.")
     question: str = Field(
         default="",
         description="Au plus UNE question, finit par '?'. Vide si le code pose déjà une question.")
@@ -219,14 +219,18 @@ def _phrases(texte: str) -> list[str]:
     return phrases
 
 
-def _sans_annonce_vide(texte: str) -> tuple[str, int]:
-    """Retire « que voici » et les comptes nus quand rien n'est affiche."""
+def _sans_annonce_vide(texte: str, *, liste_lue: bool = False) -> tuple[str, int]:
+    """Retire une annonce seulement si aucune liste ne la suit dans la phrase."""
     gardees: list[str] = []
     retirees = 0
     for phrase in _phrases(texte):
         if _VOICI.search(phrase) or _COMPTE_NU.search(phrase):
-            retirees += 1
-            continue
+            # La liste peut désormais être rédigée par le modèle. Son titre
+            # et ses éléments restent ensemble lorsque le modèle les fournit
+            # après les deux-points, sur la même ligne ou sur les suivantes.
+            if not liste_lue or not re.search(r":\s*\S", phrase):
+                retirees += 1
+                continue
         gardees.append(phrase)
     return " ".join(gardees), retirees
 
@@ -413,9 +417,9 @@ def composer(brut: ReponseDire | None, registre: Registre, faits: str,
     (e) sans faits affiches, une phrase qui annonce une liste (« que voici »,
         « 3 créneaux ») est retiree: elle promettrait ce qui ne suit pas.
     (f) si le code pose deja une question, celle de DIRE est ecartee.
-    (g) sur un tour de lecture PURE, une phrase qui redit la liste affichee
-        (annonce, element nomme avec son heure, ou deux elements nommes)
-        tombe: le code est le seul narrateur des listes.
+    (g) si le code affiche déjà une liste lue, une phrase qui la redit
+        (annonce, élément nommé avec son heure, ou deux éléments nommés)
+        tombe. Sans liste du code, celle du modèle reste visible.
     Les phrases de `actions` ne sont jamais rendues (un seul narrateur).
     """
     faits = faits or ""
@@ -441,12 +445,14 @@ def composer(brut: ReponseDire | None, registre: Registre, faits: str,
     lecture_sans_liste = False
     redites = 0
     if not faits:
-        ouverture, n1 = _sans_annonce_vide(ouverture)
-        suite, n2 = _sans_annonce_vide(suite)
+        liste_lue = any(a.succes and not a.est_mutation
+                        and (a.public or a.donnees) for a in registre.actions)
+        ouverture, n1 = _sans_annonce_vide(ouverture, liste_lue=liste_lue)
+        suite, n2 = _sans_annonce_vide(suite, liste_lue=liste_lue)
         lecture_sans_liste = bool(n1 or n2)
     elif any(a.succes and a.outil in LECTURES_RENDUES for a in registre.actions):
         titres = _titres_affiches(registre, faits)
-        # (g) Un tour de LECTURE PURE affiche sa liste par le code: une phrase
+        # (g) Si une LECTURE PURE affiche sa liste par le code, une phrase
         # qui la redit est un second narrateur (mesure prod du 2026-09-29).
         # Un tour qui a mute garde sa prose: « je l'ai deplace a 14 h » nomme
         # un titre et une heure sans rien redire.

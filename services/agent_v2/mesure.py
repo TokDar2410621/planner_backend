@@ -593,35 +593,34 @@ def _refs_verifiees(reponse, registre) -> set[str]:
 
 def verifier_prose(reponse: ReponseDire, registre, *, autoriser_conversation=False,
                    sans_faits=False) -> tuple[ReponseDire, int, list[str]]:
-    """Le code raconte les actions ; une référence ne certifie aucune prose.
+    """Garde les réponses aux lectures et protège les mutations vérifiables.
 
-    Sur un tour outillé, ouverture et suite sont retirées indépendamment de
-    leur vocabulaire. Une paraphrase n'est pas une postcondition. Le routeur
-    sémantique rend la conversation hors de cette voie ; l'option explicite
-    reste disponible aux appelants sans registre d'actions.
-
-    sans_faits dit que le code n'a rien rendu a l'ecran sur ce tour. Dans ce
-    cas, et seulement si aucune mutation n'a abouti, la prose du modele passe
-    la garde large et ne subit que la garde phrase par phrase.
+    Un résultat de lecture ou un échec d'outil revient au modèle : sa réponse
+    doit rester visible même si l'outil a aussi produit un résumé `public`.
+    Une mutation réussie reste racontée par son reçu relu. Le modèle peut
+    encore proposer une question ou une offre sans affirmation d'effet. Une
+    référence seule ne certifie aucune phrase libre au sujet de ses effets.
     """
     champs = {}
     supprimees = 0
     fuites = []
     conversation = bool(autoriser_conversation and registre is not None and registre.vide())
-    # Le code n'a rien rendu et aucune mutation n'a abouti: la prose du modele
-    # est alors tout ce qui reste, et l'effacer en bloc repondait « Je n'ai pas
-    # compris » a quelqu'un qui venait de parler. La garde PRECISE plus bas
-    # (epurer_reponse) coupe de toute facon chaque phrase qui affirme une
-    # action: on retire la garde large, jamais la fine. Une mutation reussie
-    # garde la garde entiere, car le code doit raconter ce qu'il a fait.
+    # Les lectures et les échecs ne prouvent aucune mutation. Leur explication
+    # vient du modèle, même lorsqu'un résumé d'outil a été rendu. La garde
+    # phrase par phrase reste active pour couper une action annoncée sans reçu.
     mutation = bool(registre is not None
                     and any(a.succes and a.est_mutation for a in registre.actions))
-    prose_seule = bool(sans_faits and not mutation)
-    if not conversation and not prose_seule:
+    # Sans action et sans indication explicite que la réponse est seule à
+    # l'écran, aucun texte libre ne prouve un état ou un effet passé. Le chemin
+    # de conversation passe sans_faits=True et garde sa réponse après la garde
+    # phrase par phrase. Une lecture ou un échec d'outil passe aussi sa réponse.
+    registre_vide = bool(registre is not None and registre.vide())
+    if not conversation and (mutation or (registre_vide and not sans_faits)):
         for champ in ("ouverture", "suite"):
             texte = getattr(reponse, champ, "") or ""
-            if texte.strip():
-                champs[champ] = ""
+            garde = questions_et_offres(texte) if mutation else ""
+            if texte.strip() and garde != texte.strip():
+                champs[champ] = garde
                 supprimees += 1
                 fuites.append(f"{champ}:prose_hors_contrat")
     refs = list(getattr(reponse, "refs", None) or [])

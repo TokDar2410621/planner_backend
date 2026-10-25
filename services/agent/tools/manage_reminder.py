@@ -13,7 +13,7 @@ NAME = 'manage_reminder'
 DESCRIPTION = (
     "Crée un rappel autonome à une date ET une heure explicites, ou reporte/annule "
     "un rappel vérifié via list_reminders. Si l'heure manque, demande-la avec "
-    "poser_question ou present_form avant de créer. Une tâche à faire sans demande "
+    "ask_question_custom avant de créer. Une tâche à faire sans demande "
     "d'alerte est une tâche, pas un rappel. Pour une répétition, utilise manage_recurrence."
 )
 
