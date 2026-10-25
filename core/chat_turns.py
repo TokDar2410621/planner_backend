@@ -29,6 +29,7 @@ def _fingerprint(request):
         'conversation_id': request.data.get('conversation_id', ''),
         'tap_demande': request.data.get('tap_demande', ''),
         'tap_option': request.data.get('tap_option', ''),
+        'question_answer': request.data.get('question_answer', ''),
         'attachment': file_data,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()

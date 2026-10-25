@@ -435,11 +435,19 @@ class AutresMutationsTests(SimpleTestCase):
                       {"heure_dite": "08:00"},
                       "Retenu par le code: l'utilisateur a dit 08:00."))
         sortie = faits(r)
-        self.assertIn("peut être le matin ou le soir", sortie)
-        self.assertIn("Dis-moi laquelle", sortie)
+        self.assertIn("ne correspond pas à 8 h", sortie)
+        self.assertNotIn("peut être le matin ou le soir", sortie)
         self.assertNotIn("rien n'a changé", sortie)
         self.assertNotIn("Retenu par le code", sortie)
         self.assertEqual(marqueurs_bruts(sortie), [])
+
+    def test_refus_heure_sans_meridien_garde_la_question(self):
+        r = registre(("schedule_task_at", {"title": "Dentiste", "start_time": "09:00"}, False,
+                      {"heure_dite": "08:00", "heure_ambigue": True},
+                      "Retenu par le code: l'utilisateur a dit 08:00 ou 20:00."))
+        sortie = faits(r)
+        self.assertIn("peut être le matin ou le soir", sortie)
+        self.assertIn("Dis-moi laquelle", sortie)
 
     def test_refus_evenement_unique_dit_sa_raison(self):
         # Sans succes ulterieur du meme titre : la raison se dit, pas le generique.

@@ -980,12 +980,17 @@ class _Narrateur:
                 "le nom ou le jour de la série et ses dates. Dis-moi d'abord l'un, puis l'autre.")
             return
 
-        # 2026-10-14 (14) : heure dite sans matin ni soir (T3). Le code
-        # n'impose jamais une des deux lectures, il demande.
+        # Une heure sans matin ni soir peut avoir deux lectures. Une heure
+        # au format 24 h est precise: ne jamais lui inventer cette ambiguite.
         if d.get("heure_dite"):
-            self.ajouter_refus(
-                "Je n'ai rien changé : l'heure que tu as dite peut être le matin ou le soir. "
-                "Dis-moi laquelle.")
+            if d.get("heure_ambigue"):
+                self.ajouter_refus(
+                    "Je n'ai rien changé : l'heure que tu as dite peut être le matin ou le soir. "
+                    "Dis-moi laquelle.")
+            else:
+                self.ajouter_refus(
+                    f"Je n'ai rien changé : l'heure proposée ne correspond pas à "
+                    f"{heure(d['heure_dite'])}, l'heure que tu as donnée.")
             return
 
         # 2026-10-14 (14) : jour nomme sans recurrence (T4). Le silence
