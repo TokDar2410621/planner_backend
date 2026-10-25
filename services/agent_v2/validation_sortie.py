@@ -20,11 +20,18 @@ def question_sans_outil(texte: str, registre) -> bool:
     )
 
 
+def jugement_exige_outil(verdict: dict) -> bool:
+    """Un verdict incertain ne transforme pas une relance sociale en formulaire."""
+    return (verdict.get("statut") == "decision"
+            and verdict.get("valeur") is True)
+
+
 def _simple(texte: str) -> str:
     return " ".join((texte or "").split())
 
 
-def retour_validation(texte: str, registre, *, faits_controle: str = "") -> str | None:
+def retour_validation(texte: str, registre, *, faits_controle: str = "",
+                      question_exige_outil: bool = False) -> str | None:
     """Décrit au modèle ce que le rendu retirerait, sans lui confier l'autorité.
 
     La même vérification reste exécutée après la boucle. Cette fonction ne
@@ -34,7 +41,7 @@ def retour_validation(texte: str, registre, *, faits_controle: str = "") -> str 
     if not isinstance(texte, str) or not texte.strip():
         return None
 
-    if question_sans_outil(texte, registre):
+    if question_exige_outil and question_sans_outil(texte, registre):
         return (
             "VALIDATION DE LA RÉPONSE : tu demandes une précision en prose. "
             "Appelle ask_question_custom pour poser cette question et recueillir "

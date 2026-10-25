@@ -281,6 +281,26 @@ def q_interaction_sociale() -> dict:
     }
 
 
+def q_question_requiert_outil() -> dict:
+    """Noul : la question finale recueille-t-elle une donnée pour agir ?"""
+    return {
+        "type": TYPE_NOUL,
+        "instructions": (
+            "Le champ reponse_assistant contient une question adressée à la "
+            "personne. Cette question demande-t-elle une information nécessaire "
+            "pour exécuter ou poursuivre sa demande, notamment choisir une action, "
+            "une cible ou un paramètre ? Juge le sens du message utilisateur et "
+            "de la réponse ensemble. Réponds non pour un échange social, une "
+            "question rhétorique, une citation ou une proposition facultative "
+            "après une réponse terminée."
+        ),
+        "criteria": {
+            "oui": "la réponse de la personne conditionne la suite de sa demande",
+            "non": "la question n'est pas nécessaire pour poursuivre la demande",
+        },
+    }
+
+
 def q_consultation() -> dict:
     """Choice : la personne demande-t-elle a VOIR quelque chose, et quoi ?
 

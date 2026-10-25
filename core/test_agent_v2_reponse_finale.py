@@ -13,7 +13,7 @@ from services.agent_v2.agent import PlannerAgentV2
 from services.agent_v2.mesure import verifier_prose
 from services.agent_v2.redaction import ReponseDire, bloc_factuel, composer
 from services.agent_v2.registre import Registre
-from services.agent_v2.validation_sortie import retour_validation
+from services.agent_v2.validation_sortie import jugement_exige_outil, retour_validation
 
 
 class FiltreLectureTests(SimpleTestCase):
@@ -22,6 +22,7 @@ class FiltreLectureTests(SimpleTestCase):
             "C'est noté pour lundi 26 octobre.\n\n"
             "À quelle heure commence et finit ton examen ?",
             Registre(),
+            question_exige_outil=True,
         )
 
         self.assertIsNotNone(retour)
@@ -35,14 +36,32 @@ class FiltreLectureTests(SimpleTestCase):
             }}))
 
         self.assertIsNone(retour_validation(
-            "À quelle heure commence et finit ton examen ?", registre))
+            "À quelle heure commence et finit ton examen ?", registre,
+            question_exige_outil=True))
 
     def test_question_apres_outil_echoue_revient_au_modele(self):
         registre = Registre()
         registre.ajouter("ask_question_custom", {}, ToolResult(success=False))
 
         self.assertIn("ask_question_custom", retour_validation(
-            "À quelle heure commence et finit ton examen ?", registre))
+            "À quelle heure commence et finit ton examen ?", registre,
+            question_exige_outil=True))
+
+    def test_question_sociale_ne_force_pas_un_outil(self):
+        self.assertIsNone(retour_validation(
+            "Je vais bien, merci ! Et toi, comment tu vas ?", Registre(),
+            question_exige_outil=False))
+
+    def test_jugement_incertain_ne_force_pas_un_outil(self):
+        self.assertFalse(jugement_exige_outil({
+            "statut": "incertain", "valeur": True,
+        }))
+        self.assertFalse(jugement_exige_outil({
+            "statut": "indisponible", "valeur": None,
+        }))
+        self.assertTrue(jugement_exige_outil({
+            "statut": "decision", "valeur": True,
+        }))
 
     def test_rejet_de_sortie_devient_un_retour_exploitable(self):
         registre = Registre()
@@ -256,6 +275,11 @@ class ReponseApresOutilTests(TransactionTestCase):
 
         with patch.object(module_agent, "modele_agir",
                           return_value=FunctionModel(modele, stream_function=en_flux)), \
+             patch.object(module_agent._jugement, "juger", return_value={
+                 "question_requiert_outil": {
+                     "statut": "decision", "valeur": True, "confiance": 0.95,
+                 },
+             }) as juger, \
              patch("services.agent_v2.budget_tour.modele_borne", side_effect=lambda m, _tag: m), \
              patch.object(module_agent, "outils_pour_le_modele", return_value=[ask_question_custom]), \
              patch.object(module_agent, "prompt_agir", return_value="Pose la question par outil."), \
@@ -265,6 +289,46 @@ class ReponseApresOutilTests(TransactionTestCase):
         self.assertEqual(appels, ["prose", "outil", "fin"])
         self.assertEqual(reponse.ouverture, "J'attends tes heures.")
         self.assertEqual([a.outil for a in registre.actions], ["ask_question_custom"])
+        juger.assert_called_once()
+        etat, questions = juger.call_args.args
+        self.assertEqual(etat["message"], "J'ai un examen lundi")
+        self.assertIn("À quelle heure", etat["reponse_assistant"])
+        self.assertEqual(questions["question_requiert_outil"]["type"], "noul")
+
+    def test_boucle_planner_garde_une_question_sociale_sans_outil(self):
+        from pydantic_ai.messages import ModelResponse, TextPart
+        from pydantic_ai.models.function import FunctionModel
+
+        user = User.objects.create_user(username="question-sociale")
+        registre = Registre()
+        appels = []
+
+        def modele(messages, _info):
+            appels.append(messages)
+            return ModelResponse(parts=[TextPart(
+                content="Je vais bien, merci ! Et toi, comment tu vas ?")])
+
+        async def en_flux(messages, _info):
+            appels.append(messages)
+            yield "Je vais bien, merci ! Et toi, comment tu vas ?"
+
+        with patch.object(module_agent, "modele_agir",
+                          return_value=FunctionModel(modele, stream_function=en_flux)), \
+             patch.object(module_agent._jugement, "juger", return_value={
+                 "question_requiert_outil": {
+                     "statut": "decision", "valeur": False, "confiance": 0.95,
+                 },
+             }) as juger, \
+             patch("services.agent_v2.budget_tour.modele_borne", side_effect=lambda m, _tag: m), \
+             patch.object(module_agent, "outils_pour_le_modele", return_value=[]), \
+             patch.object(module_agent, "prompt_agir", return_value="Réponds à la personne."), \
+             patch.object(PlannerAgentV2, "_historique", return_value=[]):
+            reponse = PlannerAgentV2()._boucle(user, "Comment tu vas ?", registre)
+
+        self.assertEqual(reponse.ouverture,
+                         "Je vais bien, merci ! Et toi, comment tu vas ?")
+        self.assertEqual(len(appels), 1)
+        juger.assert_called_once()
 
     def test_mutation_relu_puis_reprise_sans_nouvelle_ecriture(self):
         from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
