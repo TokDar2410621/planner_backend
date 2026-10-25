@@ -56,6 +56,16 @@ class AskQuestionCustomTests(TestCase):
         with self.assertRaises(ReponseQuestionRefusee):
             consommer_reponse(self.user, self.conversation, courant, payload)
 
+    def test_formulaire_accepte_une_plage_horaire(self):
+        result = TOOL_MAP["ask_question_custom"].execute(
+            self.user, kind="form", question="De quelle heure à quelle heure ?",
+            fields=[{"id": "horaire", "type": "time_range", "label": "Horaire",
+                     "question": "De quelle heure à quelle heure ?"}])
+
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(result.data["interactive_inputs"][0]["type"], "time_range")
+        self.assertEqual(result.data["question_custom"]["kind"], "form")
+
     def test_reponse_autre_conversation_refusee(self):
         question = {"id": "q1", "kind": "text", "fields": [{"id": "reponse", "type": "text"}]}
         autre = Conversation.objects.create(user=self.user)

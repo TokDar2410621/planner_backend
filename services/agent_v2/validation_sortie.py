@@ -1,14 +1,37 @@
 """Retour au modèle des rejets déterministes de sa réponse finale."""
 
 from services.agent_v2.mesure import verifier_prose
-from services.agent_v2.redaction import ReponseDire, composer, sans_tiret_long
+from services.agent_v2.redaction import ReponseDire, composer, contient_question, sans_tiret_long
+
+
+_OUTILS_QUESTION = frozenset({
+    "ask_question_custom", "present_form", "present_choices", "poser_question",
+})
+
+
+def question_sans_outil(texte: str, registre) -> bool:
+    """Une question libre ne peut pas remplacer une demande interactive suivie."""
+    if not contient_question(texte):
+        return False
+    return not any(
+        (action.succes and action.outil in _OUTILS_QUESTION)
+        or isinstance((action.donnees or {}).get("demande"), dict)
+        for action in registre.actions
+    )
+
+
+def jugement_exige_outil(verdict: dict) -> bool:
+    """Un verdict incertain ne transforme pas une relance sociale en formulaire."""
+    return (verdict.get("statut") == "decision"
+            and verdict.get("valeur") is True)
 
 
 def _simple(texte: str) -> str:
     return " ".join((texte or "").split())
 
 
-def retour_validation(texte: str, registre, *, faits_controle: str = "") -> str | None:
+def retour_validation(texte: str, registre, *, faits_controle: str = "",
+                      question_exige_outil: bool = False) -> str | None:
     """Décrit au modèle ce que le rendu retirerait, sans lui confier l'autorité.
 
     La même vérification reste exécutée après la boucle. Cette fonction ne
@@ -17,6 +40,15 @@ def retour_validation(texte: str, registre, *, faits_controle: str = "") -> str 
     """
     if not isinstance(texte, str) or not texte.strip():
         return None
+
+    if question_exige_outil and question_sans_outil(texte, registre):
+        return (
+            "VALIDATION DE LA RÉPONSE : tu demandes une précision en prose. "
+            "Appelle ask_question_custom pour poser cette question et recueillir "
+            "une réponse structurée. Si plusieurs valeurs manquent, utilise "
+            "kind=form. Attends la réponse de l'utilisateur avant toute action "
+            "qui dépend de ces valeurs."
+        )
 
     brut = ReponseDire(ouverture=texte.strip())
     # Même contrat que le rendu final : sans action ni faits du code, la

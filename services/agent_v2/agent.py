@@ -61,7 +61,8 @@ from services.agent_v2.redaction import (LECTURES_RENDUES, ReponseDire,
                                          contient_question, marqueurs_bruts,
                                          question_code, sans_tiret_long)
 from services.agent_v2.registre import Registre
-from services.agent_v2.validation_sortie import retour_validation
+from services.agent_v2.validation_sortie import (jugement_exige_outil,
+                                                 question_sans_outil, retour_validation)
 
 logger = logging.getLogger(__name__)
 
@@ -554,9 +555,25 @@ class PlannerAgentV2:
                                    type(exc).__name__)
             faits_controle = (bloc_factuel(registre)
                              if self._lecture_sans_demande(registre) else "")
+            question_exige_outil = False
+            if question_sans_outil(sortie, registre):
+                extrait_message = (message if len(message) <= 1200 else
+                                   f"{message[:600]}\n[...]\n{message[-600:]}")
+                extrait_sortie = (sortie if len(sortie) <= 1200 else
+                                  f"{sortie[:600]}\n[...]\n{sortie[-600:]}")
+                verdicts = await asyncio.to_thread(
+                    _jugement.juger,
+                    {"message": extrait_message,
+                     "reponse_assistant": extrait_sortie},
+                    {"question_requiert_outil": _jugement.q_question_requiert_outil()},
+                )
+                verdict = (verdicts or {}).get("question_requiert_outil") or {}
+                question_exige_outil = jugement_exige_outil(verdict)
             retour = retour_validation(sortie, registre,
-                                       faits_controle=faits_controle)
-            if retour and reprises_sortie < 2:
+                                       faits_controle=faits_controle,
+                                       question_exige_outil=question_exige_outil)
+            if retour and (question_exige_outil
+                           or reprises_sortie < 2):
                 reprises_sortie += 1
                 logger.info("agent_v2 sortie rejetee reprise=%d actions=%d",
                             reprises_sortie, len(registre.actions))
