@@ -17,6 +17,33 @@ from services.agent_v2.validation_sortie import retour_validation
 
 
 class FiltreLectureTests(SimpleTestCase):
+    def test_question_en_prose_sans_outil_revient_au_modele(self):
+        retour = retour_validation(
+            "C'est noté pour lundi 26 octobre.\n\n"
+            "À quelle heure commence et finit ton examen ?",
+            Registre(),
+        )
+
+        self.assertIsNotNone(retour)
+        self.assertIn("ask_question_custom", retour)
+
+    def test_question_deja_posee_par_outil_ne_revient_pas_au_modele(self):
+        registre = Registre()
+        registre.ajouter("ask_question_custom", {}, ToolResult(
+            success=True, data={"question_custom": {
+                "id": "q1", "kind": "form", "question": "À quelles heures ?",
+            }}))
+
+        self.assertIsNone(retour_validation(
+            "À quelle heure commence et finit ton examen ?", registre))
+
+    def test_question_apres_outil_echoue_revient_au_modele(self):
+        registre = Registre()
+        registre.ajouter("ask_question_custom", {}, ToolResult(success=False))
+
+        self.assertIn("ask_question_custom", retour_validation(
+            "À quelle heure commence et finit ton examen ?", registre))
+
     def test_rejet_de_sortie_devient_un_retour_exploitable(self):
         registre = Registre()
         registre.ajouter("create_task", {"title": "Rapport"}, ToolResult(
@@ -182,6 +209,63 @@ class FiltreLectureTests(SimpleTestCase):
 
 
 class ReponseApresOutilTests(TransactionTestCase):
+    def test_boucle_planner_demande_les_heures_par_outil(self):
+        from pydantic_ai.messages import (ModelResponse, RetryPromptPart,
+                                          TextPart, ToolCallPart, ToolReturnPart)
+        from pydantic_ai.models.function import DeltaToolCall, FunctionModel
+
+        user = User.objects.create_user(username="reprise-question")
+        registre = Registre()
+        appels = []
+
+        def etape(messages):
+            parties = [p for m in messages for p in getattr(m, "parts", [])]
+            if any(isinstance(p, ToolReturnPart) for p in parties):
+                return "fin"
+            if any(isinstance(p, RetryPromptPart) for p in parties):
+                return "outil"
+            return "prose"
+
+        def modele(messages, _info):
+            phase = etape(messages)
+            appels.append(phase)
+            if phase == "prose":
+                return ModelResponse(parts=[TextPart(
+                    content="À quelle heure commence et finit ton examen ?")])
+            if phase == "outil":
+                return ModelResponse(parts=[ToolCallPart(
+                    tool_name="ask_question_custom", args={})])
+            return ModelResponse(parts=[TextPart(content="J'attends tes heures.")])
+
+        async def en_flux(messages, _info):
+            phase = etape(messages)
+            appels.append(phase)
+            if phase == "prose":
+                yield "À quelle heure commence et finit ton examen ?"
+            elif phase == "outil":
+                yield {0: DeltaToolCall(name="ask_question_custom", json_args="{}")}
+            else:
+                yield "J'attends tes heures."
+
+        def ask_question_custom() -> str:
+            registre.ajouter("ask_question_custom", {}, ToolResult(
+                success=True, data={"question_custom": {
+                    "id": "q1", "kind": "form", "question": "À quelles heures ?",
+                }}))
+            return "Question posée."
+
+        with patch.object(module_agent, "modele_agir",
+                          return_value=FunctionModel(modele, stream_function=en_flux)), \
+             patch("services.agent_v2.budget_tour.modele_borne", side_effect=lambda m, _tag: m), \
+             patch.object(module_agent, "outils_pour_le_modele", return_value=[ask_question_custom]), \
+             patch.object(module_agent, "prompt_agir", return_value="Pose la question par outil."), \
+             patch.object(PlannerAgentV2, "_historique", return_value=[]):
+            reponse = PlannerAgentV2()._boucle(user, "J'ai un examen lundi", registre)
+
+        self.assertEqual(appels, ["prose", "outil", "fin"])
+        self.assertEqual(reponse.ouverture, "J'attends tes heures.")
+        self.assertEqual([a.outil for a in registre.actions], ["ask_question_custom"])
+
     def test_mutation_relu_puis_reprise_sans_nouvelle_ecriture(self):
         from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
         from pydantic_ai.models.function import DeltaToolCall, FunctionModel

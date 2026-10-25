@@ -61,7 +61,7 @@ from services.agent_v2.redaction import (LECTURES_RENDUES, ReponseDire,
                                          contient_question, marqueurs_bruts,
                                          question_code, sans_tiret_long)
 from services.agent_v2.registre import Registre
-from services.agent_v2.validation_sortie import retour_validation
+from services.agent_v2.validation_sortie import question_sans_outil, retour_validation
 
 logger = logging.getLogger(__name__)
 
@@ -556,7 +556,8 @@ class PlannerAgentV2:
                              if self._lecture_sans_demande(registre) else "")
             retour = retour_validation(sortie, registre,
                                        faits_controle=faits_controle)
-            if retour and reprises_sortie < 2:
+            if retour and (question_sans_outil(sortie, registre)
+                           or reprises_sortie < 2):
                 reprises_sortie += 1
                 logger.info("agent_v2 sortie rejetee reprise=%d actions=%d",
                             reprises_sortie, len(registre.actions))
